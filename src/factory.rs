@@ -16,6 +16,14 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
     match name {
         #[cfg(feature = "rle")]
         crate::rle::Rle::NAME => Some(Box::new(<crate::rle::Rle as Algorithm>::encoder())),
+        #[cfg(feature = "deflate")]
+        crate::deflate::Deflate::NAME => {
+            Some(Box::new(<crate::deflate::Deflate as Algorithm>::encoder()))
+        }
+        #[cfg(feature = "zlib")]
+        crate::zlib::Zlib::NAME => Some(Box::new(<crate::zlib::Zlib as Algorithm>::encoder())),
+        #[cfg(feature = "gzip")]
+        crate::gzip::Gzip::NAME => Some(Box::new(<crate::gzip::Gzip as Algorithm>::encoder())),
         _ => None,
     }
 }
@@ -26,6 +34,14 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
     match name {
         #[cfg(feature = "rle")]
         crate::rle::Rle::NAME => Some(Box::new(<crate::rle::Rle as Algorithm>::decoder())),
+        #[cfg(feature = "deflate")]
+        crate::deflate::Deflate::NAME => {
+            Some(Box::new(<crate::deflate::Deflate as Algorithm>::decoder()))
+        }
+        #[cfg(feature = "zlib")]
+        crate::zlib::Zlib::NAME => Some(Box::new(<crate::zlib::Zlib as Algorithm>::decoder())),
+        #[cfg(feature = "gzip")]
+        crate::gzip::Gzip::NAME => Some(Box::new(<crate::gzip::Gzip as Algorithm>::decoder())),
         _ => None,
     }
 }
@@ -36,5 +52,11 @@ pub const fn names() -> &'static [&'static str] {
     &[
         #[cfg(feature = "rle")]
         crate::rle::Rle::NAME,
+        #[cfg(feature = "deflate")]
+        crate::deflate::Deflate::NAME,
+        #[cfg(feature = "zlib")]
+        crate::zlib::Zlib::NAME,
+        #[cfg(feature = "gzip")]
+        crate::gzip::Gzip::NAME,
     ]
 }

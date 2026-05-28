@@ -10,7 +10,7 @@ keywords    = ["compression", "no_std", "embedded"]
 categories  = ["compression", "no-std"]
 
 [features]
-default = ["alloc", "rle"]
+default = ["alloc", "rle", "deflate", "zlib", "gzip"]
 # Enables `alloc`-backed conveniences (e.g. the `factory` module). Pulled in
 # automatically by features that require heap allocation.
 alloc   = []
@@ -18,6 +18,13 @@ alloc   = []
 factory = ["alloc"]
 # Run-length encoding.
 rle     = []
+# RFC 1951 raw deflate. Requires `alloc` for the 32 KiB sliding window and
+# the per-block symbol/bit buffers.
+deflate = ["alloc"]
+# RFC 1950 zlib (deflate + Adler-32 + 2-byte header / 4-byte trailer).
+zlib    = ["deflate"]
+# RFC 1952 gzip (deflate + CRC-32 + 10-byte header / 8-byte trailer).
+gzip    = ["deflate"]
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -21,8 +21,26 @@ mod traits;
 pub use error::Error;
 pub use traits::{Algorithm, Decoder, Encoder, Progress};
 
+// Shared internals used by the deflate-family codecs. Kept private; the
+// surface that downstream crates see is the per-algorithm modules below.
+#[cfg(any(feature = "deflate", test))]
+mod bits;
+#[cfg(any(feature = "zlib", feature = "gzip", test))]
+mod checksum;
+#[cfg(any(feature = "deflate", test))]
+mod huffman;
+
 #[cfg(feature = "rle")]
 pub mod rle;
+
+#[cfg(feature = "deflate")]
+pub mod deflate;
+
+#[cfg(feature = "zlib")]
+pub mod zlib;
+
+#[cfg(feature = "gzip")]
+pub mod gzip;
 
 #[cfg(feature = "factory")]
 pub mod factory;

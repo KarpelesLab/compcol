@@ -1,0 +1,606 @@
+//! RFC 1952 gzip container around RFC 1951 deflate.
+//!
+//! Wire format:
+//! ```text
+//! +---+---+---+---+---+---+---+---+---+---+---== ... ==---+---+---+---+---+---+---+---+---+
+//! |1F |8B |CM |FLG|    MTIME      |XFL|OS |  optional |    deflate    |    CRC-32     |   ISIZE   |
+//! +---+---+---+---+---+---+---+---+---+---+---== ... ==---+---+---+---+---+---+---+---+---+
+//! ```
+//! Fixed 10-byte header followed by optional fields gated by FLG bits:
+//!   FEXTRA (bit 2)   — 2-byte XLEN + XLEN bytes
+//!   FNAME  (bit 3)   — NUL-terminated filename
+//!   FCOMMENT (bit 4) — NUL-terminated comment
+//!   FHCRC  (bit 1)   — 2-byte header CRC16 (low 16 bits of CRC-32)
+//! Then deflate, then 8-byte trailer (little-endian CRC-32 of original data +
+//! ISIZE = uncompressed length mod 2^32).
+//!
+//! v1 limitations:
+//! - Decoder ignores MTIME/XFL/OS and any optional metadata; it parses but
+//!   doesn't expose the filename or comment.
+//! - Encoder always emits a minimal 10-byte header (FLG = 0).
+//! - Concatenated gzip members are not supported — decoder stops at the
+//!   first member's trailer.
+
+use crate::checksum::Crc32;
+use crate::deflate;
+use crate::error::Error;
+use crate::traits::{Algorithm, Decoder as DecoderTrait, Encoder as EncoderTrait, Progress};
+
+const MAGIC_ID1: u8 = 0x1F;
+const MAGIC_ID2: u8 = 0x8B;
+const CM_DEFLATE: u8 = 0x08;
+
+const FTEXT: u8 = 1 << 0;
+const FHCRC: u8 = 1 << 1;
+const FEXTRA: u8 = 1 << 2;
+const FNAME: u8 = 1 << 3;
+const FCOMMENT: u8 = 1 << 4;
+/// Mask of reserved FLG bits that, if set, mean the file uses an extension
+/// we don't understand.
+const FLG_RESERVED: u8 = !(FTEXT | FHCRC | FEXTRA | FNAME | FCOMMENT);
+
+/// Zero-sized marker type implementing [`Algorithm`] for gzip.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Gzip;
+
+impl Algorithm for Gzip {
+    const NAME: &'static str = "gzip";
+    type Encoder = Encoder;
+    type Decoder = Decoder;
+
+    fn encoder() -> Encoder {
+        Encoder::new()
+    }
+    fn decoder() -> Decoder {
+        Decoder::new()
+    }
+}
+
+// ─── decoder ─────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecPhase {
+    /// Reading the 10-byte fixed header into `header_bytes`.
+    FixedHeader,
+    /// Reading XLEN (2 bytes LE) for the FEXTRA field.
+    ExtraLen,
+    /// Skipping `remaining` extra-data bytes.
+    ExtraData,
+    /// Skipping bytes of the filename until a NUL is seen.
+    Name,
+    /// Skipping bytes of the comment until a NUL is seen.
+    Comment,
+    /// Skipping the 2-byte header-CRC trailer (validation deferred — v1).
+    HeaderCrc,
+    /// Streaming the deflate payload.
+    Deflate,
+    /// Collecting the 8-byte trailer (CRC-32 + ISIZE, little-endian).
+    Trailer,
+    /// Trailer validated; nothing more to consume.
+    Done,
+}
+
+pub struct Decoder {
+    inner: deflate::Decoder,
+    crc: Crc32,
+    isize_count: u32, // running uncompressed byte count (mod 2^32)
+    header_bytes: [u8; 10],
+    header_idx: u8,
+    flg: u8,
+    aux_idx: u8,         // index inside the current sub-phase
+    aux_xlen: u16,       // FEXTRA length captured from the 2-byte XLEN
+    aux_remaining: u32,  // bytes left to skip in the current sub-phase
+    trailer_carryover: alloc::vec::Vec<u8>,
+    trailer_carryover_idx: usize,
+    trailer: [u8; 8],
+    trailer_idx: u8,
+    phase: DecPhase,
+    poisoned: bool,
+}
+
+impl Decoder {
+    pub fn new() -> Self {
+        Self {
+            inner: deflate::Decoder::new(),
+            crc: Crc32::new(),
+            isize_count: 0,
+            header_bytes: [0u8; 10],
+            header_idx: 0,
+            flg: 0,
+            aux_idx: 0,
+            aux_xlen: 0,
+            aux_remaining: 0,
+            trailer_carryover: alloc::vec::Vec::new(),
+            trailer_carryover_idx: 0,
+            trailer: [0u8; 8],
+            trailer_idx: 0,
+            phase: DecPhase::FixedHeader,
+            poisoned: false,
+        }
+    }
+
+    fn poison(&mut self, e: Error) -> Error {
+        self.poisoned = true;
+        e
+    }
+
+    fn validate_fixed_header(&mut self) -> Result<(), Error> {
+        let b = &self.header_bytes;
+        if b[0] != MAGIC_ID1 || b[1] != MAGIC_ID2 {
+            return Err(self.poison(Error::BadHeader));
+        }
+        if b[2] != CM_DEFLATE {
+            return Err(self.poison(Error::Unsupported));
+        }
+        let flg = b[3];
+        if flg & FLG_RESERVED != 0 {
+            return Err(self.poison(Error::Unsupported));
+        }
+        self.flg = flg;
+        Ok(())
+    }
+
+    /// Decide which sub-phase comes after `after`, based on the FLG bits.
+    fn next_after(&self, after: DecPhase) -> DecPhase {
+        // The optional fields appear in this fixed order:
+        //   FEXTRA, FNAME, FCOMMENT, FHCRC.
+        // For each candidate, only consider it if `after` is strictly before it.
+        let order = [
+            (DecPhase::FixedHeader, FEXTRA, DecPhase::ExtraLen),
+            (DecPhase::ExtraData, FNAME, DecPhase::Name),
+            (DecPhase::Name, FCOMMENT, DecPhase::Comment),
+            (DecPhase::Comment, FHCRC, DecPhase::HeaderCrc),
+        ];
+        // `after` ranks the phases by progress.
+        let after_rank = phase_rank(after);
+        for &(predecessor, flag, candidate) in &order {
+            if phase_rank(predecessor) >= after_rank && self.flg & flag != 0 {
+                return candidate;
+            }
+        }
+        DecPhase::Deflate
+    }
+}
+
+/// Total ordering of optional-header phases by progress; used by
+/// [`Decoder::next_after`] to skip flag bits whose field is already behind us.
+fn phase_rank(p: DecPhase) -> u8 {
+    match p {
+        DecPhase::FixedHeader => 0,
+        DecPhase::ExtraLen => 1,
+        DecPhase::ExtraData => 2,
+        DecPhase::Name => 3,
+        DecPhase::Comment => 4,
+        DecPhase::HeaderCrc => 5,
+        DecPhase::Deflate => 6,
+        DecPhase::Trailer => 7,
+        DecPhase::Done => 8,
+    }
+}
+
+impl Default for Decoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DecoderTrait for Decoder {
+    fn decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+        if self.poisoned {
+            return Err(Error::Corrupt);
+        }
+        let mut consumed = 0usize;
+        let mut written = 0usize;
+
+        loop {
+            let initial_consumed = consumed;
+            let initial_written = written;
+
+            match self.phase {
+                DecPhase::FixedHeader => {
+                    while (self.header_idx as usize) < 10 && consumed < input.len() {
+                        self.header_bytes[self.header_idx as usize] = input[consumed];
+                        self.header_idx += 1;
+                        consumed += 1;
+                    }
+                    if self.header_idx == 10 {
+                        self.validate_fixed_header()?;
+                        self.phase = self.next_after(DecPhase::FixedHeader);
+                        self.aux_idx = 0;
+                    } else {
+                        return Ok(Progress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                }
+                DecPhase::ExtraLen => {
+                    // Read 2 little-endian bytes.
+                    while self.aux_idx < 2 && consumed < input.len() {
+                        let b = input[consumed];
+                        consumed += 1;
+                        if self.aux_idx == 0 {
+                            self.aux_xlen = b as u16;
+                        } else {
+                            self.aux_xlen |= (b as u16) << 8;
+                        }
+                        self.aux_idx += 1;
+                    }
+                    if self.aux_idx == 2 {
+                        self.aux_remaining = self.aux_xlen as u32;
+                        self.phase = DecPhase::ExtraData;
+                    } else {
+                        return Ok(Progress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                }
+                DecPhase::ExtraData => {
+                    while self.aux_remaining > 0 && consumed < input.len() {
+                        consumed += 1;
+                        self.aux_remaining -= 1;
+                    }
+                    if self.aux_remaining == 0 {
+                        self.phase = self.next_after(DecPhase::ExtraData);
+                    } else {
+                        return Ok(Progress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                }
+                DecPhase::Name => {
+                    let mut found_nul = false;
+                    while consumed < input.len() {
+                        let b = input[consumed];
+                        consumed += 1;
+                        if b == 0 {
+                            found_nul = true;
+                            break;
+                        }
+                    }
+                    if found_nul {
+                        self.phase = self.next_after(DecPhase::Name);
+                    } else {
+                        return Ok(Progress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                }
+                DecPhase::Comment => {
+                    let mut found_nul = false;
+                    while consumed < input.len() {
+                        let b = input[consumed];
+                        consumed += 1;
+                        if b == 0 {
+                            found_nul = true;
+                            break;
+                        }
+                    }
+                    if found_nul {
+                        self.phase = self.next_after(DecPhase::Comment);
+                    } else {
+                        return Ok(Progress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                }
+                DecPhase::HeaderCrc => {
+                    // Skip 2 bytes — we don't validate the header CRC in v1.
+                    while self.aux_idx < 2 && consumed < input.len() {
+                        consumed += 1;
+                        self.aux_idx += 1;
+                    }
+                    if self.aux_idx == 2 {
+                        self.phase = DecPhase::Deflate;
+                    } else {
+                        return Ok(Progress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                }
+                DecPhase::Deflate => {
+                    let before_written = written;
+                    let p = self
+                        .inner
+                        .decode(&input[consumed..], &mut output[written..])
+                        .map_err(|e| self.poison(e))?;
+                    consumed += p.consumed;
+                    written += p.written;
+                    let new_bytes = &output[before_written..written];
+                    self.crc.update(new_bytes);
+                    self.isize_count = self.isize_count.wrapping_add(new_bytes.len() as u32);
+
+                    if self.inner.is_complete() {
+                        self.trailer_carryover = self.inner.drain_trailing_bytes();
+                        self.trailer_carryover_idx = 0;
+                        self.phase = DecPhase::Trailer;
+                    } else if p.consumed == 0 && p.written == 0 {
+                        return Ok(Progress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                }
+                DecPhase::Trailer => {
+                    while self.trailer_idx < 8 {
+                        let byte = if self.trailer_carryover_idx < self.trailer_carryover.len() {
+                            let b = self.trailer_carryover[self.trailer_carryover_idx];
+                            self.trailer_carryover_idx += 1;
+                            b
+                        } else if consumed < input.len() {
+                            let b = input[consumed];
+                            consumed += 1;
+                            b
+                        } else {
+                            return Ok(Progress {
+                                consumed,
+                                written,
+                                done: false,
+                            });
+                        };
+                        self.trailer[self.trailer_idx as usize] = byte;
+                        self.trailer_idx += 1;
+                    }
+                    let expected_crc = u32::from_le_bytes([
+                        self.trailer[0],
+                        self.trailer[1],
+                        self.trailer[2],
+                        self.trailer[3],
+                    ]);
+                    let expected_isize = u32::from_le_bytes([
+                        self.trailer[4],
+                        self.trailer[5],
+                        self.trailer[6],
+                        self.trailer[7],
+                    ]);
+                    if expected_crc != self.crc.finalize() {
+                        return Err(self.poison(Error::ChecksumMismatch));
+                    }
+                    if expected_isize != self.isize_count {
+                        return Err(self.poison(Error::TrailerMismatch));
+                    }
+                    self.phase = DecPhase::Done;
+                }
+                DecPhase::Done => {
+                    return Ok(Progress {
+                        consumed,
+                        written,
+                        done: false,
+                    });
+                }
+            }
+
+            if consumed == initial_consumed && written == initial_written {
+                return Ok(Progress {
+                    consumed,
+                    written,
+                    done: false,
+                });
+            }
+        }
+    }
+
+    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+        if self.poisoned {
+            return Err(Error::Corrupt);
+        }
+        let empty: [u8; 0] = [];
+        let p = self.decode(&empty, output)?;
+        if matches!(self.phase, DecPhase::Done) {
+            Ok(Progress {
+                consumed: 0,
+                written: p.written,
+                done: true,
+            })
+        } else {
+            Err(self.poison(Error::UnexpectedEnd))
+        }
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+        self.crc.reset();
+        self.isize_count = 0;
+        self.header_idx = 0;
+        self.flg = 0;
+        self.aux_idx = 0;
+        self.aux_xlen = 0;
+        self.aux_remaining = 0;
+        self.trailer_carryover.clear();
+        self.trailer_carryover_idx = 0;
+        self.trailer_idx = 0;
+        self.phase = DecPhase::FixedHeader;
+        self.poisoned = false;
+    }
+}
+
+// ─── encoder ─────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EncPhase {
+    Header,
+    Deflate,
+    Trailer,
+    Done,
+}
+
+/// Minimal 10-byte gzip header: magic, deflate method, no flags, MTIME=0,
+/// XFL=0, OS=0xFF (unknown).
+const FIXED_HEADER: [u8; 10] = [
+    MAGIC_ID1, MAGIC_ID2, CM_DEFLATE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
+];
+
+pub struct Encoder {
+    inner: deflate::Encoder,
+    crc: Crc32,
+    isize_count: u32,
+    header_idx: u8,
+    trailer: [u8; 8],
+    trailer_idx: u8,
+    phase: EncPhase,
+}
+
+impl Encoder {
+    pub fn new() -> Self {
+        Self {
+            inner: deflate::Encoder::new(),
+            crc: Crc32::new(),
+            isize_count: 0,
+            header_idx: 0,
+            trailer: [0u8; 8],
+            trailer_idx: 0,
+            phase: EncPhase::Header,
+        }
+    }
+
+    fn drain_header(&mut self, output: &mut [u8], written: &mut usize) -> bool {
+        while (self.header_idx as usize) < FIXED_HEADER.len() && *written < output.len() {
+            output[*written] = FIXED_HEADER[self.header_idx as usize];
+            *written += 1;
+            self.header_idx += 1;
+        }
+        self.header_idx as usize == FIXED_HEADER.len()
+    }
+
+    fn drain_trailer(&mut self, output: &mut [u8], written: &mut usize) -> bool {
+        while self.trailer_idx < 8 && *written < output.len() {
+            output[*written] = self.trailer[self.trailer_idx as usize];
+            *written += 1;
+            self.trailer_idx += 1;
+        }
+        self.trailer_idx == 8
+    }
+}
+
+impl Default for Encoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EncoderTrait for Encoder {
+    fn encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+        let mut consumed = 0usize;
+        let mut written = 0usize;
+
+        if matches!(self.phase, EncPhase::Header) {
+            if !self.drain_header(output, &mut written) {
+                return Ok(Progress {
+                    consumed,
+                    written,
+                    done: false,
+                });
+            }
+            self.phase = EncPhase::Deflate;
+        }
+        if !matches!(self.phase, EncPhase::Deflate) {
+            return Err(Error::Corrupt);
+        }
+        let before = consumed;
+        let p = self
+            .inner
+            .encode(&input[consumed..], &mut output[written..])?;
+        consumed += p.consumed;
+        written += p.written;
+        let new = &input[before..before + p.consumed];
+        self.crc.update(new);
+        self.isize_count = self.isize_count.wrapping_add(new.len() as u32);
+
+        Ok(Progress {
+            consumed,
+            written,
+            done: false,
+        })
+    }
+
+    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+        let mut written = 0usize;
+
+        if matches!(self.phase, EncPhase::Header) {
+            if !self.drain_header(output, &mut written) {
+                return Ok(Progress {
+                    consumed: 0,
+                    written,
+                    done: false,
+                });
+            }
+            self.phase = EncPhase::Deflate;
+        }
+
+        if matches!(self.phase, EncPhase::Deflate) {
+            loop {
+                let p = self.inner.finish(&mut output[written..])?;
+                written += p.written;
+                if p.done {
+                    let crc = self.crc.finalize();
+                    let isz = self.isize_count;
+                    self.trailer = [
+                        (crc & 0xFF) as u8,
+                        ((crc >> 8) & 0xFF) as u8,
+                        ((crc >> 16) & 0xFF) as u8,
+                        ((crc >> 24) & 0xFF) as u8,
+                        (isz & 0xFF) as u8,
+                        ((isz >> 8) & 0xFF) as u8,
+                        ((isz >> 16) & 0xFF) as u8,
+                        ((isz >> 24) & 0xFF) as u8,
+                    ];
+                    self.trailer_idx = 0;
+                    self.phase = EncPhase::Trailer;
+                    break;
+                }
+                if p.written == 0 {
+                    return Ok(Progress {
+                        consumed: 0,
+                        written,
+                        done: false,
+                    });
+                }
+            }
+        }
+
+        if matches!(self.phase, EncPhase::Trailer) && self.drain_trailer(output, &mut written) {
+            self.phase = EncPhase::Done;
+            return Ok(Progress {
+                consumed: 0,
+                written,
+                done: true,
+            });
+        }
+
+        if matches!(self.phase, EncPhase::Done) {
+            return Ok(Progress {
+                consumed: 0,
+                written,
+                done: true,
+            });
+        }
+
+        Ok(Progress {
+            consumed: 0,
+            written,
+            done: false,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+        self.crc.reset();
+        self.isize_count = 0;
+        self.header_idx = 0;
+        self.trailer = [0u8; 8];
+        self.trailer_idx = 0;
+        self.phase = EncPhase::Header;
+    }
+}
