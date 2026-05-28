@@ -7,11 +7,6 @@
 
 #![cfg(feature = "alloc")]
 
-use compcol::Error;
-use compcol::vec::{
-    compress_to_vec, compress_to_vec_with, decompress_to_vec, decompress_to_vec_with,
-};
-
 fn payload(n: usize) -> Vec<u8> {
     // Mixed corpus: short alphabet noise + repeated phrase. Compresses
     // well enough to exercise the codec; large enough (~96 KiB) to
@@ -35,6 +30,7 @@ fn payload(n: usize) -> Vec<u8> {
 #[cfg(feature = "rle")]
 mod rle {
     use super::*;
+    use compcol::vec::{compress_to_vec, decompress_to_vec};
 
     #[test]
     fn round_trip_empty() {
@@ -66,6 +62,9 @@ mod rle {
 mod gzip {
     use super::*;
     use compcol::gzip::{EncoderConfig, Gzip};
+    use compcol::vec::{
+        compress_to_vec, compress_to_vec_with, decompress_to_vec, decompress_to_vec_with,
+    };
 
     #[test]
     fn round_trip_default_config() {
@@ -93,6 +92,7 @@ mod gzip {
 
     #[test]
     fn decompress_truncated_input_errors() {
+        use compcol::Error;
         let input = payload(8 * 1024);
         let compressed = compress_to_vec::<Gzip>(&input).unwrap();
         // Drop the last 4 bytes (CRC/ISIZE region).
@@ -120,6 +120,7 @@ mod gzip {
 #[cfg(feature = "zstd")]
 mod zstd {
     use super::*;
+    use compcol::vec::{compress_to_vec, decompress_to_vec};
     use compcol::zstd::Zstd;
 
     #[test]
@@ -137,6 +138,7 @@ mod zstd {
 mod lz4 {
     use super::*;
     use compcol::lz4::Lz4;
+    use compcol::vec::{compress_to_vec, decompress_to_vec};
 
     #[test]
     fn round_trip_64k_plus_1() {
@@ -154,6 +156,7 @@ mod lz4 {
 mod brotli {
     use super::*;
     use compcol::brotli::Brotli;
+    use compcol::vec::{compress_to_vec, decompress_to_vec};
 
     #[test]
     fn round_trip_above_old_buggy_size() {

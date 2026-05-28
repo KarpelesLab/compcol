@@ -37,8 +37,9 @@
 //!
 //! ## What does not work
 //!
-//! [`Decoder::decode`] / [`Decoder::finish`] return [`Error::Unsupported`]
-//! on any non-empty input. The reason is **the static Huffman code-length
+//! [`crate::Decoder::decode`] / [`crate::Decoder::finish`] return
+//! [`Error::Unsupported`] on any non-empty input. The reason is
+//! **the static Huffman code-length
 //! tables**: RAR1 doesn't transmit them, so any working decoder has to
 //! ship them. They are not public-domain data; the only published forms
 //! known to us are inside LGPL'd reverse-engineered code (The Unarchiver)

@@ -50,12 +50,14 @@ fn run_with_stdin(args: &[&str], stdin: &[u8]) -> (Vec<u8>, Vec<u8>, i32) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn compcol");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(stdin)
-        .expect("write stdin");
+    // The child can exit before we finish writing stdin (e.g. usage
+    // errors that fail fast without consuming input). The kernel then
+    // returns EPIPE; treat that as "child ate what it wanted, move on."
+    if let Err(e) = child.stdin.as_mut().unwrap().write_all(stdin)
+        && e.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        panic!("write stdin: {e:?}");
+    }
     drop(child.stdin.take());
     let mut out = Vec::new();
     let mut err = Vec::new();

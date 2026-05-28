@@ -32,8 +32,8 @@
 //! - `bvx2` (LZFSE v2 compressed) blocks: the FSE table-construction
 //!   primitives are present (see `fse.rs`), but the full v2 block decoder
 //!   is gated off in this release. `bvx2` blocks return
-//!   [`Error::Unsupported`]; see [`lzfse_v2`] for the layout reference
-//!   and the gap analysis.
+//!   [`Error::Unsupported`]; see the internal `lzfse_v2` module for the
+//!   layout reference and the gap analysis.
 //!
 //! Real LZFSE files produced by Apple's encoders mix these block types
 //! freely: small payloads land in `bvxn`, large ones in `bvx2`, and short
