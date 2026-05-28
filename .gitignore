@@ -1,0 +1,3 @@
+/target
+# Library crate — lockfile is excluded so downstream resolution wins.
+/Cargo.lock

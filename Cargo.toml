@@ -1,0 +1,23 @@
+[package]
+name        = "compcol"
+version     = "0.1.0"
+edition     = "2024"
+description = "A no_std collection of compression algorithms behind a uniform streaming trait, gated per-algorithm by Cargo features."
+license     = "MIT"
+repository  = "https://github.com/magicaltux/compcol"
+readme      = "README.md"
+keywords    = ["compression", "no_std", "embedded"]
+categories  = ["compression", "no-std"]
+
+[features]
+default = ["alloc", "rle"]
+# Enables `alloc`-backed conveniences (e.g. the `factory` module). Pulled in
+# automatically by features that require heap allocation.
+alloc   = []
+# Runtime by-name lookup that returns boxed trait objects. Requires `alloc`.
+factory = ["alloc"]
+# Run-length encoding.
+rle     = []
+
+[lints.rust]
+unsafe_code = "forbid"
