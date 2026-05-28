@@ -56,9 +56,7 @@ fn decode_handcrafted_stored_block() {
     //   LEN  = 5 (little-endian)              -> 0x05 0x00
     //   NLEN = ~5 = 0xFFFA (little-endian)    -> 0xFA 0xFF
     //   data = "hello"                        -> 68 65 6C 6C 6F
-    let stream = [
-        0x01, 0x05, 0x00, 0xFA, 0xFF, b'h', b'e', b'l', b'l', b'o',
-    ];
+    let stream = [0x01, 0x05, 0x00, 0xFA, 0xFF, b'h', b'e', b'l', b'l', b'o'];
     let decoded = decode_chunked(&stream, 1024, 1024).unwrap();
     assert_eq!(decoded, b"hello");
 }
@@ -79,9 +77,7 @@ fn decode_two_stored_blocks() {
 
 #[test]
 fn decode_stored_block_streaming_one_byte_at_a_time() {
-    let stream = [
-        0x01, 0x05, 0x00, 0xFA, 0xFF, b'h', b'e', b'l', b'l', b'o',
-    ];
+    let stream = [0x01, 0x05, 0x00, 0xFA, 0xFF, b'h', b'e', b'l', b'l', b'o'];
     let decoded = decode_chunked(&stream, 1, 1).unwrap();
     assert_eq!(decoded, b"hello");
 }
@@ -119,7 +115,8 @@ fn decode_fixed_huffman_two_runs() {
 #[test]
 fn decode_lorem_fixed_huffman() {
     // 896-byte Lorem ipsum compressed at level 6 — fixed Huffman block.
-    let stream = hex("f3c92f4acd55c82c282ecd5548c9cfc92f5228ce2c5148cc4d2dd151f019951b951b95a3a91c00");
+    let stream =
+        hex("f3c92f4acd55c82c282ecd5548c9cfc92f5228ce2c5148cc4d2dd151f019951b951b95a3a91c00");
     let decoded = decode_chunked(&stream, 1024, 1024).unwrap();
     let expected = b"Lorem ipsum dolor sit amet, ".repeat(32);
     assert_eq!(decoded, expected);
@@ -128,7 +125,9 @@ fn decode_lorem_fixed_huffman() {
 #[test]
 fn decode_dynamic_huffman_quick_brown_fox() {
     // 4500-byte "The quick brown fox..." compressed at level 6 — dynamic Huffman.
-    let stream = hex("edca470180301045412b5f016a628092d0d910084d3d88e0f8ce33aef35a735f8faa929d8b825d1af21c37d9e193f68fa7f2b9d5585bc891c96432994c2693c96432994c2693ffc82f");
+    let stream = hex(
+        "edca470180301045412b5f016a628092d0d910084d3d88e0f8ce33aef35a735f8faa929d8b825d1af21c37d9e193f68fa7f2b9d5585bc891c96432994c2693c96432994c2693ffc82f",
+    );
     let decoded = decode_chunked(&stream, 1024, 1024).unwrap();
     let expected = b"The quick brown fox jumps over the lazy dog. ".repeat(100);
     assert_eq!(decoded, expected);
@@ -137,7 +136,9 @@ fn decode_dynamic_huffman_quick_brown_fox() {
 #[test]
 fn decode_dynamic_huffman_streaming_one_byte() {
     // Same dynamic-Huffman fixture, fed 1 byte at a time and drained 1 byte at a time.
-    let stream = hex("edca470180301045412b5f016a628092d0d910084d3d88e0f8ce33aef35a735f8faa929d8b825d1af21c37d9e193f68fa7f2b9d5585bc891c96432994c2693c96432994c2693ffc82f");
+    let stream = hex(
+        "edca470180301045412b5f016a628092d0d910084d3d88e0f8ce33aef35a735f8faa929d8b825d1af21c37d9e193f68fa7f2b9d5585bc891c96432994c2693c96432994c2693ffc82f",
+    );
     let decoded = decode_chunked(&stream, 1, 1).unwrap();
     let expected = b"The quick brown fox jumps over the lazy dog. ".repeat(100);
     assert_eq!(decoded, expected);
@@ -180,7 +181,12 @@ fn encode_chunked(input: &[u8], in_chunk: usize, out_chunk: usize) -> Vec<u8> {
 fn round_trip(input: &[u8]) {
     let encoded = encode_chunked(input, 4096, 4096);
     let decoded = decode_chunked(&encoded, 4096, 4096).unwrap();
-    assert_eq!(decoded, input, "round-trip mismatch (input len {})", input.len());
+    assert_eq!(
+        decoded,
+        input,
+        "round-trip mismatch (input len {})",
+        input.len()
+    );
 }
 
 #[test]
@@ -210,7 +216,12 @@ fn round_trip_long_zeros() {
     let input = vec![0u8; 4096];
     let encoded = encode_chunked(&input, 4096, 4096);
     // Should compress significantly.
-    assert!(encoded.len() < input.len() / 10, "zeros didn't compress: {} -> {}", input.len(), encoded.len());
+    assert!(
+        encoded.len() < input.len() / 10,
+        "zeros didn't compress: {} -> {}",
+        input.len(),
+        encoded.len()
+    );
     let decoded = decode_chunked(&encoded, 4096, 4096).unwrap();
     assert_eq!(decoded, input);
 }
@@ -219,7 +230,12 @@ fn round_trip_long_zeros() {
 fn round_trip_lorem_ipsum() {
     let input = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(20);
     let encoded = encode_chunked(&input, 4096, 4096);
-    assert!(encoded.len() < input.len() / 2, "text didn't compress: {} -> {}", input.len(), encoded.len());
+    assert!(
+        encoded.len() < input.len() / 2,
+        "text didn't compress: {} -> {}",
+        input.len(),
+        encoded.len()
+    );
     let decoded = decode_chunked(&encoded, 4096, 4096).unwrap();
     assert_eq!(decoded, input);
 }

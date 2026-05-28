@@ -140,7 +140,9 @@ where
 
 fn set_positional(args: &mut Args, raw: OsString) -> Result<(), ParseError> {
     if args.input.is_some() {
-        return Err(ParseError::ExtraPositional(raw.to_string_lossy().into_owned()));
+        return Err(ParseError::ExtraPositional(
+            raw.to_string_lossy().into_owned(),
+        ));
     }
     args.input = Some(PathBuf::from(raw));
     Ok(())
@@ -255,9 +257,7 @@ fn derive_output(args: &Args) -> Result<Output, String> {
 
     let algo = args.algorithm.as_deref().unwrap_or_default();
     let ext = factory::extension(algo).ok_or_else(|| {
-        format!(
-            "no default extension for algorithm '{algo}'; use -c or -o to pick output"
-        )
+        format!("no default extension for algorithm '{algo}'; use -c or -o to pick output")
     })?;
 
     if args.decompress {
@@ -353,8 +353,12 @@ fn run(args: &Args, algo: &str) -> Result<(), RunError> {
 
     // Reader.
     let mut reader: Box<dyn Read> = if let Some(p) = &args.input {
-        let f = File::open(p)
-            .map_err(|e| RunError::Io(io::Error::new(e.kind(), format!("open {}: {e}", p.display()))))?;
+        let f = File::open(p).map_err(|e| {
+            RunError::Io(io::Error::new(
+                e.kind(),
+                format!("open {}: {e}", p.display()),
+            ))
+        })?;
         Box::new(BufReader::new(f))
     } else {
         Box::new(BufReader::new(io::stdin()))
@@ -376,20 +380,23 @@ fn run(args: &Args, algo: &str) -> Result<(), RunError> {
                 .create(true)
                 .truncate(true)
                 .open(p)
-                .map_err(|e| RunError::Io(io::Error::new(e.kind(), format!("create {}: {e}", p.display()))))?;
+                .map_err(|e| {
+                    RunError::Io(io::Error::new(
+                        e.kind(),
+                        format!("create {}: {e}", p.display()),
+                    ))
+                })?;
             (Box::new(BufWriter::new(f)), Some(p.clone()))
         }
     };
 
     let result = if args.decompress {
-        let dec = factory::decoder_by_name(algo).ok_or_else(|| {
-            RunError::Usage(format!("unknown algorithm: '{algo}' (use --list)"))
-        })?;
+        let dec = factory::decoder_by_name(algo)
+            .ok_or_else(|| RunError::Usage(format!("unknown algorithm: '{algo}' (use --list)")))?;
         stream_decode(dec, &mut *reader, &mut *writer)
     } else {
-        let enc = factory::encoder_by_name(algo).ok_or_else(|| {
-            RunError::Usage(format!("unknown algorithm: '{algo}' (use --list)"))
-        })?;
+        let enc = factory::encoder_by_name(algo)
+            .ok_or_else(|| RunError::Usage(format!("unknown algorithm: '{algo}' (use --list)")))?;
         stream_encode(enc, &mut *reader, &mut *writer)
     };
 

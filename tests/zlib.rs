@@ -128,7 +128,11 @@ fn round_trip_long_zeros() {
     let input = vec![0u8; 4096];
     let encoded = encode_all(&input);
     // Should compress well: 4096 bytes -> << 100 with the header/trailer overhead.
-    assert!(encoded.len() < 100, "zeros didn't compress: {}", encoded.len());
+    assert!(
+        encoded.len() < 100,
+        "zeros didn't compress: {}",
+        encoded.len()
+    );
     let decoded = decode_chunked(&encoded, 4096, 4096).unwrap();
     assert_eq!(decoded, input);
 }

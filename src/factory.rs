@@ -27,9 +27,7 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         #[cfg(feature = "lzma")]
         crate::lzma::Lzma::NAME => Some(Box::new(<crate::lzma::Lzma as Algorithm>::encoder())),
         #[cfg(feature = "lzma2")]
-        crate::lzma2::Lzma2::NAME => {
-            Some(Box::new(<crate::lzma2::Lzma2 as Algorithm>::encoder()))
-        }
+        crate::lzma2::Lzma2::NAME => Some(Box::new(<crate::lzma2::Lzma2 as Algorithm>::encoder())),
         #[cfg(feature = "xz")]
         crate::xz::Xz::NAME => Some(Box::new(<crate::xz::Xz as Algorithm>::encoder())),
         #[cfg(feature = "zstd")]
@@ -67,9 +65,7 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         #[cfg(feature = "lzma")]
         crate::lzma::Lzma::NAME => Some(Box::new(<crate::lzma::Lzma as Algorithm>::decoder())),
         #[cfg(feature = "lzma2")]
-        crate::lzma2::Lzma2::NAME => {
-            Some(Box::new(<crate::lzma2::Lzma2 as Algorithm>::decoder()))
-        }
+        crate::lzma2::Lzma2::NAME => Some(Box::new(<crate::lzma2::Lzma2 as Algorithm>::decoder())),
         #[cfg(feature = "xz")]
         crate::xz::Xz::NAME => Some(Box::new(<crate::xz::Xz as Algorithm>::decoder())),
         #[cfg(feature = "zstd")]

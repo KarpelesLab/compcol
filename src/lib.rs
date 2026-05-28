@@ -23,11 +23,13 @@ pub use traits::{Algorithm, Decoder, Encoder, Progress};
 
 // Shared internals used by the deflate-family codecs. Kept private; the
 // surface that downstream crates see is the per-algorithm modules below.
-#[cfg(any(feature = "deflate", test))]
+// Gated on the features that consume them so a narrow build (e.g. just
+// `lz4`) doesn't pull them in via `cfg(test)`.
+#[cfg(feature = "deflate")]
 mod bits;
-#[cfg(any(feature = "zlib", feature = "gzip", test))]
+#[cfg(any(feature = "zlib", feature = "gzip"))]
 mod checksum;
-#[cfg(any(feature = "deflate", test))]
+#[cfg(feature = "deflate")]
 mod huffman;
 
 #[cfg(feature = "rle")]

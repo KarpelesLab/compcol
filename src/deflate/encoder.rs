@@ -15,7 +15,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use crate::bits::{reverse_bits, BitWriter};
+use crate::bits::{BitWriter, reverse_bits};
 use crate::error::Error;
 use crate::huffman::{canonical_codes_from_lengths, length_limited_huffman};
 use crate::traits::{Encoder as EncoderTrait, Progress};
@@ -85,9 +85,9 @@ enum Symbol {
 
 #[derive(Clone, Copy)]
 struct ClSymbol {
-    sym: u8,           // 0..=18
-    extra_value: u16,  // 0..=127
-    extra_bits: u8,    // 0, 2, 3, or 7
+    sym: u8,          // 0..=18
+    extra_value: u16, // 0..=127
+    extra_bits: u8,   // 0, 2, 3, or 7
 }
 
 fn rle_encode_lengths(lengths: &[u8]) -> Vec<ClSymbol> {
@@ -498,4 +498,3 @@ impl EncoderTrait for Encoder {
         self.final_emitted = false;
     }
 }
-

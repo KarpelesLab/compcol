@@ -108,7 +108,10 @@ fn our_gzip_encode_then_system_gunzip() {
     }
     for (label, input) in [
         ("small", b"hello world\n".to_vec()),
-        ("medium", b"The quick brown fox jumps over the lazy dog. ".repeat(200)),
+        (
+            "medium",
+            b"The quick brown fox jumps over the lazy dog. ".repeat(200),
+        ),
         ("large", b"Mary had a little lamb. ".repeat(10_000)),
     ] {
         let encoded = our_gzip_encode(&input);
@@ -125,7 +128,10 @@ fn system_gzip_then_our_gzip_decode() {
     }
     for (label, input) in [
         ("small", b"hello world\n".to_vec()),
-        ("medium", b"The quick brown fox jumps over the lazy dog. ".repeat(200)),
+        (
+            "medium",
+            b"The quick brown fox jumps over the lazy dog. ".repeat(200),
+        ),
         ("large", b"Mary had a little lamb. ".repeat(10_000)),
     ] {
         let encoded = pipe_through("gzip", &["-c", "-n"], &input);
@@ -140,8 +146,7 @@ const PY_ZLIB_COMPRESS: &str =
     "import sys, zlib; sys.stdout.buffer.write(zlib.compress(sys.stdin.buffer.read(), 6))";
 const PY_ZLIB_DECOMPRESS: &str =
     "import sys, zlib; sys.stdout.buffer.write(zlib.decompress(sys.stdin.buffer.read()))";
-const PY_DEFLATE_COMPRESS: &str =
-    "import sys, zlib; co=zlib.compressobj(6, zlib.DEFLATED, -15); sys.stdout.buffer.write(co.compress(sys.stdin.buffer.read())+co.flush())";
+const PY_DEFLATE_COMPRESS: &str = "import sys, zlib; co=zlib.compressobj(6, zlib.DEFLATED, -15); sys.stdout.buffer.write(co.compress(sys.stdin.buffer.read())+co.flush())";
 const PY_DEFLATE_DECOMPRESS: &str =
     "import sys, zlib; sys.stdout.buffer.write(zlib.decompress(sys.stdin.buffer.read(), -15))";
 
@@ -258,7 +263,9 @@ fn our_zlib_encode_then_python_decompress() {
     for input in [
         b"hello".to_vec(),
         b"Lorem ipsum dolor sit amet. ".repeat(500),
-        (0..200_000u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>(),
+        (0..200_000u32)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<u8>>(),
     ] {
         let encoded = our_zlib_encode(&input);
         let decoded = pipe_through("python3", &["-c", PY_ZLIB_DECOMPRESS], &encoded);
@@ -275,7 +282,9 @@ fn python_zlib_compress_then_our_decode() {
     for input in [
         b"hello".to_vec(),
         b"Lorem ipsum dolor sit amet. ".repeat(500),
-        (0..200_000u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>(),
+        (0..200_000u32)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<u8>>(),
     ] {
         let encoded = pipe_through("python3", &["-c", PY_ZLIB_COMPRESS], &input);
         let decoded = our_zlib_decode(&encoded);
@@ -292,7 +301,9 @@ fn our_deflate_encode_then_python_inflate_raw() {
     for input in [
         b"hello".to_vec(),
         b"Lorem ipsum dolor sit amet. ".repeat(500),
-        (0..200_000u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>(),
+        (0..200_000u32)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<u8>>(),
     ] {
         let encoded = our_deflate_encode(&input);
         let decoded = pipe_through("python3", &["-c", PY_DEFLATE_DECOMPRESS], &encoded);
@@ -309,7 +320,9 @@ fn python_deflate_then_our_decode() {
     for input in [
         b"hello".to_vec(),
         b"Lorem ipsum dolor sit amet. ".repeat(500),
-        (0..200_000u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>(),
+        (0..200_000u32)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<u8>>(),
     ] {
         let encoded = pipe_through("python3", &["-c", PY_DEFLATE_COMPRESS], &input);
         let decoded = our_deflate_decode(&encoded);

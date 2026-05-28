@@ -59,8 +59,18 @@ fn run_with_stdin(args: &[&str], stdin: &[u8]) -> (Vec<u8>, Vec<u8>, i32) {
     drop(child.stdin.take());
     let mut out = Vec::new();
     let mut err = Vec::new();
-    child.stdout.as_mut().unwrap().read_to_end(&mut out).unwrap();
-    child.stderr.as_mut().unwrap().read_to_end(&mut err).unwrap();
+    child
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_to_end(&mut out)
+        .unwrap();
+    child
+        .stderr
+        .as_mut()
+        .unwrap()
+        .read_to_end(&mut err)
+        .unwrap();
     let status = child.wait().expect("wait");
     let code = status.code().unwrap_or(-1);
     (out, err, code)
@@ -76,11 +86,7 @@ fn run(args: &[&str]) -> (Vec<u8>, Vec<u8>, i32) {
         .spawn()
         .expect("spawn compcol");
     let out = child.wait_with_output().expect("wait");
-    (
-        out.stdout,
-        out.stderr,
-        out.status.code().unwrap_or(-1),
-    )
+    (out.stdout, out.stderr, out.status.code().unwrap_or(-1))
 }
 
 fn file_contents(p: &Path) -> Vec<u8> {

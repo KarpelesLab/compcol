@@ -8,16 +8,16 @@ use crate::huffman::CanonicalDecoder;
 use crate::traits::{Decoder as DecoderTrait, Progress};
 
 use super::tables::{
-    CODE_LENGTH_ORDER, DIST_BASE, DIST_EXTRA, END_OF_BLOCK, FIXED_DIST_LENGTHS,
-    FIXED_LIT_LENGTHS, LENGTH_BASE, LENGTH_EXTRA, WINDOW_SIZE,
+    CODE_LENGTH_ORDER, DIST_BASE, DIST_EXTRA, END_OF_BLOCK, FIXED_DIST_LENGTHS, FIXED_LIT_LENGTHS,
+    LENGTH_BASE, LENGTH_EXTRA, WINDOW_SIZE,
 };
 
 // ─── per-block work buffers, boxed to keep the enum tiny ────────────────
 
 struct DynamicLensWork {
     cl_dec: CanonicalDecoder<19>,
-    hlit_count: u16, // HLIT + 257; number of literal/length code lengths
-    hdist_count: u8, // HDIST + 1; number of distance code lengths
+    hlit_count: u16,    // HLIT + 257; number of literal/length code lengths
+    hdist_count: u8,    // HDIST + 1; number of distance code lengths
     lengths: [u8; 320], // capacity for max HLIT(286) + max HDIST(30) + slack
     pos: u16,
     prev_len: u8,
@@ -64,7 +64,9 @@ enum DecState {
     BlockHeader,
     StoredAlign,
     StoredLength,
-    Stored { remaining: u32 },
+    Stored {
+        remaining: u32,
+    },
     DynamicHeader,
     /// Reading the HCLEN+4 code-length-code lengths (3 bits each), permuted
     /// by `CODE_LENGTH_ORDER`.
@@ -390,8 +392,8 @@ impl Decoder {
                     };
                     return Ok(progress);
                 }
-                let cl_dec = CanonicalDecoder::<19>::from_lengths(&cl_lens)
-                    .map_err(|e| self.poison(e))?;
+                let cl_dec =
+                    CanonicalDecoder::<19>::from_lengths(&cl_lens).map_err(|e| self.poison(e))?;
                 let hlit_count = hlit as u16 + 257;
                 let hdist_count = hdist + 1;
                 let work = DynamicLensWork {
@@ -511,10 +513,10 @@ impl Decoder {
                 dist_lens[..work.hdist_count as usize]
                     .copy_from_slice(&work.lengths[dist_src_start..dist_src_end]);
 
-                let lit = CanonicalDecoder::<288>::from_lengths(&lit_lens)
-                    .map_err(|e| self.poison(e))?;
-                let dist = CanonicalDecoder::<32>::from_lengths(&dist_lens)
-                    .map_err(|e| self.poison(e))?;
+                let lit =
+                    CanonicalDecoder::<288>::from_lengths(&lit_lens).map_err(|e| self.poison(e))?;
+                let dist =
+                    CanonicalDecoder::<32>::from_lengths(&dist_lens).map_err(|e| self.poison(e))?;
                 self.state = DecState::HuffmanBlock(Box::new(HuffmanBlockWork {
                     lit,
                     dist,

@@ -87,9 +87,9 @@ pub struct Decoder {
     header_bytes: [u8; 10],
     header_idx: u8,
     flg: u8,
-    aux_idx: u8,         // index inside the current sub-phase
-    aux_xlen: u16,       // FEXTRA length captured from the 2-byte XLEN
-    aux_remaining: u32,  // bytes left to skip in the current sub-phase
+    aux_idx: u8,        // index inside the current sub-phase
+    aux_xlen: u16,      // FEXTRA length captured from the 2-byte XLEN
+    aux_remaining: u32, // bytes left to skip in the current sub-phase
     trailer_carryover: alloc::vec::Vec<u8>,
     trailer_carryover_idx: usize,
     trailer: [u8; 8],

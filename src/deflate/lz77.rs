@@ -113,7 +113,8 @@ impl MatchFinder {
             // the current best already reaches the end of the lookahead,
             // skipping this test costs nothing because the extend loop
             // below will bail immediately.
-            if best_len > 0 && best_len < max_len
+            if best_len > 0
+                && best_len < max_len
                 && buffer[cur_pos + best_len] != buffer[pos + best_len]
             {
                 cur = self.prev[cur_pos];

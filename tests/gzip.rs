@@ -128,7 +128,11 @@ fn round_trip_repeated() {
 fn round_trip_long_zeros() {
     let input = vec![0u8; 8192];
     let encoded = encode_all(&input);
-    assert!(encoded.len() < 200, "zeros didn't compress: {}", encoded.len());
+    assert!(
+        encoded.len() < 200,
+        "zeros didn't compress: {}",
+        encoded.len()
+    );
     let decoded = decode_chunked(&encoded, 4096, 4096).unwrap();
     assert_eq!(decoded, input);
 }
