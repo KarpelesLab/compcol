@@ -1,4 +1,3 @@
-#![cfg(any())] // TODO(v0.3): port to new (Progress, Status) API
 //! Integration tests for the RAR 3.x decoder.
 //!
 //! The decoder takes the raw bytes that follow a RAR3 file-header inside an
@@ -8,23 +7,26 @@
 //! stripped. The expected outputs come from running `unrar p` against the
 //! original `.rar` files. See `src/rar3/mod.rs` for the calling
 //! convention.
+//!
+//! Canonical v0.3 port: every call returns `(Progress, Status)` and the
+//! loop dispatches on `Status` rather than inferring from byte counts.
 
 #![cfg(feature = "rar3")]
 
 use compcol::rar3::{Decoder, Encoder, Rar3, apply_e8_filter};
-use compcol::{Algorithm, Decoder as _, Encoder as _, Error};
+use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Status};
 
 // ─── helpers ──────────────────────────────────────────────────────────────
 
-/// Drain `Decoder::finish` until `done` or no further progress.
+/// Drain `Decoder::finish` until `StreamEnd` (or no further progress).
 fn drain(dec: &mut Decoder, out: &mut Vec<u8>) {
     let mut buf = [0u8; 4096];
     loop {
-        let p = dec.finish(&mut buf).unwrap_or_else(|e| {
+        let (p, status) = dec.finish(&mut buf).unwrap_or_else(|e| {
             panic!("finish failed: {e:?}");
         });
         out.extend_from_slice(&buf[..p.written]);
-        if matches!(_s, compcol::Status::StreamEnd) {
+        if matches!(status, Status::StreamEnd) {
             break;
         }
         if p.written == 0 {
@@ -33,10 +35,11 @@ fn drain(dec: &mut Decoder, out: &mut Vec<u8>) {
     }
 }
 
-/// Decode a full RAR3 raw block in one shot.
+/// Decode a full RAR3 raw block in one shot: feed all input via `decode`,
+/// then drain via `finish`.
 fn decode_full(input: &[u8], unpack_size: u64) -> Vec<u8> {
     let mut dec = Decoder::with_unpack_size(unpack_size);
-    let _ = dec.decode(input, &mut []).unwrap();
+    let (_p, _status) = dec.decode(input, &mut []).unwrap();
     let mut out = Vec::with_capacity(unpack_size as usize);
     drain(&mut dec, &mut out);
     out
@@ -50,18 +53,37 @@ fn algorithm_name_is_rar3() {
 }
 
 #[test]
-fn encoder_is_permanently_unsupported() {
+fn rar3_algorithm_factory_produces_codec() {
+    let _enc = <Rar3 as Algorithm>::encoder();
+    let _dec = <Rar3 as Algorithm>::decoder();
+}
+
+// ─── encoder is permanently unsupported ──────────────────────────────────
+
+#[test]
+fn encoder_encode_is_unsupported() {
     let mut enc = Encoder::new();
     let mut out = [0u8; 16];
-    assert_eq!(enc.encode(b"x", &mut out).unwrap_err(), Error::Unsupported);
-    assert_eq!(enc.finish(&mut out).unwrap_err(), Error::Unsupported);
-    enc.reset();
+    assert_eq!(
+        enc.encode(b"hello", &mut out).unwrap_err(),
+        Error::Unsupported
+    );
 }
 
 #[test]
-fn algorithm_factory_produces_pair() {
-    let _enc = <Rar3 as Algorithm>::encoder();
-    let _dec = <Rar3 as Algorithm>::decoder();
+fn encoder_finish_is_unsupported() {
+    let mut enc = Encoder::new();
+    let mut out = [0u8; 16];
+    assert_eq!(enc.finish(&mut out).unwrap_err(), Error::Unsupported);
+}
+
+#[test]
+fn encoder_reset_is_a_no_op() {
+    // Encoder is stateless; reset must not panic.
+    let mut enc = Encoder::new();
+    enc.reset();
+    let mut out = [0u8; 4];
+    assert_eq!(enc.encode(b"x", &mut out).unwrap_err(), Error::Unsupported);
 }
 
 // ─── empty stream ────────────────────────────────────────────────────────
@@ -73,13 +95,16 @@ fn unpack_size_zero_decodes_to_empty() {
 }
 
 #[test]
-fn finish_on_fresh_decoder_with_no_input_short_unpack() {
-    // unpack_size 0 ⇒ trivially Done.
+fn finish_on_fresh_decoder_with_zero_unpack_returns_stream_end() {
+    // unpack_size 0 ⇒ trivially Done after the first finish.
     let mut dec = Decoder::with_unpack_size(0);
     let mut buf = [0u8; 8];
-    let p = dec.finish(&mut buf).unwrap();
+    let (p, status) = dec.finish(&mut buf).unwrap();
     assert_eq!(p.written, 0);
-    assert!(matches!(_s, compcol::Status::StreamEnd));
+    assert!(
+        matches!(status, Status::StreamEnd),
+        "expected StreamEnd on empty finish, got {status:?}",
+    );
 }
 
 // ─── real fixture: testdir/test.txt from libarchive's
@@ -121,8 +146,14 @@ fn decodes_libarchive_test_txt_chunked_input() {
     let mut dec = Decoder::with_unpack_size(TESTDIR_TEST_TXT_EXPECTED.len() as u64);
     // Feed input one byte at a time.
     for chunk in TESTDIR_TEST_TXT_BLOCK.chunks(1) {
-        let p = dec.decode(chunk, &mut []).unwrap();
+        let (p, status) = dec.decode(chunk, &mut []).unwrap();
         assert_eq!(p.consumed, chunk.len());
+        // After feeding input fully and asking for no output, the decoder
+        // is still buffering — InputEmpty is the expected status.
+        assert!(
+            matches!(status, Status::InputEmpty),
+            "expected InputEmpty after feeding 1 byte, got {status:?}",
+        );
     }
     let mut out = Vec::new();
     drain(&mut dec, &mut out);
@@ -132,14 +163,14 @@ fn decodes_libarchive_test_txt_chunked_input() {
 #[test]
 fn decodes_libarchive_test_txt_tight_output_buffer() {
     let mut dec = Decoder::with_unpack_size(TESTDIR_TEST_TXT_EXPECTED.len() as u64);
-    let _ = dec.decode(TESTDIR_TEST_TXT_BLOCK, &mut []).unwrap();
+    let (_p, _status) = dec.decode(TESTDIR_TEST_TXT_BLOCK, &mut []).unwrap();
     let mut out: Vec<u8> = Vec::new();
     // Drain through a 3-byte output buffer.
     let mut buf = [0u8; 3];
     loop {
-        let p = dec.finish(&mut buf).unwrap();
+        let (p, status) = dec.finish(&mut buf).unwrap();
         out.extend_from_slice(&buf[..p.written]);
-        if matches!(_s, compcol::Status::StreamEnd) {
+        if matches!(status, Status::StreamEnd) {
             break;
         }
         if p.written == 0 {
@@ -157,13 +188,13 @@ fn ppmd_block_is_unsupported() {
     // 0x80 = 1000_0000 → byte-aligned start, top bit = 1 ⇒ PPMd.
     let ppmd_marker = [0x80u8, 0x00, 0x00, 0x00];
     let mut dec = Decoder::with_unpack_size(32);
-    let _ = dec.decode(&ppmd_marker, &mut []).unwrap();
+    let (_p, _status) = dec.decode(&ppmd_marker, &mut []).unwrap();
     let mut buf = [0u8; 16];
     let err = dec.finish(&mut buf).unwrap_err();
     assert_eq!(err, Error::Unsupported);
 }
 
-// ─── error path: truncated input ─────────────────────────────────────────
+// ─── error path: malformed inputs ────────────────────────────────────────
 
 #[test]
 fn truncated_input_fails_with_unexpected_end_or_corrupt() {
@@ -172,13 +203,12 @@ fn truncated_input_fails_with_unexpected_end_or_corrupt() {
     // partial bits decode to something invalid first).
     let truncated = &TESTDIR_TEST_TXT_BLOCK[..2];
     let mut dec = Decoder::with_unpack_size(20);
-    let _ = dec.decode(truncated, &mut []).unwrap();
+    let (_p, _status) = dec.decode(truncated, &mut []).unwrap();
     let mut buf = [0u8; 8];
     let err = dec.finish(&mut buf).unwrap_err();
     assert!(
         matches!(err, Error::UnexpectedEnd | Error::Corrupt),
-        "expected UnexpectedEnd or Corrupt, got {:?}",
-        err
+        "expected UnexpectedEnd or Corrupt, got {err:?}",
     );
 }
 
@@ -188,7 +218,7 @@ fn corrupt_input_does_not_panic() {
     // decoder rejects them cleanly (some error) without panicking.
     let junk = [0xFFu8; 64];
     let mut dec = Decoder::with_unpack_size(64);
-    let _ = dec.decode(&junk, &mut []).unwrap();
+    let (_p, _status) = dec.decode(&junk, &mut []).unwrap();
     let mut buf = [0u8; 64];
     let _ = dec.finish(&mut buf);
     // Any result (Ok or Err) is acceptable as long as it didn't panic.
@@ -199,13 +229,13 @@ fn corrupt_input_does_not_panic() {
 #[test]
 fn reset_clears_state_and_allows_redecode() {
     let mut dec = Decoder::with_unpack_size(TESTDIR_TEST_TXT_EXPECTED.len() as u64);
-    let _ = dec.decode(TESTDIR_TEST_TXT_BLOCK, &mut []).unwrap();
+    let (_p, _status) = dec.decode(TESTDIR_TEST_TXT_BLOCK, &mut []).unwrap();
     let mut out1 = Vec::new();
     drain(&mut dec, &mut out1);
     assert_eq!(out1, TESTDIR_TEST_TXT_EXPECTED);
 
     dec.reset();
-    let _ = dec.decode(TESTDIR_TEST_TXT_BLOCK, &mut []).unwrap();
+    let (_p, _status) = dec.decode(TESTDIR_TEST_TXT_BLOCK, &mut []).unwrap();
     let mut out2 = Vec::new();
     drain(&mut dec, &mut out2);
     assert_eq!(out2, TESTDIR_TEST_TXT_EXPECTED);
@@ -251,7 +281,7 @@ fn decoder_with_e8_filter_round_trip_on_synthetic_data() {
     // that contains no 0xE8 / 0xE9 bytes (so the filter is a no-op).
     let mut dec =
         Decoder::with_unpack_size(TESTDIR_TEST_TXT_EXPECTED.len() as u64).with_e8_filter(true);
-    let _ = dec.decode(TESTDIR_TEST_TXT_BLOCK, &mut []).unwrap();
+    let (_p, _status) = dec.decode(TESTDIR_TEST_TXT_BLOCK, &mut []).unwrap();
     let mut out = Vec::new();
     drain(&mut dec, &mut out);
     assert_eq!(out, TESTDIR_TEST_TXT_EXPECTED);
@@ -261,12 +291,33 @@ fn decoder_with_e8_filter_round_trip_on_synthetic_data() {
 
 #[cfg(feature = "factory")]
 mod factory {
+    use compcol::Error;
     use compcol::factory;
 
     #[test]
-    fn lookup_rar3_decoder_and_encoder() {
-        let enc = factory::encoder_by_name("rar3");
-        let dec = factory::decoder_by_name("rar3");
-        assert_eq!(enc.is_some(), dec.is_some());
+    fn lookup_rar3_encoder_and_decoder() {
+        assert!(factory::encoder_by_name("rar3").is_some());
+        assert!(factory::decoder_by_name("rar3").is_some());
+    }
+
+    #[test]
+    fn lookup_unknown() {
+        assert!(factory::encoder_by_name("not-a-real-rar3").is_none());
+        assert!(factory::decoder_by_name("not-a-real-rar3").is_none());
+    }
+
+    #[test]
+    fn names_contains_rar3() {
+        assert!(factory::names().contains(&"rar3"));
+    }
+
+    #[test]
+    fn boxed_encoder_is_unsupported() {
+        let mut enc = factory::encoder_by_name("rar3").unwrap();
+        let mut out = [0u8; 16];
+        assert_eq!(
+            enc.encode(b"hello", &mut out).unwrap_err(),
+            Error::Unsupported
+        );
     }
 }
