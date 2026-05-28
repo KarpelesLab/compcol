@@ -299,6 +299,18 @@ including round-trip tests for every algorithm, cross-validation
 against system `gzip` / `xz` / `zstd` / `brotli` / `compress`, and
 hand-crafted hex fixtures for known corner cases.
 
+A simple benchmark harness lives at `examples/bench.rs`. Run it with:
+
+```sh
+cargo run --release --all-features --example bench
+```
+
+It measures each compiled-in algorithm's encoder/decoder throughput
+and compression ratio on a small fixed corpus and compares against
+the system reference (gzip, xz, zstd, brotli, lz4, compress, python's
+zlib / lzma / snappy) when one is installed. A snapshot of the output
+is kept in [`BENCH.md`](./BENCH.md).
+
 ## License
 
 MIT. © 2026 Karpeles Lab Inc.
