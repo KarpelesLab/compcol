@@ -33,21 +33,42 @@
 //! bytes encode `compressed_size - 1` (16 bits, up to 64 KiB); a properties
 //! byte follows if the control byte's reset flags require it.
 //!
-//! ## Status: stored-only encoder
+//! ## Status: stored-only encoder, full decoder for dict-reset chunks
 //!
 //! This iteration ships:
 //!
-//! * a **decoder** that handles uncompressed-only LZMA2 streams (control
-//!   bytes `0x00`, `0x01`, `0x02`). A compressed-chunk control byte
-//!   (`0x80..=0xFF`) returns [`Error::Unsupported`] cleanly. Invalid control
-//!   bytes return [`Error::Corrupt`].
+//! * a **decoder** that handles uncompressed LZMA2 streams (control bytes
+//!   `0x00`, `0x01`, `0x02`) and compressed chunks whose control byte
+//!   requests a dictionary reset (`0xE0..=0xFF`, i.e. state reset + new
+//!   properties + dictionary reset). Compressed chunks without dictionary
+//!   reset (`0x80..=0xDF`) are rare in xz-utils output and return
+//!   [`Error::Unsupported`]. Invalid control bytes return [`Error::Corrupt`].
 //! * an **encoder** that emits *only* type-`0x01` chunks (uncompressed,
 //!   dictionary reset), capped at 64 KiB of uncompressed data per chunk,
 //!   followed by a `0x00` end-of-stream marker on `finish`.
 //!
-//! Real LZMA-compressed chunks are deliberately out of scope here; a parallel
-//! work item implements the LZMA range codec, and once it lands a follow-up
-//! can wire it into this module without changing the public surface.
+//! ## How the compressed-chunk path works
+//!
+//! Each `0xE0..=0xFF` chunk in LZMA2 is a self-contained LZMA stream (state
+//! reset + dictionary reset means no probability or history is shared across
+//! chunks). The chunk header tells us the uncompressed and compressed sizes
+//! and a single LZMA properties byte; the chunk payload is a range-coded LZMA
+//! body with no trailing EOS marker.
+//!
+//! Rather than duplicate the ~700-line LZMA core here, we **synthesise a
+//! 13-byte legacy `.lzma` ("alone") header** in memory — `[props,
+//! dict_size_LE32, uncompressed_size_LE64]` — and drive a fresh
+//! [`crate::lzma::Decoder`] with that header followed by the chunk payload.
+//! Since the synthesised uncompressed size matches the chunk, the inner
+//! decoder finishes precisely when the chunk's bytes are out. The inner
+//! decoder is constructed once and reset between chunks.
+//!
+//! The fake-header approach was chosen over inlining a second copy of the
+//! LZMA decoder because it adds tens of lines instead of hundreds and only
+//! ever needs to support the dict-reset case — the only case we accept here.
+
+extern crate alloc;
+use alloc::boxed::Box;
 
 use crate::error::Error;
 use crate::traits::{Algorithm, Decoder as DecoderTrait, Encoder as EncoderTrait, Progress};
@@ -76,7 +97,39 @@ impl Algorithm for Lzma2 {
 
 // ─── decoder ──────────────────────────────────────────────────────────────
 
+/// State machine for parsing a compressed-chunk header. After the control
+/// byte we need 2 size bytes (uncompressed) + 2 size bytes (compressed)
+/// + an optional 1 properties byte, then the LZMA payload itself.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct CompHeader {
+    /// Top 5 bits of the 21-bit uncompressed-size-minus-1 from the control byte.
+    unc_top5: u32,
+    /// Whether the control byte's reset flags require a new properties byte.
+    needs_props: bool,
+    /// Bytes-read counter, drives the sub-phase below.
+    read: u8,
+    /// Bytes of the size header that we've already read (0..=4).
+    /// 0..=1: filling `unc_low_hi`, `unc_low_lo`
+    /// 2..=3: filling `cmp_hi`, `cmp_lo`
+    unc_low_hi: u8,
+    unc_low_lo: u8,
+    cmp_hi: u8,
+    cmp_lo: u8,
+    /// Buffered properties byte, valid once `read >= 5 && needs_props`.
+    props: u8,
+}
+
+impl CompHeader {
+    /// Once `read` has advanced past the size + props bytes, return the
+    /// computed uncompressed-size, compressed-size, and props.
+    fn unpack(&self) -> (u32, u32, u8) {
+        let unc_low = ((self.unc_low_hi as u32) << 8) | (self.unc_low_lo as u32);
+        let unc = (self.unc_top5 << 16) | unc_low;
+        let cmp = ((self.cmp_hi as u32) << 8) | (self.cmp_lo as u32);
+        (unc + 1, cmp + 1, self.props)
+    }
+}
+
 enum DecPhase {
     /// Waiting for the next chunk's control byte.
     Control,
@@ -85,15 +138,40 @@ enum DecPhase {
     UncompSize { ctrl: u8, idx: u8, hi: u8 },
     /// Streaming out `remaining` raw bytes of an uncompressed chunk.
     UncompData { remaining: u32 },
+    /// Reading the size + (optional) props bytes that follow a compressed
+    /// chunk's control byte.
+    CompHdr(CompHeader),
+    /// Streaming the LZMA payload of a compressed chunk through `inner`.
+    /// `cmp_remaining` is how many compressed-stream bytes we still owe the
+    /// inner decoder; `unc_remaining` is how many output bytes we still owe
+    /// the caller. Once `cmp_remaining` hits zero we switch into
+    /// `CompDrain` to call `inner.finish()` — the inner LZMA decoder
+    /// otherwise stalls at the tail because its packet gate requires
+    /// `REQUIRED_INPUT_MAX` (20) bytes of look-ahead.
+    CompData {
+        cmp_remaining: u32,
+        unc_remaining: u32,
+    },
+    /// All compressed bytes have been fed to `inner`; drain the rest of
+    /// its output via `inner.finish()`. `unc_remaining` is the bytes the
+    /// chunk still owes the caller.
+    CompDrain { unc_remaining: u32 },
     /// Hit the `0x00` end-of-stream marker; nothing more to read or emit.
     Done,
 }
 
-/// Streaming LZMA2 decoder. Handles uncompressed-only streams; refuses
-/// compressed chunks with [`Error::Unsupported`].
+/// Streaming LZMA2 decoder.
+///
+/// Handles uncompressed chunks (`0x01`, `0x02`) and compressed chunks that
+/// reset the dictionary (`0xE0..=0xFF`). Compressed chunks without a
+/// dictionary reset (`0x80..=0xDF`) currently return [`Error::Unsupported`].
 pub struct Decoder {
     phase: DecPhase,
     poisoned: bool,
+    /// Inner LZMA decoder used to decode compressed chunks. Constructed
+    /// lazily on first compressed chunk to keep the empty-stream path
+    /// allocation-free; reset between chunks.
+    inner: Option<Box<crate::lzma::Decoder>>,
 }
 
 impl Decoder {
@@ -101,12 +179,55 @@ impl Decoder {
         Self {
             phase: DecPhase::Control,
             poisoned: false,
+            inner: None,
         }
     }
 
     fn poison(&mut self, e: Error) -> Error {
         self.poisoned = true;
         e
+    }
+
+    /// Bootstrap the inner LZMA decoder for a single compressed chunk:
+    /// reset it and prime it with a synthesised 13-byte `.lzma` header
+    /// containing the chunk's properties byte and an exact-size trailer.
+    fn prime_inner(&mut self, props: u8, uncompressed: u32) -> Result<(), Error> {
+        // Validate the LZMA properties byte the same way the LZMA decoder
+        // does, so we surface a clean error before reset.
+        if props >= 9 * 5 * 5 {
+            return Err(Error::BadHeader);
+        }
+
+        // Construct the synthetic `.lzma` header:
+        //   byte 0:     props
+        //   bytes 1-4:  dict size, little-endian. Sized to cover the chunk;
+        //               the inner decoder clamps below 4096 and above 64 MiB.
+        //   bytes 5-12: uncompressed size, little-endian.
+        // We pick `dict_size = max(uncompressed, 4096)`: every backreference
+        // in this chunk must land within the bytes we've already produced
+        // for this chunk (state + dict were both reset), so the chunk's own
+        // size is a safe upper bound on any in-chunk distance.
+        let dict_size: u32 = uncompressed.max(4096);
+        let unc_u64: u64 = uncompressed as u64;
+        let mut header = [0u8; 13];
+        header[0] = props;
+        header[1..5].copy_from_slice(&dict_size.to_le_bytes());
+        header[5..13].copy_from_slice(&unc_u64.to_le_bytes());
+
+        let inner = self
+            .inner
+            .get_or_insert_with(|| Box::new(crate::lzma::Decoder::new()));
+        inner.reset();
+        // Feed the 13 header bytes with no output room. The inner decoder
+        // accepts the bytes into its internal buffer and returns Progress
+        // without writing anything (header parse happens lazily on the next
+        // decode() call once range-coder bytes are available).
+        let mut nothing: [u8; 0] = [];
+        let p = inner.decode(&header, &mut nothing)?;
+        // The inner decoder absorbs all bytes we hand it into its own buffer.
+        debug_assert_eq!(p.consumed, header.len());
+        debug_assert_eq!(p.written, 0);
+        Ok(())
     }
 }
 
@@ -151,10 +272,32 @@ impl DecoderTrait for Decoder {
                                 hi: 0,
                             };
                         }
-                        0x80..=0xFF => {
-                            // Compressed LZMA chunk — out of scope in this
-                            // iteration. Poison the decoder so callers can't
-                            // keep poking it.
+                        0xE0..=0xFF => {
+                            // State reset + new properties + dictionary
+                            // reset. We can decode these directly because
+                            // every per-chunk LZMA state and dictionary is
+                            // restarted.
+                            self.phase = DecPhase::CompHdr(CompHeader {
+                                unc_top5: (ctrl as u32) & 0x1F,
+                                needs_props: true,
+                                read: 0,
+                                unc_low_hi: 0,
+                                unc_low_lo: 0,
+                                cmp_hi: 0,
+                                cmp_lo: 0,
+                                props: 0,
+                            });
+                        }
+                        0x80..=0xDF => {
+                            // 0x80..=0x9F: no reset (rare; would require us
+                            //              to keep LZMA range/state alive
+                            //              across chunks).
+                            // 0xA0..=0xBF: state reset, keep old properties.
+                            // 0xC0..=0xDF: state reset + new properties.
+                            // None of these reset the dictionary, so we
+                            // cannot honour them with a fresh LZMA decoder
+                            // per chunk. Surface cleanly until we wire a
+                            // persistent inner LZMA state.
                             return Err(self.poison(Error::Unsupported));
                         }
                         _ => {
@@ -213,6 +356,158 @@ impl DecoderTrait for Decoder {
                         }
                     };
                 }
+                DecPhase::CompHdr(mut hdr) => {
+                    // We need 4 size bytes; one props byte if needs_props.
+                    let needed = if hdr.needs_props { 5 } else { 4 };
+                    while hdr.read < needed && consumed < input.len() {
+                        let b = input[consumed];
+                        consumed += 1;
+                        match hdr.read {
+                            0 => hdr.unc_low_hi = b,
+                            1 => hdr.unc_low_lo = b,
+                            2 => hdr.cmp_hi = b,
+                            3 => hdr.cmp_lo = b,
+                            4 => hdr.props = b,
+                            _ => unreachable!(),
+                        }
+                        hdr.read += 1;
+                    }
+                    if hdr.read < needed {
+                        // Out of input; stash partial header back and ask
+                        // the caller for more bytes.
+                        self.phase = DecPhase::CompHdr(hdr);
+                        return Ok(Progress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+
+                    let (unc, cmp, props) = hdr.unpack();
+                    self.prime_inner(props, unc).map_err(|e| self.poison(e))?;
+                    self.phase = DecPhase::CompData {
+                        cmp_remaining: cmp,
+                        unc_remaining: unc,
+                    };
+                }
+                DecPhase::CompData {
+                    mut cmp_remaining,
+                    mut unc_remaining,
+                } => {
+                    if unc_remaining == 0 {
+                        // Chunk produced everything it owes the caller; the
+                        // inner decoder may still have trailing bytes
+                        // buffered (range-coder normalisation), but they
+                        // can't yield output past `uncompressed_size`. Skip
+                        // straight to the next chunk header.
+                        self.phase = DecPhase::Control;
+                        continue;
+                    }
+                    if cmp_remaining == 0 {
+                        // Fed everything the chunk header promised. The
+                        // inner decoder's packet gate (REQUIRED_INPUT_MAX
+                        // bytes of buffered look-ahead) would otherwise
+                        // stall at the tail of the stream, so switch to
+                        // finish() mode to disable it.
+                        self.phase = DecPhase::CompDrain { unc_remaining };
+                        continue;
+                    }
+                    if consumed == input.len() {
+                        // Need more compressed bytes before we can
+                        // continue.
+                        self.phase = DecPhase::CompData {
+                            cmp_remaining,
+                            unc_remaining,
+                        };
+                        return Ok(Progress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                    if written == output.len() {
+                        self.phase = DecPhase::CompData {
+                            cmp_remaining,
+                            unc_remaining,
+                        };
+                        return Ok(Progress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+
+                    let inner = match self.inner.as_mut() {
+                        Some(i) => i,
+                        None => {
+                            // CompData is only entered after prime_inner
+                            // sets self.inner; this is a logic error.
+                            return Err(self.poison(Error::Corrupt));
+                        }
+                    };
+
+                    // Feed at most cmp_remaining bytes; clamp output to
+                    // unc_remaining so the inner decoder cannot over-produce.
+                    let in_left = input.len() - consumed;
+                    let feed = core::cmp::min(cmp_remaining as usize, in_left);
+                    let out_room = core::cmp::min(unc_remaining as usize, output.len() - written);
+
+                    let p = inner
+                        .decode(
+                            &input[consumed..consumed + feed],
+                            &mut output[written..written + out_room],
+                        )
+                        .map_err(|e| self.poison(e))?;
+                    consumed += p.consumed;
+                    written += p.written;
+                    cmp_remaining -= p.consumed as u32;
+                    unc_remaining -= p.written as u32;
+
+                    self.phase = DecPhase::CompData {
+                        cmp_remaining,
+                        unc_remaining,
+                    };
+                }
+                DecPhase::CompDrain { mut unc_remaining } => {
+                    if unc_remaining == 0 {
+                        self.phase = DecPhase::Control;
+                        continue;
+                    }
+                    if written == output.len() {
+                        self.phase = DecPhase::CompDrain { unc_remaining };
+                        return Ok(Progress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                    let inner = match self.inner.as_mut() {
+                        Some(i) => i,
+                        None => return Err(self.poison(Error::Corrupt)),
+                    };
+                    let out_room = core::cmp::min(unc_remaining as usize, output.len() - written);
+                    let p = inner
+                        .finish(&mut output[written..written + out_room])
+                        .map_err(|e| self.poison(e))?;
+                    written += p.written;
+                    unc_remaining -= p.written as u32;
+                    self.phase = DecPhase::CompDrain { unc_remaining };
+                    // If the inner reports done but we still owe output,
+                    // the stream was truncated relative to the chunk
+                    // header — surface that as Corrupt because the LZMA2
+                    // chunk lied about its uncompressed size.
+                    if p.done && unc_remaining > 0 {
+                        return Err(self.poison(Error::Corrupt));
+                    }
+                    if p.written == 0 && !p.done {
+                        // Inner needs more space; bounce.
+                        return Ok(Progress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                }
                 DecPhase::Done => {
                     return Ok(Progress {
                         consumed,
@@ -258,6 +553,9 @@ impl DecoderTrait for Decoder {
     fn reset(&mut self) {
         self.phase = DecPhase::Control;
         self.poisoned = false;
+        if let Some(inner) = self.inner.as_mut() {
+            inner.reset();
+        }
     }
 }
 

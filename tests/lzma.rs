@@ -1,9 +1,11 @@
-//! Integration tests for the LZMA decoder.
+//! Integration tests for the LZMA encoder and decoder.
 //!
-//! The encoder is intentionally unimplemented in this build — the tests
-//! exercise the decoder against pre-generated `.lzma` fixtures produced by
-//! Python's stdlib `lzma` module (which uses XZ Utils internally) via
+//! The decoder tests use pre-generated `.lzma` fixtures produced by Python's
+//! stdlib `lzma` module (which uses XZ Utils internally) via
 //! `lzma.compress(payload, format=lzma.FORMAT_ALONE)`.
+//!
+//! The encoder tests verify round-trip against our own decoder, plus a
+//! handful of decoder-only edge cases.
 
 #![cfg(feature = "lzma")]
 
@@ -226,16 +228,297 @@ fn unexpected_eof_on_finish() {
     assert_eq!(err, Error::UnexpectedEnd);
 }
 
-// ─── encoder is documented as unsupported ────────────────────────────────
+// ─── encoder round-trip tests ────────────────────────────────────────────
+
+/// Push `payload` through the encoder in one shot, then run the resulting
+/// bytes through `decode_one_shot`. Returns the recovered payload.
+fn round_trip(payload: &[u8]) -> Vec<u8> {
+    let compressed = encode_one_shot(payload);
+    decode_one_shot(&compressed).expect("decoding our own output failed")
+}
+
+fn encode_one_shot(payload: &[u8]) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    // Pipe everything in. The encoder buffers internally and produces no
+    // output bytes until finish, so we can pass a small scratch buffer.
+    let mut scratch = [0u8; 64];
+    let mut consumed = 0;
+    while consumed < payload.len() {
+        let p = enc.encode(&payload[consumed..], &mut scratch).unwrap();
+        consumed += p.consumed;
+        // Output should always be empty from encode() for LZMA.
+        assert_eq!(p.written, 0);
+        if p.consumed == 0 {
+            panic!("encoder stalled mid-input");
+        }
+    }
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    loop {
+        let p = enc.finish(&mut buf).unwrap();
+        out.extend_from_slice(&buf[..p.written]);
+        if p.done {
+            break;
+        }
+        if p.written == 0 {
+            panic!("encoder finish stalled");
+        }
+    }
+    out
+}
 
 #[test]
-fn encoder_returns_unsupported() {
+fn encode_empty_round_trip() {
+    let compressed = encode_one_shot(b"");
+    assert!(
+        compressed.len() >= 13,
+        "encoder must always emit a header, got {} bytes",
+        compressed.len()
+    );
+    assert_eq!(
+        compressed[0], 0x5d,
+        "props byte = (pb=2)*5*9 + (lp=0)*9 + (lc=3)"
+    );
+    // Dict size LE at bytes 1..5; we use 1 MiB.
+    let dict = u32::from_le_bytes([compressed[1], compressed[2], compressed[3], compressed[4]]);
+    assert_eq!(dict, 1 << 20);
+    // Uncompressed size sentinel = u64::MAX.
+    for &b in &compressed[5..13] {
+        assert_eq!(b, 0xFF);
+    }
+    let recovered = decode_one_shot(&compressed).unwrap();
+    assert!(recovered.is_empty());
+}
+
+#[test]
+fn encode_single_byte_round_trip() {
+    for b in [0u8, 1, 0x7F, 0xFE, 0xFF, b'A'] {
+        let recovered = round_trip(&[b]);
+        assert_eq!(recovered, vec![b], "byte 0x{:02x}", b);
+    }
+}
+
+#[test]
+fn encode_small_text_round_trip() {
+    let payload = b"hello world! hello world! hello world!";
+    let recovered = round_trip(payload);
+    assert_eq!(recovered.as_slice(), payload.as_slice());
+}
+
+#[test]
+fn encode_4kib_pseudorandom_round_trip() {
+    // Pseudo-random but deterministic — a tiny xorshift, since we can't
+    // use any external rng crate.
+    let mut state: u32 = 0xDEADBEEF;
+    let mut payload = vec![0u8; 4096];
+    for byte in payload.iter_mut() {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        *byte = (state & 0xFF) as u8;
+    }
+    let recovered = round_trip(&payload);
+    assert_eq!(recovered.len(), payload.len());
+    assert_eq!(recovered, payload);
+}
+
+#[test]
+fn encode_16kib_lorem_round_trip() {
+    let lorem_chunk = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
+    let payload: Vec<u8> = lorem_chunk
+        .repeat(200)
+        .into_bytes()
+        .into_iter()
+        .take(16384)
+        .collect();
+    let compressed = encode_one_shot(&payload);
+    // Lorem ipsum is highly repetitive; we should beat the 1:1 ratio by a
+    // wide margin even with a greedy parser. (xz at level 6 reaches ~180
+    // bytes on this 16 KiB input; this greedy encoder lands at ~184 bytes —
+    // long matches mean greedy parsing is near-optimal here.)
+    assert!(
+        compressed.len() < payload.len() / 2,
+        "expected at least 2x compression on lorem, got {} -> {}",
+        payload.len(),
+        compressed.len()
+    );
+    eprintln!(
+        "lorem 16 KiB compressed to {} bytes (xz-level-6 reference ~180)",
+        compressed.len()
+    );
+    let recovered = decode_one_shot(&compressed).unwrap();
+    assert_eq!(recovered, payload);
+}
+
+#[test]
+fn encode_4kib_repeating_byte_round_trip() {
+    // All-A's: dominated by rep matches.
+    let payload = vec![b'A'; 4096];
+    let compressed = encode_one_shot(&payload);
+    // Highly compressible: should be well under 100 bytes for this case.
+    assert!(
+        compressed.len() < 100,
+        "expected strong compression on repeating byte, got {} bytes",
+        compressed.len()
+    );
+    let recovered = decode_one_shot(&compressed).unwrap();
+    assert_eq!(recovered, payload);
+}
+
+#[test]
+fn encode_streaming_one_byte_chunks_round_trip() {
+    let payload = b"The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog.";
+
     let mut enc = Encoder::new();
-    let mut out = [0u8; 16];
-    let err = enc.encode(b"hi", &mut out).unwrap_err();
-    assert_eq!(err, Error::Unsupported);
-    let err = enc.finish(&mut out).unwrap_err();
-    assert_eq!(err, Error::Unsupported);
+    let mut scratch = [0u8; 4];
+    for byte in payload {
+        let p = enc
+            .encode(core::slice::from_ref(byte), &mut scratch)
+            .unwrap();
+        assert_eq!(p.consumed, 1);
+        assert_eq!(p.written, 0);
+    }
+    let mut compressed = Vec::new();
+    let mut buf = [0u8; 1];
+    loop {
+        let p = enc.finish(&mut buf).unwrap();
+        compressed.extend_from_slice(&buf[..p.written]);
+        if p.done {
+            break;
+        }
+        if p.written == 0 {
+            panic!("encoder finish stalled in single-byte streaming mode");
+        }
+    }
+
+    // Now also stream the decode side one byte at a time on input and one
+    // byte at a time on output.
+    let recovered = decode_chunked(&compressed, 1, 1).unwrap();
+    assert_eq!(recovered, payload);
+}
+
+#[test]
+fn encode_then_decode_match_with_high_dist_slot() {
+    // 64 KiB of a 64-byte pattern. Forces distances large enough to require
+    // the direct-bits + align-bittree path. Our encoder advertises a 1 MiB
+    // dict, so all distances are reachable.
+    let pattern: &[u8] = b"ABCDEFGHIJKLMNOPABCDEFGHIJKLMNOPABCDEFGHIJKLMNOPABCDEFGHIJKLMNOP";
+    let mut payload = Vec::with_capacity(64 * 1024);
+    while payload.len() < 64 * 1024 {
+        payload.extend_from_slice(pattern);
+    }
+    payload.truncate(64 * 1024);
+    let recovered = round_trip(&payload);
+    assert_eq!(recovered.len(), payload.len());
+    assert_eq!(recovered, payload);
+}
+
+#[test]
+fn encode_after_reset_round_trip() {
+    let mut enc = Encoder::new();
+    let mut scratch = [0u8; 64];
+
+    let _ = enc.encode(b"first payload", &mut scratch).unwrap();
+    enc.reset();
+
+    let payload = b"second payload after reset";
+    let mut consumed = 0;
+    while consumed < payload.len() {
+        let p = enc.encode(&payload[consumed..], &mut scratch).unwrap();
+        consumed += p.consumed;
+    }
+    let mut compressed = Vec::new();
+    let mut buf = [0u8; 64];
+    loop {
+        let p = enc.finish(&mut buf).unwrap();
+        compressed.extend_from_slice(&buf[..p.written]);
+        if p.done {
+            break;
+        }
+    }
+    let recovered = decode_one_shot(&compressed).unwrap();
+    assert_eq!(recovered.as_slice(), payload.as_slice());
+}
+
+#[test]
+fn encode_byte_value_coverage() {
+    // Every byte value 0..=255 in sequence, to exercise every literal path.
+    let payload: Vec<u8> = (0u8..=255).collect();
+    let recovered = round_trip(&payload);
+    assert_eq!(recovered, payload);
+}
+
+/// Pipe `compressed` to `python3 -c "import sys, lzma; sys.stdout.buffer.write(
+/// lzma.decompress(sys.stdin.buffer.read(), format=lzma.FORMAT_ALONE))"` and
+/// return the decompressed bytes. Returns `None` if `python3` is missing.
+fn python_decompress_alone(compressed: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("python3")
+        .args([
+            "-c",
+            "import sys, lzma; sys.stdout.buffer.write(lzma.decompress(sys.stdin.buffer.read(), format=lzma.FORMAT_ALONE))",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    {
+        // Take stdin so it drops at end of this scope, closing the pipe.
+        let mut stdin = child.stdin.take()?;
+        stdin.write_all(compressed).ok()?;
+    }
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        eprintln!(
+            "python3 lzma.decompress failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return None;
+    }
+    Some(out.stdout)
+}
+
+#[test]
+fn encode_decodes_externally_with_python_lzma() {
+    // Cross-validate against Python's stdlib `lzma` (XZ Utils-backed) to
+    // prove the output is a valid `.lzma` (alone) stream, not just one our
+    // decoder happens to accept.
+    let payloads: &[&[u8]] = &[
+        b"",
+        b"hello world",
+        &[42u8; 4096],
+        b"The quick brown fox jumps over the lazy dog. ",
+    ];
+    for payload in payloads {
+        let compressed = encode_one_shot(payload);
+        match python_decompress_alone(&compressed) {
+            Some(recovered) => assert_eq!(
+                recovered.as_slice(),
+                *payload,
+                "external decode mismatch for {} bytes",
+                payload.len()
+            ),
+            None => {
+                eprintln!("skipping external validation (no python3 available)");
+                return;
+            }
+        }
+    }
+
+    // One bigger payload — the same 16 KiB lorem we use elsewhere.
+    let lorem_chunk = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
+    let big: Vec<u8> = lorem_chunk
+        .repeat(200)
+        .into_bytes()
+        .into_iter()
+        .take(16384)
+        .collect();
+    let compressed = encode_one_shot(&big);
+    if let Some(rec) = python_decompress_alone(&compressed) {
+        assert_eq!(rec, big);
+    }
 }
 
 #[test]

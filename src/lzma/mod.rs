@@ -1,8 +1,9 @@
 //! LZMA (Lempel–Ziv–Markov chain Algorithm).
 //!
-//! This build ships a **decoder for the legacy `.lzma` (alone) format only**.
-//! The encoder is unimplemented and returns [`Error::Unsupported`] from every
-//! call — LZMA has no uncompressed mode, so there is no fall-back.
+//! This build ships **both an encoder and a decoder** for the legacy `.lzma`
+//! (alone) format. The encoder produces a stream that round-trips through
+//! our own decoder and decompresses cleanly with external implementations
+//! (Python's stdlib `lzma`, XZ Utils, etc.).
 //!
 //! Wire format (legacy "alone"):
 //! - 1 byte properties (`pp*9*5 + pp*5 + lc`, where `pb`, `lp`, `lc` are the
@@ -22,6 +23,11 @@
 //! of the buffered input it is rolled back and the codec asks for more input
 //! on the next call. This keeps the per-call buffers small while preserving
 //! the streaming `consumed`/`written` contract from `traits.rs`.
+//!
+//! The encoder lives in [`encoder`]. It accumulates input into a buffer and
+//! emits the entire compressed stream on `finish` — LZMA's range coder
+//! prevents a true byte-streaming output, and full-buffer encoding is by far
+//! the simplest correct strategy.
 
 extern crate alloc;
 use alloc::boxed::Box;
@@ -29,7 +35,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::traits::{Algorithm, Decoder as DecoderTrait, Encoder as EncoderTrait, Progress};
+use crate::traits::{Algorithm, Decoder as DecoderTrait, Progress};
+
+mod encoder;
+pub use encoder::Encoder;
 
 // ─── algorithm marker ────────────────────────────────────────────────────
 
@@ -47,32 +56,6 @@ impl Algorithm for Lzma {
     fn decoder() -> Decoder {
         Decoder::new()
     }
-}
-
-// ─── encoder: unsupported ────────────────────────────────────────────────
-
-/// Decode-only build: the encoder always returns [`Error::Unsupported`].
-///
-/// LZMA has no "stored" / uncompressed block mode that we could trivially
-/// fall back to, so a partial implementation would be worse than a clear
-/// error.
-#[derive(Debug, Default)]
-pub struct Encoder;
-
-impl Encoder {
-    pub const fn new() -> Self {
-        Self
-    }
-}
-
-impl EncoderTrait for Encoder {
-    fn encode(&mut self, _input: &[u8], _output: &mut [u8]) -> Result<Progress, Error> {
-        Err(Error::Unsupported)
-    }
-    fn finish(&mut self, _output: &mut [u8]) -> Result<Progress, Error> {
-        Err(Error::Unsupported)
-    }
-    fn reset(&mut self) {}
 }
 
 // ─── LZMA constants ──────────────────────────────────────────────────────

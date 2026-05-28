@@ -1,4 +1,4 @@
-//! xz container around LZMA2 — uncompressed-only.
+//! xz container around LZMA2.
 //!
 //! Reference: <https://tukaani.org/xz/xz-file-format.txt>.
 //!
@@ -17,18 +17,18 @@
 //!  Stream Footer (12 B)
 //! ```
 //!
-//! This implementation only supports a single filter (LZMA2, filter ID 0x21)
-//! and only emits / accepts LZMA2 chunks of types `0x00` (end marker), `0x01`
-//! (uncompressed + dictionary reset), and `0x02` (uncompressed, no reset).
-//! Encountering an LZMA-compressed chunk type (`>= 0x80`) during decoding
-//! yields [`Error::Unsupported`] cleanly. The encoder always emits a single
-//! Block whose payload is a sequence of type-`0x01` uncompressed chunks
-//! terminated by `0x00`; system `xz` decodes this correctly.
+//! This implementation supports a single filter (LZMA2, filter ID 0x21).
+//! Decoding handles every LZMA2 chunk type: `0x00` (end marker), `0x01`
+//! (uncompressed + dictionary reset), `0x02` (uncompressed, no reset),
+//! and `0x80..=0xFF` (LZMA-compressed, with the spec's full matrix of
+//! state/properties/dictionary reset flags). The compressed-chunk
+//! decoder is in [`lzma2_decoder`] and is adapted from this crate's
+//! `lzma` module.
 //!
-//! Real LZMA2 compression is **not** implemented here — this module is a
-//! container-only fallback that gives bit-identical xz framing without any
-//! entropy coding. It is wire-compatible with `xz`(1) for both directions
-//! within the uncompressed-chunk subset.
+//! The encoder still emits only uncompressed chunks (type `0x01`) —
+//! real LZMA2 *compression* is not implemented in this module, only
+//! decompression. The encoder output remains wire-compatible with
+//! `xz`(1).
 //!
 //! No dependency on the sibling `lzma` / `lzma2` modules: the small amount of
 //! LZMA2 framing we need (control byte, big-endian 16-bit size) and the
@@ -41,10 +41,14 @@
 // duplicate "return Ok(Progress { ... })" tails. Allow the lint here.
 #![allow(clippy::collapsible_match, clippy::collapsible_if)]
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::error::Error;
 use crate::traits::{Algorithm, Decoder as DecoderTrait, Encoder as EncoderTrait, Progress};
+
+mod lzma2_decoder;
+use lzma2_decoder::{Lzma2Props, LzmaCore, lzma2_dict_size};
 
 // ─── constants ─────────────────────────────────────────────────────────────
 
@@ -671,6 +675,13 @@ enum DecPhase {
     /// to either `Lzma2Data` or `Done` (end marker) or `Lzma2BlockEnd`.
     Lzma2Control,
     Lzma2Data,
+    /// Buffering the remaining bytes of a compressed-LZMA2 chunk header
+    /// (4 or 5 more bytes after the control byte).
+    Lzma2CompHeader,
+    /// Buffering the compressed payload for the current chunk.
+    Lzma2CompBuffer,
+    /// Streaming the decoded chunk bytes out to the caller.
+    Lzma2CompDrain,
     /// After the LZMA2 end marker: skip 0..=3 padding zeros and read the
     /// 4-byte Check.
     BlockPadding,
@@ -720,6 +731,37 @@ pub struct Decoder {
     /// so we resume varint parsing where we left off.
     index_pos: usize,
 
+    // ── compressed-LZMA2 chunk state ──────────────────────────────────
+    /// LZMA2 dictionary size derived from the Block Header's filter
+    /// properties byte. Set when a Block Header is parsed.
+    lzma2_dict_size: u32,
+    /// Lazily-instantiated LZMA core, persists across chunks subject to
+    /// reset bits in each chunk's control byte. Allocated on first
+    /// compressed chunk and dropped when the block ends.
+    lzma_core: Option<Box<LzmaCore>>,
+    /// True until the first chunk of a block is parsed. The LZMA2 spec
+    /// requires the first chunk of any block to be a "full reset" chunk
+    /// (control byte `0xE0..=0xFF` for compressed, or `0x01` for
+    /// uncompressed); reject any other first chunk.
+    expecting_block_first_chunk: bool,
+    /// Control byte of the in-flight compressed chunk.
+    comp_ctrl: u8,
+    /// Uncompressed size of the in-flight chunk (1..=65_536 for
+    /// uncompressed chunks, 1..=2_097_152 for compressed).
+    comp_uncomp_size: u32,
+    /// Compressed size of the in-flight chunk (1..=65_536).
+    comp_size: u32,
+    /// Buffer for the compressed payload of the current chunk.
+    comp_buf: Vec<u8>,
+    /// Decoded output of the current compressed chunk, drained byte-by-byte.
+    comp_decoded: Vec<u8>,
+    /// Read cursor within `comp_decoded` during streaming drain.
+    comp_decoded_pos: usize,
+    /// Properties byte from the most recent reset chunk; only valid when
+    /// `lzma_core` is `Some`. Used to detect whether `replace_props` is
+    /// required on subsequent reset chunks.
+    last_props: u8,
+
     poisoned: bool,
 }
 
@@ -741,6 +783,16 @@ impl Decoder {
             index_records_remaining: 0,
             index_records_total: 0,
             index_pos: 0,
+            lzma2_dict_size: 0,
+            lzma_core: None,
+            expecting_block_first_chunk: false,
+            comp_ctrl: 0,
+            comp_uncomp_size: 0,
+            comp_size: 0,
+            comp_buf: Vec::new(),
+            comp_decoded: Vec::new(),
+            comp_decoded_pos: 0,
+            last_props: 0,
             poisoned: false,
         }
     }
@@ -775,12 +827,13 @@ impl Decoder {
         if check_id & 0xF0 != 0 {
             return Err(self.poison(Error::Unsupported));
         }
-        // We accept any check type with the right size when reading, but for
-        // simplicity here we only verify CRC32 checks; others get accepted
-        // (their bytes are skipped without validation) when check_id != 0x01
-        // and != 0x00. To keep things tight, restrict to None/CRC32.
+        // Accept the spec's standard check types. We verify CRC32 (0x01)
+        // bit-for-bit; for CRC64 (0x04) and SHA-256 (0x0A) we simply
+        // consume the trailing bytes without validating them, since the
+        // CRC64 polynomial and SHA-256 hash function aren't built into
+        // this crate. Reserved values are rejected.
         match check_id & 0x0F {
-            0x00 | 0x01 => {}
+            0x00 | 0x01 | 0x04 | 0x0A => {}
             _ => return Err(self.poison(Error::Unsupported)),
         }
         self.check_id = check_id & 0x0F;
@@ -801,6 +854,8 @@ impl Decoder {
         match self.check_id {
             0x00 => 0,
             0x01 => 4,
+            0x04 => 8,
+            0x0A => 32,
             _ => 0, // unreachable: parse_stream_header rejects others
         }
     }
@@ -864,6 +919,13 @@ impl Decoder {
         cur += 1;
         if dict_flag & 0xC0 != 0 {
             return Err(self.poison(Error::Unsupported));
+        }
+        // Compute and store the LZMA2 dictionary size for the compressed
+        // chunk decoder. `lzma2_dict_size` already validates the flag's
+        // range (only 0..=40 are legal).
+        match lzma2_dict_size(dict_flag) {
+            Ok(v) => self.lzma2_dict_size = v,
+            Err(e) => return Err(self.poison(e)),
         }
         // Any remaining bytes before the CRC must be zero padding.
         while cur < body_end {
@@ -939,6 +1001,8 @@ impl DecoderTrait for Decoder {
                             self.block_compressed_seen = 0;
                             self.block_uncompressed_seen = 0;
                             self.check = Crc32::new();
+                            self.lzma_core = None;
+                            self.expecting_block_first_chunk = true;
                             self.phase = DecPhase::BlockHeader;
                         }
                     } else {
@@ -964,10 +1028,9 @@ impl DecoderTrait for Decoder {
                     }
                 }
                 DecPhase::Lzma2Control => {
-                    // We need either 1 byte (for end marker) or 3 bytes
-                    // (control + 2-byte size for uncompressed chunks). Read
-                    // the first byte first; once we see 0x01/0x02 we extend
-                    // to 3.
+                    // We need either 1 byte (end marker), 3 bytes
+                    // (uncompressed chunk header), or 5/6 bytes (compressed
+                    // chunk header, with optional 1-byte properties).
                     if self.scratch.is_empty() {
                         self.scratch_want = 1;
                         if !self.fill_scratch(input, &mut consumed) {
@@ -989,8 +1052,25 @@ impl DecoderTrait for Decoder {
                             + self.check_size() as u64;
                         let pad = (4 - (unpadded_no_pad % 4) as usize) % 4;
                         self.scratch_want = pad;
+                        // Free the (potentially MiB-sized) compressed-chunk
+                        // working buffers now that the block has ended.
+                        self.lzma_core = None;
+                        self.comp_buf = Vec::new();
+                        self.comp_decoded = Vec::new();
                         self.phase = DecPhase::BlockPadding;
                     } else if control == 0x01 || control == 0x02 {
+                        // Uncompressed chunk. First chunk in a block must
+                        // be a dictionary-reset chunk; for uncompressed
+                        // that means 0x01 specifically.
+                        if self.expecting_block_first_chunk && control != 0x01 {
+                            return Err(self.poison(Error::Corrupt));
+                        }
+                        // 0x01 also resets the LZ dictionary in any
+                        // straddling compressed state.
+                        if control == 0x01 {
+                            self.lzma_core = None;
+                        }
+                        self.expecting_block_first_chunk = false;
                         self.scratch_want = 3;
                         if !self.fill_scratch(input, &mut consumed) {
                             return Ok(Progress {
@@ -1008,9 +1088,176 @@ impl DecoderTrait for Decoder {
                         self.scratch_want = 0;
                         self.phase = DecPhase::Lzma2Data;
                     } else if control >= 0x80 {
-                        return Err(self.poison(Error::Unsupported));
+                        // Compressed LZMA-coded chunk. Continue parsing
+                        // the remaining header bytes in the next phase.
+                        // First chunk in a block must perform a full dict
+                        // reset, i.e. control byte in `0xE0..=0xFF`.
+                        if self.expecting_block_first_chunk && control < 0xE0 {
+                            return Err(self.poison(Error::Corrupt));
+                        }
+                        self.comp_ctrl = control;
+                        // Need 5 more bytes (uncomp-mid, uncomp-lo, comp-hi,
+                        // comp-lo) plus 1 properties byte when bit 6 of the
+                        // control byte requires it.
+                        let needs_props = (control & 0x40) != 0; // bit 6 set
+                        self.scratch_want = if needs_props { 6 } else { 5 };
+                        self.phase = DecPhase::Lzma2CompHeader;
                     } else {
                         return Err(self.poison(Error::Corrupt));
+                    }
+                }
+                DecPhase::Lzma2CompHeader => {
+                    if !self.fill_scratch(input, &mut consumed) {
+                        return Ok(Progress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                    // Layout of self.scratch:
+                    //   [0]   = control byte (top 5 bits of uncomp_size-1 in
+                    //           bits 0-4)
+                    //   [1-2] = remaining 16 bits of uncomp_size-1 (big-endian)
+                    //   [3-4] = comp_size-1 (big-endian, 16 bits)
+                    //   [5]?  = properties (if bit 6 of control set)
+                    let control = self.scratch[0];
+                    let needs_props = (control & 0x40) != 0;
+                    let header_len = self.scratch.len();
+                    let uncomp_top = (control & 0x1F) as u32;
+                    let uncomp_mid = self.scratch[1] as u32;
+                    let uncomp_lo = self.scratch[2] as u32;
+                    let uncomp_size = ((uncomp_top << 16) | (uncomp_mid << 8) | uncomp_lo) + 1;
+                    let comp_hi = self.scratch[3] as u32;
+                    let comp_lo = self.scratch[4] as u32;
+                    let comp_size = ((comp_hi << 8) | comp_lo) + 1;
+                    self.comp_uncomp_size = uncomp_size;
+                    self.comp_size = comp_size;
+                    self.block_compressed_seen += header_len as u64;
+
+                    // Apply reset semantics. Bits 5-6 of control:
+                    //   11 → dict reset + props reset + state reset (needs
+                    //         properties byte and full re-init).
+                    //   10 → props reset + state reset (needs properties
+                    //         byte; dict carries over).
+                    //   01 → state reset (no new properties; dict carries).
+                    //   00 → continuation (no resets).
+                    let reset_bits = (control >> 5) & 0x03;
+                    if reset_bits == 0b11 {
+                        // Full reset: re-create the LZMA core fresh, parsing
+                        // properties.
+                        let props_byte = self.scratch[5];
+                        let props = match Lzma2Props::parse(props_byte) {
+                            Ok(p) => p,
+                            Err(e) => return Err(self.poison(e)),
+                        };
+                        let dict_size = (self.lzma2_dict_size as usize).max(4096);
+                        // Cap at 128 MiB to bound memory; legitimate xz
+                        // outputs almost never need more than 64 MiB.
+                        let dict_size = dict_size.min(128 * 1024 * 1024);
+                        self.lzma_core = Some(Box::new(LzmaCore::new(props, dict_size)));
+                        self.last_props = props_byte;
+                    } else if reset_bits == 0b10 {
+                        // Props reset + state reset, dict carries over.
+                        let props_byte = self.scratch[5];
+                        let props = match Lzma2Props::parse(props_byte) {
+                            Ok(p) => p,
+                            Err(e) => return Err(self.poison(e)),
+                        };
+                        if self.lzma_core.is_none() {
+                            // Must have had a prior full-reset chunk to
+                            // carry a dict — but the first chunk in a block
+                            // is required to be full-reset (we enforced
+                            // that above), so this can only happen for
+                            // a malformed stream that escaped that check.
+                            return Err(self.poison(Error::Corrupt));
+                        }
+                        let core_ref = self.lzma_core.as_mut().unwrap();
+                        core_ref.replace_props(props);
+                        core_ref.reset_state();
+                        self.last_props = props_byte;
+                    } else if reset_bits == 0b01 {
+                        // State reset only; properties and dict carry over.
+                        // Sanity: bit 6 (`needs_props`) must be clear here.
+                        let _ = needs_props;
+                        if self.lzma_core.is_none() {
+                            return Err(self.poison(Error::Corrupt));
+                        }
+                        self.lzma_core.as_mut().unwrap().reset_state();
+                    } else {
+                        // 00: continuation. The core must already exist.
+                        if self.lzma_core.is_none() {
+                            return Err(self.poison(Error::Corrupt));
+                        }
+                    }
+
+                    self.expecting_block_first_chunk = false;
+                    self.scratch.clear();
+                    self.comp_buf.clear();
+                    self.scratch_want = 0;
+                    self.phase = DecPhase::Lzma2CompBuffer;
+                }
+                DecPhase::Lzma2CompBuffer => {
+                    // Pull up to comp_size compressed bytes into comp_buf.
+                    let need = self.comp_size as usize - self.comp_buf.len();
+                    let take = need.min(input.len() - consumed);
+                    if take > 0 {
+                        self.comp_buf
+                            .extend_from_slice(&input[consumed..consumed + take]);
+                        consumed += take;
+                    }
+                    if self.comp_buf.len() < self.comp_size as usize {
+                        return Ok(Progress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                    self.block_compressed_seen += self.comp_size as u64;
+                    // Decode the entire chunk into comp_decoded.
+                    self.comp_decoded.clear();
+                    self.comp_decoded
+                        .resize(self.comp_uncomp_size as usize, 0u8);
+                    if self.lzma_core.is_none() {
+                        return Err(self.poison(Error::Corrupt));
+                    }
+                    let init_res = self.lzma_core.as_mut().unwrap().init_range(&self.comp_buf);
+                    if let Err(e) = init_res {
+                        return Err(self.poison(e));
+                    }
+                    let dec_res = self
+                        .lzma_core
+                        .as_mut()
+                        .unwrap()
+                        .decode_chunk(&self.comp_buf, &mut self.comp_decoded);
+                    if let Err(e) = dec_res {
+                        return Err(self.poison(e));
+                    }
+                    self.comp_decoded_pos = 0;
+                    self.phase = DecPhase::Lzma2CompDrain;
+                }
+                DecPhase::Lzma2CompDrain => {
+                    let total = self.comp_decoded.len();
+                    while self.comp_decoded_pos < total && written < output.len() {
+                        let take = (total - self.comp_decoded_pos).min(output.len() - written);
+                        let src =
+                            &self.comp_decoded[self.comp_decoded_pos..self.comp_decoded_pos + take];
+                        output[written..written + take].copy_from_slice(src);
+                        self.check.update(src);
+                        self.block_uncompressed_seen += take as u64;
+                        self.comp_decoded_pos += take;
+                        written += take;
+                    }
+                    if self.comp_decoded_pos >= total {
+                        // Chunk drained; back to control byte parsing.
+                        self.scratch.clear();
+                        self.scratch_want = 1;
+                        self.phase = DecPhase::Lzma2Control;
+                    } else {
+                        return Ok(Progress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
                     }
                 }
                 DecPhase::Lzma2Data => {

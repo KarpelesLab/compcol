@@ -387,24 +387,29 @@ fn decode_rejects_reserved_block_type() {
 }
 
 #[test]
-fn decode_returns_unsupported_for_compressed_block() {
-    // Build a frame announcing a Compressed_Block (Type=2). The decoder
-    // should refuse with Unsupported before it tries to parse the payload.
+fn decode_rejects_malformed_compressed_block() {
+    // Build a frame announcing a 4-byte Compressed_Block whose literals
+    // header advertises a Compressed_Literals_Block with garbage Huffman
+    // tree data. The decoder should bail with Corrupt.
     let mut f = Vec::new();
     f.extend_from_slice(&[0x28, 0xB5, 0x2F, 0xFD]);
     f.push(0x00);
     f.push(0x50);
-    // BH: Last=1, Type=2 (Compressed), Size=2 (arbitrary).
-    let bh: u32 = 1 | (2u32 << 1) | (2u32 << 3);
+    // BH: Last=1, Type=2 (Compressed), Size=4.
+    let bh: u32 = 1 | (2u32 << 1) | (4u32 << 3);
     f.push((bh & 0xFF) as u8);
     f.push(((bh >> 8) & 0xFF) as u8);
     f.push(((bh >> 16) & 0xFF) as u8);
-    f.push(0x00);
-    f.push(0x00);
+    // LHD = 0x02 → Compressed_Literals_Block, SF=00 (3-byte header total),
+    // followed by some garbage that won't form a valid Huffman tree.
+    f.push(0x02);
+    f.push(0xFF);
+    f.push(0xFF);
+    f.push(0xFF);
     let mut dec = Decoder::new();
     let mut out = [0u8; 16];
     let err = dec.decode(&f, &mut out).unwrap_err();
-    assert_eq!(err, Error::Unsupported);
+    assert_eq!(err, Error::Corrupt);
 }
 
 #[test]
@@ -488,12 +493,9 @@ fn decode_known_good_zstd_fixture_with_checksum_unsupported() {
 }
 
 #[test]
-fn decode_known_good_zstd_fixture_compressed_unsupported() {
-    // The classic case: data large enough that `zstd -1` actually emits a
-    // Compressed_Block. We can't easily inline a real fixture here without
-    // regenerating against a known-stable zstd version, so we build a frame
-    // by hand whose body is a Compressed_Block (Type=2). The decoder must
-    // reject it as Unsupported.
+fn decode_short_compressed_block_too_small() {
+    // A Compressed_Block needs at least a literals header byte and a
+    // sequence-count byte — a 1-byte body cannot be valid.
     let mut f = Vec::new();
     f.extend_from_slice(&[0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x50]);
     let bh: u32 = 1 | (2u32 << 1) | (1u32 << 3); // Last=1, Type=2, Size=1
@@ -504,7 +506,7 @@ fn decode_known_good_zstd_fixture_compressed_unsupported() {
     let mut dec = Decoder::new();
     let mut out = vec![0u8; 16];
     let err = dec.decode(&f, &mut out).unwrap_err();
-    assert_eq!(err, Error::Unsupported);
+    assert_eq!(err, Error::Corrupt);
 }
 
 // ─── encoder: frame shape sanity ─────────────────────────────────────────
@@ -542,6 +544,585 @@ fn empty_encode_emits_empty_last_block() {
     // 3-byte block header with Last=1, Type=0, Size=0 → bytes 01 00 00.
     assert_eq!(&encoded[6..9], &[0x01, 0x00, 0x00]);
     assert_eq!(encoded.len(), 9);
+}
+
+// ─── decode-only against system zstd ─────────────────────────────────────
+
+#[cfg(unix)]
+fn tool_available(name: &str) -> bool {
+    std::process::Command::new(name)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn zstd_encode(input: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("zstd")
+        .args(["--no-check", "-c"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn zstd");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(input).unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "zstd failed");
+    out.stdout
+}
+
+#[cfg(unix)]
+fn decode_all(encoded: &[u8]) -> Vec<u8> {
+    let mut dec = Decoder::new();
+    let mut decoded = Vec::new();
+    let mut buf = vec![0u8; 8192];
+    let mut input_pos = 0usize;
+    loop {
+        let p = match dec.decode(&encoded[input_pos..], &mut buf) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "decode err {:?} at input_pos {} (decoded so far {})",
+                    e,
+                    input_pos,
+                    decoded.len()
+                );
+                panic!("{:?}", e);
+            }
+        };
+        decoded.extend_from_slice(&buf[..p.written]);
+        input_pos += p.consumed;
+        if p.consumed == 0 && p.written == 0 {
+            break;
+        }
+    }
+    loop {
+        let pf = dec.finish(&mut buf).unwrap();
+        decoded.extend_from_slice(&buf[..pf.written]);
+        if pf.done {
+            break;
+        }
+        if pf.written == 0 {
+            panic!("decoder finish stalled");
+        }
+    }
+    decoded
+}
+
+#[cfg(unix)]
+#[test]
+fn decode_zstd_cli_empty() {
+    if !tool_available("zstd") {
+        return;
+    }
+    let encoded = zstd_encode(b"");
+    let decoded = decode_all(&encoded);
+    assert_eq!(decoded, b"");
+}
+
+#[cfg(unix)]
+#[test]
+fn decode_zstd_cli_hello() {
+    if !tool_available("zstd") {
+        return;
+    }
+    let encoded = zstd_encode(b"hello world\n");
+    let decoded = decode_all(&encoded);
+    assert_eq!(decoded, b"hello world\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn decode_zstd_cli_lorem_4k() {
+    if !tool_available("zstd") {
+        return;
+    }
+    let snippet = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
+    let mut input = Vec::with_capacity(4096);
+    while input.len() < 4096 {
+        input.extend_from_slice(snippet);
+    }
+    input.truncate(4096);
+    let encoded = zstd_encode(&input);
+    let decoded = decode_all(&encoded);
+    assert_eq!(decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn debug_huff_tree_weights_lorem_4k() {
+    if !tool_available("zstd") {
+        return;
+    }
+    let snippet = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
+    let mut input = Vec::with_capacity(4096);
+    while input.len() < 4096 {
+        input.extend_from_slice(snippet);
+    }
+    input.truncate(4096);
+    let encoded = zstd_encode(&input);
+    let body_offset = 9;
+    let bh = (encoded[6] as u32) | ((encoded[7] as u32) << 8) | ((encoded[8] as u32) << 16);
+    let bsize = ((bh >> 3) & 0x1F_FFFF) as usize;
+    if (bh >> 1) & 0b11 != 2 {
+        return;
+    }
+    let body = &encoded[body_offset..body_offset + bsize];
+    // skip 3-byte literals header
+    let lit_payload = &body[3..];
+    let weights = compcol::zstd::_internal_test_api::huff_tree_weights_for_test(lit_payload)
+        .expect("weights decode");
+    eprintln!("decoded {} weights", weights.len());
+    eprintln!("weights: {:?}", weights);
+}
+
+#[cfg(unix)]
+#[test]
+fn debug_literals_only_lorem_4k() {
+    if !tool_available("zstd") {
+        return;
+    }
+    let snippet = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
+    let mut input = Vec::with_capacity(4096);
+    while input.len() < 4096 {
+        input.extend_from_slice(snippet);
+    }
+    input.truncate(4096);
+    let encoded = zstd_encode(&input);
+    let body_offset = 9;
+    let bh = (encoded[6] as u32) | ((encoded[7] as u32) << 8) | ((encoded[8] as u32) << 16);
+    let bsize = ((bh >> 3) & 0x1F_FFFF) as usize;
+    let btype = (bh >> 1) & 0b11;
+    eprintln!("first block: type={}, size={}", btype, bsize);
+    if btype != 2 {
+        return;
+    }
+    let body = &encoded[body_offset..body_offset + bsize];
+    eprintln!("body[..16] = {:02x?}", &body[..body.len().min(16)]);
+    let (lits, used) = compcol::zstd::_internal_test_api::decode_literals_for_test(body).unwrap();
+    eprintln!(
+        "literals: {} bytes (consumed {} of {}); first 64 as str: {:?}",
+        lits.len(),
+        used,
+        body.len(),
+        std::str::from_utf8(&lits[..lits.len().min(64)])
+    );
+}
+
+/// Isolated literals-section test against the body of a Compressed_Block
+/// produced by the system `zstd` CLI. Useful when full-decode tests fail —
+/// pinpoints whether the bug is in literals or sequences.
+#[cfg(unix)]
+#[test]
+fn debug_literals_only_lorem_200() {
+    if !tool_available("zstd") {
+        return;
+    }
+    let snippet = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit. ";
+    let mut input = Vec::with_capacity(200);
+    while input.len() < 200 {
+        input.extend_from_slice(snippet);
+    }
+    input.truncate(200);
+    let encoded = zstd_encode(&input);
+    // Frame layout: magic(4) + FHD(1) + WD(1) + BH(3) + body.
+    let body_offset = 9;
+    let bh = (encoded[6] as u32) | ((encoded[7] as u32) << 8) | ((encoded[8] as u32) << 16);
+    let bsize = ((bh >> 3) & 0x1F_FFFF) as usize;
+    let btype = (bh >> 1) & 0b11;
+    eprintln!("first block: type={}, size={}", btype, bsize);
+    if btype != 2 {
+        eprintln!("not a compressed block ({}), skipping", btype);
+        return;
+    }
+    let body = &encoded[body_offset..body_offset + bsize];
+    eprintln!("body[..16] = {:02x?}", &body[..body.len().min(16)]);
+    match compcol::zstd::_internal_test_api::decode_literals_for_test(body) {
+        Ok((lits, used)) => {
+            eprintln!(
+                "literals: {} bytes (consumed {} of body); first 32: {:?}",
+                lits.len(),
+                used,
+                &lits[..lits.len().min(32)]
+            );
+        }
+        Err(e) => panic!("literals decode failed: {:?}", e),
+    }
+}
+
+#[test]
+fn check_default_ll_table_entries() {
+    let entries = compcol::zstd::_internal_test_api::default_ll_entries();
+    // RFC 8478 Appendix A.1 worked example: state 0 → symbol 0,
+    // state 16 → symbol 24. (More cross-checks would be ideal but the RFC
+    // truncates the table in the version we can fetch.)
+    eprintln!("entries[0] = {:?}", entries[0]);
+    eprintln!("entries[16] = {:?}", entries[16]);
+    eprintln!("entries[20] = {:?}", entries[20]);
+    eprintln!("entries[32] = {:?}", entries[32]);
+    eprintln!("entries[63] = {:?}", entries[63]);
+    assert_eq!(entries[0].0, 0, "state 0 should be symbol 0");
+    assert_eq!(entries[16].0, 24, "state 16 should be symbol 24");
+    let mle = compcol::zstd::_internal_test_api::default_ml_entries();
+    eprintln!("ML[20] = {:?}", mle[20]);
+    let ofe = compcol::zstd::_internal_test_api::default_of_entries();
+    eprintln!("OF[10] = {:?}", ofe[10]);
+}
+
+#[cfg(unix)]
+#[test]
+fn debug_sequences_lorem_200() {
+    if !tool_available("zstd") {
+        return;
+    }
+    let snippet = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit. ";
+    let mut input = Vec::with_capacity(200);
+    while input.len() < 200 {
+        input.extend_from_slice(snippet);
+    }
+    input.truncate(200);
+    let encoded = zstd_encode(&input);
+    let body_offset = 9;
+    let bh = (encoded[6] as u32) | ((encoded[7] as u32) << 8) | ((encoded[8] as u32) << 16);
+    let bsize = ((bh >> 3) & 0x1F_FFFF) as usize;
+    let btype = (bh >> 1) & 0b11;
+    if btype != 2 {
+        return;
+    }
+    let body = &encoded[body_offset..body_offset + bsize];
+    let (_lits, used) = compcol::zstd::_internal_test_api::decode_literals_for_test(body).unwrap();
+    let seq = &body[used..];
+    eprintln!("sequence section ({} bytes): {:02x?}", seq.len(), seq);
+    match compcol::zstd::_internal_test_api::decode_sequences_for_test(seq) {
+        Ok(n) => eprintln!("decoded {} sequences", n),
+        Err(e) => panic!("sequences decode failed: {:?}", e),
+    }
+}
+
+/// Same as above but also runs the sequences-and-execute pass.
+#[cfg(unix)]
+#[test]
+fn debug_full_block_lorem_200() {
+    if !tool_available("zstd") {
+        return;
+    }
+    let snippet = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit. ";
+    let mut input = Vec::with_capacity(200);
+    while input.len() < 200 {
+        input.extend_from_slice(snippet);
+    }
+    input.truncate(200);
+    let encoded = zstd_encode(&input);
+    let body_offset = 9;
+    let bh = (encoded[6] as u32) | ((encoded[7] as u32) << 8) | ((encoded[8] as u32) << 16);
+    let bsize = ((bh >> 3) & 0x1F_FFFF) as usize;
+    let btype = (bh >> 1) & 0b11;
+    if btype != 2 {
+        return;
+    }
+    let body = &encoded[body_offset..body_offset + bsize];
+    match compcol::zstd::_internal_test_api::decode_compressed_block_body(body) {
+        Ok(out) => {
+            eprintln!(
+                "decoded block: {} bytes; first 32: {:?}",
+                out.len(),
+                &out[..out.len().min(32)]
+            );
+            assert_eq!(out.len(), input.len());
+            assert_eq!(out, input);
+        }
+        Err(e) => panic!("block decode failed: {:?}", e),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn decode_zstd_cli_lorem_32k() {
+    if !tool_available("zstd") {
+        return;
+    }
+    let snippet = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
+    let mut input = Vec::with_capacity(32 * 1024);
+    while input.len() < 32 * 1024 {
+        input.extend_from_slice(snippet);
+    }
+    input.truncate(32 * 1024);
+    let encoded = zstd_encode(&input);
+    let decoded = decode_all(&encoded);
+    assert_eq!(decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn decode_zstd_cli_pseudo_random_64k() {
+    // Pseudo-random — likely encoded as a Raw_Block (high entropy), but it
+    // still exercises the frame parser end-to-end.
+    if !tool_available("zstd") {
+        return;
+    }
+    let input = lcg_bytes(0xCAFEBABE, 64 * 1024);
+    let encoded = zstd_encode(&input);
+    let decoded = decode_all(&encoded);
+    assert_eq!(decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn decode_zstd_cli_rle_friendly() {
+    // 5000 'a's — zstd will collapse this to an RLE block at the block layer,
+    // or to a tiny compressed block with mostly LZ77 sequences.
+    if !tool_available("zstd") {
+        return;
+    }
+    let input = vec![b'a'; 5000];
+    let encoded = zstd_encode(&input);
+    let decoded = decode_all(&encoded);
+    assert_eq!(decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn decode_zstd_cli_pangram_repeat() {
+    if !tool_available("zstd") {
+        return;
+    }
+    let snippet = b"The quick brown fox jumps over the lazy dog.\n";
+    let mut input = Vec::new();
+    while input.len() < 4500 {
+        input.extend_from_slice(snippet);
+    }
+    input.truncate(4500);
+    let encoded = zstd_encode(&input);
+    let decoded = decode_all(&encoded);
+    assert_eq!(decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn decode_zstd_cli_long_rle() {
+    // 50 KiB of 'a' — likely spans multiple blocks; tests Repeat_Mode for
+    // sequence tables across blocks.
+    if !tool_available("zstd") {
+        return;
+    }
+    let input = vec![b'a'; 50 * 1024];
+    let encoded = zstd_encode(&input);
+    let decoded = decode_all(&encoded);
+    assert_eq!(decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn decode_zstd_cli_sweep_abc_sizes() {
+    // Sweep through many input sizes to exercise FSE/Huffman edge cases.
+    if !tool_available("zstd") {
+        return;
+    }
+    for n in [
+        5usize, 10, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 50000,
+    ] {
+        let snippet = b"abc";
+        let mut input = Vec::with_capacity(n * snippet.len());
+        for _ in 0..n {
+            input.extend_from_slice(snippet);
+        }
+        let encoded = zstd_encode(&input);
+        let decoded = decode_all(&encoded);
+        assert_eq!(decoded, input, "mismatch for n={}", n);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn decode_zstd_cli_streaming_byte_by_byte() {
+    // Feed a Compressed_Block-bearing frame to the decoder one byte at a
+    // time. Ensures the buffering path for compressed blocks works under
+    // tight streaming constraints.
+    if !tool_available("zstd") {
+        return;
+    }
+    let snippet = b"abcdefghij" as &[u8];
+    let mut input = Vec::with_capacity(4096);
+    while input.len() < 4096 {
+        input.extend_from_slice(snippet);
+    }
+    input.truncate(4096);
+    let encoded = zstd_encode(&input);
+    let decoded = decode_chunked(&encoded, 1, 1);
+    assert_eq!(decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn decode_zstd_cli_tiny_rle_pattern() {
+    // 31 'a's — small enough that zstd may use Predefined_Mode tables and
+    // RLE_Literals_Block. Edge case for tiny-block decoding.
+    if !tool_available("zstd") {
+        return;
+    }
+    let input = vec![b'a'; 31];
+    let encoded = zstd_encode(&input);
+    let decoded = decode_all(&encoded);
+    assert_eq!(decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn decode_zstd_cli_diverse_300k() {
+    // 300 KB of diverse text — likely produces multiple blocks (≤128 KiB
+    // each), exercising Treeless_Literals_Block reuse across blocks.
+    if !tool_available("zstd") {
+        return;
+    }
+    let words: &[&[u8]] = &[
+        b"the ",
+        b"quick ",
+        b"brown ",
+        b"fox ",
+        b"jumps ",
+        b"over ",
+        b"lazy ",
+        b"dog ",
+        b"pack ",
+        b"my ",
+        b"box ",
+        b"with ",
+        b"five ",
+        b"dozen ",
+        b"liquor ",
+        b"jugs ",
+        b"sphinx ",
+        b"of ",
+        b"black ",
+        b"quartz ",
+        b"judge ",
+        b"how ",
+        b"vexingly ",
+        b"daft ",
+        b"zebras ",
+        b"jump ",
+        b"a ",
+        b"an ",
+        b"are ",
+        b"as ",
+        b"at ",
+        b"be ",
+    ];
+    // Deterministic LCG to pick word indices.
+    let mut input = Vec::with_capacity(300 * 1024);
+    let mut state: u32 = 0x9E37_79B1;
+    while input.len() < 300 * 1024 {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let idx = (state as usize) % words.len();
+        input.extend_from_slice(words[idx]);
+    }
+    input.truncate(300 * 1024);
+    let encoded = zstd_encode(&input);
+    let decoded = decode_all(&encoded);
+    assert_eq!(decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn decode_zstd_cli_lorem_128k() {
+    // 128 KiB exercises multi-block decoding (each block ≤ 128 KiB; this size
+    // forces at least 2 blocks at default compression level).
+    if !tool_available("zstd") {
+        return;
+    }
+    let snippet = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
+    let mut input = Vec::with_capacity(128 * 1024);
+    while input.len() < 128 * 1024 {
+        input.extend_from_slice(snippet);
+    }
+    input.truncate(128 * 1024);
+    let encoded = zstd_encode(&input);
+    let decoded = decode_all(&encoded);
+    assert_eq!(decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn decode_zstd_cli_mixed_content() {
+    // English prose mixed with binary noise — produces a mix of
+    // Compressed_Literals and likely some Raw_Block payloads.
+    if !tool_available("zstd") {
+        return;
+    }
+    let mut input = Vec::with_capacity(20 * 1024);
+    let snippet = b"The quick brown fox jumps over the lazy dog. ";
+    let noise = lcg_bytes(0x1234, 4096);
+    while input.len() < 20 * 1024 {
+        input.extend_from_slice(snippet);
+        input.extend_from_slice(&noise[..256]);
+    }
+    input.truncate(20 * 1024);
+    let encoded = zstd_encode(&input);
+    let decoded = decode_all(&encoded);
+    assert_eq!(decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn decode_zstd_cli_low_level_1() {
+    // -1: lowest compression. Often produces simpler block structures.
+    if !tool_available("zstd") {
+        return;
+    }
+    let snippet = b"hello, world! ";
+    let mut input = Vec::new();
+    while input.len() < 4096 {
+        input.extend_from_slice(snippet);
+    }
+    input.truncate(4096);
+    use std::io::Write;
+    let mut child = std::process::Command::new("zstd")
+        .args(["--no-check", "-1", "-c"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(&input).unwrap();
+    let encoded = child.wait_with_output().unwrap().stdout;
+    let decoded = decode_all(&encoded);
+    assert_eq!(decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn decode_zstd_cli_high_compression_level() {
+    // Compression level -3 (default), -9 (high), and -1 (low) may produce
+    // different block structures (Compressed_Literals_Block vs Treeless,
+    // FSE_Compressed_Mode vs Predefined). Test that we handle level 9.
+    if !tool_available("zstd") {
+        return;
+    }
+    let snippet = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
+    let mut input = Vec::with_capacity(8192);
+    while input.len() < 8192 {
+        input.extend_from_slice(snippet);
+    }
+    input.truncate(8192);
+    use std::io::Write;
+    let mut child = std::process::Command::new("zstd")
+        .args(["--no-check", "-9", "-c"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(&input).unwrap();
+    let encoded = child.wait_with_output().unwrap().stdout;
+    let decoded = decode_all(&encoded);
+    assert_eq!(decoded, input);
 }
 
 // ─── pseudo-random helper ────────────────────────────────────────────────

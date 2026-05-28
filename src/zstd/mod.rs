@@ -4,31 +4,39 @@
 //!
 //! # What works
 //!
-//! - **Decoder**: streams Zstd frames whose data blocks are all `Raw_Block`
-//!   (Block_Type=0) or `RLE_Block` (Block_Type=1). The frame header parser
-//!   handles the full set of Frame_Header_Descriptor permutations
-//!   (Single_Segment_Flag, optional Window_Descriptor, optional Dictionary_ID
-//!   field of 0/1/2/4 bytes, optional Frame_Content_Size of 0/1/2/4/8 bytes
-//!   with the 2-byte FCS+256 quirk).
+//! - **Decoder**: streams Zstd frames whose data blocks are `Raw_Block`
+//!   (Block_Type=0), `RLE_Block` (Block_Type=1), or `Compressed_Block`
+//!   (Block_Type=2). The Compressed_Block path implements:
+//!     - All four literals encodings: Raw, RLE, Compressed (fresh Huffman
+//!       tree), and Treeless (reuse previous tree). Both 1-stream and
+//!       4-stream Huffman bitstream layouts.
+//!     - Huffman tree decoding for both direct (nibble-packed) and
+//!       FSE-compressed weight encodings.
+//!     - FSE table decoding for the literal-length / offset / match-length
+//!       sequences. Predefined_Mode, RLE_Mode, FSE_Compressed_Mode, and
+//!       Repeat_Mode are all supported.
+//!     - LZ77 reconstruction including the "previous offsets" repeat-code
+//!       quirk (offset values 1..=3 alias the three most recent offsets,
+//!       with special handling when `literal_length == 0`).
+//!
+//!   The frame header parser handles the full set of Frame_Header_Descriptor
+//!   permutations (Single_Segment_Flag, optional Window_Descriptor, optional
+//!   Dictionary_ID field of 0/1/2/4 bytes, optional Frame_Content_Size of
+//!   0/1/2/4/8 bytes with the 2-byte FCS+256 quirk).
 //!
 //! - **Encoder**: emits a valid Zstd frame whose body is one or more
-//!   `Raw_Block`s. **No compression is actually performed** — every input byte
-//!   is copied into the output verbatim, wrapped in Zstd block headers. This
-//!   is the "fallback" encoder mode required by the task: it lets the decoder
-//!   round-trip its own output without bringing in the FSE/Huffman/LZ77
-//!   machinery that real Zstd compression demands.
+//!   `Raw_Block`s. **No compression is actually performed** — every input
+//!   byte is copied into the output verbatim, wrapped in Zstd block headers.
+//!   This is the "fallback" encoder mode: it lets the decoder round-trip its
+//!   own output without bringing in the FSE/Huffman/LZ77 machinery that real
+//!   Zstd compression demands.
 //!
 //! # What does NOT work
 //!
-//! - **`Compressed_Block` (Block_Type=2) decoding** is the bulk of the spec
-//!   (FSE entropy coding, Huffman literals, LZ77 sequences). The decoder
-//!   returns [`Error::Unsupported`] when it encounters such a block.
-//!
 //! - **Content_Checksum_Flag** in the Frame_Header. The 4-byte trailer is the
 //!   low 32 bits of XXH64 over the decompressed data; we do not ship an
-//!   XXH64 implementation, so any frame that advertises a content checksum is
-//!   refused with [`Error::Unsupported`] (the task spec explicitly permits
-//!   this).
+//!   XXH64 implementation, so any frame that advertises a content checksum
+//!   is refused with [`Error::Unsupported`].
 //!
 //! - **Skippable_Frame** magic numbers (`0x184D2A50..=0x184D2A5F`) are
 //!   detected and rejected as unsupported rather than silently skipped.
@@ -41,11 +49,87 @@
 //! Both halves are pure streaming: caller owns the input/output buffers and
 //! the codec preserves state across `encode`/`decode` calls.
 
+mod bitreader;
 mod decoder;
 mod encoder;
+mod fse;
+mod huffman;
+mod literals;
+mod sequences;
 
 pub use decoder::Decoder;
 pub use encoder::Encoder;
+
+/// Internal helpers exposed for integration tests only. Not part of the
+/// public API; subject to change without notice.
+#[doc(hidden)]
+pub mod _internal_test_api {
+    use crate::error::Error;
+
+    /// Decode a single Compressed_Block body (the bytes after its 3-byte
+    /// block header) into the decompressed output. Returns the decoded
+    /// bytes. State carried across blocks is **not** preserved — for
+    /// multi-block decoding use the [`super::Decoder`] type.
+    pub fn decode_compressed_block_body(body: &[u8]) -> Result<alloc::vec::Vec<u8>, Error> {
+        use alloc::vec::Vec;
+        let mut lit_state = super::literals::LiteralsState::default();
+        let mut seq_state = super::sequences::SequencesState::new();
+        let lit = super::literals::decode_literals(body, &mut lit_state)?;
+        let seq_data = &body[lit.consumed..];
+        let seqs = super::sequences::decode_sequences(seq_data, &mut seq_state)?;
+        let mut out: Vec<u8> = Vec::new();
+        super::sequences::execute_sequences(&seqs, &lit.literals, &mut out)?;
+        Ok(out)
+    }
+
+    /// Just the literals section.
+    pub fn decode_literals_for_test(body: &[u8]) -> Result<(alloc::vec::Vec<u8>, usize), Error> {
+        let mut s = super::literals::LiteralsState::default();
+        let r = super::literals::decode_literals(body, &mut s)?;
+        Ok((r.literals, r.consumed))
+    }
+
+    /// Just the sequences section. Returns the number of sequences decoded.
+    pub fn decode_sequences_for_test(seq_data: &[u8]) -> Result<usize, Error> {
+        let mut s = super::sequences::SequencesState::new();
+        let seqs = super::sequences::decode_sequences(seq_data, &mut s)?;
+        Ok(seqs.len())
+    }
+
+    /// Dump the default LL table for inspection.
+    pub fn default_ll_entries() -> alloc::vec::Vec<(u16, u8, u16)> {
+        let t = super::fse::default_ll_table();
+        t.entries
+            .iter()
+            .map(|e| (e.symbol, e.num_bits, e.base_state))
+            .collect()
+    }
+
+    /// Dump the default ML table.
+    pub fn default_ml_entries() -> alloc::vec::Vec<(u16, u8, u16)> {
+        let t = super::fse::default_ml_table();
+        t.entries
+            .iter()
+            .map(|e| (e.symbol, e.num_bits, e.base_state))
+            .collect()
+    }
+
+    /// Dump the default OF table.
+    pub fn default_of_entries() -> alloc::vec::Vec<(u16, u8, u16)> {
+        let t = super::fse::default_of_table();
+        t.entries
+            .iter()
+            .map(|e| (e.symbol, e.num_bits, e.base_state))
+            .collect()
+    }
+
+    /// Decode the FSE weights from a Huffman tree description and return them.
+    /// `data` should point to the literals payload (starting at the Huffman
+    /// Header_Byte). Returns `(weights, header_bytes_consumed)`.
+    pub fn huff_tree_weights_for_test(data: &[u8]) -> Result<alloc::vec::Vec<u8>, Error> {
+        super::huffman::decode_huffman_tree_weights_for_test(data)
+    }
+}
 
 use crate::traits::Algorithm;
 

@@ -1,17 +1,19 @@
 //! Streaming Zstandard decoder.
 //!
-//! Supports frames whose data blocks are all `Raw_Block` (Block_Type=0) or
-//! `RLE_Block` (Block_Type=1). A `Compressed_Block` (Block_Type=2) causes the
-//! decoder to return [`Error::Unsupported`]; `Reserved` (Block_Type=3) is
-//! [`Error::Corrupt`].
+//! Supports `Raw_Block` (Block_Type=0), `RLE_Block` (Block_Type=1), and
+//! `Compressed_Block` (Block_Type=2). See the module-level `mod.rs` docs for
+//! a full list of supported literal / sequence sub-modes.
 //!
 //! The decoder also refuses frames whose Frame_Header sets the
 //! `Content_Checksum_Flag` — we do not implement XXH64 in this crate, so we
-//! cannot validate the trailing 4-byte checksum and treat the option as
-//! unsupported (per task spec).
+//! cannot validate the trailing 4-byte checksum.
+
+use alloc::vec::Vec;
 
 use crate::error::Error;
 use crate::traits::{Decoder as DecoderTrait, Progress};
+use crate::zstd::literals::{LiteralsState, decode_literals};
+use crate::zstd::sequences::{SequencesState, decode_sequences, execute_sequences};
 
 const MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// Skippable_Frame magic numbers occupy 0x184D2A50..=0x184D2A5F. We do not
@@ -38,6 +40,11 @@ enum DecPhase {
     RleByte,
     /// Emitting the byte read in `RleByte` `rle_remaining` times.
     RleEmit,
+    /// Buffering the Compressed_Block payload into `comp_buf`.
+    CompressedBuffer,
+    /// Emitting the bytes decoded out of a Compressed_Block (held in
+    /// `emit_buf`).
+    CompressedEmit,
     /// Reading 4-byte Content_Checksum trailer (only entered if we somehow
     /// allowed a checksummed frame — currently we refuse such frames in
     /// `Fhd`).
@@ -82,6 +89,26 @@ pub struct Decoder {
     rle_byte: u8,
     /// RLE_Block remaining repeats.
     rle_remaining: u32,
+
+    /// Total bytes a Compressed_Block expects to consume from the input.
+    comp_total: u32,
+    /// Buffer holding the Compressed_Block payload as it's accumulated from
+    /// the input stream.
+    comp_buf: Vec<u8>,
+
+    /// All previously decoded output bytes (back-reference history).
+    /// Kept across blocks; the LZ77 reconstruction reads from this.
+    history: Vec<u8>,
+    /// Last fully-decoded length of `history` — we slice
+    /// `history[history_emitted..]` to find bytes still to deliver.
+    history_emitted: usize,
+
+    /// Carry-over state for Treeless_Literals_Block (most recent Huffman
+    /// tree).
+    lit_state: LiteralsState,
+    /// Carry-over state for sequence FSE tables (Repeat_Mode) and the
+    /// previous-offsets stack.
+    seq_state: SequencesState,
 }
 
 impl Decoder {
@@ -102,6 +129,12 @@ impl Decoder {
             raw_remaining: 0,
             rle_byte: 0,
             rle_remaining: 0,
+            comp_total: 0,
+            comp_buf: Vec::new(),
+            history: Vec::new(),
+            history_emitted: 0,
+            lit_state: LiteralsState::default(),
+            seq_state: SequencesState::new(),
         }
     }
 
@@ -256,8 +289,20 @@ impl Decoder {
                 Ok(DecPhase::RleByte)
             }
             2 => {
-                // Compressed_Block — not implemented in this build.
-                Err(self.poison(Error::Unsupported))
+                // Compressed_Block: buffer `block_size` bytes, then decode.
+                if block_size as u64 > 128 * 1024 {
+                    return Err(self.poison(Error::Corrupt));
+                }
+                if block_size < 2 {
+                    // Compressed blocks need at least a literals section
+                    // header (1 byte) and a sequences-count byte. Anything
+                    // smaller is malformed.
+                    return Err(self.poison(Error::Corrupt));
+                }
+                self.comp_total = block_size;
+                self.comp_buf.clear();
+                self.comp_buf.reserve(block_size as usize);
+                Ok(DecPhase::CompressedBuffer)
             }
             3 => {
                 // Reserved.
@@ -422,6 +467,11 @@ impl DecoderTrait for Decoder {
                         });
                     }
                     output[written..written + n].copy_from_slice(&input[consumed..consumed + n]);
+                    // Mirror into history so subsequent Compressed_Blocks can
+                    // back-reference these bytes.
+                    self.history
+                        .extend_from_slice(&input[consumed..consumed + n]);
+                    self.history_emitted = self.history.len();
                     consumed += n;
                     written += n;
                     self.raw_remaining -= n as u32;
@@ -453,9 +503,65 @@ impl DecoderTrait for Decoder {
                     for slot in &mut output[written..written + n] {
                         *slot = self.rle_byte;
                     }
+                    // Mirror into history.
+                    for _ in 0..n {
+                        self.history.push(self.rle_byte);
+                    }
+                    self.history_emitted = self.history.len();
                     written += n;
                     self.rle_remaining -= n as u32;
                     if self.rle_remaining == 0 {
+                        self.advance_after_block();
+                    }
+                }
+                DecPhase::CompressedBuffer => {
+                    // Accumulate `comp_total` bytes from input.
+                    let need = self.comp_total as usize - self.comp_buf.len();
+                    let in_avail = input.len() - consumed;
+                    let n = core::cmp::min(need, in_avail);
+                    if n > 0 {
+                        self.comp_buf
+                            .extend_from_slice(&input[consumed..consumed + n]);
+                        consumed += n;
+                    }
+                    if self.comp_buf.len() == self.comp_total as usize {
+                        // Decode the block into history.
+                        if let Err(e) = self.decode_compressed_block() {
+                            return Err(self.poison(e));
+                        }
+                        self.phase = DecPhase::CompressedEmit;
+                    } else {
+                        return Ok(Progress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                }
+                DecPhase::CompressedEmit => {
+                    // Drain freshly decoded bytes from history into output.
+                    let out_avail = output.len() - written;
+                    let pending = self.history.len() - self.history_emitted;
+                    if pending == 0 {
+                        // Block produced no output (legal for very small
+                        // synthetic cases); advance.
+                        self.advance_after_block();
+                        continue;
+                    }
+                    if out_avail == 0 {
+                        return Ok(Progress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                    let n = core::cmp::min(pending, out_avail);
+                    output[written..written + n].copy_from_slice(
+                        &self.history[self.history_emitted..self.history_emitted + n],
+                    );
+                    self.history_emitted += n;
+                    written += n;
+                    if self.history_emitted == self.history.len() {
                         self.advance_after_block();
                     }
                 }
@@ -504,7 +610,7 @@ impl DecoderTrait for Decoder {
             }),
             // If we're still in RLE_Emit and the output filled up, we owe
             // more bytes — not done yet, no error.
-            DecPhase::RleEmit => Ok(Progress {
+            DecPhase::RleEmit | DecPhase::CompressedEmit => Ok(Progress {
                 consumed: 0,
                 written: p.written,
                 done: false,
@@ -519,6 +625,28 @@ impl DecoderTrait for Decoder {
 }
 
 impl Decoder {
+    /// Decode the fully-buffered Compressed_Block in `comp_buf` and stash the
+    /// produced bytes in `emit_buf`. Updates `history` with the new bytes so
+    /// later blocks can reference them.
+    fn decode_compressed_block(&mut self) -> Result<(), Error> {
+        let block = core::mem::take(&mut self.comp_buf);
+        // 1. Literals section.
+        let lit = decode_literals(&block, &mut self.lit_state)?;
+        let after_lit = lit.consumed;
+        if after_lit > block.len() {
+            return Err(Error::Corrupt);
+        }
+        // 2. Sequences section.
+        let seq_data = &block[after_lit..];
+        let seqs = decode_sequences(seq_data, &mut self.seq_state)?;
+        // 3. LZ77 reconstruction. Append to history.
+        execute_sequences(&seqs, &lit.literals, &mut self.history)?;
+        // Return ownership of comp_buf for reuse.
+        self.comp_buf = block;
+        self.comp_buf.clear();
+        Ok(())
+    }
+
     /// Called after a block body has been fully consumed/emitted. Transitions
     /// either to the next block header, the optional content checksum, or
     /// `Done`.

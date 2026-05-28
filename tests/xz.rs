@@ -351,8 +351,9 @@ fn system_xz_encode_then_our_decode_small() {
         return;
     }
     // For small enough inputs, `xz` emits uncompressed LZMA2 chunks (the
-    // compressor decides that compression would expand the data). Pick
-    // small inputs so this is the common case.
+    // compressor decides that compression would expand the data). For
+    // larger inputs `xz` emits LZMA-compressed chunks. Our decoder
+    // accepts both.
     for input in [
         b"".to_vec(),
         b"hello".to_vec(),
@@ -368,14 +369,112 @@ fn system_xz_encode_then_our_decode_small() {
         };
         match decode_chunked(&encoded, 1024, 1024) {
             Ok(decoded) => assert_eq!(decoded, input),
-            Err(Error::Unsupported) => {
-                // xz chose to LZMA-compress this input; our decoder
-                // correctly reports it as Unsupported.
-            }
             Err(e) => panic!(
                 "our decoder failed for system-xz output ({:?}): {:?}",
                 input, e
             ),
         }
     }
+}
+
+// ─── round-trip via the system `xz` CLI (decode side) ──────────────────────
+
+#[cfg(unix)]
+#[test]
+fn system_xz_encode_then_our_decode_empty() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    let input: Vec<u8> = Vec::new();
+    let encoded = pipe_through("xz", &["-c", "-z"], &input).unwrap();
+    let decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn system_xz_encode_then_our_decode_small_string() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    let input: Vec<u8> = b"hello world\n".to_vec();
+    let encoded = pipe_through("xz", &["-c", "-z"], &input).unwrap();
+    let decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn system_xz_encode_then_our_decode_medium_ascii() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    // ~10 KiB of compressible ASCII.
+    let mut input: Vec<u8> = Vec::with_capacity(10 * 1024);
+    while input.len() < 10 * 1024 {
+        input.extend_from_slice(b"The quick brown fox jumps over the lazy dog. 0123456789\n");
+    }
+    input.truncate(10 * 1024);
+    let encoded = pipe_through("xz", &["-c", "-z"], &input).unwrap();
+    let decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn system_xz_encode_then_our_decode_lorem_ipsum() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    // ~16 KiB of Lorem ipsum.
+    let para: &[u8] = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do \
+                       eiusmod tempor incididunt ut labore et dolore magna aliqua. \
+                       Ut enim ad minim veniam, quis nostrud exercitation ullamco \
+                       laboris nisi ut aliquip ex ea commodo consequat. Duis aute \
+                       irure dolor in reprehenderit in voluptate velit esse cillum \
+                       dolore eu fugiat nulla pariatur.\n";
+    let mut input: Vec<u8> = Vec::with_capacity(16 * 1024);
+    while input.len() < 16 * 1024 {
+        input.extend_from_slice(para);
+    }
+    input.truncate(16 * 1024);
+    let encoded = pipe_through("xz", &["-c", "-z"], &input).unwrap();
+    let decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn system_xz_encode_then_our_decode_large_zeros() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    // 64 KiB of zero bytes — exercises LZMA's match-back logic over a
+    // size that is large enough to force xz into compressed-chunk mode.
+    let input: Vec<u8> = vec![0u8; 64 * 1024];
+    let encoded = pipe_through("xz", &["-c", "-z"], &input).unwrap();
+    let decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn system_xz_encode_then_our_decode_binary() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    // Pseudo-random but reproducible binary input that compresses
+    // poorly — exercises a different LZMA code path (mostly literals).
+    let input: Vec<u8> = (0..30_000u32)
+        .map(|i| (i.wrapping_mul(0x9E37_79B1) >> 16) as u8)
+        .collect();
+    let encoded = pipe_through("xz", &["-c", "-z"], &input).unwrap();
+    let decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
+    assert_eq!(decoded, input);
 }

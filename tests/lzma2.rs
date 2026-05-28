@@ -1,9 +1,18 @@
 //! Streaming round-trip tests for the LZMA2 algorithm.
 //!
 //! The crate currently ships a stored-only LZMA2 encoder (type-0x01 chunks)
-//! and an uncompressed-only decoder. These tests exercise both ends of that
-//! contract; the compressed-chunk path is checked only insofar as the decoder
-//! must reject it cleanly without panicking.
+//! and a decoder that accepts uncompressed chunks **and** compressed chunks
+//! whose control byte requests a dictionary reset (`0xE0..=0xFF`). The
+//! compressed-chunk fixtures below were produced by the system `xz` CLI in
+//! raw mode:
+//!
+//! ```sh
+//! printf '...' | xz --format=raw --lzma2=preset=6 -c | xxd -p
+//! ```
+//!
+//! The control byte `0xE0` (state reset + new properties + dict reset) is
+//! the only compressed variant xz-utils actually emits in normal output,
+//! which is why we focus on it here.
 
 #![cfg(feature = "lzma2")]
 
@@ -226,15 +235,19 @@ fn streaming_just_over_64k_with_tiny_buffers() {
 }
 
 #[test]
-fn decoder_rejects_compressed_chunk_as_unsupported() {
-    // A compressed-LZMA chunk control byte (any of 0x80..=0xFF) must surface
-    // as Error::Unsupported, not panic, not Corrupt.
-    let mut dec = Decoder::new();
-    let mut out = [0u8; 4];
-    let err = dec
-        .decode(&[0xE0, 0x00, 0x00, 0x00, 0x00, 0x5D], &mut out)
-        .unwrap_err();
-    assert_eq!(err, Error::Unsupported);
+fn decoder_rejects_non_dict_reset_compressed_chunk_as_unsupported() {
+    // Compressed chunks without a dictionary reset (0x80..=0xDF) still
+    // require a persistent inner LZMA state, which we don't carry across
+    // chunks in this build. Each of the three sub-ranges must surface
+    // cleanly as Error::Unsupported.
+    for ctrl in [0x80u8, 0xA0, 0xC0] {
+        let mut dec = Decoder::new();
+        let mut out = [0u8; 4];
+        let err = dec
+            .decode(&[ctrl, 0x00, 0x00, 0x00, 0x00, 0x5D], &mut out)
+            .unwrap_err();
+        assert_eq!(err, Error::Unsupported, "ctrl=0x{ctrl:02X}");
+    }
 }
 
 #[test]
@@ -327,4 +340,253 @@ fn decoder_reset_recycles_state() {
     assert_eq!(out[0], 0xCD);
     let pf = dec.finish(&mut out).unwrap();
     assert!(pf.done);
+}
+
+// ─── compressed-chunk fixtures (produced by xz-utils raw mode) ──────────────
+
+/// `'hello world '.repeat(50)` (600 bytes) — fits in a single 0xE0 chunk.
+///
+/// Generated with:
+/// ```sh
+/// python3 -c "import sys; sys.stdout.buffer.write(b'hello world ' * 50)" \
+///   | xz --format=raw --lzma2=preset=6 -c | xxd -p
+/// ```
+const HELLO_REPEATED_LZMA2: &[u8] = &[
+    0xe0, 0x02, 0x57, 0x00, 0x16, 0x5d, 0x00, 0x34, 0x19, 0x49, 0xee, 0x8d, 0xe9, 0x17, 0x89, 0x3a,
+    0x33, 0x5f, 0xfd, 0x82, 0x7c, 0x64, 0xd3, 0x9c, 0xa1, 0xcb, 0x89, 0xa0, 0x00, 0x00,
+];
+
+/// `b'A' * 4096` — same 0xE0 chunk family, exercises a tight back-reference
+/// pattern (every byte after the first is a match).
+const REPEATING_4K_LZMA2: &[u8] = &[
+    0xe0, 0x0f, 0xff, 0x00, 0x19, 0x5d, 0x00, 0x20, 0xef, 0xfb, 0xbf, 0xfe, 0xa3, 0xb1, 0x5e, 0xe5,
+    0xf8, 0x3f, 0xb2, 0xaa, 0x26, 0x55, 0xf8, 0x68, 0x70, 0x41, 0x70, 0x15, 0x0e, 0x24, 0x18, 0xcf,
+    0x00,
+];
+
+/// 16 KiB of `"The quick brown fox jumps over the lazy dog. "`, generated
+/// via `xz --format=raw --lzma2=preset=6` over the first 16 384 bytes of
+/// that pangram repeated. Exercises long-distance back-references because
+/// the pangram length (45 bytes) doesn't evenly divide 16 384, so xz
+/// builds a mixture of fresh literals and matches across the whole window.
+const FOX_16K_LZMA2: &[u8] = &[
+    0xe0, 0x3f, 0xff, 0x00, 0x63, 0x5d, 0x00, 0x2a, 0x1a, 0x08, 0xa2, 0x03, 0x25, 0x66, 0xf1, 0x4b,
+    0x78, 0xc5, 0xa2, 0x05, 0xff, 0x2e, 0xe6, 0xd9, 0xd2, 0x20, 0x1a, 0xad, 0x34, 0xf8, 0xe2, 0x1d,
+    0xe8, 0x41, 0x36, 0xfa, 0xdc, 0x06, 0x69, 0xbb, 0x3c, 0xe4, 0x10, 0x34, 0x27, 0x09, 0xeb, 0xb3,
+    0x66, 0xe3, 0xed, 0x37, 0x98, 0xed, 0x92, 0xad, 0xd5, 0x27, 0x45, 0x08, 0x30, 0x5e, 0x5d, 0x9a,
+    0x3c, 0x41, 0xc4, 0x18, 0x4a, 0x53, 0xf6, 0x6a, 0xd9, 0xfd, 0xd0, 0x04, 0xac, 0x83, 0x78, 0x9d,
+    0x17, 0x17, 0x82, 0x3e, 0x6c, 0x38, 0xb1, 0xde, 0xcc, 0x3f, 0xba, 0xe5, 0x03, 0xb1, 0x5b, 0x44,
+    0xb8, 0x9d, 0x9c, 0x3d, 0x06, 0x69, 0x4b, 0x3a, 0x2c, 0x00, 0x00,
+];
+
+/// Reconstruct the payload that `FOX_16K_LZMA2` should decompress to.
+fn fox_text() -> Vec<u8> {
+    let unit = "The quick brown fox jumps over the lazy dog. ";
+    let repeated = unit.repeat(400);
+    repeated.as_bytes()[..16_384].to_vec()
+}
+
+/// Drive `dec` to completion against `encoded` using a fixed-size output
+/// buffer; mirrors `decode_chunked` above but is simpler since we never
+/// need to deliver input in slices for these tests.
+fn decode_all(dec: &mut Decoder, encoded: &[u8]) -> Vec<u8> {
+    let mut decoded = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut i = 0;
+    while i < encoded.len() {
+        let p = dec.decode(&encoded[i..], &mut buf).unwrap();
+        decoded.extend_from_slice(&buf[..p.written]);
+        i += p.consumed;
+        if p.consumed == 0 && p.written == 0 {
+            // Decoder accepted everything from the current slice; advance
+            // by 0 means we'll bail out via the while-condition if we'd
+            // looped — that only happens if encoded contains garbage,
+            // which these tests don't.
+            break;
+        }
+    }
+    loop {
+        let pf = dec.finish(&mut buf).unwrap();
+        decoded.extend_from_slice(&buf[..pf.written]);
+        if pf.done {
+            break;
+        }
+        if pf.written == 0 {
+            panic!("decoder finish stalled");
+        }
+    }
+    decoded
+}
+
+#[test]
+fn compressed_empty_stream_is_just_eos_marker() {
+    // `xz --format=raw --lzma2=... -c` over zero-length input emits a single
+    // 0x00 EOS marker, no chunks at all.
+    let mut dec = Decoder::new();
+    let decoded = decode_all(&mut dec, &[0x00]);
+    assert!(decoded.is_empty());
+}
+
+#[test]
+fn compressed_hello_world_repeated_round_trip() {
+    let expected: Vec<u8> = "hello world "
+        .as_bytes()
+        .iter()
+        .cycle()
+        .take(600)
+        .copied()
+        .collect();
+    let mut dec = Decoder::new();
+    let decoded = decode_all(&mut dec, HELLO_REPEATED_LZMA2);
+    assert_eq!(decoded.len(), 600);
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn compressed_4k_repeating_round_trip() {
+    let expected = vec![b'A'; 4096];
+    let mut dec = Decoder::new();
+    let decoded = decode_all(&mut dec, REPEATING_4K_LZMA2);
+    assert_eq!(decoded.len(), 4096);
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn compressed_16k_fox_round_trip() {
+    let expected = fox_text();
+    let mut dec = Decoder::new();
+    let decoded = decode_all(&mut dec, FOX_16K_LZMA2);
+    assert_eq!(decoded.len(), 16_384);
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn compressed_chunk_one_byte_input_buffers() {
+    // Feed the encoded stream one byte at a time and pull output through a
+    // small buffer. Stresses the streaming-header parser and the
+    // pump-the-inner-decoder loop in CompData.
+    let expected = fox_text();
+    let mut dec = Decoder::new();
+    let mut decoded = Vec::with_capacity(expected.len());
+    let mut buf = [0u8; 7];
+
+    let mut i = 0;
+    while i < FOX_16K_LZMA2.len() {
+        let one = &FOX_16K_LZMA2[i..i + 1];
+        let p = dec.decode(one, &mut buf).unwrap();
+        decoded.extend_from_slice(&buf[..p.written]);
+        i += p.consumed;
+        // After consuming the single byte, drain any pending output by
+        // calling decode again with an empty input until written == 0.
+        if p.consumed == 1 {
+            loop {
+                let p2 = dec.decode(&[], &mut buf).unwrap();
+                decoded.extend_from_slice(&buf[..p2.written]);
+                if p2.written == 0 {
+                    break;
+                }
+            }
+        }
+    }
+    loop {
+        let pf = dec.finish(&mut buf).unwrap();
+        decoded.extend_from_slice(&buf[..pf.written]);
+        if pf.done {
+            break;
+        }
+        if pf.written == 0 {
+            panic!("finish stalled");
+        }
+    }
+    assert_eq!(decoded.len(), expected.len());
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn compressed_then_uncompressed_chunk_concat() {
+    // Hand-glue a compressed chunk (`'A' * 4096`) followed by an
+    // uncompressed `0x01` chunk carrying the single byte 0xCD, then EOS.
+    // The decoder must clean-finish each chunk before consuming the next
+    // control byte. The compressed fixture below ends with the EOS marker
+    // `0x00`, so we have to strip that to splice.
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&REPEATING_4K_LZMA2[..REPEATING_4K_LZMA2.len() - 1]);
+    bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0xCD]);
+    bytes.push(0x00); // overall EOS marker
+
+    let mut dec = Decoder::new();
+    let decoded = decode_all(&mut dec, &bytes);
+    assert_eq!(decoded.len(), 4097);
+    assert!(decoded[..4096].iter().all(|&b| b == b'A'));
+    assert_eq!(decoded[4096], 0xCD);
+}
+
+#[test]
+fn compressed_chunk_corrupt_payload_surfaces_error() {
+    // Take the 4K repeating fixture, scramble a byte in the LZMA payload,
+    // and expect Error::Corrupt (or some non-panic error). The fixture's
+    // LZMA payload is at offset 6 (control + 4 size + 1 props).
+    let mut bytes = REPEATING_4K_LZMA2.to_vec();
+    bytes[10] ^= 0xFF;
+
+    let mut dec = Decoder::new();
+    let mut buf = [0u8; 4096];
+    // Either the decode call or the finish call should surface an error.
+    let mut err = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match dec.decode(&bytes[i..], &mut buf) {
+            Ok(p) => {
+                i += p.consumed;
+                if p.consumed == 0 && p.written == 0 {
+                    break;
+                }
+            }
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        }
+    }
+    if err.is_none() {
+        err = dec.finish(&mut buf).err();
+    }
+    let err = err.expect("expected an error on corrupt payload");
+    assert!(
+        matches!(err, Error::Corrupt | Error::UnexpectedEnd),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn compressed_chunk_invalid_properties_is_bad_header() {
+    // Hand-craft a 0xE0 chunk header but with a properties byte beyond the
+    // LZMA range (>= 9*5*5 = 225). The decoder should surface BadHeader
+    // before touching the payload.
+    let bad_props: u8 = 230;
+    let stream = [
+        0xE0, // ctrl: state reset + props + dict reset, unc top5 = 0
+        0x00, 0x00, // uncompressed size = 1
+        0x00, 0x00,      // compressed size = 1
+        bad_props, // props byte (invalid)
+        0x00,      // 1 byte of (unreachable) payload
+        0x00,      // EOS marker
+    ];
+    let mut dec = Decoder::new();
+    let mut buf = [0u8; 16];
+    let err = dec.decode(&stream, &mut buf).unwrap_err();
+    assert_eq!(err, Error::BadHeader);
+}
+
+#[test]
+fn compressed_chunk_then_reset_recycles_inner_state() {
+    // Decode one compressed chunk, reset the decoder, then decode another.
+    // The inner LZMA decoder must come back fresh.
+    let mut dec = Decoder::new();
+    let decoded1 = decode_all(&mut dec, REPEATING_4K_LZMA2);
+    assert_eq!(decoded1.len(), 4096);
+    dec.reset();
+    let decoded2 = decode_all(&mut dec, HELLO_REPEATED_LZMA2);
+    assert_eq!(decoded2.len(), 600);
+    assert!(decoded2.starts_with(b"hello world "));
 }
