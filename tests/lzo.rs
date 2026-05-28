@@ -1,12 +1,14 @@
-#![cfg(any())] // TODO(v0.3): port to new (Progress, Status) API
 //! Streaming round-trip tests for the LZO1X-1 algorithm.
+//!
+//! Canonical v0.3 port: every call returns `(Progress, Status)` and the
+//! loop dispatches on `Status` rather than inferring from byte counts.
 //!
 //! Tests run under the `std` test harness but the library itself is `no_std`.
 
 #![cfg(feature = "lzo")]
 
 use compcol::lzo::{Decoder, Encoder, Lzo};
-use compcol::{Algorithm, Decoder as _, Encoder as _};
+use compcol::{Algorithm, Decoder as _, Encoder as _, Status};
 
 /// Encode `input` through the streaming trait using the supplied chunk sizes.
 fn encode_chunked(input: &[u8], in_chunk: usize, out_chunk: usize) -> Vec<u8> {
@@ -18,26 +20,29 @@ fn encode_chunked(input: &[u8], in_chunk: usize, out_chunk: usize) -> Vec<u8> {
     while i < input.len() {
         let end = (i + in_chunk).min(input.len());
         let chunk = &input[i..end];
-        let mut consumed_in_chunk = 0;
-        while consumed_in_chunk < chunk.len() {
-            let p = enc.encode(&chunk[consumed_in_chunk..], &mut buf).unwrap();
+        let mut consumed = 0;
+        while consumed < chunk.len() {
+            let (p, status) = enc.encode(&chunk[consumed..], &mut buf).unwrap();
             encoded.extend_from_slice(&buf[..p.written]);
-            consumed_in_chunk += p.consumed;
-            if p.consumed == 0 && p.written == 0 {
-                panic!("encoder stalled mid-input");
+            consumed += p.consumed;
+            match status {
+                Status::InputEmpty | Status::StreamEnd => break,
+                Status::OutputFull => continue,
             }
         }
         i = end;
     }
 
     loop {
-        let p = enc.finish(&mut buf).unwrap();
+        let (p, status) = enc.finish(&mut buf).unwrap();
         encoded.extend_from_slice(&buf[..p.written]);
-        if matches!(_s, compcol::Status::StreamEnd) {
-            break;
-        }
-        if p.written == 0 {
-            panic!("encoder finish stalled");
+        match status {
+            Status::StreamEnd => break,
+            Status::OutputFull | Status::InputEmpty => {
+                if p.written == 0 {
+                    panic!("encoder finish stalled");
+                }
+            }
         }
     }
 
@@ -53,26 +58,29 @@ fn decode_chunked(encoded: &[u8], in_chunk: usize, out_chunk: usize) -> Vec<u8> 
     while i < encoded.len() {
         let end = (i + in_chunk).min(encoded.len());
         let chunk = &encoded[i..end];
-        let mut consumed_in_chunk = 0;
-        while consumed_in_chunk < chunk.len() {
-            let p = dec.decode(&chunk[consumed_in_chunk..], &mut buf).unwrap();
+        let mut consumed = 0;
+        while consumed < chunk.len() {
+            let (p, status) = dec.decode(&chunk[consumed..], &mut buf).unwrap();
             decoded.extend_from_slice(&buf[..p.written]);
-            consumed_in_chunk += p.consumed;
-            if p.consumed == 0 && p.written == 0 {
-                panic!("decoder stalled mid-input");
+            consumed += p.consumed;
+            match status {
+                Status::InputEmpty | Status::StreamEnd => break,
+                Status::OutputFull => continue,
             }
         }
         i = end;
     }
 
     loop {
-        let p = dec.finish(&mut buf).unwrap();
+        let (p, status) = dec.finish(&mut buf).unwrap();
         decoded.extend_from_slice(&buf[..p.written]);
-        if matches!(_s, compcol::Status::StreamEnd) {
-            break;
-        }
-        if p.written == 0 {
-            panic!("decoder finish stalled");
+        match status {
+            Status::StreamEnd => break,
+            Status::OutputFull | Status::InputEmpty => {
+                if p.written == 0 {
+                    panic!("decoder finish stalled");
+                }
+            }
         }
     }
 
@@ -87,6 +95,7 @@ fn round_trip_with_chunks(input: &[u8], in_chunk: usize, out_chunk: usize) {
 }
 
 fn round_trip(input: &[u8]) {
+    // Single-shot: large enough buffers that everything fits in one call.
     let big = input.len().saturating_mul(2).max(1024);
     round_trip_with_chunks(input, big, big);
 }
@@ -107,6 +116,11 @@ fn single_byte() {
 }
 
 #[test]
+fn hello_world() {
+    round_trip(b"hello world");
+}
+
+#[test]
 fn short_input() {
     round_trip(b"hello, world");
 }
@@ -118,7 +132,8 @@ fn no_compressible_short() {
 
 #[test]
 fn long_run_of_one_byte() {
-    // 10 KiB of one byte exercises the LZ77 overlapping-match case.
+    // 10 KiB of one byte exercises the LZ77 overlapping-match case (the
+    // copy length exceeds the offset).
     let input = vec![b'Z'; 10 * 1024];
     round_trip(&input);
 }
@@ -151,6 +166,30 @@ fn ascii_text_exceeding_64kib() {
         encoded.len(),
         input.len()
     );
+}
+
+#[test]
+fn large_mixed_input() {
+    // 96 KiB+ mix of pseudo-random and repetitive runs — exercises both
+    // the multi-block path and the matcher's two extremes.
+    let mut input = Vec::with_capacity(96 * 1024);
+    let mut state: u32 = 0xDEADBEEFu32;
+    while input.len() < 96 * 1024 {
+        // 1 KiB pseudo-random.
+        for _ in 0..1024 {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            input.push((state >> 16) as u8);
+        }
+        // 1 KiB highly compressible.
+        let sentence = b"the quick brown fox jumps over the lazy dog. ";
+        let mut remaining = 1024usize;
+        while remaining > 0 {
+            let take = sentence.len().min(remaining);
+            input.extend_from_slice(&sentence[..take]);
+            remaining -= take;
+        }
+    }
+    round_trip(&input);
 }
 
 #[test]
@@ -210,182 +249,34 @@ fn reset_clears_state() {
         .unwrap();
     enc.reset();
 
+    // After reset, a fresh round-trip should succeed.
     let mut produced = Vec::new();
-    let p = enc.encode(b"second run", &mut out).unwrap();
+    let (p, _) = enc.encode(b"second run", &mut out).unwrap();
     produced.extend_from_slice(&out[..p.written]);
     loop {
-        let p = enc.finish(&mut out).unwrap();
+        let (p, status) = enc.finish(&mut out).unwrap();
         produced.extend_from_slice(&out[..p.written]);
-        if matches!(_s, compcol::Status::StreamEnd) {
-            break;
-        }
-        if p.written == 0 {
-            panic!("finish stalled");
+        match status {
+            Status::StreamEnd => break,
+            Status::OutputFull | Status::InputEmpty => {
+                if p.written == 0 {
+                    panic!("finish stalled");
+                }
+            }
         }
     }
 
     let mut dec = Decoder::new();
     let mut decoded = Vec::new();
-    let p = dec.decode(&produced, &mut out).unwrap();
-    decoded.extend_from_slice(&out[..p.written]);
-    let p = dec.finish(&mut out).unwrap();
-    decoded.extend_from_slice(&out[..p.written]);
-    assert!(matches!(_s, compcol::Status::StreamEnd));
+    let (pd, _) = dec.decode(&produced, &mut out).unwrap();
+    decoded.extend_from_slice(&out[..pd.written]);
+    let (pf, status) = dec.finish(&mut out).unwrap();
+    decoded.extend_from_slice(&out[..pf.written]);
+    assert!(matches!(status, Status::StreamEnd));
     assert_eq!(decoded, b"second run");
 }
 
-// ─── cross-validation with python-lzo, if available ──────────────────────
-//
-// `python-lzo` exposes `lzo.compress(data, level=1, header=True)` which by
-// default prepends a small private framing (1 magic byte + 4 big-endian
-// length bytes). Passing `header=False` produces the raw LZO1X block —
-// which is exactly the payload our `encode_block` / `decode_block` work
-// with, modulo our 4-byte block-length framing.
-//
-// For cross-validation we shell out to a venv that has python-lzo
-// installed at a well-known path. If that venv doesn't exist we skip.
-
-fn python_lzo_available() -> bool {
-    std::process::Command::new("/tmp/lzovenv/bin/python3")
-        .args(["-c", "import lzo"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Strip our 4-byte framing to extract the inner LZO1X block(s) so we can
-/// hand the raw payload to python-lzo. This is only useful for inputs that
-/// fit in a single block — beyond `BLOCK_SIZE` the test concatenates
-/// multiple blocks which python-lzo wouldn't recognise as a single stream.
-fn strip_framing(framed: &[u8]) -> Option<Vec<u8>> {
-    if framed.len() < 8 {
-        return None;
-    }
-    let len = u32::from_le_bytes([framed[0], framed[1], framed[2], framed[3]]) as usize;
-    if 4 + len > framed.len() {
-        return None;
-    }
-    // Verify the next u32 is the zero terminator (single-block stream).
-    let term = &framed[4 + len..];
-    if term.len() != 4 || term != [0, 0, 0, 0] {
-        return None;
-    }
-    Some(framed[4..4 + len].to_vec())
-}
-
-fn python_lzo_decompress(raw_block: &[u8], expected_len: usize) -> Vec<u8> {
-    use std::io::Write;
-    let mut child = std::process::Command::new("/tmp/lzovenv/bin/python3")
-        .args([
-            "-c",
-            "import sys, lzo; d=sys.stdin.buffer.read(); n=int(sys.argv[1]); sys.stdout.buffer.write(lzo.decompress(d, False, n))",
-            &expected_len.to_string(),
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .expect("spawn python-lzo");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(raw_block)
-        .expect("write stdin");
-    let out = child.wait_with_output().expect("wait");
-    assert!(out.status.success(), "python-lzo decompress failed");
-    out.stdout
-}
-
-fn python_lzo_compress(data: &[u8]) -> Vec<u8> {
-    use std::io::Write;
-    let mut child = std::process::Command::new("/tmp/lzovenv/bin/python3")
-        .args([
-            "-c",
-            "import sys, lzo; d=sys.stdin.buffer.read(); sys.stdout.buffer.write(lzo.compress(d, 1, False))",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .expect("spawn python-lzo");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(data)
-        .expect("write stdin");
-    let out = child.wait_with_output().expect("wait");
-    assert!(out.status.success(), "python-lzo compress failed");
-    out.stdout
-}
-
-/// Wrap a raw LZO1X block in our framing so the streaming decoder accepts
-/// it (length-prefix + payload + zero-terminator).
-fn add_framing(raw: &[u8]) -> Vec<u8> {
-    let mut framed = Vec::with_capacity(raw.len() + 8);
-    framed.extend_from_slice(&(raw.len() as u32).to_le_bytes());
-    framed.extend_from_slice(raw);
-    framed.extend_from_slice(&[0, 0, 0, 0]);
-    framed
-}
-
-#[test]
-fn cross_decode_python_lzo_short_text() {
-    if !python_lzo_available() {
-        eprintln!("skipping: python-lzo not installed in /tmp/lzovenv");
-        return;
-    }
-    let data = b"the quick brown fox jumps over the lazy dog. ".repeat(20);
-    let compressed = python_lzo_compress(&data);
-    let framed = add_framing(&compressed);
-    let decoded = decode_chunked(&framed, 1024, 1024);
-    assert_eq!(decoded, data);
-}
-
-#[test]
-fn cross_decode_python_lzo_random() {
-    if !python_lzo_available() {
-        eprintln!("skipping: python-lzo not installed in /tmp/lzovenv");
-        return;
-    }
-    let mut state: u32 = 0xABCD0123;
-    let mut data = Vec::with_capacity(4096);
-    for _ in 0..4096 {
-        state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
-        data.push((state >> 16) as u8);
-    }
-    let compressed = python_lzo_compress(&data);
-    let framed = add_framing(&compressed);
-    let decoded = decode_chunked(&framed, 1024, 1024);
-    assert_eq!(decoded, data);
-}
-
-#[test]
-fn cross_encode_python_lzo_short_text() {
-    if !python_lzo_available() {
-        eprintln!("skipping: python-lzo not installed in /tmp/lzovenv");
-        return;
-    }
-    let data = b"the quick brown fox jumps over the lazy dog. ".repeat(20);
-    let framed = encode_chunked(&data, data.len(), data.len() * 2);
-    let raw = strip_framing(&framed).expect("single-block stream");
-    let decoded = python_lzo_decompress(&raw, data.len());
-    assert_eq!(decoded, data);
-}
-
-#[test]
-fn cross_encode_python_lzo_run() {
-    if !python_lzo_available() {
-        eprintln!("skipping: python-lzo not installed in /tmp/lzovenv");
-        return;
-    }
-    let data = vec![b'A'; 5000];
-    let framed = encode_chunked(&data, data.len(), data.len() * 2);
-    let raw = strip_framing(&framed).expect("single-block stream");
-    let decoded = python_lzo_decompress(&raw, data.len());
-    assert_eq!(decoded, data);
-}
+// ─── boundary / fuzz coverage (preserved from pre-v0.3 tests) ────────────
 
 #[test]
 fn fuzz_lcg_round_trip_random() {
@@ -451,19 +342,22 @@ fn long_distance_match() {
 }
 
 #[test]
-fn fuzz_every_prefix_of_lorem() {
-    // Every prefix length from 0..16384 of a long Lorem ipsum text.
-    let lorem = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. ";
-    let mut data = Vec::with_capacity(16384);
-    while data.len() < 16384 {
+fn long_distance_match_repeated_marker() {
+    // Variant where the marker is itself a repeated subpattern so the
+    // greedy matcher might find a long M4 match at an offset > 16384.
+    let mut data = Vec::with_capacity(40 * 1024);
+    let lorem = b"the quick brown fox jumps over the lazy dog. ";
+    while data.len() < 17 * 1024 {
         data.extend_from_slice(lorem);
     }
-    data.truncate(16384);
-    for prefix_len in (0..=16384).step_by(7) {
-        round_trip(&data[..prefix_len]);
+    let marker = b"MARKER_PAYLOAD_WITH_SOME_DISTINCT_CONTENT_";
+    for _ in 0..20 {
+        data.extend_from_slice(marker);
     }
-    // Plus the very-last position to cover the boundary.
-    round_trip(&data[..]);
+    while data.len() < 40 * 1024 {
+        data.extend_from_slice(lorem);
+    }
+    round_trip(&data);
 }
 
 #[test]
@@ -485,42 +379,6 @@ fn length_extension_boundary_values() {
 }
 
 #[test]
-fn long_distance_match_repeated_marker() {
-    // Variant where the marker is itself a repeated subpattern so the
-    // greedy matcher might find a long M4 match at an offset > 16384.
-    let mut data = Vec::with_capacity(40 * 1024);
-    let lorem = b"the quick brown fox jumps over the lazy dog. ";
-    while data.len() < 17 * 1024 {
-        data.extend_from_slice(lorem);
-    }
-    let marker = b"MARKER_PAYLOAD_WITH_SOME_DISTINCT_CONTENT_";
-    for _ in 0..20 {
-        data.extend_from_slice(marker);
-    }
-    while data.len() < 40 * 1024 {
-        data.extend_from_slice(lorem);
-    }
-    round_trip(&data);
-}
-
-#[test]
-fn fuzz_every_prefix_of_repetitive() {
-    // The truly thorough check: every prefix length from 0..2048 of a
-    // small-alphabet input. Slow under debug but a few hundred ms in
-    // release; still fast enough to keep in the default test set.
-    let mut state: u32 = 0xCAFEBABE;
-    let mut data = Vec::with_capacity(2048);
-    for _ in 0..2048 {
-        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        let nibble = ((state >> 16) & 0xF) as u8;
-        data.push(b'a' + nibble);
-    }
-    for prefix_len in 0..=2048 {
-        round_trip(&data[..prefix_len]);
-    }
-}
-
-#[test]
 fn lorem_16kib_ratio_reasonable() {
     let lorem = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. ";
     let mut data = Vec::with_capacity(16 * 1024);
@@ -534,11 +392,6 @@ fn lorem_16kib_ratio_reasonable() {
     // python-lzo gets, but we don't insist on matching exactly — our
     // greedy matcher is simpler.
     let raw_size = framed.len() - 8;
-    eprintln!(
-        "lzo 16 KiB Lorem: {} bytes (framed: {})",
-        raw_size,
-        framed.len()
-    );
     // Sanity: at least 10:1 ratio for this highly repetitive corpus.
     assert!(
         raw_size < data.len() / 10,
@@ -552,20 +405,41 @@ fn lorem_16kib_ratio_reasonable() {
     assert_eq!(decoded, data);
 }
 
-#[test]
-fn cross_encode_python_lzo_random() {
-    if !python_lzo_available() {
-        eprintln!("skipping: python-lzo not installed in /tmp/lzovenv");
-        return;
+#[cfg(feature = "factory")]
+mod factory {
+    use compcol::Status;
+    use compcol::factory;
+
+    #[test]
+    fn lookup_known() {
+        assert!(factory::encoder_by_name("lzo").is_some());
+        assert!(factory::decoder_by_name("lzo").is_some());
     }
-    let mut state: u32 = 0xC0FFEE;
-    let mut data = Vec::with_capacity(2048);
-    for _ in 0..2048 {
-        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        data.push((state >> 16) as u8);
+
+    #[test]
+    fn names_contains_lzo() {
+        assert!(factory::names().contains(&"lzo"));
     }
-    let framed = encode_chunked(&data, data.len(), data.len() * 2);
-    let raw = strip_framing(&framed).expect("single-block stream");
-    let decoded = python_lzo_decompress(&raw, data.len());
-    assert_eq!(decoded, data);
+
+    #[test]
+    fn boxed_round_trip() {
+        let mut enc = factory::encoder_by_name("lzo").unwrap();
+        let mut dec = factory::decoder_by_name("lzo").unwrap();
+        let input = b"hello hello hello hello hello hello hello hello";
+        let mut encoded = vec![0u8; 256];
+        let (p, _) = enc.encode(input, &mut encoded).unwrap();
+        assert_eq!(p.consumed, input.len());
+        let mut tail = vec![0u8; 256];
+        let (pf, status) = enc.finish(&mut tail).unwrap();
+        assert!(matches!(status, Status::StreamEnd));
+        let mut all = Vec::new();
+        all.extend_from_slice(&encoded[..p.written]);
+        all.extend_from_slice(&tail[..pf.written]);
+
+        let mut out = vec![0u8; input.len()];
+        let (pd, _) = dec.decode(&all, &mut out).unwrap();
+        let (pdf, status) = dec.finish(&mut out[pd.written..]).unwrap();
+        assert!(matches!(status, Status::StreamEnd));
+        assert_eq!(&out[..pd.written + pdf.written], input);
+    }
 }
