@@ -1,4 +1,3 @@
-#![cfg(any())] // TODO(v0.3): port to new (Progress, Status) API
 //! Integration tests for the Quantum decoder.
 //!
 //! Quantum streams have no in-band length or window-size; both are carried
@@ -8,27 +7,32 @@
 //! libmspack repository, which despite its CVE name happens to be a
 //! perfectly valid Quantum stream (a 512 KiB run of zero bytes); the CVE
 //! is about an output-flush bug, not a malformed stream.
+//!
+//! Canonical v0.3 port: every call returns `(Progress, Status)` and the
+//! loop dispatches on `Status` rather than inferring from byte counts.
 
 #![cfg(feature = "quantum")]
 
 use compcol::quantum::{Decoder, Encoder, Quantum};
-use compcol::{Algorithm, Decoder as _, Encoder as _, Error};
+use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Status};
 
 // ─── helpers ──────────────────────────────────────────────────────────────
 
 /// Decode `input` in one shot with the supplied window size. Returns the
-/// full decoded output.
+/// full decoded output, capped at `expected_len`. Quantum has no in-band
+/// length, so the caller is responsible for stopping at the expected
+/// output length.
 fn decode_oneshot(input: &[u8], window_bits: u32, expected_len: usize) -> Vec<u8> {
     let mut dec = Decoder::with_window_bits(window_bits).expect("valid window bits");
     let mut output = vec![0u8; expected_len];
     let mut total_written = 0usize;
     // Feed all input at once, then drain in repeated decode() calls.
-    let p = dec.decode(input, &mut output[total_written..]).unwrap();
+    let (p, _status) = dec.decode(input, &mut output[total_written..]).unwrap();
     total_written += p.written;
     // After feeding input, repeatedly call decode with an empty input
     // until the decoder has nothing more to produce.
     while total_written < expected_len {
-        let p = dec.decode(&[], &mut output[total_written..]).unwrap();
+        let (p, _status) = dec.decode(&[], &mut output[total_written..]).unwrap();
         total_written += p.written;
         if p.written == 0 {
             break;
@@ -36,9 +40,9 @@ fn decode_oneshot(input: &[u8], window_bits: u32, expected_len: usize) -> Vec<u8
     }
     // Call finish to allow EOF padding to flush the final renorm bits.
     while total_written < expected_len {
-        let p = dec.finish(&mut output[total_written..]).unwrap();
+        let (p, status) = dec.finish(&mut output[total_written..]).unwrap();
         total_written += p.written;
-        if p.written == 0 {
+        if p.written == 0 || matches!(status, Status::StreamEnd) {
             break;
         }
     }
@@ -67,21 +71,22 @@ fn decode_chunked(
         let mut consumed_in_chunk = 0;
         while consumed_in_chunk < chunk.len() && decoded.len() < expected_len {
             let want = (expected_len - decoded.len()).min(buf.len());
-            let p = dec
+            let (p, status) = dec
                 .decode(&chunk[consumed_in_chunk..], &mut buf[..want])
                 .unwrap();
             decoded.extend_from_slice(&buf[..p.written]);
             consumed_in_chunk += p.consumed;
-            if p.consumed == 0 && p.written == 0 {
-                // No more progress with this chunk; surface more input.
-                break;
+            match status {
+                Status::InputEmpty | Status::StreamEnd => break,
+                Status::OutputFull => continue,
             }
         }
         i = end;
-        // After feeding, drain whatever is currently producible.
+        // After feeding, drain whatever is currently producible without
+        // additional input.
         while decoded.len() < expected_len {
             let want = (expected_len - decoded.len()).min(buf.len());
-            let p = dec.decode(&[], &mut buf[..want]).unwrap();
+            let (p, _status) = dec.decode(&[], &mut buf[..want]).unwrap();
             decoded.extend_from_slice(&buf[..p.written]);
             if p.written == 0 {
                 break;
@@ -99,20 +104,37 @@ fn algorithm_name_is_quantum() {
 }
 
 #[test]
-fn encoder_is_unsupported() {
+fn quantum_algorithm_factory_produces_codec() {
+    let _enc = <Quantum as Algorithm>::encoder();
+    let _dec = <Quantum as Algorithm>::decoder();
+}
+
+// ─── encoder is permanently unsupported ──────────────────────────────────
+
+#[test]
+fn encoder_encode_is_unsupported() {
     let mut enc = Encoder::new();
     let mut out = [0u8; 16];
     assert_eq!(
         enc.encode(b"hello", &mut out).unwrap_err(),
         Error::Unsupported
     );
+}
+
+#[test]
+fn encoder_finish_is_unsupported() {
+    let mut enc = Encoder::new();
+    let mut out = [0u8; 16];
     assert_eq!(enc.finish(&mut out).unwrap_err(), Error::Unsupported);
 }
 
 #[test]
-fn quantum_algorithm_factory_produces_decoder() {
-    let _enc = <Quantum as Algorithm>::encoder();
-    let _dec = <Quantum as Algorithm>::decoder();
+fn encoder_reset_is_a_no_op() {
+    // Encoder is stateless; reset must not panic.
+    let mut enc = Encoder::new();
+    enc.reset();
+    let mut out = [0u8; 4];
+    assert_eq!(enc.encode(b"x", &mut out).unwrap_err(), Error::Unsupported);
 }
 
 // ─── window-bits validation ───────────────────────────────────────────────
@@ -139,12 +161,16 @@ fn window_bits_in_range_accepted() {
 // ─── empty input ─────────────────────────────────────────────────────────
 
 #[test]
-fn empty_input_finish_is_done() {
+fn empty_input_finish_is_stream_end() {
     let mut dec = Decoder::new();
     let mut out = [0u8; 8];
-    let p = dec.finish(&mut out).unwrap();
+    let (p, status) = dec.finish(&mut out).unwrap();
     assert_eq!(p.written, 0);
-    assert!(matches!(_s, compcol::Status::StreamEnd));
+    assert!(
+        matches!(status, Status::StreamEnd),
+        "expected StreamEnd on empty finish, got {:?}",
+        status
+    );
 }
 
 // ─── real-world fixture: cve-2010-2801-qtm-flush.cab ─────────────────────
@@ -251,11 +277,11 @@ fn truncated_input_does_not_panic() {
     let mut dec = Decoder::with_window_bits(18).unwrap();
     let mut out = vec![0u8; 32_768];
     // First decode: feed the truncated input.
-    let p1 = dec.decode(truncated, &mut out).unwrap();
+    let (p1, _status) = dec.decode(truncated, &mut out).unwrap();
     // It may or may not produce output before stalling; key thing is no panic.
     let _ = p1;
     // Subsequent finish should not error catastrophically. It may report
-    // done==true with written < expected (we accept this: caller's CAB
+    // StreamEnd with written < expected (we accept this: caller's CAB
     // container detects truncation by counting output bytes).
     let mut tail = vec![0u8; 1024];
     let _ = dec.finish(&mut tail);
@@ -285,7 +311,7 @@ fn corrupt_trailer_byte_rejected_in_full_stream() {
             // Drain & finish to give the trailer state a chance to execute.
             loop {
                 match dec.decode(&[], &mut more) {
-                    Ok(p) if p.written > 0 => continue,
+                    Ok((p, _)) if p.written > 0 => continue,
                     Ok(_) => break,
                     Err(e) => return assert_eq!(e, Error::Corrupt),
                 }
@@ -312,18 +338,19 @@ fn reset_clears_state() {
     // After reset, decoding the same input again should yield the same
     // 32 KiB of zeros, with no stale models or window contents leaking in.
     let mut out2 = vec![0u8; 32_768];
-    let p = dec.decode(&CVE_2010_2801_INPUT[..15], &mut out2).unwrap();
+    let (p, _status) = dec.decode(&CVE_2010_2801_INPUT[..15], &mut out2).unwrap();
     let mut total = p.written;
     while total < 32_768 {
-        let p = dec.decode(&[], &mut out2[total..]).unwrap();
+        let (p, _status) = dec.decode(&[], &mut out2[total..]).unwrap();
         if p.written == 0 {
             break;
         }
         total += p.written;
     }
     while total < 32_768 {
-        let p = dec.finish(&mut out2[total..]).unwrap();
-        if p.written == 0 {
+        let (p, status) = dec.finish(&mut out2[total..]).unwrap();
+        if p.written == 0 || matches!(status, Status::StreamEnd) {
+            total += p.written;
             break;
         }
         total += p.written;
@@ -339,13 +366,30 @@ mod factory {
     use compcol::factory;
 
     #[test]
-    fn lookup_quantum_decoder_and_encoder() {
-        // Either both present or both absent; we just check they're reachable
-        // by name if the factory feature exposes them.
-        let enc = factory::encoder_by_name("quantum");
-        let dec = factory::decoder_by_name("quantum");
-        // The factory may or may not expose Quantum depending on the
-        // build; if it does, both should be Some.
-        assert_eq!(enc.is_some(), dec.is_some());
+    fn lookup_quantum_encoder_and_decoder() {
+        assert!(factory::encoder_by_name("quantum").is_some());
+        assert!(factory::decoder_by_name("quantum").is_some());
+    }
+
+    #[test]
+    fn lookup_unknown() {
+        assert!(factory::encoder_by_name("not-a-real-quantum").is_none());
+        assert!(factory::decoder_by_name("not-a-real-quantum").is_none());
+    }
+
+    #[test]
+    fn names_contains_quantum() {
+        assert!(factory::names().contains(&"quantum"));
+    }
+
+    #[test]
+    fn boxed_encoder_is_unsupported() {
+        use compcol::Error;
+        let mut enc = factory::encoder_by_name("quantum").unwrap();
+        let mut out = [0u8; 16];
+        assert_eq!(
+            enc.encode(b"hello", &mut out).unwrap_err(),
+            Error::Unsupported
+        );
     }
 }
