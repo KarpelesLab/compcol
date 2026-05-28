@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/KarpelesLab/compcol/compare/v0.2.0...v0.3.0) - 2026-05-29
+
+### Trait redesign (breaking)
+
+- `Encoder::encode`, `Encoder::finish`, `Decoder::decode`, `Decoder::finish`
+  now return `Result<(Progress, Status), Error>` instead of
+  `Result<Progress, Error>`. `Status` is an explicit enum
+  (`InputEmpty`, `OutputFull`, `StreamEnd`) so callers no longer have to
+  infer end-of-stream from byte counts.
+- `Progress` no longer carries a `done` field — `Status::StreamEnd`
+  replaces it.
+- `Decoder::skip` renamed to `Decoder::discard_output` to better describe
+  what it does (advance past decompressed bytes without writing them).
+- `Algorithm` gains two associated config types:
+  `type EncoderConfig: Clone + Default` and
+  `type DecoderConfig: Clone + Default`, plus two new constructors:
+  `encoder_with(config) -> Encoder` and `decoder_with(config) -> Decoder`.
+  The existing `encoder()`/`decoder()` continue to work via the
+  `Default` impl.
+- New post-error contract documented on `Encoder`/`Decoder`: after any
+  `Err(_)` return, the codec is poisoned; further calls are
+  unspecified until `reset()`.
+- Private `RawEncoder` / `RawDecoder` traits bridge each algorithm's
+  byte-counts-only impl to the new public surface — algorithms don't
+  have to think about `Status` themselves; the blanket impl computes
+  it from `consumed == input.len()` etc.
+
+### Compression level configuration
+
+Levelled algorithms now expose a `pub struct EncoderConfig` with a
+`level` (or `quality` for brotli) field:
+
+| Algorithm | Range  | Default |
+|-----------|--------|---------|
+| deflate   | 1..=9  | 6       |
+| zlib      | 1..=9  | 6       |
+| gzip      | 1..=9  | 6       |
+| lzma      | 0..=9  | 6       |
+| xz        | 0..=9  | 6       |
+| zstd      | 1..=22 | 3       |
+| brotli    | 0..=11 | 6       |
+
+Out-of-range values are clamped, not rejected. `level=1` should be
+measurably faster than the max level, and the max level produces
+≥ the compression ratio of `level=1` on a realistic corpus. The
+plumbing into match-finder depth / nice-match cutoff / strategy is
+honest end-to-end — see each `tests/<algo>.rs` for the size-relation
+assertions.
+
+Algorithms without a level (rle, lz4, snappy, lzw, lzo, lzx,
+quantum, rar1/2/3/5) use `type EncoderConfig = ();`.
+
+### Other
+
+- 17 algorithms ported under the new trait API across 4 parallel-agent
+  rounds, ~640 tests total (was ~178 on v0.2.0).
+- `tests/<algo>.rs` files rewritten in the canonical
+  `(Progress, Status)` pattern; `tests/rle.rs` is the reference example.
+
 ## [0.2.0](https://github.com/KarpelesLab/compcol/compare/v0.1.0...v0.2.0) - 2026-05-28
 
 ### Other

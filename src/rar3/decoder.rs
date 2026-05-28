@@ -637,9 +637,10 @@ fn promote_offset(ctx: &mut RunCtx, idx: usize, offs: u32) {
     ctx.old_offsets[0] = offs;
 }
 
-#[cfg(any())] // TODO(v0.3): port unit tests to new (Progress, Status) API
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::Decoder as _;
     extern crate std;
     use std::vec;
 
@@ -647,9 +648,9 @@ mod tests {
     fn unpack_size_zero_is_immediate_done() {
         let mut dec = Decoder::with_unpack_size(0);
         let mut out = [0u8; 8];
-        let p = dec.finish(&mut out).unwrap();
+        let (p, status) = dec.finish(&mut out).unwrap();
         assert_eq!(p.written, 0);
-        assert!(matches!(_s, crate::Status::StreamEnd));
+        assert!(matches!(status, crate::Status::StreamEnd));
     }
 
     #[test]

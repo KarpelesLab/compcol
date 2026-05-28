@@ -133,7 +133,7 @@ impl BitBuf {
     }
 }
 
-#[cfg(any())] // TODO(v0.3): port unit tests to new (Progress, Status) API
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -171,7 +171,7 @@ mod tests {
         let mut br = BitBuf::new();
         br.reset(&[0xAB, 0xCD, 0xEF, 0x12], 8);
         assert_eq!(br.peek_bits(16), 0xABCD);
-        br.discard_output(4);
+        br.skip(4);
         assert_eq!(br.peek_bits(16), 0xBCDE);
     }
 }

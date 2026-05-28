@@ -1,4 +1,3 @@
-#![cfg(any())] // TODO(v0.3): port to new (Progress, Status) API
 //! Cross-validation against system tools (`gzip`, `python3 zlib`).
 //!
 //! Each test probes for the required tool with `--version`; if it's missing,
@@ -55,7 +54,7 @@ fn our_gzip_encode(input: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; 8192];
     let mut consumed = 0;
     while consumed < input.len() {
-        let p = enc.encode(&input[consumed..], &mut buf).unwrap();
+        let (p, _s) = enc.encode(&input[consumed..], &mut buf).unwrap();
         out.extend_from_slice(&buf[..p.written]);
         consumed += p.consumed;
         if p.consumed == 0 && p.written == 0 {
@@ -63,7 +62,7 @@ fn our_gzip_encode(input: &[u8]) -> Vec<u8> {
         }
     }
     loop {
-        let p = enc.finish(&mut buf).unwrap();
+        let (p, _s) = enc.finish(&mut buf).unwrap();
         out.extend_from_slice(&buf[..p.written]);
         if matches!(_s, compcol::Status::StreamEnd) {
             break;
@@ -81,7 +80,7 @@ fn our_gzip_decode(input: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; 8192];
     let mut consumed = 0;
     while consumed < input.len() {
-        let p = dec.decode(&input[consumed..], &mut buf).unwrap();
+        let (p, _s) = dec.decode(&input[consumed..], &mut buf).unwrap();
         out.extend_from_slice(&buf[..p.written]);
         consumed += p.consumed;
         if p.consumed == 0 && p.written == 0 {
@@ -89,7 +88,7 @@ fn our_gzip_decode(input: &[u8]) -> Vec<u8> {
         }
     }
     loop {
-        let p = dec.finish(&mut buf).unwrap();
+        let (p, _s) = dec.finish(&mut buf).unwrap();
         out.extend_from_slice(&buf[..p.written]);
         if matches!(_s, compcol::Status::StreamEnd) {
             break;
@@ -157,7 +156,7 @@ fn our_zlib_encode(input: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; 8192];
     let mut consumed = 0;
     while consumed < input.len() {
-        let p = enc.encode(&input[consumed..], &mut buf).unwrap();
+        let (p, _s) = enc.encode(&input[consumed..], &mut buf).unwrap();
         out.extend_from_slice(&buf[..p.written]);
         consumed += p.consumed;
         if p.consumed == 0 && p.written == 0 {
@@ -165,7 +164,7 @@ fn our_zlib_encode(input: &[u8]) -> Vec<u8> {
         }
     }
     loop {
-        let p = enc.finish(&mut buf).unwrap();
+        let (p, _s) = enc.finish(&mut buf).unwrap();
         out.extend_from_slice(&buf[..p.written]);
         if matches!(_s, compcol::Status::StreamEnd) {
             break;
@@ -183,7 +182,7 @@ fn our_zlib_decode(input: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; 8192];
     let mut consumed = 0;
     while consumed < input.len() {
-        let p = dec.decode(&input[consumed..], &mut buf).unwrap();
+        let (p, _s) = dec.decode(&input[consumed..], &mut buf).unwrap();
         out.extend_from_slice(&buf[..p.written]);
         consumed += p.consumed;
         if p.consumed == 0 && p.written == 0 {
@@ -191,7 +190,7 @@ fn our_zlib_decode(input: &[u8]) -> Vec<u8> {
         }
     }
     loop {
-        let p = dec.finish(&mut buf).unwrap();
+        let (p, _s) = dec.finish(&mut buf).unwrap();
         out.extend_from_slice(&buf[..p.written]);
         if matches!(_s, compcol::Status::StreamEnd) {
             break;
@@ -209,7 +208,7 @@ fn our_deflate_encode(input: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; 8192];
     let mut consumed = 0;
     while consumed < input.len() {
-        let p = enc.encode(&input[consumed..], &mut buf).unwrap();
+        let (p, _s) = enc.encode(&input[consumed..], &mut buf).unwrap();
         out.extend_from_slice(&buf[..p.written]);
         consumed += p.consumed;
         if p.consumed == 0 && p.written == 0 {
@@ -217,7 +216,7 @@ fn our_deflate_encode(input: &[u8]) -> Vec<u8> {
         }
     }
     loop {
-        let p = enc.finish(&mut buf).unwrap();
+        let (p, _s) = enc.finish(&mut buf).unwrap();
         out.extend_from_slice(&buf[..p.written]);
         if matches!(_s, compcol::Status::StreamEnd) {
             break;
@@ -235,7 +234,7 @@ fn our_deflate_decode(input: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; 8192];
     let mut consumed = 0;
     while consumed < input.len() {
-        let p = dec.decode(&input[consumed..], &mut buf).unwrap();
+        let (p, _s) = dec.decode(&input[consumed..], &mut buf).unwrap();
         out.extend_from_slice(&buf[..p.written]);
         consumed += p.consumed;
         if p.consumed == 0 && p.written == 0 {
@@ -243,7 +242,7 @@ fn our_deflate_decode(input: &[u8]) -> Vec<u8> {
         }
     }
     loop {
-        let p = dec.finish(&mut buf).unwrap();
+        let (p, _s) = dec.finish(&mut buf).unwrap();
         out.extend_from_slice(&buf[..p.written]);
         if matches!(_s, compcol::Status::StreamEnd) {
             break;
