@@ -25,7 +25,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::traits::{Decoder as DecoderTrait, Progress};
+use crate::traits::{RawDecoder, RawProgress};
 
 use super::bitreader::BitReader;
 use super::huffman::LzxHuffman;
@@ -235,8 +235,8 @@ impl Default for Decoder {
     }
 }
 
-impl DecoderTrait for Decoder {
-    fn decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+impl RawDecoder for Decoder {
+    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
@@ -253,7 +253,7 @@ impl DecoderTrait for Decoder {
                         *have += 1;
                     }
                     if (*have as usize) < buf.len() {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -306,7 +306,7 @@ impl DecoderTrait for Decoder {
                         // Frame fully drained — fall through to keep going.
                     }
                     if written == output.len() && ctx.frame_emitted < ctx.frame_buf.len() {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -342,7 +342,7 @@ impl DecoderTrait for Decoder {
                 }
 
                 DecState::Done => {
-                    return Ok(Progress {
+                    return Ok(RawProgress {
                         consumed,
                         written,
                         done: false,
@@ -358,14 +358,14 @@ impl DecoderTrait for Decoder {
             }
         }
 
-        Ok(Progress {
+        Ok(RawProgress {
             consumed,
             written,
             done: false,
         })
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
@@ -377,7 +377,7 @@ impl DecoderTrait for Decoder {
             }
         }
         match &self.state {
-            DecState::Done => Ok(Progress {
+            DecState::Done => Ok(RawProgress {
                 consumed: 0,
                 written,
                 done: true,
@@ -386,7 +386,7 @@ impl DecoderTrait for Decoder {
                 if *have == 0 {
                     // Empty stream — treat as Done.
                     self.state = DecState::Done;
-                    Ok(Progress {
+                    Ok(RawProgress {
                         consumed: 0,
                         written,
                         done: true,
@@ -399,7 +399,7 @@ impl DecoderTrait for Decoder {
                 if written == 0 {
                     Err(self.poison(Error::UnexpectedEnd))
                 } else {
-                    Ok(Progress {
+                    Ok(RawProgress {
                         consumed: 0,
                         written,
                         done: false,
@@ -409,7 +409,7 @@ impl DecoderTrait for Decoder {
         }
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         self.state = DecState::Header {
             buf: [0; 5],
             have: 0,

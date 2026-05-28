@@ -34,7 +34,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::traits::{Encoder as EncoderTrait, Progress};
+use crate::traits::{RawEncoder, RawProgress};
 use crate::zstd::encoder_bitwriter::RevBitWriter;
 use crate::zstd::encoder_fse::{
     DEFAULT_LL_ACCURACY_LOG, DEFAULT_LL_COUNTS, DEFAULT_ML_ACCURACY_LOG, DEFAULT_ML_COUNTS,
@@ -868,8 +868,8 @@ impl Default for Encoder {
     }
 }
 
-impl EncoderTrait for Encoder {
-    fn encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+impl RawEncoder for Encoder {
+    fn raw_encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         let mut consumed = 0usize;
         let mut written = 0usize;
 
@@ -897,7 +897,7 @@ impl EncoderTrait for Encoder {
                         // We have header bytes pending; drain them.
                         self.state = State::Draining { last: false };
                     } else {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -907,7 +907,7 @@ impl EncoderTrait for Encoder {
                 State::Draining { last } => {
                     let drained = self.drain_into(output, &mut written);
                     if !drained {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -920,7 +920,7 @@ impl EncoderTrait for Encoder {
                     }
                 }
                 State::Done => {
-                    return Ok(Progress {
+                    return Ok(RawProgress {
                         consumed,
                         written,
                         done: false,
@@ -930,7 +930,7 @@ impl EncoderTrait for Encoder {
         }
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         let mut written = 0usize;
 
         loop {
@@ -952,7 +952,7 @@ impl EncoderTrait for Encoder {
                 State::Draining { last } => {
                     let drained = self.drain_into(output, &mut written);
                     if !drained {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed: 0,
                             written,
                             done: false,
@@ -965,7 +965,7 @@ impl EncoderTrait for Encoder {
                     }
                 }
                 State::Done => {
-                    return Ok(Progress {
+                    return Ok(RawProgress {
                         consumed: 0,
                         written,
                         done: true,
@@ -975,7 +975,7 @@ impl EncoderTrait for Encoder {
         }
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         self.state = State::Accepting;
         self.pending.clear();
         self.out_buf.clear();

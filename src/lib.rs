@@ -19,7 +19,7 @@ mod error;
 mod traits;
 
 pub use error::Error;
-pub use traits::{Algorithm, Decoder, Encoder, Progress};
+pub use traits::{Algorithm, Decoder, Encoder, Progress, Status};
 
 // Shared internals used by the deflate-family codecs. Kept private; the
 // surface that downstream crates see is the per-algorithm modules below.

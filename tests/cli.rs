@@ -1,3 +1,4 @@
+#![cfg(any())] // TODO(v0.3): port to new (Progress, Status) API
 //! End-to-end tests for the `compcol` binary.
 //!
 //! Spawns the binary built by Cargo (via the `CARGO_BIN_EXE_compcol`

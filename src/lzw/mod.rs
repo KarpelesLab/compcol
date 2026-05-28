@@ -32,7 +32,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::traits::{Algorithm, Decoder as DecoderTrait, Encoder as EncoderTrait, Progress};
+use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
 
 /// Zero-sized marker type implementing [`Algorithm`] for LZW (compress(1) flavour).
 #[derive(Debug, Clone, Copy, Default)]
@@ -42,10 +42,12 @@ impl Algorithm for Lzw {
     const NAME: &'static str = "lzw";
     type Encoder = Encoder;
     type Decoder = Decoder;
-    fn encoder() -> Encoder {
+    type EncoderConfig = ();
+    type DecoderConfig = ();
+    fn encoder_with(_: ()) -> Encoder {
         Encoder::new()
     }
-    fn decoder() -> Decoder {
+    fn decoder_with(_: ()) -> Decoder {
         Decoder::new()
     }
 }
@@ -267,8 +269,8 @@ impl Default for Encoder {
     }
 }
 
-impl EncoderTrait for Encoder {
-    fn encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+impl RawEncoder for Encoder {
+    fn raw_encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         self.ensure_header();
 
         let mut consumed = 0usize;
@@ -331,16 +333,16 @@ impl EncoderTrait for Encoder {
             written += self.pending.drain_into(&mut output[written..]);
         }
 
-        Ok(Progress {
+        Ok(RawProgress {
             consumed,
             written,
             done: false,
         })
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.completed {
-            return Ok(Progress {
+            return Ok(RawProgress {
                 consumed: 0,
                 written: 0,
                 done: true,
@@ -374,14 +376,14 @@ impl EncoderTrait for Encoder {
         if done {
             self.completed = true;
         }
-        Ok(Progress {
+        Ok(RawProgress {
             consumed: 0,
             written,
             done,
         })
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         for slot in self.ht_key.iter_mut() {
             *slot = 0;
         }
@@ -572,8 +574,8 @@ impl Default for Decoder {
     }
 }
 
-impl DecoderTrait for Decoder {
-    fn decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+impl RawDecoder for Decoder {
+    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         let mut in_cursor = 0usize;
         let mut written = 0usize;
 
@@ -588,7 +590,7 @@ impl DecoderTrait for Decoder {
                 written += self.drain_emit(&mut output[written..]);
                 if self.emit_head < self.emit_buf.len() {
                     // Caller's output is full but we still owe bytes.
-                    return Ok(Progress {
+                    return Ok(RawProgress {
                         consumed: in_cursor,
                         written,
                         done: false,
@@ -598,7 +600,7 @@ impl DecoderTrait for Decoder {
 
             if self.header_pos < 3 {
                 // Need more input to finish reading the header.
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed: in_cursor,
                     written,
                     done: false,
@@ -613,7 +615,7 @@ impl DecoderTrait for Decoder {
             };
             if self.next_code > bump_threshold && self.nbits < self.maxbits {
                 if !self.skip_to_group_boundary(input, &mut in_cursor) {
-                    return Ok(Progress {
+                    return Ok(RawProgress {
                         consumed: in_cursor,
                         written,
                         done: false,
@@ -625,7 +627,7 @@ impl DecoderTrait for Decoder {
             let code = match self.try_read_code(input, &mut in_cursor) {
                 Some(c) => c,
                 None => {
-                    return Ok(Progress {
+                    return Ok(RawProgress {
                         consumed: in_cursor,
                         written,
                         done: false,
@@ -639,7 +641,7 @@ impl DecoderTrait for Decoder {
                 if !self.skip_to_group_boundary(input, &mut in_cursor) {
                     // We've already partially consumed bits for this CLEAR;
                     // the codes_in_group counter remembers how far we got.
-                    return Ok(Progress {
+                    return Ok(RawProgress {
                         consumed: in_cursor,
                         written,
                         done: false,
@@ -686,9 +688,9 @@ impl DecoderTrait for Decoder {
         }
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.completed {
-            return Ok(Progress {
+            return Ok(RawProgress {
                 consumed: 0,
                 written: 0,
                 done: true,
@@ -699,7 +701,7 @@ impl DecoderTrait for Decoder {
         if self.emit_head < self.emit_buf.len() {
             written += self.drain_emit(&mut output[written..]);
             if self.emit_head < self.emit_buf.len() {
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed: 0,
                     written,
                     done: false,
@@ -714,14 +716,14 @@ impl DecoderTrait for Decoder {
 
         // Trailing bits less than `nbits` are EOF padding; not an error.
         self.completed = true;
-        Ok(Progress {
+        Ok(RawProgress {
             consumed: 0,
             written,
             done: true,
         })
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         self.header_pos = 0;
         self.block_mode = true;
         self.maxbits = MAX_BITS;

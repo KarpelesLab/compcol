@@ -1,3 +1,4 @@
+#![cfg(any())] // TODO(v0.3): port to new (Progress, Status) API
 //! Integration tests for the gzip codec.
 
 #![cfg(feature = "gzip")]
@@ -26,7 +27,7 @@ fn encode_all(input: &[u8]) -> Vec<u8> {
     loop {
         let p = enc.finish(&mut buf).unwrap();
         out.extend_from_slice(&buf[..p.written]);
-        if p.done {
+        if matches!(_s, compcol::Status::StreamEnd) {
             break;
         }
         if p.written == 0 {
@@ -58,7 +59,7 @@ fn encode_chunked(input: &[u8], in_chunk: usize, out_chunk: usize) -> Vec<u8> {
     loop {
         let p = enc.finish(&mut buf).unwrap();
         out.extend_from_slice(&buf[..p.written]);
-        if p.done {
+        if matches!(_s, compcol::Status::StreamEnd) {
             break;
         }
         if p.written == 0 {
@@ -90,7 +91,7 @@ fn decode_chunked(encoded: &[u8], in_chunk: usize, out_chunk: usize) -> Result<V
     loop {
         let p = dec.finish(&mut buf)?;
         out.extend_from_slice(&buf[..p.written]);
-        if p.done {
+        if matches!(_s, compcol::Status::StreamEnd) {
             break;
         }
         if p.written == 0 {

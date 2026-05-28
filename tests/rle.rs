@@ -1,14 +1,13 @@
 //! Streaming round-trip tests for the RLE algorithm.
 //!
-//! Tests run under the `std` test harness but the library itself is `no_std`.
+//! Canonical v0.3 port: every call returns `(Progress, Status)` and the
+//! loop dispatches on `Status` rather than inferring from byte counts.
 
 #![cfg(feature = "rle")]
 
 use compcol::rle::{Decoder, Encoder, Rle};
-use compcol::{Algorithm, Decoder as _, Encoder as _, Error};
+use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Status};
 
-/// Encode `input` into `dst` using the supplied output-chunk size, then
-/// return the encoded bytes.
 fn encode_chunked(input: &[u8], in_chunk: usize, out_chunk: usize) -> Vec<u8> {
     let mut enc = Encoder::new();
     let mut encoded = Vec::new();
@@ -18,26 +17,29 @@ fn encode_chunked(input: &[u8], in_chunk: usize, out_chunk: usize) -> Vec<u8> {
     while i < input.len() {
         let end = (i + in_chunk).min(input.len());
         let chunk = &input[i..end];
-        let mut consumed_in_chunk = 0;
-        while consumed_in_chunk < chunk.len() {
-            let p = enc.encode(&chunk[consumed_in_chunk..], &mut buf).unwrap();
+        let mut consumed = 0;
+        while consumed < chunk.len() {
+            let (p, status) = enc.encode(&chunk[consumed..], &mut buf).unwrap();
             encoded.extend_from_slice(&buf[..p.written]);
-            consumed_in_chunk += p.consumed;
-            if p.consumed == 0 && p.written == 0 {
-                panic!("encoder stalled mid-input");
+            consumed += p.consumed;
+            match status {
+                Status::InputEmpty | Status::StreamEnd => break,
+                Status::OutputFull => continue,
             }
         }
         i = end;
     }
 
     loop {
-        let p = enc.finish(&mut buf).unwrap();
+        let (p, status) = enc.finish(&mut buf).unwrap();
         encoded.extend_from_slice(&buf[..p.written]);
-        if p.done {
-            break;
-        }
-        if p.written == 0 {
-            panic!("encoder finish stalled");
+        match status {
+            Status::StreamEnd => break,
+            Status::OutputFull | Status::InputEmpty => {
+                if p.written == 0 {
+                    panic!("encoder finish stalled");
+                }
+            }
         }
     }
 
@@ -53,26 +55,29 @@ fn decode_chunked(encoded: &[u8], in_chunk: usize, out_chunk: usize) -> Vec<u8> 
     while i < encoded.len() {
         let end = (i + in_chunk).min(encoded.len());
         let chunk = &encoded[i..end];
-        let mut consumed_in_chunk = 0;
-        while consumed_in_chunk < chunk.len() {
-            let p = dec.decode(&chunk[consumed_in_chunk..], &mut buf).unwrap();
+        let mut consumed = 0;
+        while consumed < chunk.len() {
+            let (p, status) = dec.decode(&chunk[consumed..], &mut buf).unwrap();
             decoded.extend_from_slice(&buf[..p.written]);
-            consumed_in_chunk += p.consumed;
-            if p.consumed == 0 && p.written == 0 {
-                panic!("decoder stalled mid-input");
+            consumed += p.consumed;
+            match status {
+                Status::InputEmpty | Status::StreamEnd => break,
+                Status::OutputFull => continue,
             }
         }
         i = end;
     }
 
     loop {
-        let p = dec.finish(&mut buf).unwrap();
+        let (p, status) = dec.finish(&mut buf).unwrap();
         decoded.extend_from_slice(&buf[..p.written]);
-        if p.done {
-            break;
-        }
-        if p.written == 0 {
-            panic!("decoder finish stalled");
+        match status {
+            Status::StreamEnd => break,
+            Status::OutputFull | Status::InputEmpty => {
+                if p.written == 0 {
+                    panic!("decoder finish stalled");
+                }
+            }
         }
     }
 
@@ -107,9 +112,7 @@ fn run_of_one() {
 
 #[test]
 fn long_run_forces_split() {
-    // 600 zero bytes — three pairs of (255,0), (255,0), (90,0).
-    let input = vec![0u8; 600];
-    round_trip(&input);
+    round_trip(&vec![0u8; 600]);
 }
 
 #[test]
@@ -119,13 +122,12 @@ fn mixed_runs() {
     input.extend(core::iter::repeat_n(b'b', 1));
     input.extend(core::iter::repeat_n(b'c', 300));
     input.extend(core::iter::repeat_n(b'd', 255));
-    input.extend(core::iter::repeat_n(b'd', 1)); // forces a 255+1 split
+    input.extend(core::iter::repeat_n(b'd', 1));
     round_trip(&input);
 }
 
 #[test]
 fn pseudo_random_input() {
-    // Tiny LCG, fixed seed; keeps the test dependency-free.
     let mut state: u32 = 0xC0FFEEu32;
     let mut input = Vec::with_capacity(2048);
     for _ in 0..2048 {
@@ -137,7 +139,6 @@ fn pseudo_random_input() {
 
 #[test]
 fn chunked_one_byte_at_a_time() {
-    // The acid test: 1-byte buffers on both input and output, on both sides.
     let input: Vec<u8> = (0..512u32).map(|i| (i % 7) as u8).collect();
     let encoded = encode_chunked(&input, 1, 1);
     let decoded = decode_chunked(&encoded, 1, 1);
@@ -156,7 +157,7 @@ fn corrupt_zero_count_rejected() {
 fn truncated_pair_rejected() {
     let mut dec = Decoder::new();
     let mut out = [0u8; 4];
-    let p = dec.decode(&[0x03], &mut out).unwrap(); // count only
+    let (p, _status) = dec.decode(&[0x03], &mut out).unwrap();
     assert_eq!(p.consumed, 1);
     assert_eq!(p.written, 0);
     let err = dec.finish(&mut out).unwrap_err();
@@ -165,26 +166,22 @@ fn truncated_pair_rejected() {
 
 #[test]
 fn skip_via_default_impl_advances_decoded_position() {
-    // Encode "aaabbbcccdddeeefffggg" then skip 9 decompressed bytes and read
-    // the next 6 — should give "dddeee".
     let input = b"aaabbbcccdddeeefffggg";
     let mut enc = Encoder::new();
     let mut buf = [0u8; 64];
     let mut encoded = Vec::new();
-    let p = enc.encode(input, &mut buf).unwrap();
+    let (p, _status) = enc.encode(input, &mut buf).unwrap();
     encoded.extend_from_slice(&buf[..p.written]);
     assert_eq!(p.consumed, input.len());
-    let p = enc.finish(&mut buf).unwrap();
+    let (p, status) = enc.finish(&mut buf).unwrap();
     encoded.extend_from_slice(&buf[..p.written]);
-    assert!(p.done);
+    assert!(matches!(status, Status::StreamEnd));
 
     let mut dec = Decoder::new();
-    // Feed the whole encoded payload and skip the first 9 bytes.
-    let p = dec.skip(&encoded, 9).unwrap();
+    let (p, _status) = dec.discard_output(&encoded, 9).unwrap();
     assert_eq!(p.written, 9, "should have skipped 9 bytes");
-    // Continue decoding from where skip left off.
     let mut out = [0u8; 6];
-    let p2 = dec.decode(&encoded[p.consumed..], &mut out).unwrap();
+    let (p2, _status) = dec.decode(&encoded[p.consumed..], &mut out).unwrap();
     assert_eq!(&out[..p2.written], b"dddeee");
 }
 
@@ -194,19 +191,18 @@ fn reset_clears_state() {
     let mut out = [0u8; 16];
     let _ = enc.encode(b"aaaa", &mut out).unwrap();
     enc.reset();
-    // After reset, encoding new input followed by finish should produce just
-    // that input's encoding, with no leftover state from before.
     let mut produced = Vec::new();
-    let p = enc.encode(b"bbb", &mut out).unwrap();
+    let (p, _) = enc.encode(b"bbb", &mut out).unwrap();
     produced.extend_from_slice(&out[..p.written]);
-    let p = enc.finish(&mut out).unwrap();
+    let (p, status) = enc.finish(&mut out).unwrap();
     produced.extend_from_slice(&out[..p.written]);
-    assert!(p.done);
+    assert!(matches!(status, Status::StreamEnd));
     assert_eq!(produced, vec![3, b'b']);
 }
 
 #[cfg(feature = "factory")]
 mod factory {
+    use compcol::Status;
     use compcol::factory;
 
     #[test]
@@ -232,20 +228,19 @@ mod factory {
         let mut dec = factory::decoder_by_name("rle").unwrap();
         let input = b"hello hello hello";
         let mut encoded = vec![0u8; 64];
-        let p = enc.encode(input, &mut encoded).unwrap();
-        let consumed = p.consumed;
-        assert_eq!(consumed, input.len());
+        let (p, _) = enc.encode(input, &mut encoded).unwrap();
+        assert_eq!(p.consumed, input.len());
         let mut tail = vec![0u8; 16];
-        let pf = enc.finish(&mut tail).unwrap();
-        assert!(pf.done);
+        let (pf, status) = enc.finish(&mut tail).unwrap();
+        assert!(matches!(status, Status::StreamEnd));
         let mut all = Vec::new();
         all.extend_from_slice(&encoded[..p.written]);
         all.extend_from_slice(&tail[..pf.written]);
 
         let mut out = vec![0u8; input.len()];
-        let pd = dec.decode(&all, &mut out).unwrap();
-        let pdf = dec.finish(&mut out[pd.written..]).unwrap();
-        assert!(pdf.done);
+        let (pd, _) = dec.decode(&all, &mut out).unwrap();
+        let (pdf, status) = dec.finish(&mut out[pd.written..]).unwrap();
+        assert!(matches!(status, Status::StreamEnd));
         assert_eq!(&out[..pd.written + pdf.written], input);
     }
 }

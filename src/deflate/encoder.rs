@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use crate::bits::{BitWriter, reverse_bits};
 use crate::error::Error;
 use crate::huffman::{canonical_codes_from_lengths, length_limited_huffman};
-use crate::traits::{Encoder as EncoderTrait, Progress};
+use crate::traits::{RawEncoder, RawProgress};
 
 use super::lz77::MatchFinder;
 use super::tables::{
@@ -770,8 +770,8 @@ impl Default for Encoder {
     }
 }
 
-impl EncoderTrait for Encoder {
-    fn encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+impl RawEncoder for Encoder {
+    fn raw_encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         if matches!(self.state, EncState::Done) || self.final_emitted {
             return Err(Error::Corrupt);
         }
@@ -817,17 +817,17 @@ impl EncoderTrait for Encoder {
             }
         }
 
-        Ok(Progress {
+        Ok(RawProgress {
             consumed,
             written,
             done: false,
         })
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         let mut written = 0usize;
         if matches!(self.state, EncState::Done) {
-            return Ok(Progress {
+            return Ok(RawProgress {
                 consumed: 0,
                 written: 0,
                 done: true,
@@ -841,7 +841,7 @@ impl EncoderTrait for Encoder {
                     self.out_pos = 0;
                     if self.final_emitted {
                         self.state = EncState::Done;
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed: 0,
                             written,
                             done: true,
@@ -872,14 +872,14 @@ impl EncoderTrait for Encoder {
             }
         }
 
-        Ok(Progress {
+        Ok(RawProgress {
             consumed: 0,
             written,
             done: false,
         })
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         self.window.clear();
         self.cursor = 0;
         self.window_start_abs = 0;

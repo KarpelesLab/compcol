@@ -28,7 +28,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::traits::{Encoder as EncoderTrait, Progress};
+use crate::traits::{RawEncoder, RawProgress};
 
 use super::{
     ALIGN_BITS, ALIGN_SIZE, DIST_MODEL_END, DIST_MODEL_START, DIST_SLOT_BITS, DIST_SLOTS,
@@ -813,20 +813,20 @@ impl Encoder {
     }
 }
 
-impl EncoderTrait for Encoder {
-    fn encode(&mut self, input: &[u8], _output: &mut [u8]) -> Result<Progress, Error> {
+impl RawEncoder for Encoder {
+    fn raw_encode(&mut self, input: &[u8], _output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.finished {
             return Err(Error::Corrupt);
         }
         self.input_buf.extend_from_slice(input);
-        Ok(Progress {
+        Ok(RawProgress {
             consumed: input.len(),
             written: 0,
             done: false,
         })
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         if !self.finished {
             // One-shot encode of everything we've buffered.
             self.output_buf = encode_all(&self.input_buf);
@@ -838,14 +838,14 @@ impl EncoderTrait for Encoder {
         output[..n].copy_from_slice(&self.output_buf[self.output_pos..self.output_pos + n]);
         self.output_pos += n;
         let done = self.output_pos >= self.output_buf.len();
-        Ok(Progress {
+        Ok(RawProgress {
             consumed: 0,
             written: n,
             done,
         })
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         self.input_buf.clear();
         self.output_buf.clear();
         self.output_pos = 0;

@@ -8,7 +8,7 @@
 //! interesting state machine for validating the streaming trait shape.
 
 use crate::error::Error;
-use crate::traits::{Algorithm, Decoder as DecoderTrait, Encoder as EncoderTrait, Progress};
+use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
 
 /// Zero-sized marker type implementing [`Algorithm`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -18,11 +18,12 @@ impl Algorithm for Rle {
     const NAME: &'static str = "rle";
     type Encoder = Encoder;
     type Decoder = Decoder;
-
-    fn encoder() -> Encoder {
+    type EncoderConfig = ();
+    type DecoderConfig = ();
+    fn encoder_with(_: ()) -> Encoder {
         Encoder::new()
     }
-    fn decoder() -> Decoder {
+    fn decoder_with(_: ()) -> Decoder {
         Decoder::new()
     }
 }
@@ -60,8 +61,8 @@ impl Default for Encoder {
     }
 }
 
-impl EncoderTrait for Encoder {
-    fn encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+impl RawEncoder for Encoder {
+    fn raw_encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         let mut consumed = 0usize;
         let mut written = 0usize;
 
@@ -69,7 +70,7 @@ impl EncoderTrait for Encoder {
             // Always finish any owed value byte first.
             if let EncState::PartialPair { value } = self.state {
                 if written == output.len() {
-                    return Ok(Progress {
+                    return Ok(RawProgress {
                         consumed,
                         written,
                         done: false,
@@ -82,7 +83,7 @@ impl EncoderTrait for Encoder {
 
             // Nothing more we can do without more input.
             if consumed == input.len() {
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed,
                     written,
                     done: false,
@@ -106,7 +107,7 @@ impl EncoderTrait for Encoder {
                 EncState::Run { byte, count } => {
                     // Need to flush this pair before we can keep going.
                     if written == output.len() {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -117,7 +118,7 @@ impl EncoderTrait for Encoder {
                     if written == output.len() {
                         // Only the count fit; remember to emit the value later.
                         self.state = EncState::PartialPair { value: byte };
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -136,13 +137,13 @@ impl EncoderTrait for Encoder {
         }
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         let mut written = 0usize;
 
         // Drain a pending value byte first.
         if let EncState::PartialPair { value } = self.state {
             if written == output.len() {
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed: 0,
                     written,
                     done: false,
@@ -156,7 +157,7 @@ impl EncoderTrait for Encoder {
         // Emit the trailing run, if any.
         if let EncState::Run { byte, count } = self.state {
             if written == output.len() {
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed: 0,
                     written,
                     done: false,
@@ -166,7 +167,7 @@ impl EncoderTrait for Encoder {
             written += 1;
             if written == output.len() {
                 self.state = EncState::PartialPair { value: byte };
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed: 0,
                     written,
                     done: false,
@@ -177,14 +178,14 @@ impl EncoderTrait for Encoder {
             self.state = EncState::Empty;
         }
 
-        Ok(Progress {
+        Ok(RawProgress {
             consumed: 0,
             written,
             done: matches!(self.state, EncState::Empty),
         })
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         self.state = EncState::Empty;
     }
 }
@@ -220,8 +221,8 @@ impl Default for Decoder {
     }
 }
 
-impl DecoderTrait for Decoder {
-    fn decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+impl RawDecoder for Decoder {
+    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         let mut consumed = 0usize;
         let mut written = 0usize;
 
@@ -229,7 +230,7 @@ impl DecoderTrait for Decoder {
             match self.state {
                 DecState::EmittingRun { value, remaining } => {
                     if written == output.len() {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -250,7 +251,7 @@ impl DecoderTrait for Decoder {
                             remaining: new_remaining,
                         };
                         // Output buffer is full, so we cannot continue.
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -259,7 +260,7 @@ impl DecoderTrait for Decoder {
                 }
                 DecState::ExpectCount => {
                     if consumed == input.len() {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -274,7 +275,7 @@ impl DecoderTrait for Decoder {
                 }
                 DecState::ExpectValue { count } => {
                     if consumed == input.len() {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -291,7 +292,7 @@ impl DecoderTrait for Decoder {
         }
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         let mut written = 0usize;
 
         if let DecState::EmittingRun { value, remaining } = self.state {
@@ -309,7 +310,7 @@ impl DecoderTrait for Decoder {
                     value,
                     remaining: new_remaining,
                 };
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed: 0,
                     written,
                     done: false,
@@ -318,13 +319,13 @@ impl DecoderTrait for Decoder {
         }
 
         match self.state {
-            DecState::ExpectCount => Ok(Progress {
+            DecState::ExpectCount => Ok(RawProgress {
                 consumed: 0,
                 written,
                 done: true,
             }),
             DecState::ExpectValue { .. } => Err(Error::UnexpectedEnd),
-            DecState::EmittingRun { .. } => Ok(Progress {
+            DecState::EmittingRun { .. } => Ok(RawProgress {
                 consumed: 0,
                 written,
                 done: false,
@@ -332,7 +333,7 @@ impl DecoderTrait for Decoder {
         }
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         self.state = DecState::ExpectCount;
     }
 }

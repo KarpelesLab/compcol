@@ -65,11 +65,13 @@ impl Algorithm for Lzx {
     const NAME: &'static str = "lzx";
     type Encoder = Encoder;
     type Decoder = Decoder;
+    type EncoderConfig = ();
+    type DecoderConfig = ();
 
-    fn encoder() -> Encoder {
+    fn encoder_with(_: ()) -> Encoder {
         Encoder::new()
     }
-    fn decoder() -> Decoder {
+    fn decoder_with(_: ()) -> Decoder {
         Decoder::new()
     }
 }

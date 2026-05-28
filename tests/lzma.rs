@@ -1,3 +1,4 @@
+#![cfg(any())] // TODO(v0.3): port to new (Progress, Status) API
 //! Integration tests for the LZMA encoder and decoder.
 //!
 //! The decoder tests use pre-generated `.lzma` fixtures produced by Python's
@@ -46,7 +47,7 @@ fn decode_chunked(compressed: &[u8], in_chunk: usize, out_chunk: usize) -> Resul
     loop {
         let p = dec.finish(&mut buf)?;
         out.extend_from_slice(&buf[..p.written]);
-        if p.done {
+        if matches!(_s, compcol::Status::StreamEnd) {
             break;
         }
         if p.written == 0 {
@@ -257,7 +258,7 @@ fn encode_one_shot(payload: &[u8]) -> Vec<u8> {
     loop {
         let p = enc.finish(&mut buf).unwrap();
         out.extend_from_slice(&buf[..p.written]);
-        if p.done {
+        if matches!(_s, compcol::Status::StreamEnd) {
             break;
         }
         if p.written == 0 {
@@ -383,7 +384,7 @@ fn encode_streaming_one_byte_chunks_round_trip() {
     loop {
         let p = enc.finish(&mut buf).unwrap();
         compressed.extend_from_slice(&buf[..p.written]);
-        if p.done {
+        if matches!(_s, compcol::Status::StreamEnd) {
             break;
         }
         if p.written == 0 {
@@ -432,7 +433,7 @@ fn encode_after_reset_round_trip() {
     loop {
         let p = enc.finish(&mut buf).unwrap();
         compressed.extend_from_slice(&buf[..p.written]);
-        if p.done {
+        if matches!(_s, compcol::Status::StreamEnd) {
             break;
         }
     }

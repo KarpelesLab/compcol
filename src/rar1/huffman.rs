@@ -236,7 +236,7 @@ mod tests {
         assert!(dec.is_empty());
         let mut r = BitReader::new();
         r.feed_byte(0xFF);
-        assert_eq!(dec.decode(&mut r), Err(Error::InvalidHuffmanTree));
+        assert!(matches!(dec.decode(&mut r), Err(Error::InvalidHuffmanTree)));
     }
 
     #[test]
@@ -263,7 +263,7 @@ mod tests {
         // The only assigned code is "0" (symbol 0). A "1" bit doesn't
         // match anything at length 1, and max_length is 1 so the loop
         // can't extend → InvalidHuffmanTree.
-        assert_eq!(dec.decode(&mut r), Err(Error::InvalidHuffmanTree));
+        assert!(matches!(dec.decode(&mut r), Err(Error::InvalidHuffmanTree)));
 
         // And the "0" code itself still works.
         let mut r2 = BitReader::new();

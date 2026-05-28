@@ -19,7 +19,7 @@ use crate::error::Error;
 use crate::quantum::bits::BitReader;
 use crate::quantum::model::{ArithDecoder, Model};
 use crate::quantum::tables::{EXTRA_BITS, LENGTH_BASE, LENGTH_EXTRA, POSITION_BASE};
-use crate::traits::{Decoder as DecoderTrait, Progress};
+use crate::traits::{RawDecoder, RawProgress};
 
 /// One Quantum frame is 32 KiB of output. After each frame the bit reader
 /// realigns to a byte boundary and a small trailer is consumed.
@@ -597,21 +597,21 @@ impl Default for Decoder {
     }
 }
 
-impl DecoderTrait for Decoder {
-    fn decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+impl RawDecoder for Decoder {
+    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         self.ensure_window();
         self.input_buf.extend_from_slice(input);
         let mut written = 0usize;
         self.drain(output, &mut written)?;
         self.compact_input();
-        Ok(Progress {
+        Ok(RawProgress {
             consumed: input.len(),
             written,
             done: false,
         })
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         self.ensure_window();
         self.bit_reader.set_eof(true);
         let mut written = 0usize;
@@ -628,14 +628,14 @@ impl DecoderTrait for Decoder {
         // they're done.
         let done =
             self.pending_output.is_none() && self.pending_match.is_none() && written < output.len();
-        Ok(Progress {
+        Ok(RawProgress {
             consumed: 0,
             written,
             done,
         })
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         self.input_buf.clear();
         if self.initialised {
             // Zero the window so back-references into it are deterministic.

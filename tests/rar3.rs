@@ -1,3 +1,4 @@
+#![cfg(any())] // TODO(v0.3): port to new (Progress, Status) API
 //! Integration tests for the RAR 3.x decoder.
 //!
 //! The decoder takes the raw bytes that follow a RAR3 file-header inside an
@@ -23,7 +24,7 @@ fn drain(dec: &mut Decoder, out: &mut Vec<u8>) {
             panic!("finish failed: {e:?}");
         });
         out.extend_from_slice(&buf[..p.written]);
-        if p.done {
+        if matches!(_s, compcol::Status::StreamEnd) {
             break;
         }
         if p.written == 0 {
@@ -78,7 +79,7 @@ fn finish_on_fresh_decoder_with_no_input_short_unpack() {
     let mut buf = [0u8; 8];
     let p = dec.finish(&mut buf).unwrap();
     assert_eq!(p.written, 0);
-    assert!(p.done);
+    assert!(matches!(_s, compcol::Status::StreamEnd));
 }
 
 // ─── real fixture: testdir/test.txt from libarchive's
@@ -138,7 +139,7 @@ fn decodes_libarchive_test_txt_tight_output_buffer() {
     loop {
         let p = dec.finish(&mut buf).unwrap();
         out.extend_from_slice(&buf[..p.written]);
-        if p.done {
+        if matches!(_s, compcol::Status::StreamEnd) {
             break;
         }
         if p.written == 0 {

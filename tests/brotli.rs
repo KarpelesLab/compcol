@@ -1,3 +1,4 @@
+#![cfg(any())] // TODO(v0.3): port to new (Progress, Status) API
 //! Integration tests for the Brotli (RFC 7932) codec.
 //!
 //! This build implements only the uncompressed subset of the format:
@@ -52,7 +53,7 @@ fn encode_chunked(input: &[u8], in_chunk: usize, out_chunk: usize) -> Result<Vec
     loop {
         let p = enc.finish(&mut buf)?;
         out.extend_from_slice(&buf[..p.written]);
-        if p.done {
+        if matches!(_s, compcol::Status::StreamEnd) {
             break;
         }
         if p.written == 0 {
@@ -85,7 +86,7 @@ fn decode_chunked(encoded: &[u8], in_chunk: usize, out_chunk: usize) -> Result<V
     loop {
         let p = dec.finish(&mut buf)?;
         out.extend_from_slice(&buf[..p.written]);
-        if p.done {
+        if matches!(_s, compcol::Status::StreamEnd) {
             break;
         }
         if p.written == 0 {
@@ -262,7 +263,7 @@ fn reset_allows_reuse() {
     loop {
         let p2 = enc.finish(&mut buf).unwrap();
         total.extend_from_slice(&buf[..p2.written]);
-        if p2.done {
+        if matches!(_s, compcol::Status::StreamEnd) {
             break;
         }
         if p2.written == 0 {

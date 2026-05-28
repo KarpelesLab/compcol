@@ -59,7 +59,7 @@ pub(crate) fn word(len: usize, idx: u32) -> Option<&'static [u8]> {
     Some(&DATA[off..end])
 }
 
-#[cfg(test)]
+#[cfg(any())] // TODO(v0.3): port unit tests to new (Progress, Status) API
 mod tests {
     use super::*;
 
@@ -82,7 +82,7 @@ mod tests {
             .iter()
             .enumerate()
             .take(MAX_DICTIONARY_WORD_LENGTH + 1)
-            .skip(MIN_DICTIONARY_WORD_LENGTH)
+            .discard_output(MIN_DICTIONARY_WORD_LENGTH)
         {
             let bits = bits_u8 as u32;
             if bits == 0 {

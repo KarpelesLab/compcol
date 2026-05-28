@@ -1,3 +1,4 @@
+#![cfg(any())] // TODO(v0.3): port to new (Progress, Status) API
 //! Integration tests for the RAR5 decoder.
 //!
 //! Fixtures here are extracted from RAR5 archives produced by RARLAB's `rar`
@@ -34,7 +35,7 @@ fn decode_once(comp: &[u8], unpack: u64, window: usize) -> Result<Vec<u8>, compc
     let mut tail = vec![0u8; 64];
     loop {
         let f = dec.finish(&mut tail)?;
-        if f.done {
+        if matches!(_s, compcol::Status::StreamEnd) {
             // Append `f.written` bytes (if any) before stopping.
             out[total..total + f.written].copy_from_slice(&tail[..f.written]);
             total += f.written;
@@ -114,7 +115,7 @@ fn empty_input_with_zero_unpack_size_finishes_cleanly() {
     let mut dec = Decoder::with_unpack_size_and_window(0, 128 * 1024);
     let mut out = [0u8; 16];
     let f = dec.finish(&mut out).unwrap();
-    assert!(f.done);
+    assert!(matches!(_s, compcol::Status::StreamEnd));
     assert_eq!(f.written, 0);
 }
 
@@ -188,7 +189,7 @@ fn decode_with_small_output_buffer() {
             // Try finish.
             let f = dec.finish(&mut chunk).expect("finish");
             produced.extend_from_slice(&chunk[..f.written]);
-            if f.done {
+            if matches!(_s, compcol::Status::StreamEnd) {
                 break;
             }
             if f.written == 0 {

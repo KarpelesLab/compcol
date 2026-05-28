@@ -55,7 +55,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::traits::{Decoder as DecoderTrait, Progress};
+use crate::traits::{RawDecoder, RawProgress};
 
 use super::bits::BitBuf;
 use super::filters::{Filter, FilterKind};
@@ -181,8 +181,8 @@ impl Default for Decoder {
     }
 }
 
-impl DecoderTrait for Decoder {
-    fn decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+impl RawDecoder for Decoder {
+    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
@@ -207,14 +207,14 @@ impl DecoderTrait for Decoder {
                 self.state = State::Done;
             }
             if matches!(self.state, State::Done) {
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed,
                     written,
                     done: false,
                 });
             }
             if written == output.len() && !self.ready.is_empty() {
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed,
                     written,
                     done: false,
@@ -233,7 +233,7 @@ impl DecoderTrait for Decoder {
                 Err(e) => return Err(self.poison(e)),
             };
             if !progressed {
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed,
                     written,
                     done: false,
@@ -242,7 +242,7 @@ impl DecoderTrait for Decoder {
         }
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
@@ -260,14 +260,14 @@ impl DecoderTrait for Decoder {
             self.state = State::Done;
         }
         match &self.state {
-            State::Done => Ok(Progress {
+            State::Done => Ok(RawProgress {
                 consumed: 0,
                 written,
                 done: true,
             }),
             State::BlockHeader if self.input.is_empty() && self.unpack_total == 0 => {
                 self.state = State::Done;
-                Ok(Progress {
+                Ok(RawProgress {
                     consumed: 0,
                     written,
                     done: true,
@@ -277,7 +277,7 @@ impl DecoderTrait for Decoder {
                 if written == 0 {
                     Err(self.poison(Error::UnexpectedEnd))
                 } else {
-                    Ok(Progress {
+                    Ok(RawProgress {
                         consumed: 0,
                         written,
                         done: false,
@@ -287,7 +287,7 @@ impl DecoderTrait for Decoder {
         }
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         self.state = State::BlockHeader;
         self.poisoned = false;
         self.input.clear();

@@ -58,7 +58,7 @@
 //!   for the LZ77 + Huffman path.
 
 use crate::error::Error;
-use crate::traits::{Algorithm, Encoder as EncoderTrait, Progress};
+use crate::traits::{Algorithm, RawEncoder, RawProgress};
 
 mod bits;
 mod decoder;
@@ -77,10 +77,12 @@ impl Algorithm for Rar3 {
     const NAME: &'static str = "rar3";
     type Encoder = Encoder;
     type Decoder = Decoder;
-    fn encoder() -> Encoder {
+    type EncoderConfig = ();
+    type DecoderConfig = ();
+    fn encoder_with(_: ()) -> Encoder {
         Encoder::new()
     }
-    fn decoder() -> Decoder {
+    fn decoder_with(_: ()) -> Decoder {
         Decoder::new()
     }
 }
@@ -93,12 +95,12 @@ impl Encoder {
         Self
     }
 }
-impl EncoderTrait for Encoder {
-    fn encode(&mut self, _input: &[u8], _output: &mut [u8]) -> Result<Progress, Error> {
+impl RawEncoder for Encoder {
+    fn raw_encode(&mut self, _input: &[u8], _output: &mut [u8]) -> Result<RawProgress, Error> {
         Err(Error::Unsupported)
     }
-    fn finish(&mut self, _output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, _output: &mut [u8]) -> Result<RawProgress, Error> {
         Err(Error::Unsupported)
     }
-    fn reset(&mut self) {}
+    fn raw_reset(&mut self) {}
 }

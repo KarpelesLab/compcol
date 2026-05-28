@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use crate::checksum::Adler32;
 use crate::deflate;
 use crate::error::Error;
-use crate::traits::{Algorithm, Decoder as DecoderTrait, Encoder as EncoderTrait, Progress};
+use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
 
 /// Canonical "default compression" header, divisible by 31 with CINFO=7,
 /// FDICT=0, FLEVEL=2.
@@ -31,11 +31,13 @@ impl Algorithm for Zlib {
     const NAME: &'static str = "zlib";
     type Encoder = Encoder;
     type Decoder = Decoder;
+    type EncoderConfig = ();
+    type DecoderConfig = ();
 
-    fn encoder() -> Encoder {
+    fn encoder_with(_: ()) -> Encoder {
         Encoder::new()
     }
-    fn decoder() -> Decoder {
+    fn decoder_with(_: ()) -> Decoder {
         Decoder::new()
     }
 }
@@ -136,8 +138,8 @@ impl Default for Decoder {
     }
 }
 
-impl DecoderTrait for Decoder {
-    fn decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+impl RawDecoder for Decoder {
+    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
@@ -159,7 +161,7 @@ impl DecoderTrait for Decoder {
                         self.validate_header()?;
                         self.phase = DecPhase::Deflate;
                     } else {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -170,7 +172,7 @@ impl DecoderTrait for Decoder {
                     let before_written = written;
                     let p = self
                         .inner
-                        .decode(&input[consumed..], &mut output[written..])
+                        .raw_decode(&input[consumed..], &mut output[written..])
                         .map_err(|e| self.poison(e))?;
                     consumed += p.consumed;
                     written += p.written;
@@ -181,7 +183,7 @@ impl DecoderTrait for Decoder {
                         self.trailer_carryover_idx = 0;
                         self.phase = DecPhase::Trailer;
                     } else if p.consumed == 0 && p.written == 0 {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -191,7 +193,7 @@ impl DecoderTrait for Decoder {
                 DecPhase::Trailer => {
                     while self.trailer_idx < 4 {
                         if self.next_trailer_byte(input, &mut consumed).is_none() {
-                            return Ok(Progress {
+                            return Ok(RawProgress {
                                 consumed,
                                 written,
                                 done: false,
@@ -205,7 +207,7 @@ impl DecoderTrait for Decoder {
                     self.phase = DecPhase::Done;
                 }
                 DecPhase::Done => {
-                    return Ok(Progress {
+                    return Ok(RawProgress {
                         consumed,
                         written,
                         done: false,
@@ -214,7 +216,7 @@ impl DecoderTrait for Decoder {
             }
 
             if consumed == initial_consumed && written == initial_written {
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed,
                     written,
                     done: false,
@@ -223,7 +225,7 @@ impl DecoderTrait for Decoder {
         }
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
@@ -231,9 +233,9 @@ impl DecoderTrait for Decoder {
         // bytes via decode() but didn't realise the trailer hadn't been
         // validated yet.
         let empty: [u8; 0] = [];
-        let p = self.decode(&empty, output)?;
+        let p = self.raw_decode(&empty, output)?;
         if matches!(self.phase, DecPhase::Done) {
-            Ok(Progress {
+            Ok(RawProgress {
                 consumed: 0,
                 written: p.written,
                 done: true,
@@ -243,8 +245,8 @@ impl DecoderTrait for Decoder {
         }
     }
 
-    fn reset(&mut self) {
-        self.inner.reset();
+    fn raw_reset(&mut self) {
+        self.inner.raw_reset();
         self.adler.reset();
         self.header_idx = 0;
         self.trailer_carryover.clear();
@@ -317,15 +319,15 @@ impl Default for Encoder {
     }
 }
 
-impl EncoderTrait for Encoder {
-    fn encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+impl RawEncoder for Encoder {
+    fn raw_encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         let mut consumed = 0usize;
         let mut written = 0usize;
 
         // Header.
         if matches!(self.phase, EncPhase::Header) {
             if !self.drain_header(output, &mut written) {
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed,
                     written,
                     done: false,
@@ -342,25 +344,25 @@ impl EncoderTrait for Encoder {
         let before = consumed;
         let p = self
             .inner
-            .encode(&input[consumed..], &mut output[written..])?;
+            .raw_encode(&input[consumed..], &mut output[written..])?;
         consumed += p.consumed;
         written += p.written;
         self.adler.update(&input[before..before + p.consumed]);
 
-        Ok(Progress {
+        Ok(RawProgress {
             consumed,
             written,
             done: false,
         })
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         let mut written = 0usize;
 
         // If finish is called before any encode, we still need to emit the header.
         if matches!(self.phase, EncPhase::Header) {
             if !self.drain_header(output, &mut written) {
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed: 0,
                     written,
                     done: false,
@@ -371,7 +373,7 @@ impl EncoderTrait for Encoder {
 
         if matches!(self.phase, EncPhase::Deflate) {
             loop {
-                let p = self.inner.finish(&mut output[written..])?;
+                let p = self.inner.raw_finish(&mut output[written..])?;
                 written += p.written;
                 if p.done {
                     let adler = self.adler.finalize();
@@ -382,7 +384,7 @@ impl EncoderTrait for Encoder {
                 }
                 if p.written == 0 {
                     // No output room and not done.
-                    return Ok(Progress {
+                    return Ok(RawProgress {
                         consumed: 0,
                         written,
                         done: false,
@@ -393,7 +395,7 @@ impl EncoderTrait for Encoder {
 
         if matches!(self.phase, EncPhase::Trailer) && self.drain_trailer(output, &mut written) {
             self.phase = EncPhase::Done;
-            return Ok(Progress {
+            return Ok(RawProgress {
                 consumed: 0,
                 written,
                 done: true,
@@ -401,22 +403,22 @@ impl EncoderTrait for Encoder {
         }
 
         if matches!(self.phase, EncPhase::Done) {
-            return Ok(Progress {
+            return Ok(RawProgress {
                 consumed: 0,
                 written,
                 done: true,
             });
         }
 
-        Ok(Progress {
+        Ok(RawProgress {
             consumed: 0,
             written,
             done: false,
         })
     }
 
-    fn reset(&mut self) {
-        self.inner.reset();
+    fn raw_reset(&mut self) {
+        self.inner.raw_reset();
         self.adler.reset();
         self.header_idx = 0;
         self.trailer = [0u8; 4];

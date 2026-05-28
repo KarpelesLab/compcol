@@ -44,7 +44,7 @@
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::traits::{Algorithm, Decoder as DecoderTrait, Encoder as EncoderTrait, Progress};
+use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
 
 /// Zero-sized marker type implementing [`Algorithm`] for Snappy.
 #[derive(Debug, Clone, Copy, Default)]
@@ -54,10 +54,12 @@ impl Algorithm for Snappy {
     const NAME: &'static str = "snappy";
     type Encoder = Encoder;
     type Decoder = Decoder;
-    fn encoder() -> Encoder {
+    type EncoderConfig = ();
+    type DecoderConfig = ();
+    fn encoder_with(_: ()) -> Encoder {
         Encoder::new()
     }
-    fn decoder() -> Decoder {
+    fn decoder_with(_: ()) -> Decoder {
         Decoder::new()
     }
 }
@@ -127,20 +129,20 @@ impl Encoder {
     }
 }
 
-impl EncoderTrait for Encoder {
-    fn encode(&mut self, input: &[u8], _output: &mut [u8]) -> Result<Progress, Error> {
+impl RawEncoder for Encoder {
+    fn raw_encode(&mut self, input: &[u8], _output: &mut [u8]) -> Result<RawProgress, Error> {
         // Buffer the whole input — Snappy needs the total length up front,
         // and back-references can reach anywhere within the block, so we
         // can't emit anything until the caller signals end of input.
         self.input.extend_from_slice(input);
-        Ok(Progress {
+        Ok(RawProgress {
             consumed: input.len(),
             written: 0,
             done: false,
         })
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         if !self.compressed {
             compress_block(&self.input, &mut self.output);
             self.compressed = true;
@@ -150,14 +152,14 @@ impl EncoderTrait for Encoder {
         output[..n].copy_from_slice(&self.output[self.out_pos..self.out_pos + n]);
         self.out_pos += n;
         let done = self.out_pos == self.output.len();
-        Ok(Progress {
+        Ok(RawProgress {
             consumed: 0,
             written: n,
             done,
         })
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         self.input.clear();
         self.output.clear();
         self.out_pos = 0;
@@ -379,17 +381,17 @@ impl Decoder {
     }
 }
 
-impl DecoderTrait for Decoder {
-    fn decode(&mut self, input: &[u8], _output: &mut [u8]) -> Result<Progress, Error> {
+impl RawDecoder for Decoder {
+    fn raw_decode(&mut self, input: &[u8], _output: &mut [u8]) -> Result<RawProgress, Error> {
         self.input.extend_from_slice(input);
-        Ok(Progress {
+        Ok(RawProgress {
             consumed: input.len(),
             written: 0,
             done: false,
         })
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         if !self.decompressed {
             decompress_block(&self.input, &mut self.output)?;
             self.decompressed = true;
@@ -399,14 +401,14 @@ impl DecoderTrait for Decoder {
         output[..n].copy_from_slice(&self.output[self.out_pos..self.out_pos + n]);
         self.out_pos += n;
         let done = self.out_pos == self.output.len();
-        Ok(Progress {
+        Ok(RawProgress {
             consumed: 0,
             written: n,
             done,
         })
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         self.input.clear();
         self.output.clear();
         self.out_pos = 0;

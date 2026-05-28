@@ -35,7 +35,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::traits::{Algorithm, Decoder as DecoderTrait, Progress};
+use crate::traits::{Algorithm, RawDecoder, RawProgress};
 
 mod encoder;
 pub use encoder::Encoder;
@@ -50,10 +50,12 @@ impl Algorithm for Lzma {
     const NAME: &'static str = "lzma";
     type Encoder = Encoder;
     type Decoder = Decoder;
-    fn encoder() -> Encoder {
+    type EncoderConfig = ();
+    type DecoderConfig = ();
+    fn encoder_with(_: ()) -> Encoder {
         Encoder::new()
     }
-    fn decoder() -> Decoder {
+    fn decoder_with(_: ()) -> Decoder {
         Decoder::new()
     }
 }
@@ -743,8 +745,8 @@ impl Decoder {
     }
 }
 
-impl DecoderTrait for Decoder {
-    fn decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+impl RawDecoder for Decoder {
+    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         let initial_buf_len = self.buf.len();
         self.buf.extend_from_slice(input);
         let mut written = 0usize;
@@ -752,7 +754,7 @@ impl DecoderTrait for Decoder {
         // ── header parsing ────────────────────────────────────────────
         if matches!(self.header_state, HeaderState::Empty) {
             if self.buf.len() < 13 {
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed: input.len(),
                     written: 0,
                     done: false,
@@ -814,7 +816,7 @@ impl DecoderTrait for Decoder {
                     dict_size,
                     uncompressed_size,
                 };
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed: input.len(),
                     written: 0,
                     done: false,
@@ -831,7 +833,7 @@ impl DecoderTrait for Decoder {
         // into our internal buffer), but compact_buf has already dropped the
         // prefix that the range decoder finished with.
         match result {
-            Ok(()) => Ok(Progress {
+            Ok(()) => Ok(RawProgress {
                 consumed: input.len(),
                 written,
                 done: false,
@@ -845,7 +847,7 @@ impl DecoderTrait for Decoder {
         }
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         let mut written = 0usize;
         // Drain whatever we can with at_eof=true so the streaming gate is
         // disabled and any genuine short read errors with UnexpectedEnd.
@@ -874,14 +876,14 @@ impl DecoderTrait for Decoder {
             _ => return Err(Error::UnexpectedEnd),
         };
 
-        Ok(Progress {
+        Ok(RawProgress {
             consumed: 0,
             written,
             done,
         })
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         self.buf.clear();
         self.pending_match = None;
         self.pending_literal = None;

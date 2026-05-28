@@ -55,7 +55,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::traits::{Decoder as DecoderTrait, Progress};
+use crate::traits::{RawDecoder, RawProgress};
 
 use super::audio::{AudioState, decode_sample};
 use super::bitreader::BitReader;
@@ -129,8 +129,8 @@ impl Default for Decoder {
     }
 }
 
-impl DecoderTrait for Decoder {
-    fn decode(&mut self, input: &[u8], _output: &mut [u8]) -> Result<Progress, Error> {
+impl RawDecoder for Decoder {
+    fn raw_decode(&mut self, input: &[u8], _output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
@@ -140,20 +140,20 @@ impl DecoderTrait for Decoder {
             if !input.is_empty() {
                 return Err(self.poison(Error::Corrupt));
             }
-            return Ok(Progress::default());
+            return Ok(RawProgress::default());
         }
         // Buffer everything; we don't have a way to know where a sub-block
         // ends without decoding it, so we keep the whole compressed payload
         // in memory until finish is called.
         self.input_buf.extend_from_slice(input);
-        Ok(Progress {
+        Ok(RawProgress {
             consumed: input.len(),
             written: 0,
             done: false,
         })
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
@@ -170,14 +170,14 @@ impl DecoderTrait for Decoder {
             self.drained += n;
         }
         let done = self.drained == self.output.len();
-        Ok(Progress {
+        Ok(RawProgress {
             consumed: 0,
             written: n,
             done,
         })
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         self.input_buf.clear();
         self.output.clear();
         self.drained = 0;

@@ -5,7 +5,7 @@ use alloc::boxed::Box;
 use crate::bits::BitReader;
 use crate::error::Error;
 use crate::huffman::CanonicalDecoder;
-use crate::traits::{Decoder as DecoderTrait, Progress};
+use crate::traits::{RawDecoder, RawProgress};
 
 use super::tables::{
     CODE_LENGTH_ORDER, DIST_BASE, DIST_EXTRA, END_OF_BLOCK, FIXED_DIST_LENGTHS, FIXED_LIT_LENGTHS,
@@ -174,8 +174,8 @@ impl Default for Decoder {
     }
 }
 
-impl DecoderTrait for Decoder {
-    fn decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+impl RawDecoder for Decoder {
+    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
@@ -200,14 +200,14 @@ impl DecoderTrait for Decoder {
             }
         }
 
-        Ok(Progress {
+        Ok(RawProgress {
             consumed,
             written,
             done: false,
         })
     }
 
-    fn finish(&mut self, _output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, _output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
@@ -216,7 +216,7 @@ impl DecoderTrait for Decoder {
         // in which case we're done; or we didn't, in which case the stream
         // ended mid-block.
         match self.state {
-            DecState::Done => Ok(Progress {
+            DecState::Done => Ok(RawProgress {
                 consumed: 0,
                 written: 0,
                 done: true,
@@ -225,7 +225,7 @@ impl DecoderTrait for Decoder {
         }
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         self.bit_reader.reset();
         self.window_pos = 0;
         self.window_size = 0;

@@ -111,53 +111,61 @@ fn our_encode(algo: &str, input: &[u8]) -> Result<Vec<u8>, String> {
     let mut enc = factory::encoder_by_name(algo).ok_or_else(|| format!("unknown algo {algo}"))?;
     let mut out = Vec::with_capacity(input.len());
     let mut buf = vec![0u8; 64 * 1024];
+    use compcol::Status;
     let mut consumed = 0;
     while consumed < input.len() {
-        let p = enc
+        let (p, status) = enc
             .encode(&input[consumed..], &mut buf)
             .map_err(|e| format!("{e}"))?;
         out.extend_from_slice(&buf[..p.written]);
         consumed += p.consumed;
-        if p.consumed == 0 && p.written == 0 {
-            break;
+        match status {
+            Status::InputEmpty | Status::StreamEnd => break,
+            Status::OutputFull => continue,
         }
     }
     loop {
-        let p = enc.finish(&mut buf).map_err(|e| format!("{e}"))?;
+        let (p, status) = enc.finish(&mut buf).map_err(|e| format!("{e}"))?;
         out.extend_from_slice(&buf[..p.written]);
-        if p.done {
-            break;
-        }
-        if p.written == 0 {
-            return Err(format!("{algo}: encoder finish stalled"));
+        match status {
+            Status::StreamEnd => break,
+            Status::OutputFull | Status::InputEmpty => {
+                if p.written == 0 {
+                    return Err(format!("{algo}: encoder finish stalled"));
+                }
+            }
         }
     }
     Ok(out)
 }
 
 fn our_decode(algo: &str, encoded: &[u8]) -> Result<Vec<u8>, String> {
+    use compcol::Status;
     let mut dec = factory::decoder_by_name(algo).ok_or_else(|| format!("unknown algo {algo}"))?;
     let mut out = Vec::with_capacity(encoded.len() * 4);
     let mut buf = vec![0u8; 64 * 1024];
     let mut consumed = 0;
     while consumed < encoded.len() {
-        let p = dec
+        let (p, status) = dec
             .decode(&encoded[consumed..], &mut buf)
             .map_err(|e| format!("{e}"))?;
         out.extend_from_slice(&buf[..p.written]);
         consumed += p.consumed;
-        if p.consumed == 0 && p.written == 0 {
-            break;
+        match status {
+            Status::InputEmpty | Status::StreamEnd => break,
+            Status::OutputFull => continue,
         }
     }
     loop {
-        let p = dec.finish(&mut buf).map_err(|e| format!("{e}"))?;
+        let (p, status) = dec.finish(&mut buf).map_err(|e| format!("{e}"))?;
         out.extend_from_slice(&buf[..p.written]);
-        if p.done {
-            break;
-        }
-        if p.written == 0 {
-            return Err(format!("{algo}: decoder finish stalled"));
+        match status {
+            Status::StreamEnd => break,
+            Status::OutputFull | Status::InputEmpty => {
+                if p.written == 0 {
+                    return Err(format!("{algo}: decoder finish stalled"));
+                }
+            }
         }
     }
     Ok(out)

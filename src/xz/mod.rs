@@ -51,7 +51,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::traits::{Algorithm, Decoder as DecoderTrait, Encoder as EncoderTrait, Progress};
+use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
 
 mod lzma2_decoder;
 mod lzma2_encoder;
@@ -209,10 +209,12 @@ impl Algorithm for Xz {
     const NAME: &'static str = "xz";
     type Encoder = Encoder;
     type Decoder = Decoder;
-    fn encoder() -> Encoder {
+    type EncoderConfig = ();
+    type DecoderConfig = ();
+    fn encoder_with(_: ()) -> Encoder {
         Encoder::new()
     }
-    fn decoder() -> Decoder {
+    fn decoder_with(_: ()) -> Decoder {
         Decoder::new()
     }
 }
@@ -523,8 +525,8 @@ impl Default for Encoder {
     }
 }
 
-impl EncoderTrait for Encoder {
-    fn encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+impl RawEncoder for Encoder {
+    fn raw_encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         let mut consumed = 0usize;
         let mut written = 0usize;
 
@@ -542,7 +544,7 @@ impl EncoderTrait for Encoder {
                         self.pending_idx = 0;
                         self.phase = EncPhase::BlockHeader;
                     } else {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -553,7 +555,7 @@ impl EncoderTrait for Encoder {
                     if self.drain_pending(output, &mut written) {
                         self.phase = EncPhase::Body;
                     } else {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -578,7 +580,7 @@ impl EncoderTrait for Encoder {
                         self.phase = EncPhase::DrainPending;
                     } else {
                         // Need more input; come back via another call.
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -589,7 +591,7 @@ impl EncoderTrait for Encoder {
                     if self.drain_pending(output, &mut written) {
                         self.phase = EncPhase::Body;
                     } else {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -600,7 +602,7 @@ impl EncoderTrait for Encoder {
                     // The remaining phases (BlockTrailer, Index, StreamFooter,
                     // Done) only run from `finish`. If we got here from
                     // `encode` it means the caller is misusing the API.
-                    return Ok(Progress {
+                    return Ok(RawProgress {
                         consumed,
                         written,
                         done: false,
@@ -609,7 +611,7 @@ impl EncoderTrait for Encoder {
             }
 
             if consumed == init_c && written == init_w && self.phase == init_phase {
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed,
                     written,
                     done: false,
@@ -618,7 +620,7 @@ impl EncoderTrait for Encoder {
         }
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         let mut written = 0usize;
 
         loop {
@@ -633,7 +635,7 @@ impl EncoderTrait for Encoder {
                         self.pending_idx = 0;
                         self.phase = EncPhase::BlockHeader;
                     } else {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed: 0,
                             written,
                             done: false,
@@ -644,7 +646,7 @@ impl EncoderTrait for Encoder {
                     if self.drain_pending(output, &mut written) {
                         self.phase = EncPhase::Body;
                     } else {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed: 0,
                             written,
                             done: false,
@@ -671,7 +673,7 @@ impl EncoderTrait for Encoder {
                         // body has more buffered or we're really done.
                         self.phase = EncPhase::Body;
                     } else {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed: 0,
                             written,
                             done: false,
@@ -693,7 +695,7 @@ impl EncoderTrait for Encoder {
                         self.pending_idx = 0;
                         self.phase = EncPhase::Tail;
                     } else {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed: 0,
                             written,
                             done: false,
@@ -703,20 +705,20 @@ impl EncoderTrait for Encoder {
                 EncPhase::Tail => {
                     if self.drain_pending(output, &mut written) {
                         self.phase = EncPhase::Done;
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed: 0,
                             written,
                             done: true,
                         });
                     }
-                    return Ok(Progress {
+                    return Ok(RawProgress {
                         consumed: 0,
                         written,
                         done: false,
                     });
                 }
                 EncPhase::Done => {
-                    return Ok(Progress {
+                    return Ok(RawProgress {
                         consumed: 0,
                         written,
                         done: true,
@@ -727,13 +729,13 @@ impl EncoderTrait for Encoder {
             if written == init_w && self.phase == init_phase {
                 // No progress and no phase change — bail out.
                 if matches!(self.phase, EncPhase::Done) {
-                    return Ok(Progress {
+                    return Ok(RawProgress {
                         consumed: 0,
                         written,
                         done: true,
                     });
                 }
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed: 0,
                     written,
                     done: false,
@@ -742,7 +744,7 @@ impl EncoderTrait for Encoder {
         }
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         *self = Self::new();
     }
 }
@@ -1032,8 +1034,8 @@ impl Default for Decoder {
     }
 }
 
-impl DecoderTrait for Decoder {
-    fn decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+impl RawDecoder for Decoder {
+    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
@@ -1060,7 +1062,7 @@ impl DecoderTrait for Decoder {
                         self.scratch_want = 1; // peek first byte after header
                         self.phase = DecPhase::BlockOrIndex;
                     } else {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -1094,7 +1096,7 @@ impl DecoderTrait for Decoder {
                             self.phase = DecPhase::BlockHeader;
                         }
                     } else {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -1108,7 +1110,7 @@ impl DecoderTrait for Decoder {
                         self.scratch_want = 1;
                         self.phase = DecPhase::Lzma2Control;
                     } else {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -1122,7 +1124,7 @@ impl DecoderTrait for Decoder {
                     if self.scratch.is_empty() {
                         self.scratch_want = 1;
                         if !self.fill_scratch(input, &mut consumed) {
-                            return Ok(Progress {
+                            return Ok(RawProgress {
                                 consumed,
                                 written,
                                 done: false,
@@ -1161,7 +1163,7 @@ impl DecoderTrait for Decoder {
                         self.expecting_block_first_chunk = false;
                         self.scratch_want = 3;
                         if !self.fill_scratch(input, &mut consumed) {
-                            return Ok(Progress {
+                            return Ok(RawProgress {
                                 consumed,
                                 written,
                                 done: false,
@@ -1196,7 +1198,7 @@ impl DecoderTrait for Decoder {
                 }
                 DecPhase::Lzma2CompHeader => {
                     if !self.fill_scratch(input, &mut consumed) {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -1294,7 +1296,7 @@ impl DecoderTrait for Decoder {
                         consumed += take;
                     }
                     if self.comp_buf.len() < self.comp_size as usize {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -1341,7 +1343,7 @@ impl DecoderTrait for Decoder {
                         self.scratch_want = 1;
                         self.phase = DecPhase::Lzma2Control;
                     } else {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -1371,7 +1373,7 @@ impl DecoderTrait for Decoder {
                         self.scratch_want = 1;
                         self.phase = DecPhase::Lzma2Control;
                     } else {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -1392,7 +1394,7 @@ impl DecoderTrait for Decoder {
                         self.scratch_want = self.check_size();
                         self.phase = DecPhase::BlockCheck;
                     } else {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -1431,7 +1433,7 @@ impl DecoderTrait for Decoder {
                         self.scratch_want = 1;
                         self.phase = DecPhase::BlockOrIndex;
                     } else {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -1570,7 +1572,7 @@ impl DecoderTrait for Decoder {
                         }
                         self.phase = DecPhase::Done;
                     } else {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -1578,7 +1580,7 @@ impl DecoderTrait for Decoder {
                     }
                 }
                 DecPhase::Done => {
-                    return Ok(Progress {
+                    return Ok(RawProgress {
                         consumed,
                         written,
                         done: false,
@@ -1587,7 +1589,7 @@ impl DecoderTrait for Decoder {
             }
 
             if consumed == init_c && written == init_w && self.phase == init_phase {
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed,
                     written,
                     done: false,
@@ -1596,14 +1598,14 @@ impl DecoderTrait for Decoder {
         }
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
         let empty: [u8; 0] = [];
-        let p = self.decode(&empty, output)?;
+        let p = self.raw_decode(&empty, output)?;
         if matches!(self.phase, DecPhase::Done) {
-            Ok(Progress {
+            Ok(RawProgress {
                 consumed: 0,
                 written: p.written,
                 done: true,
@@ -1613,7 +1615,7 @@ impl DecoderTrait for Decoder {
         }
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         *self = Self::new();
     }
 }

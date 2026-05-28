@@ -157,6 +157,7 @@ fn stream_encode(
     reader: &mut dyn Read,
     writer: &mut dyn Write,
 ) -> io::Result<()> {
+    use compcol::Status;
     let mut in_buf = [0u8; BUF_SIZE];
     let mut out_buf = [0u8; BUF_SIZE];
 
@@ -167,25 +168,29 @@ fn stream_encode(
         }
         let mut consumed = 0;
         while consumed < n {
-            let p = enc
+            let (p, status) = enc
                 .encode(&in_buf[consumed..n], &mut out_buf)
                 .map_err(codec_err)?;
             writer.write_all(&out_buf[..p.written])?;
             consumed += p.consumed;
-            if p.consumed == 0 && p.written == 0 {
-                break;
+            match status {
+                Status::InputEmpty => break,
+                Status::OutputFull => continue,
+                Status::StreamEnd => break,
             }
         }
     }
 
     loop {
-        let p = enc.finish(&mut out_buf).map_err(codec_err)?;
+        let (p, status) = enc.finish(&mut out_buf).map_err(codec_err)?;
         writer.write_all(&out_buf[..p.written])?;
-        if p.done {
-            break;
-        }
-        if p.written == 0 {
-            return Err(io::Error::other("encoder stalled in finish"));
+        match status {
+            Status::StreamEnd => break,
+            Status::OutputFull | Status::InputEmpty => {
+                if p.written == 0 {
+                    return Err(io::Error::other("encoder stalled in finish"));
+                }
+            }
         }
     }
 
@@ -197,6 +202,7 @@ fn stream_decode(
     reader: &mut dyn Read,
     writer: &mut dyn Write,
 ) -> io::Result<()> {
+    use compcol::Status;
     let mut in_buf = [0u8; BUF_SIZE];
     let mut out_buf = [0u8; BUF_SIZE];
 
@@ -207,25 +213,29 @@ fn stream_decode(
         }
         let mut consumed = 0;
         while consumed < n {
-            let p = dec
+            let (p, status) = dec
                 .decode(&in_buf[consumed..n], &mut out_buf)
                 .map_err(codec_err)?;
             writer.write_all(&out_buf[..p.written])?;
             consumed += p.consumed;
-            if p.consumed == 0 && p.written == 0 {
-                break;
+            match status {
+                Status::InputEmpty => break,
+                Status::OutputFull => continue,
+                Status::StreamEnd => break,
             }
         }
     }
 
     loop {
-        let p = dec.finish(&mut out_buf).map_err(codec_err)?;
+        let (p, status) = dec.finish(&mut out_buf).map_err(codec_err)?;
         writer.write_all(&out_buf[..p.written])?;
-        if p.done {
-            break;
-        }
-        if p.written == 0 {
-            return Err(io::Error::other("decoder stalled in finish"));
+        match status {
+            Status::StreamEnd => break,
+            Status::OutputFull | Status::InputEmpty => {
+                if p.written == 0 {
+                    return Err(io::Error::other("decoder stalled in finish"));
+                }
+            }
         }
     }
 

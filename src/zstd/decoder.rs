@@ -11,7 +11,7 @@
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::traits::{Decoder as DecoderTrait, Progress};
+use crate::traits::{RawDecoder, RawProgress};
 use crate::zstd::literals::{LiteralsState, decode_literals};
 use crate::zstd::sequences::{SequencesState, decode_sequences, execute_sequences};
 
@@ -319,8 +319,8 @@ impl Default for Decoder {
     }
 }
 
-impl DecoderTrait for Decoder {
-    fn decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+impl RawDecoder for Decoder {
+    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
@@ -334,7 +334,7 @@ impl DecoderTrait for Decoder {
             match self.phase {
                 DecPhase::Magic => {
                     if !self.fill_scratch(input, &mut consumed) {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -357,7 +357,7 @@ impl DecoderTrait for Decoder {
                 }
                 DecPhase::Fhd => {
                     if !self.fill_scratch(input, &mut consumed) {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -386,7 +386,7 @@ impl DecoderTrait for Decoder {
                 }
                 DecPhase::WindowDescriptor => {
                     if !self.fill_scratch(input, &mut consumed) {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -406,7 +406,7 @@ impl DecoderTrait for Decoder {
                 }
                 DecPhase::DictionaryId => {
                     if !self.fill_scratch(input, &mut consumed) {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -423,7 +423,7 @@ impl DecoderTrait for Decoder {
                 }
                 DecPhase::FrameContentSize => {
                     if !self.fill_scratch(input, &mut consumed) {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -435,7 +435,7 @@ impl DecoderTrait for Decoder {
                 }
                 DecPhase::BlockHeader => {
                     if !self.fill_scratch(input, &mut consumed) {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -460,7 +460,7 @@ impl DecoderTrait for Decoder {
                         core::cmp::min(in_avail, out_avail),
                     );
                     if n == 0 {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -481,7 +481,7 @@ impl DecoderTrait for Decoder {
                 }
                 DecPhase::RleByte => {
                     if !self.fill_scratch(input, &mut consumed) {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -493,7 +493,7 @@ impl DecoderTrait for Decoder {
                 DecPhase::RleEmit => {
                     let out_avail = output.len() - written;
                     if out_avail == 0 {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -531,7 +531,7 @@ impl DecoderTrait for Decoder {
                         }
                         self.phase = DecPhase::CompressedEmit;
                     } else {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -549,7 +549,7 @@ impl DecoderTrait for Decoder {
                         continue;
                     }
                     if out_avail == 0 {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -569,7 +569,7 @@ impl DecoderTrait for Decoder {
                     // Currently unreachable — we reject checksummed frames
                     // in `parse_fhd`. Kept as a state for future XXH64 work.
                     if !self.fill_scratch(input, &mut consumed) {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -578,7 +578,7 @@ impl DecoderTrait for Decoder {
                     self.phase = DecPhase::Done;
                 }
                 DecPhase::Done => {
-                    return Ok(Progress {
+                    return Ok(RawProgress {
                         consumed,
                         written,
                         done: false,
@@ -587,7 +587,7 @@ impl DecoderTrait for Decoder {
             }
 
             if consumed == initial_consumed && written == initial_written {
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed,
                     written,
                     done: false,
@@ -596,21 +596,21 @@ impl DecoderTrait for Decoder {
         }
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
         let empty: [u8; 0] = [];
-        let p = self.decode(&empty, output)?;
+        let p = self.raw_decode(&empty, output)?;
         match self.phase {
-            DecPhase::Done => Ok(Progress {
+            DecPhase::Done => Ok(RawProgress {
                 consumed: 0,
                 written: p.written,
                 done: true,
             }),
             // If we're still in RLE_Emit and the output filled up, we owe
             // more bytes — not done yet, no error.
-            DecPhase::RleEmit | DecPhase::CompressedEmit => Ok(Progress {
+            DecPhase::RleEmit | DecPhase::CompressedEmit => Ok(RawProgress {
                 consumed: 0,
                 written: p.written,
                 done: false,
@@ -619,7 +619,7 @@ impl DecoderTrait for Decoder {
         }
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         *self = Self::new();
     }
 }

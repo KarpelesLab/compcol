@@ -54,7 +54,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::traits::{Algorithm, Decoder as DecoderTrait, Encoder as EncoderTrait, Progress};
+use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
 
 mod context;
 mod dictionary;
@@ -81,10 +81,12 @@ impl Algorithm for Brotli {
     const NAME: &'static str = "brotli";
     type Encoder = Encoder;
     type Decoder = Decoder;
-    fn encoder() -> Encoder {
+    type EncoderConfig = ();
+    type DecoderConfig = ();
+    fn encoder_with(_: ()) -> Encoder {
         Encoder::new()
     }
-    fn decoder() -> Decoder {
+    fn decoder_with(_: ()) -> Decoder {
         Decoder::new()
     }
 }
@@ -315,8 +317,8 @@ impl Default for Encoder {
     }
 }
 
-impl EncoderTrait for Encoder {
-    fn encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+impl RawEncoder for Encoder {
+    fn raw_encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.stage == EncStage::Done {
             return Err(Error::Corrupt);
         }
@@ -324,7 +326,7 @@ impl EncoderTrait for Encoder {
         if self.out_pos < self.out.len() {
             written += self.drain_out_into(&mut output[written..]);
             if written == output.len() {
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed: 0,
                     written,
                     done: false,
@@ -341,16 +343,16 @@ impl EncoderTrait for Encoder {
         self.flush_full_blocks();
         written += self.drain_out_into(&mut output[written..]);
         self.compact_out();
-        Ok(Progress {
+        Ok(RawProgress {
             consumed,
             written,
             done: false,
         })
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.stage == EncStage::Done {
-            return Ok(Progress {
+            return Ok(RawProgress {
                 consumed: 0,
                 written: 0,
                 done: true,
@@ -360,7 +362,7 @@ impl EncoderTrait for Encoder {
         if self.out_pos < self.out.len() {
             written += self.drain_out_into(&mut output[written..]);
             if written == output.len() {
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed: 0,
                     written,
                     done: false,
@@ -380,14 +382,14 @@ impl EncoderTrait for Encoder {
         if done {
             self.stage = EncStage::Done;
         }
-        Ok(Progress {
+        Ok(RawProgress {
             consumed: 0,
             written,
             done,
         })
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         self.pending.clear();
         self.out.clear();
         self.out_pos = 0;
@@ -2266,8 +2268,8 @@ impl Default for Decoder {
     }
 }
 
-impl DecoderTrait for Decoder {
-    fn decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+impl RawDecoder for Decoder {
+    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
@@ -2316,14 +2318,14 @@ impl DecoderTrait for Decoder {
             }
         }
         self.compact_out();
-        Ok(Progress {
+        Ok(RawProgress {
             consumed,
             written,
             done: false,
         })
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
@@ -2335,7 +2337,7 @@ impl DecoderTrait for Decoder {
         }
         let done = self.state == DecState::Done && self.out_pos == self.out.len();
         if done {
-            return Ok(Progress {
+            return Ok(RawProgress {
                 consumed: 0,
                 written,
                 done: true,
@@ -2343,7 +2345,7 @@ impl DecoderTrait for Decoder {
         }
         if self.state == DecState::Done && self.out_pos < self.out.len() {
             // More output to drain.
-            return Ok(Progress {
+            return Ok(RawProgress {
                 consumed: 0,
                 written,
                 done: false,
@@ -2352,7 +2354,7 @@ impl DecoderTrait for Decoder {
         Err(self.poison(Error::UnexpectedEnd))
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         self.raw.clear();
         self.bit_pos = 0;
         self.out.clear();

@@ -182,7 +182,7 @@ mod tests {
         let mut r = BitReader::new();
         r.feed(0xFF);
         r.feed(0xFF);
-        assert_eq!(dec.decode(&mut r), Err(Error::InvalidHuffmanTree));
+        assert!(matches!(dec.decode(&mut r), Err(Error::InvalidHuffmanTree)));
     }
 
     #[test]

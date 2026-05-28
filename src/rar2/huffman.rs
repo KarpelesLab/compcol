@@ -193,7 +193,10 @@ mod tests {
         assert!(h.is_empty());
         let mut r = BitReader::new();
         let input = [0xFF];
-        assert_eq!(h.decode(&mut r, &input), Err(Error::InvalidHuffmanTree));
+        assert!(matches!(
+            h.decode(&mut r, &input),
+            Err(Error::InvalidHuffmanTree)
+        ));
     }
 
     #[test]
@@ -222,7 +225,10 @@ mod tests {
         // Empty input → first decode returns UnexpectedEnd.
         let input: [u8; 0] = [];
         let mut r = BitReader::new();
-        assert_eq!(h.decode(&mut r, &input), Err(Error::UnexpectedEnd));
+        assert!(matches!(
+            h.decode(&mut r, &input),
+            Err(Error::UnexpectedEnd)
+        ));
     }
 
     #[test]

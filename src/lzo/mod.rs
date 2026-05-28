@@ -28,7 +28,7 @@
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::traits::{Algorithm, Decoder as DecoderTrait, Encoder as EncoderTrait, Progress};
+use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
 
 mod block;
 
@@ -46,10 +46,12 @@ impl Algorithm for Lzo {
     const NAME: &'static str = "lzo";
     type Encoder = Encoder;
     type Decoder = Decoder;
-    fn encoder() -> Encoder {
+    type EncoderConfig = ();
+    type DecoderConfig = ();
+    fn encoder_with(_: ()) -> Encoder {
         Encoder::new()
     }
-    fn decoder() -> Decoder {
+    fn decoder_with(_: ()) -> Decoder {
         Decoder::new()
     }
 }
@@ -143,8 +145,8 @@ impl Default for Encoder {
     }
 }
 
-impl EncoderTrait for Encoder {
-    fn encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+impl RawEncoder for Encoder {
+    fn raw_encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         let mut consumed = 0usize;
         let mut written = 0usize;
 
@@ -152,7 +154,7 @@ impl EncoderTrait for Encoder {
             if self.phase == EncPhase::Flushing {
                 self.drain_compressed(output, &mut written);
                 if self.phase == EncPhase::Flushing {
-                    return Ok(Progress {
+                    return Ok(RawProgress {
                         consumed,
                         written,
                         done: false,
@@ -161,7 +163,7 @@ impl EncoderTrait for Encoder {
             }
 
             if self.phase != EncPhase::Buffering {
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed,
                     written,
                     done: false,
@@ -169,7 +171,7 @@ impl EncoderTrait for Encoder {
             }
 
             if consumed == input.len() {
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed,
                     written,
                     done: false,
@@ -186,7 +188,7 @@ impl EncoderTrait for Encoder {
                 self.build_block();
                 continue;
             }
-            return Ok(Progress {
+            return Ok(RawProgress {
                 consumed,
                 written,
                 done: false,
@@ -194,7 +196,7 @@ impl EncoderTrait for Encoder {
         }
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         let mut written = 0usize;
 
         loop {
@@ -209,7 +211,7 @@ impl EncoderTrait for Encoder {
                 EncPhase::Flushing => {
                     self.drain_compressed(output, &mut written);
                     if self.phase == EncPhase::Flushing {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed: 0,
                             written,
                             done: false,
@@ -219,7 +221,7 @@ impl EncoderTrait for Encoder {
                 EncPhase::Terminating => {
                     self.drain_terminator(output, &mut written);
                     if self.phase == EncPhase::Terminating {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed: 0,
                             written,
                             done: false,
@@ -227,7 +229,7 @@ impl EncoderTrait for Encoder {
                     }
                 }
                 EncPhase::Done => {
-                    return Ok(Progress {
+                    return Ok(RawProgress {
                         consumed: 0,
                         written,
                         done: true,
@@ -237,7 +239,7 @@ impl EncoderTrait for Encoder {
         }
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         self.raw.clear();
         self.compressed.clear();
         self.compressed_idx = 0;
@@ -306,8 +308,8 @@ impl Default for Decoder {
     }
 }
 
-impl DecoderTrait for Decoder {
-    fn decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
+impl RawDecoder for Decoder {
+    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
@@ -323,7 +325,7 @@ impl DecoderTrait for Decoder {
                         consumed += 1;
                     }
                     if self.length_idx < 4 {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -332,7 +334,7 @@ impl DecoderTrait for Decoder {
                     self.expected_len = u32::from_le_bytes(self.length_buf) as usize;
                     if self.expected_len == 0 {
                         self.phase = DecPhase::Done;
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -352,7 +354,7 @@ impl DecoderTrait for Decoder {
                         consumed += take;
                     }
                     if self.compressed.len() < self.expected_len {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -369,7 +371,7 @@ impl DecoderTrait for Decoder {
                 DecPhase::Draining => {
                     self.drain_decoded(output, &mut written);
                     if self.phase == DecPhase::Draining {
-                        return Ok(Progress {
+                        return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
@@ -377,7 +379,7 @@ impl DecoderTrait for Decoder {
                     }
                 }
                 DecPhase::Done => {
-                    return Ok(Progress {
+                    return Ok(RawProgress {
                         consumed,
                         written,
                         done: false,
@@ -387,7 +389,7 @@ impl DecoderTrait for Decoder {
         }
     }
 
-    fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
@@ -396,7 +398,7 @@ impl DecoderTrait for Decoder {
         if self.phase == DecPhase::Draining {
             self.drain_decoded(output, &mut written);
             if self.phase == DecPhase::Draining {
-                return Ok(Progress {
+                return Ok(RawProgress {
                     consumed: 0,
                     written,
                     done: false,
@@ -405,12 +407,12 @@ impl DecoderTrait for Decoder {
         }
 
         match self.phase {
-            DecPhase::Done => Ok(Progress {
+            DecPhase::Done => Ok(RawProgress {
                 consumed: 0,
                 written,
                 done: true,
             }),
-            DecPhase::Length if self.length_idx == 0 => Ok(Progress {
+            DecPhase::Length if self.length_idx == 0 => Ok(RawProgress {
                 consumed: 0,
                 written,
                 done: true,
@@ -420,7 +422,7 @@ impl DecoderTrait for Decoder {
         }
     }
 
-    fn reset(&mut self) {
+    fn raw_reset(&mut self) {
         self.length_buf = [0; 4];
         self.length_idx = 0;
         self.expected_len = 0;
