@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **LZFSE** (Apple's LZ77 + Finite State Entropy). Decoder-only; encoder
+  permanently returns `Error::Unsupported` (matches lzx/quantum/rar*
+  pattern). Handles `bvx-` (raw) and `bvxn` (LZVN) block types. `bvx2`
+  (LZFSE v2) block type currently returns `Error::Unsupported`; the FSE
+  primitives and v2 bit reader scaffolding are in place for a future
+  round to wire up. Feature: `lzfse`.
+- **ADC** (Apple Data Compression — DMG / HFS+ compressed-resource
+  format). Full encoder + decoder. Simple LZSS-style 3-token format
+  (raw run, short match, long match) with a 64 KiB sliding window.
+  Greedy match-finder on the encode side. Feature: `adc`.
+- Both algorithms wired into the `factory` module (by-name lookup,
+  extension table, names list) and the `all` meta-feature.
+
 ## [0.3.0](https://github.com/KarpelesLab/compcol/compare/v0.2.0...v0.3.0) - 2026-05-29
 
 ### Trait redesign (breaking)

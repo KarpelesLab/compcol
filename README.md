@@ -45,6 +45,8 @@ algorithms selectable from configuration or a CLI flag, and a
 | LZO (LZO1X-1) | `lzo` | `.lzo` | LZ77 hash matcher | full | `python3 -c "import lzo"` |
 | LZX (Microsoft CAB / WIM) | `lzx` | `.lzx` | uncompressed blocks only | full (verbatim + aligned-offset + uncompressed; E8 filter) | — |
 | Quantum (Stac, old CAB) | `quantum` | `.q` | `Unsupported` (no public encoder exists) | full (libmspack-equivalent) | libmspack regression fixtures |
+| LZFSE (Apple) | `lzfse` | `.lzfse` | `Unsupported` (decoder-only) | `bvx-` raw + `bvxn` (LZVN); `bvx2` returns `Unsupported` | hand-built fixtures (no Apple toolchain bundled) |
+| ADC (Apple DMG) | `adc` | `.adc` | LZSS-style greedy match-finder | full | hand-built fixtures |
 | RAR 1.x | `rar1` | `.rar` | `Unsupported` (license) | building blocks only (Huffman tables not license-clean) | — |
 | RAR 2.x | `rar2` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + audio predictor | real rar-2.60 fixtures |
 | RAR 3.x | `rar3` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + E8 filter; PPMd & VM filters refused | libarchive RAR3 fixtures |
@@ -259,7 +261,7 @@ all     = ["alloc", "factory",
            "rle", "deflate", "zlib", "gzip",
            "lzma", "xz",
            "zstd", "brotli", "lz4", "snappy", "lzw",
-           "lzo", "lzx", "quantum",
+           "lzo", "lzx", "quantum", "lzfse", "adc",
            "rar1", "rar2", "rar3", "rar5"]
 alloc   = []
 factory = ["alloc"]            # by-name lookup, returns Box<dyn …>
@@ -277,6 +279,8 @@ lzw     = ["alloc"]
 lzo     = ["alloc"]
 lzx     = ["alloc"]
 quantum = ["alloc"]
+lzfse   = ["alloc"]            # decoder-only, bvx2 returns Unsupported
+adc     = ["alloc"]
 rar1    = ["alloc"]
 rar2    = ["alloc"]
 rar3    = ["alloc"]
