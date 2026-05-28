@@ -1,4 +1,3 @@
-#![cfg(any())] // TODO(v0.3): port to new (Progress, Status) API
 //! Integration tests for the RAR 2.x decoder.
 //!
 //! RAR2 is a 1997-2002 format with effectively no surviving public fixture
@@ -12,11 +11,14 @@
 //! handled in unit tests inside `src/rar2/` because building a valid audio
 //! block by hand is verbose enough that putting it here would obscure the
 //! integration intent.
+//!
+//! Canonical v0.3 port: every call returns `(Progress, Status)` and the
+//! loop dispatches on `Status` rather than inferring from byte counts.
 
 #![cfg(feature = "rar2")]
 
-use compcol::rar2::{Decoder, Rar2};
-use compcol::{Algorithm, Decoder as DecoderTrait};
+use compcol::rar2::{Decoder, Encoder, Rar2};
+use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Status};
 
 // ---------------------------------------------------------------------------
 // Minimal MSB-first bit-writer for building synthetic RAR2 streams in tests.
@@ -105,16 +107,14 @@ fn write_block_header(w: &mut BitWriter, audio: bool, keep_lengths: bool) {
 }
 
 /// Write a synthetic non-audio block whose main tree assigns a 1-bit code to
-/// `literal_sym` and a 2-bit code to `match_sym`, with empty offset/length
-/// trees (we won't be hitting them in the all-literals test).
+/// `literal_sym` and empty offset/length trees (we won't be hitting them in
+/// the all-literals test).
 ///
 /// Returns the assembled compressed bytes.
 fn build_literals_only_block(literal_byte: u8, count: usize) -> Vec<u8> {
     // We need a *valid* main tree. The simplest configuration that lets us
-    // emit literals only: assign every literal length 9 → main alphabet 298,
-    // but only one literal actually needs to encode. We can give exactly one
-    // length-1 main symbol — Rar2Huffman accepts under-full trees with a
-    // single length-1 entry.
+    // emit literals only: a single length-1 main symbol — Rar2Huffman accepts
+    // under-full trees with a single length-1 entry.
     let mut main_lens = vec![0u8; MAIN_TREE_SIZE];
     main_lens[literal_byte as usize] = 1;
     // Empty offset and length trees (all zeros) — we won't decode from them.
@@ -128,15 +128,6 @@ fn build_literals_only_block(literal_byte: u8, count: usize) -> Vec<u8> {
     full.extend(length_lens);
 
     // Build a pretree that can encode this run of lengths.
-    // We need to emit symbols:
-    //   - 19 4-bit pretree-length values
-    //   - then the encoded run of 374 length entries
-    //
-    // Strategy: use only pretree symbols 0..=15 (no run-length escapes for
-    // the simple case) — but our table has a long run of zeros (literals 0..255
-    // minus the one we set), so we want symbol 18 (long run of zeros).
-    //
-    // Plan: pretree must encode at least the literals we use plus zero-runs.
     //   sym 0  ("delta 0") → length 1   (code "0")
     //   sym 1  ("delta 1") → length 2   (code "10")
     //   sym 18 ("run of zeros, 7 bits + 11") → length 2 (code "11")
@@ -156,11 +147,7 @@ fn build_literals_only_block(literal_byte: u8, count: usize) -> Vec<u8> {
         w.write(l as u32, 4);
     }
 
-    // Now encode the 374 length-table entries. They start at zero, so to set
-    // entry `i` to value `v` we emit "delta v". We use:
-    //   - "delta 0" for any 0 entry (symbol 0)
-    //   - "delta 1" for the single literal_byte entry (symbol 1)
-    //   - "run of zeros" for the trailing zeros (symbol 18 + 7 bits)
+    // Now encode the 374 length-table entries.
     let mut i = 0usize;
     while i < NON_AUDIO_LENGTHS {
         if i == literal_byte as usize {
@@ -168,7 +155,7 @@ fn build_literals_only_block(literal_byte: u8, count: usize) -> Vec<u8> {
             w.write(c.bits, c.len);
             i += 1;
         } else {
-            // Count how many zero entries follow (up to 138 = max for sym 18).
+            // Count how many zero entries follow.
             let mut zero_run = 0usize;
             while i + zero_run < NON_AUDIO_LENGTHS
                 && (i + zero_run) != literal_byte as usize
@@ -183,7 +170,6 @@ fn build_literals_only_block(literal_byte: u8, count: usize) -> Vec<u8> {
                 w.write(n as u32, 7);
                 i += 11 + n;
             } else {
-                // Emit individual "delta 0" symbols.
                 let c = pre_codes[0].as_ref().unwrap();
                 for _ in 0..zero_run {
                     w.write(c.bits, c.len);
@@ -193,8 +179,7 @@ fn build_literals_only_block(literal_byte: u8, count: usize) -> Vec<u8> {
         }
     }
 
-    // Now the main loop: write `count` copies of literal_sym's main-tree code.
-    // We gave the literal a 1-bit code ("0").
+    // Main loop: write `count` copies of the literal symbol (1-bit code "0").
     for _ in 0..count {
         w.write(0, 1);
     }
@@ -202,119 +187,12 @@ fn build_literals_only_block(literal_byte: u8, count: usize) -> Vec<u8> {
     w.finish()
 }
 
-#[test]
-fn algorithm_name_is_rar2() {
-    assert_eq!(<Rar2 as Algorithm>::NAME, "rar2");
-}
-
-#[test]
-fn unsupported_encoder() {
-    use compcol::Encoder;
-    let mut enc = Rar2::encoder();
-    let mut out = [0u8; 16];
-    assert!(matches!(
-        enc.encode(b"", &mut out),
-        Err(compcol::Error::Unsupported)
-    ));
-}
-
-#[test]
-fn decoder_zero_unpack_size_is_immediately_done() {
-    let mut dec = Decoder::with_unpack_size(0);
-    let mut out = [0u8; 1];
-    let p = dec.finish(&mut out).expect("finish");
-    assert!(matches!(_s, compcol::Status::StreamEnd));
-    assert_eq!(p.written, 0);
-}
-
-#[test]
-fn decoder_default_constructor_is_zero_stream() {
-    // `new()` without with_unpack_size behaves as a zero-length stream.
-    let mut dec = <Rar2 as Algorithm>::decoder();
-    let mut out = [0u8; 4];
-    let p = dec.finish(&mut out).unwrap();
-    assert!(matches!(_s, compcol::Status::StreamEnd));
-    assert_eq!(p.written, 0);
-}
-
-#[test]
-fn literals_only_block_roundtrip() {
-    // Synthesize a block whose only main-tree symbol is the literal byte
-    // `0x41` (== 'A') with a 1-bit code; the decoder should emit `count`
-    // 'A' bytes.
-    let count = 7;
-    let bytes = build_literals_only_block(b'A', count);
-    let mut dec = Decoder::with_unpack_size(count as u64);
-    let p = dec.decode(&bytes, &mut []).unwrap();
-    assert_eq!(p.consumed, bytes.len());
-
-    let mut out = vec![0u8; count];
-    let p = dec.finish(&mut out).unwrap();
-    assert!(matches!(_s, compcol::Status::StreamEnd));
-    assert_eq!(p.written, count);
-    assert_eq!(out, vec![b'A'; count]);
-}
-
-#[test]
-fn literals_only_block_split_finish_calls() {
-    // Drive `finish` with a small buffer so it has to be called multiple
-    // times to drain the output.
-    let count = 20;
-    let bytes = build_literals_only_block(b'X', count);
-    let mut dec = Decoder::with_unpack_size(count as u64);
-    dec.decode(&bytes, &mut []).unwrap();
-
-    let mut collected = Vec::new();
-    let mut buf = [0u8; 3];
-    loop {
-        let p = dec.finish(&mut buf).unwrap();
-        collected.extend_from_slice(&buf[..p.written]);
-        if matches!(_s, compcol::Status::StreamEnd) {
-            break;
-        }
-        if p.written == 0 {
-            panic!("decoder stalled");
-        }
-    }
-    assert_eq!(collected.len(), count);
-    assert!(collected.iter().all(|&b| b == b'X'));
-}
-
-#[test]
-fn decode_then_extra_input_errors() {
-    // After finish triggers the decode, feeding more input is illegal.
-    let bytes = build_literals_only_block(b'Z', 3);
-    let mut dec = Decoder::with_unpack_size(3);
-    dec.decode(&bytes, &mut []).unwrap();
-    let mut out = [0u8; 8];
-    dec.finish(&mut out).unwrap();
-    let err = dec.decode(&[0u8], &mut []);
-    assert!(matches!(err, Err(compcol::Error::Corrupt)));
-}
-
-#[test]
-fn truncated_input_errors() {
-    // Feed an empty block then ask for a nonzero unpack — the decoder must
-    // not silently produce zeros; it should error.
-    let mut dec = Decoder::with_unpack_size(8);
-    let mut out = [0u8; 8];
-    let p = dec.finish(&mut out);
-    assert!(p.is_err());
-}
-
 /// Build a non-audio block that supports literals + one short-match symbol.
 ///
 /// Main tree:
 ///   - literal_byte: length 1 ("0")
 ///   - 261 (short match): length 1 ("1")
-///
-/// Two length-1 codes form a complete canonical tree of 2 symbols; the Kraft
-/// inequality is exactly satisfied.
-///
-/// `extra_bits` are the 2 extra bits for short-match symbol 261; the resulting
-/// offset is `1 + extra_bits` (since SHORT_BASE[0] = 0).
 fn build_short_match_block(literal_byte: u8, short_extra: u32, sequence: &[u8]) -> Vec<u8> {
-    // sequence: 0 = emit literal, 1 = emit short match
     let mut main_lens = vec![0u8; MAIN_TREE_SIZE];
     main_lens[literal_byte as usize] = 1;
     main_lens[261] = 1;
@@ -326,11 +204,6 @@ fn build_short_match_block(literal_byte: u8, short_extra: u32, sequence: &[u8]) 
     full.extend(offset_lens);
     full.extend(length_lens);
 
-    // Pretree same as before but with an extra symbol so we can step
-    // "skip 1, hit 1, skip a few, hit 1, then zeros":
-    //   sym 0 ("delta 0")  → length 1 ("0")
-    //   sym 1 ("delta 1")  → length 2 ("10")
-    //   sym 18 ("zeros")    → length 2 ("11")
     let mut pre_lens = [0u8; PRETREE_SIZE];
     pre_lens[0] = 1;
     pre_lens[1] = 2;
@@ -343,12 +216,10 @@ fn build_short_match_block(literal_byte: u8, short_extra: u32, sequence: &[u8]) 
         w.write(l as u32, 4);
     }
 
-    // We need length 1 at positions `literal_byte` and 261 in `full`.
     let mut targets = [literal_byte as usize, 261usize];
     targets.sort();
     let mut cursor = 0usize;
     for &t in &targets {
-        // Skip zeros from cursor..t.
         let gap = t - cursor;
         if gap > 0 {
             if gap >= 11 {
@@ -357,8 +228,6 @@ fn build_short_match_block(literal_byte: u8, short_extra: u32, sequence: &[u8]) 
                 w.write(c.bits, c.len);
                 w.write(n as u32, 7);
                 cursor += 11 + n;
-                // If we still have more zeros to emit, fall through to
-                // delta-0 emission below.
                 while cursor < t {
                     let c0 = pre_codes[0].as_ref().unwrap();
                     w.write(c0.bits, c0.len);
@@ -372,12 +241,10 @@ fn build_short_match_block(literal_byte: u8, short_extra: u32, sequence: &[u8]) 
                 cursor += gap;
             }
         }
-        // Emit "delta 1" for the actual target.
         let c1 = pre_codes[1].as_ref().unwrap();
         w.write(c1.bits, c1.len);
         cursor += 1;
     }
-    // Trailing zeros from cursor..NON_AUDIO_LENGTHS.
     let remaining = NON_AUDIO_LENGTHS - cursor;
     if remaining > 0 {
         let mut left = remaining;
@@ -395,8 +262,6 @@ fn build_short_match_block(literal_byte: u8, short_extra: u32, sequence: &[u8]) 
         }
     }
 
-    // Main loop: literal_byte has main code "0", 261 has main code "1"
-    // (assuming literal_byte < 261, which holds for any byte ∈ 0..256).
     let (lit_code, match_code) = if (literal_byte as usize) < 261 {
         (0u32, 1u32)
     } else {
@@ -415,6 +280,125 @@ fn build_short_match_block(literal_byte: u8, short_extra: u32, sequence: &[u8]) 
     w.finish()
 }
 
+// ─── algorithm metadata ──────────────────────────────────────────────────
+
+#[test]
+fn algorithm_name_is_rar2() {
+    assert_eq!(<Rar2 as Algorithm>::NAME, "rar2");
+}
+
+#[test]
+fn rar2_algorithm_factory_produces_codec() {
+    let _enc = <Rar2 as Algorithm>::encoder();
+    let _dec = <Rar2 as Algorithm>::decoder();
+}
+
+// ─── encoder is permanently unsupported ──────────────────────────────────
+
+#[test]
+fn encoder_encode_is_unsupported() {
+    let mut enc = Encoder::new();
+    let mut out = [0u8; 16];
+    assert_eq!(
+        enc.encode(b"hello", &mut out).unwrap_err(),
+        Error::Unsupported
+    );
+}
+
+#[test]
+fn encoder_finish_is_unsupported() {
+    let mut enc = Encoder::new();
+    let mut out = [0u8; 16];
+    assert_eq!(enc.finish(&mut out).unwrap_err(), Error::Unsupported);
+}
+
+#[test]
+fn encoder_reset_is_a_no_op() {
+    // Encoder is stateless; reset must not panic.
+    let mut enc = Encoder::new();
+    enc.reset();
+    let mut out = [0u8; 4];
+    assert_eq!(enc.encode(b"x", &mut out).unwrap_err(), Error::Unsupported);
+}
+
+#[test]
+fn algorithm_encoder_factory_is_unsupported() {
+    let mut enc = <Rar2 as Algorithm>::encoder();
+    let mut out = [0u8; 4];
+    assert_eq!(enc.encode(b"x", &mut out).unwrap_err(), Error::Unsupported);
+}
+
+// ─── trivial / empty streams ─────────────────────────────────────────────
+
+#[test]
+fn decoder_zero_unpack_size_is_immediately_done() {
+    let mut dec = Decoder::with_unpack_size(0);
+    let mut out = [0u8; 1];
+    let (p, status) = dec.finish(&mut out).expect("finish");
+    assert!(matches!(status, Status::StreamEnd));
+    assert_eq!(p.written, 0);
+}
+
+#[test]
+fn decoder_default_constructor_is_zero_stream() {
+    // `new()` without with_unpack_size behaves as a zero-length stream.
+    let mut dec = <Rar2 as Algorithm>::decoder();
+    let mut out = [0u8; 4];
+    let (p, status) = dec.finish(&mut out).unwrap();
+    assert!(matches!(status, Status::StreamEnd));
+    assert_eq!(p.written, 0);
+}
+
+// ─── literals-only roundtrip ──────────────────────────────────────────────
+
+#[test]
+fn literals_only_block_roundtrip() {
+    // Synthesize a block whose only main-tree symbol is the literal byte
+    // `0x41` (== 'A') with a 1-bit code; the decoder should emit `count`
+    // 'A' bytes.
+    let count = 7;
+    let bytes = build_literals_only_block(b'A', count);
+    let mut dec = Decoder::with_unpack_size(count as u64);
+    let (p, status) = dec.decode(&bytes, &mut []).unwrap();
+    assert_eq!(p.consumed, bytes.len());
+    // `decode` only buffers; `finish` runs the actual decode. With all input
+    // consumed, the status should be InputEmpty.
+    assert!(matches!(status, Status::InputEmpty));
+
+    let mut out = vec![0u8; count];
+    let (p, status) = dec.finish(&mut out).unwrap();
+    assert!(matches!(status, Status::StreamEnd));
+    assert_eq!(p.written, count);
+    assert_eq!(out, vec![b'A'; count]);
+}
+
+#[test]
+fn literals_only_block_split_finish_calls() {
+    // Drive `finish` with a small buffer so it has to be called multiple
+    // times to drain the output.
+    let count = 20;
+    let bytes = build_literals_only_block(b'X', count);
+    let mut dec = Decoder::with_unpack_size(count as u64);
+    let (_p, _s) = dec.decode(&bytes, &mut []).unwrap();
+
+    let mut collected = Vec::new();
+    let mut buf = [0u8; 3];
+    loop {
+        let (p, status) = dec.finish(&mut buf).unwrap();
+        collected.extend_from_slice(&buf[..p.written]);
+        if matches!(status, Status::StreamEnd) {
+            break;
+        }
+        if p.written == 0 {
+            panic!("decoder stalled");
+        }
+    }
+    assert_eq!(collected.len(), count);
+    assert!(collected.iter().all(|&b| b == b'X'));
+}
+
+// ─── short-match coverage ─────────────────────────────────────────────────
+
 #[test]
 fn short_match_repeats_prior_byte() {
     // Emit "A" then a short match of length 2 with offset 1 (extra_bits = 0,
@@ -422,39 +406,71 @@ fn short_match_repeats_prior_byte() {
     // Sequence: literal, match → "AAA" (length 3 output).
     let bytes = build_short_match_block(b'A', 0, &[0, 1]);
     let mut dec = Decoder::with_unpack_size(3);
-    dec.decode(&bytes, &mut []).unwrap();
+    let (_p, _s) = dec.decode(&bytes, &mut []).unwrap();
     let mut out = vec![0u8; 3];
-    let p = dec.finish(&mut out).unwrap();
-    assert!(matches!(_s, compcol::Status::StreamEnd));
+    let (p, status) = dec.finish(&mut out).unwrap();
+    assert!(matches!(status, Status::StreamEnd));
     assert_eq!(p.written, 3);
     assert_eq!(&out, b"AAA");
 }
 
 #[test]
 fn short_match_with_larger_offset() {
-    // Emit four literals, then a match with offset 4 length 2: this should
-    // copy from the position-4-bytes-ago slot. With extra_bits = 3, the
-    // offset is SHORT_BASE[0] + 1 + 3 = 4.
-    //
-    // Wait — that's not quite right. The four literals we emit are all the
-    // *same* byte (the literal_sym in our tree is a single value). So an
-    // offset of 4 just copies that same byte. To make a more interesting
-    // test we'd need two distinct literal symbols, which means a more
-    // elaborate main tree. Stick with the same-byte test — it still
-    // exercises the offset-4 code path including the LRU update.
+    // Emit four literals, then a match with offset 4 length 2.
+    // With extra_bits = 3, the offset is SHORT_BASE[0] + 1 + 3 = 4. Because
+    // the literal symbol is a single byte, the result is the same byte
+    // repeated six times — still exercises the offset-4 LRU path.
     let bytes = build_short_match_block(b'Q', 3, &[0, 0, 0, 0, 1]);
     let mut dec = Decoder::with_unpack_size(6);
-    dec.decode(&bytes, &mut []).unwrap();
+    let (_p, _s) = dec.decode(&bytes, &mut []).unwrap();
     let mut out = vec![0u8; 6];
-    let p = dec.finish(&mut out).unwrap();
-    assert!(matches!(_s, compcol::Status::StreamEnd));
+    let (_p, status) = dec.finish(&mut out).unwrap();
+    assert!(matches!(status, Status::StreamEnd));
     assert_eq!(&out, b"QQQQQQ");
 }
 
+// ─── malformed input ──────────────────────────────────────────────────────
+
+#[test]
+fn decode_then_extra_input_errors() {
+    // After finish triggers the decode, feeding more input is illegal.
+    let bytes = build_literals_only_block(b'Z', 3);
+    let mut dec = Decoder::with_unpack_size(3);
+    let (_p, _s) = dec.decode(&bytes, &mut []).unwrap();
+    let mut out = [0u8; 8];
+    let _ = dec.finish(&mut out).unwrap();
+    let err = dec.decode(&[0u8], &mut []).unwrap_err();
+    assert_eq!(err, Error::Corrupt);
+}
+
+#[test]
+fn truncated_input_errors() {
+    // No input fed but a nonzero unpack size requested — finish must error
+    // rather than silently produce zeros.
+    let mut dec = Decoder::with_unpack_size(8);
+    let mut out = [0u8; 8];
+    let result = dec.finish(&mut out);
+    assert!(result.is_err());
+}
+
+#[test]
+fn poisoned_after_error_stays_poisoned() {
+    // Drive a corrupt stream into the decoder; further calls must error
+    // until reset().
+    let mut dec = Decoder::with_unpack_size(8);
+    let mut out = [0u8; 8];
+    let _ = dec.finish(&mut out).expect_err("truncation should error");
+    // Subsequent finish must continue to return Err until reset.
+    assert!(dec.finish(&mut out).is_err());
+    assert!(dec.decode(&[0u8], &mut out).is_err());
+}
+
+// ─── real-world fixtures: produced by historical rar 2.60 ─────────────────
+
 /// Compressed payload from a real RAR 2.6 archive produced by the historical
-/// `rar` binary version 2.60 (Oct 1999). The archive contains a single 105-byte
-/// text file `hello.txt`; this is the body of the data block (no RAR file
-/// header bytes; those have been stripped out).
+/// `rar` binary version 2.60 (Oct 1999). The archive contains a single
+/// 105-byte text file `hello.txt`; this is the body of the data block (no
+/// RAR file header bytes; those have been stripped out).
 ///
 /// Source: `rar a -m3 hello.rar hello.txt` with rar 2.60 statically-linked
 /// Linux binary downloaded from snapshot.debian.org.
@@ -473,31 +489,17 @@ const REAL_RAR2_HELLO_PLAIN: &[u8] = b"Hello, RAR2 world!\nThis is a test of the
 #[test]
 fn real_rar2_hello_archive_decodes() {
     // Smoke test against a real, historical-archiver-produced RAR 2.x stream.
-    // If this passes, the decoder is correct against the wire format; if it
-    // fails, the failure mode tells us exactly which sub-block path is broken.
     let mut dec = Decoder::with_unpack_size(REAL_RAR2_HELLO_PLAIN.len() as u64);
-    let p = dec.decode(REAL_RAR2_HELLO, &mut []).unwrap();
+    let (p, _s) = dec.decode(REAL_RAR2_HELLO, &mut []).unwrap();
     assert_eq!(p.consumed, REAL_RAR2_HELLO.len());
 
     let mut out = vec![0u8; REAL_RAR2_HELLO_PLAIN.len()];
-    let result = dec.finish(&mut out);
-    match result {
-        Ok(p) => {
-            assert!(matches!(_s, compcol::Status::StreamEnd));
-            assert_eq!(p.written, REAL_RAR2_HELLO_PLAIN.len());
-            assert_eq!(out, REAL_RAR2_HELLO_PLAIN);
-        }
-        Err(e) => {
-            // Decoder unable to handle the real fixture — this is informative.
-            // We don't fail the entire test suite because the synthetic tests
-            // above already cover the basic building blocks; this test exists
-            // to indicate progress toward real-world coverage. Print a
-            // descriptive message and skip.
-            panic!(
-                "real RAR2 fixture decode failed: {e:?} — see module docs for the known-limitations list"
-            );
-        }
-    }
+    let (p, status) = dec
+        .finish(&mut out)
+        .expect("real rar2 hello fixture should decode");
+    assert!(matches!(status, Status::StreamEnd));
+    assert_eq!(p.written, REAL_RAR2_HELLO_PLAIN.len());
+    assert_eq!(out, REAL_RAR2_HELLO_PLAIN);
 }
 
 /// Compressed payload of `binary.bin` — a 250-byte file containing 30 copies
@@ -541,30 +543,89 @@ static REAL_RAR2_BINARY_PLAIN: &[u8] = &[
 #[test]
 fn real_rar2_binary_archive_decodes() {
     let mut dec = Decoder::with_unpack_size(REAL_RAR2_BINARY_PLAIN.len() as u64);
-    let p = dec.decode(REAL_RAR2_BINARY_COMP, &mut []).unwrap();
+    let (p, _s) = dec.decode(REAL_RAR2_BINARY_COMP, &mut []).unwrap();
     assert_eq!(p.consumed, REAL_RAR2_BINARY_COMP.len());
 
     let mut out = vec![0u8; REAL_RAR2_BINARY_PLAIN.len()];
-    let p = dec.finish(&mut out).expect("real rar2 binary decode");
-    assert!(matches!(_s, compcol::Status::StreamEnd));
+    let (p, status) = dec.finish(&mut out).expect("real rar2 binary decode");
+    assert!(matches!(status, Status::StreamEnd));
     assert_eq!(p.written, REAL_RAR2_BINARY_PLAIN.len());
     assert_eq!(out, REAL_RAR2_BINARY_PLAIN);
 }
 
+// ─── reset behaviour ──────────────────────────────────────────────────────
+
 #[test]
 fn reset_clears_state() {
-    use compcol::Decoder as _;
     let bytes = build_literals_only_block(b'Q', 2);
     let mut dec = Decoder::with_unpack_size(2);
-    dec.decode(&bytes, &mut []).unwrap();
+    let (_p, _s) = dec.decode(&bytes, &mut []).unwrap();
     let mut out = [0u8; 4];
-    let p = dec.finish(&mut out).unwrap();
+    let (p, status) = dec.finish(&mut out).unwrap();
     assert_eq!(p.written, 2);
+    assert!(matches!(status, Status::StreamEnd));
 
     dec.reset();
-    dec.set_unpack_size(2);
-    dec.decode(&bytes, &mut []).unwrap();
-    let p = dec.finish(&mut out).unwrap();
+    // `reset` preserves unpack_size; feeding the same stream should give the
+    // same output.
+    let (_p, _s) = dec.decode(&bytes, &mut []).unwrap();
+    let (p, status) = dec.finish(&mut out).unwrap();
     assert_eq!(p.written, 2);
-    assert!(matches!(_s, compcol::Status::StreamEnd));
+    assert!(matches!(status, Status::StreamEnd));
+    assert_eq!(&out[..2], b"QQ");
+}
+
+#[test]
+fn reset_after_error_recovers() {
+    let mut dec = Decoder::with_unpack_size(8);
+    let mut out = [0u8; 8];
+    // Truncation: nothing fed, nonzero unpack — finish errors.
+    let _ = dec.finish(&mut out).expect_err("expected error");
+    // Subsequent calls remain poisoned.
+    assert!(dec.finish(&mut out).is_err());
+    // reset clears the poison; we can now drive a valid stream.
+    dec.reset();
+    // unpack_size is preserved; switch to a value that matches our fixture.
+    dec.set_unpack_size(2);
+    let bytes = build_literals_only_block(b'R', 2);
+    let (_p, _s) = dec.decode(&bytes, &mut []).unwrap();
+    let (p, status) = dec.finish(&mut out).unwrap();
+    assert_eq!(p.written, 2);
+    assert!(matches!(status, Status::StreamEnd));
+    assert_eq!(&out[..2], b"RR");
+}
+
+// ─── factory (only if the feature is enabled) ─────────────────────────────
+
+#[cfg(feature = "factory")]
+mod factory {
+    use compcol::Error;
+    use compcol::factory;
+
+    #[test]
+    fn lookup_rar2_encoder_and_decoder() {
+        assert!(factory::encoder_by_name("rar2").is_some());
+        assert!(factory::decoder_by_name("rar2").is_some());
+    }
+
+    #[test]
+    fn lookup_unknown() {
+        assert!(factory::encoder_by_name("not-a-real-rar2").is_none());
+        assert!(factory::decoder_by_name("not-a-real-rar2").is_none());
+    }
+
+    #[test]
+    fn names_contains_rar2() {
+        assert!(factory::names().contains(&"rar2"));
+    }
+
+    #[test]
+    fn boxed_encoder_is_unsupported() {
+        let mut enc = factory::encoder_by_name("rar2").unwrap();
+        let mut out = [0u8; 16];
+        assert_eq!(
+            enc.encode(b"hello", &mut out).unwrap_err(),
+            Error::Unsupported
+        );
+    }
 }
