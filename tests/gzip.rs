@@ -615,3 +615,82 @@ mod factory {
         assert_eq!(&decoded[..], input);
     }
 }
+
+// ─── multi-member streams (RFC 1952 §2.2) ───────────────────────────────
+
+#[test]
+fn multi_member_stream_decodes_concatenated_members() {
+    // Encode two separate payloads, concatenate, decode as one stream.
+    let mut enc1 = Encoder::new();
+    let a = encode_chunked(&mut enc1, b"hello, ", 32, 32);
+    let mut enc2 = Encoder::new();
+    let b = encode_chunked(&mut enc2, b"world!\n", 32, 32);
+
+    let mut combined = Vec::new();
+    combined.extend_from_slice(&a);
+    combined.extend_from_slice(&b);
+
+    let decoded = decode_chunked(&combined, 32, 32).unwrap();
+    assert_eq!(decoded, b"hello, world!\n");
+}
+
+#[test]
+fn multi_member_stream_with_three_members() {
+    let mut all = Vec::new();
+    let mut expected = Vec::new();
+    for (i, payload) in [
+        b"alpha\n".as_slice(),
+        b"beta beta beta\n".as_slice(),
+        b"gamma! and the rest...".as_slice(),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut enc = Encoder::new();
+        let chunk_in = 16 + i * 7; // jitter chunking
+        let chunk_out = 16 + i * 5;
+        let bytes = encode_chunked(&mut enc, payload, chunk_in, chunk_out);
+        all.extend_from_slice(&bytes);
+        expected.extend_from_slice(payload);
+    }
+    let decoded = decode_chunked(&all, 64, 64).unwrap();
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn single_member_stream_still_works() {
+    // The multi-member code path must not regress the common case.
+    let payload = b"single member, no concatenation";
+    let mut enc = Encoder::new();
+    let encoded = encode_chunked(&mut enc, payload, 64, 64);
+    let decoded = decode_chunked(&encoded, 64, 64).unwrap();
+    assert_eq!(decoded, payload);
+}
+
+#[test]
+fn trailing_garbage_after_last_member_is_ignored() {
+    // gzip(1) ignores trailing non-magic bytes after the final trailer.
+    // Our decoder enters Done when it sees a non-0x1F next byte and
+    // leaves the garbage unconsumed for the caller.
+    let payload = b"clean payload";
+    let mut enc = Encoder::new();
+    let mut encoded = encode_chunked(&mut enc, payload, 64, 64);
+    encoded.extend_from_slice(b"xx garbage tail");
+    let decoded = decode_chunked(&encoded, 64, 64).unwrap();
+    assert_eq!(decoded, payload);
+}
+
+#[test]
+fn second_member_with_corrupted_crc_errors() {
+    let mut enc1 = Encoder::new();
+    let a = encode_chunked(&mut enc1, b"ok\n", 32, 32);
+    let mut enc2 = Encoder::new();
+    let mut b = encode_chunked(&mut enc2, b"bad\n", 32, 32);
+    // Flip a CRC byte in member 2 (CRC sits at b.len() - 8 .. b.len() - 4).
+    let last = b.len() - 5;
+    b[last] ^= 0xFF;
+    let mut combined = a;
+    combined.extend_from_slice(&b);
+    let err = decode_chunked(&combined, 64, 64).unwrap_err();
+    assert_eq!(err, Error::ChecksumMismatch);
+}
