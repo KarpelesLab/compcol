@@ -33,7 +33,7 @@
 //! bytes encode `compressed_size - 1` (16 bits, up to 64 KiB); a properties
 //! byte follows if the control byte's reset flags require it.
 //!
-//! ## Status: stored-only encoder, full decoder for dict-reset chunks
+//! ## Status: compressed-chunk encoder, full decoder for dict-reset chunks
 //!
 //! This iteration ships:
 //!
@@ -43,8 +43,11 @@
 //!   properties + dictionary reset). Compressed chunks without dictionary
 //!   reset (`0x80..=0xDF`) are rare in xz-utils output and return
 //!   [`Error::Unsupported`]. Invalid control bytes return [`Error::Corrupt`].
-//! * an **encoder** that emits *only* type-`0x01` chunks (uncompressed,
-//!   dictionary reset), capped at 64 KiB of uncompressed data per chunk,
+//! * an **encoder** that emits compressed chunks with control byte `0xE0`
+//!   (state + dictionary reset + new properties — every chunk self-contained
+//!   with no inter-chunk state) for inputs that actually shrink under LZMA,
+//!   and falls back to a stored `0x01` chunk for incompressible blocks.
+//!   Both kinds are capped at 64 KiB of uncompressed data per chunk,
 //!   followed by a `0x00` end-of-stream marker on `finish`.
 //!
 //! ## How the compressed-chunk path works
@@ -69,9 +72,12 @@
 
 extern crate alloc;
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 use crate::error::Error;
 use crate::traits::{Algorithm, Decoder as DecoderTrait, Encoder as EncoderTrait, Progress};
+
+mod lzma_payload;
 
 /// Largest payload an encoder will pack into a single 0x01 chunk.
 /// The spec allows up to 65 536 (2^16) bytes per uncompressed chunk; staying
@@ -563,36 +569,160 @@ impl DecoderTrait for Decoder {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum EncPhase {
-    /// No partial chunk in flight; ready to start a new one or finish.
-    Idle,
-    /// Mid-header: writing 3 chunk-header bytes for a chunk that will carry
-    /// `payload` total bytes of data, `header_idx` bytes of header already
-    /// emitted.
-    HeaderOut {
-        payload: u32,
-        header_idx: u8,
-        header: [u8; 3],
-    },
-    /// Mid-payload: `remaining` bytes of the current chunk still need to be
-    /// emitted into output (after being consumed from input).
-    PayloadOut { remaining: u32 },
+    /// Accepting input into `in_buf`; no encoded bytes pending in `out_buf`.
+    /// We stay here until the input buffer hits 64 KiB or the caller calls
+    /// `finish`, at which point we run a compress pass and switch to
+    /// `Draining`.
+    Accumulating,
+    /// `out_buf` holds a fully-formed chunk (header + payload) starting at
+    /// `out_pos`; stream it to the caller's output until exhausted, then
+    /// fall back to `Accumulating`.
+    Draining,
     /// `finish` was called; we still owe the `0x00` end-of-stream marker.
     NeedEosMarker,
-    /// Finished; nothing more to emit.
+    /// `finish` is done; the encoder is sealed.
     Done,
 }
 
-/// Streaming LZMA2 encoder. Emits only type-`0x01` (uncompressed, dictionary
-/// reset) chunks plus a `0x00` end-of-stream marker — see the module header
-/// for context.
+/// Streaming LZMA2 encoder.
+///
+/// Buffers up to 64 KiB of input, then emits one LZMA2 chunk per buffer.
+/// Each chunk is either:
+///
+/// * a compressed `0xE0..=0xFF` chunk (state + dictionary reset + new
+///   properties) — used when the LZMA-encoded payload is smaller than the
+///   raw input; or
+/// * an uncompressed `0x01` chunk (dictionary reset) — used as a fallback
+///   when LZMA fails to shrink the data, matching what xz-utils does for
+///   incompressible blocks.
+///
+/// On `finish`, any partial buffer is flushed as a final chunk and a `0x00`
+/// end-of-stream marker is appended.
 pub struct Encoder {
     phase: EncPhase,
+    /// Accumulator for input bytes, capped at [`ENC_CHUNK_SIZE`].
+    in_buf: Vec<u8>,
+    /// Bytes ready to stream to the caller. Holds either a chunk header +
+    /// payload or the single-byte EOS marker.
+    out_buf: Vec<u8>,
+    /// Position in `out_buf` we're streaming from.
+    out_pos: usize,
 }
 
 impl Encoder {
     pub const fn new() -> Self {
         Self {
-            phase: EncPhase::Idle,
+            phase: EncPhase::Accumulating,
+            in_buf: Vec::new(),
+            out_buf: Vec::new(),
+            out_pos: 0,
+        }
+    }
+
+    /// Build the 3-byte header for an uncompressed-type-`0x01` chunk of
+    /// `size` bytes. `size` must satisfy `1 <= size <= 65_536`.
+    fn write_uncomp_header(buf: &mut Vec<u8>, size: u32) {
+        debug_assert!((1..=65_536).contains(&size));
+        let v = size - 1; // fits in 16 bits.
+        buf.push(0x01);
+        buf.push(((v >> 8) & 0xFF) as u8);
+        buf.push((v & 0xFF) as u8);
+    }
+
+    /// Build the 6-byte header for a `0xE0` compressed chunk: state +
+    /// dictionary reset + new properties.
+    ///
+    /// * Byte 0: control = `0xE0 | unc_top5`, where `unc_top5` is the
+    ///   highest 5 bits of the 21-bit `uncompressed_size - 1`.
+    /// * Bytes 1-2: the remaining 16 bits of `uncompressed_size - 1`,
+    ///   big-endian.
+    /// * Bytes 3-4: `compressed_size - 1` as big-endian u16.
+    /// * Byte 5: LZMA properties byte.
+    ///
+    /// `uncompressed_size` is in `1..=65_536` (the LZMA2 per-chunk cap we
+    /// pick — the wire format permits up to 2 MiB but xz-utils never goes
+    /// past 64 KiB either). `compressed_size` is in `1..=65_536`.
+    fn write_comp_header(buf: &mut Vec<u8>, uncompressed: u32, compressed: u32, props: u8) {
+        debug_assert!((1..=65_536).contains(&uncompressed));
+        debug_assert!((1..=65_536).contains(&compressed));
+        let unc_m1 = uncompressed - 1; // 0..=65_535, fits in 16 bits
+        let cmp_m1 = compressed - 1; // 0..=65_535, fits in 16 bits
+        // unc_top5 occupies bits 16..=20 of the 21-bit unc-1 field; for inputs
+        // <= 65_536, those bits are always zero (since unc-1 fits in 16 bits).
+        // We still mask defensively in case the caller goes out of contract.
+        let unc_top5 = ((unc_m1 >> 16) & 0x1F) as u8;
+        buf.push(0xE0 | unc_top5);
+        buf.push(((unc_m1 >> 8) & 0xFF) as u8);
+        buf.push((unc_m1 & 0xFF) as u8);
+        buf.push(((cmp_m1 >> 8) & 0xFF) as u8);
+        buf.push((cmp_m1 & 0xFF) as u8);
+        buf.push(props);
+    }
+
+    /// Compress `self.in_buf` into a single chunk, choosing between
+    /// compressed (`0xE0`) and uncompressed (`0x01`) based on which is
+    /// smaller in bytes-on-the-wire. Leaves the encoded chunk in
+    /// `self.out_buf` and resets `out_pos`; clears `in_buf`.
+    fn finalize_chunk(&mut self) {
+        debug_assert!(!self.in_buf.is_empty());
+        debug_assert!(self.in_buf.len() <= ENC_CHUNK_SIZE);
+
+        self.out_buf.clear();
+        self.out_pos = 0;
+
+        let unc_size = self.in_buf.len() as u32;
+        let payload = lzma_payload::encode_payload(&self.in_buf);
+
+        // Compressed wire cost: 6-byte header + payload.
+        // Uncompressed wire cost: 3-byte header + raw input.
+        //
+        // `payload.len() <= 65_536` is required by the chunk header (since
+        // `compressed_size - 1` is encoded in 16 bits). The LZMA encoder
+        // can in principle produce more than 65_536 bytes for very small
+        // inputs that pay heavy range-coder overhead, so we also fall back
+        // to the uncompressed chunk in that case — that's what makes
+        // `payload.len() <= 65_536` checkable rather than provable.
+        let comp_total = 6usize + payload.len();
+        let uncomp_total = 3usize + self.in_buf.len();
+        let use_compressed = payload.len() <= 65_536 && comp_total < uncomp_total;
+
+        if use_compressed {
+            Self::write_comp_header(
+                &mut self.out_buf,
+                unc_size,
+                payload.len() as u32,
+                lzma_payload::ENC_PROPS_BYTE,
+            );
+            self.out_buf.extend_from_slice(&payload);
+        } else {
+            Self::write_uncomp_header(&mut self.out_buf, unc_size);
+            self.out_buf.extend_from_slice(&self.in_buf);
+        }
+
+        self.in_buf.clear();
+        self.phase = EncPhase::Draining;
+    }
+
+    /// Stream as much of `out_buf[out_pos..]` to `output[*written..]` as
+    /// fits. When the buffer is drained, transitions back to `Accumulating`.
+    fn drain_to(&mut self, output: &mut [u8], written: &mut usize) {
+        let remaining = self.out_buf.len() - self.out_pos;
+        let out_left = output.len() - *written;
+        let n = remaining.min(out_left);
+        if n > 0 {
+            output[*written..*written + n]
+                .copy_from_slice(&self.out_buf[self.out_pos..self.out_pos + n]);
+            *written += n;
+            self.out_pos += n;
+        }
+        if self.out_pos == self.out_buf.len() {
+            self.out_buf.clear();
+            self.out_pos = 0;
+            // Caller decides what phase comes next; default back to
+            // accepting input.
+            if self.phase == EncPhase::Draining {
+                self.phase = EncPhase::Accumulating;
+            }
         }
     }
 }
@@ -603,14 +733,6 @@ impl Default for Encoder {
     }
 }
 
-/// Build the 3-byte header for an uncompressed-type-0x01 chunk of `size`
-/// bytes. `size` must satisfy `1 <= size <= 65_536`.
-fn make_uncomp_header(size: u32) -> [u8; 3] {
-    debug_assert!((1..=65_536).contains(&size));
-    let v = size - 1; // fits in 16 bits.
-    [0x01, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8]
-}
-
 impl EncoderTrait for Encoder {
     fn encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error> {
         let mut consumed = 0usize;
@@ -618,98 +740,40 @@ impl EncoderTrait for Encoder {
 
         loop {
             match self.phase {
-                EncPhase::Idle => {
+                EncPhase::Accumulating => {
                     if consumed == input.len() {
-                        // No more input on this call; just return.
+                        // Nothing more in this call's input; come back later.
                         return Ok(Progress {
                             consumed,
                             written,
                             done: false,
                         });
                     }
-                    // Decide how big the next chunk should be. We commit
-                    // *now* to a chunk of `payload` bytes, which must then
-                    // be drained from the same input slice we were handed
-                    // — otherwise we'd be writing a chunk header for bytes
-                    // we won't actually carry. Since `payload` is capped
-                    // at the bytes remaining in this input, that always
-                    // works.
-                    let remaining_in = input.len() - consumed;
-                    let payload = core::cmp::min(remaining_in, ENC_CHUNK_SIZE) as u32;
-                    let header = make_uncomp_header(payload);
-                    self.phase = EncPhase::HeaderOut {
-                        payload,
-                        header_idx: 0,
-                        header,
-                    };
+                    // Top up `in_buf` toward ENC_CHUNK_SIZE.
+                    let room = ENC_CHUNK_SIZE - self.in_buf.len();
+                    let take = (input.len() - consumed).min(room);
+                    self.in_buf
+                        .extend_from_slice(&input[consumed..consumed + take]);
+                    consumed += take;
+                    if self.in_buf.len() == ENC_CHUNK_SIZE {
+                        // Buffer is full — encode this chunk now so we free
+                        // memory and start streaming bytes out.
+                        self.finalize_chunk();
+                    }
+                    // If we still have room in `in_buf` and ran out of input,
+                    // loop will return on the next iteration.
                 }
-                EncPhase::HeaderOut {
-                    payload,
-                    mut header_idx,
-                    header,
-                } => {
-                    while (header_idx as usize) < 3 && written < output.len() {
-                        output[written] = header[header_idx as usize];
-                        written += 1;
-                        header_idx += 1;
-                    }
-                    if (header_idx as usize) == 3 {
-                        self.phase = EncPhase::PayloadOut { remaining: payload };
-                    } else {
-                        self.phase = EncPhase::HeaderOut {
-                            payload,
-                            header_idx,
-                            header,
-                        };
-                        // Output is full and we still owe header bytes —
-                        // can't make further progress on this call.
-                        return Ok(Progress {
-                            consumed,
-                            written,
-                            done: false,
-                        });
-                    }
-                }
-                EncPhase::PayloadOut { remaining } => {
-                    if remaining == 0 {
-                        self.phase = EncPhase::Idle;
-                        continue;
-                    }
+                EncPhase::Draining => {
                     if written == output.len() {
+                        // Output is full; come back next call.
                         return Ok(Progress {
                             consumed,
                             written,
                             done: false,
                         });
                     }
-                    // We committed to `remaining` bytes of payload sourced
-                    // from this input slice in the Idle branch above. If
-                    // input is already drained we cannot honour that — that
-                    // would only happen if the caller fed us through encode
-                    // until input exhausted and then called encode again
-                    // with a different (or empty) input, but inside this
-                    // single call we always have the bytes we committed to.
-                    if consumed == input.len() {
-                        return Ok(Progress {
-                            consumed,
-                            written,
-                            done: false,
-                        });
-                    }
-                    let in_left = input.len() - consumed;
-                    let out_left = output.len() - written;
-                    let n = core::cmp::min(remaining as usize, core::cmp::min(in_left, out_left));
-                    output[written..written + n].copy_from_slice(&input[consumed..consumed + n]);
-                    consumed += n;
-                    written += n;
-                    let new_remaining = remaining - n as u32;
-                    self.phase = if new_remaining == 0 {
-                        EncPhase::Idle
-                    } else {
-                        EncPhase::PayloadOut {
-                            remaining: new_remaining,
-                        }
-                    };
+                    self.drain_to(output, &mut written);
+                    // `drain_to` flips us back to Accumulating once empty.
                 }
                 EncPhase::NeedEosMarker | EncPhase::Done => {
                     // Encoding after finish() is a misuse; refuse cleanly.
@@ -724,19 +788,33 @@ impl EncoderTrait for Encoder {
 
         loop {
             match self.phase {
-                EncPhase::Idle => {
-                    self.phase = EncPhase::NeedEosMarker;
+                EncPhase::Accumulating => {
+                    if !self.in_buf.is_empty() {
+                        // Flush the trailing partial chunk.
+                        self.finalize_chunk();
+                        // finalize_chunk() set us to Draining.
+                    } else {
+                        // Nothing buffered: jump straight to writing the EOS
+                        // marker. We use `out_buf` to hold the marker so the
+                        // drain path can share its plumbing.
+                        self.out_buf.clear();
+                        self.out_buf.push(0x00);
+                        self.out_pos = 0;
+                        self.phase = EncPhase::NeedEosMarker;
+                    }
                 }
-                EncPhase::HeaderOut { .. } | EncPhase::PayloadOut { .. } => {
-                    // The encode() above only ever returns mid-HeaderOut or
-                    // mid-PayloadOut when its output buffer ran out. Calling
-                    // finish() while a chunk is still in flight means the
-                    // caller stopped delivering both bytes and output room
-                    // before the chunk we committed to was fully written —
-                    // a contract violation we surface as Corrupt rather
-                    // than UnexpectedEnd, since the encoder has no input
-                    // stream of its own that could be "ended" early.
-                    return Err(Error::Corrupt);
+                EncPhase::Draining => {
+                    if written == output.len() {
+                        return Ok(Progress {
+                            consumed: 0,
+                            written,
+                            done: false,
+                        });
+                    }
+                    self.drain_to(output, &mut written);
+                    // Once drained, drain_to returns us to Accumulating, and
+                    // the next iteration of this loop will see in_buf empty
+                    // and transition to NeedEosMarker.
                 }
                 EncPhase::NeedEosMarker => {
                     if written == output.len() {
@@ -746,9 +824,14 @@ impl EncoderTrait for Encoder {
                             done: false,
                         });
                     }
-                    output[written] = 0x00;
-                    written += 1;
-                    self.phase = EncPhase::Done;
+                    // Drain the 0x00 byte we queued above. We reuse the
+                    // Draining helper rather than open-coding the copy, but
+                    // we need to manually flip to Done at the end since
+                    // drain_to defaults to Accumulating.
+                    self.drain_to(output, &mut written);
+                    if self.out_buf.is_empty() {
+                        self.phase = EncPhase::Done;
+                    }
                 }
                 EncPhase::Done => {
                     return Ok(Progress {
@@ -762,6 +845,9 @@ impl EncoderTrait for Encoder {
     }
 
     fn reset(&mut self) {
-        self.phase = EncPhase::Idle;
+        self.phase = EncPhase::Accumulating;
+        self.in_buf.clear();
+        self.out_buf.clear();
+        self.out_pos = 0;
     }
 }

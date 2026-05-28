@@ -52,9 +52,13 @@
 mod bitreader;
 mod decoder;
 mod encoder;
+mod encoder_bitwriter;
+mod encoder_fse;
+mod encoder_seq;
 mod fse;
 mod huffman;
 mod literals;
+mod matcher;
 mod sequences;
 
 pub use decoder::Decoder;

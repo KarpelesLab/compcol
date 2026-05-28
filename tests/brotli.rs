@@ -516,3 +516,273 @@ fn decode_fixed_reference_streams() {
         );
     }
 }
+
+// ─── compressed-encoder coverage ────────────────────────────────────────
+
+/// Generate a 16 KiB Lorem ipsum sample.
+fn lorem_16k() -> Vec<u8> {
+    let lorem: &[u8] = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. ";
+    let mut input = Vec::with_capacity(16 * 1024);
+    while input.len() < 16 * 1024 {
+        input.extend_from_slice(lorem);
+    }
+    input.truncate(16 * 1024);
+    input
+}
+
+/// Verify our encoder's output decodes correctly through our own
+/// decoder for the four "shape" inputs from the task description.
+#[test]
+fn compressed_encoder_internal_round_trip_shapes() {
+    let cases: &[(&str, Vec<u8>)] = &[
+        ("empty", Vec::new()),
+        ("single byte", b"a".to_vec()),
+        ("hello world", b"hello world\n".to_vec()),
+        ("4k lorem", {
+            let mut v = Vec::with_capacity(4096);
+            while v.len() < 4096 {
+                v.extend_from_slice(b"The quick brown fox jumps over the lazy dog.\n");
+            }
+            v.truncate(4096);
+            v
+        }),
+        ("16k lorem", lorem_16k()),
+    ];
+    for (name, input) in cases {
+        let encoded = encode_chunked(input, input.len().max(1), input.len().max(1) + 64).unwrap();
+        let decoded =
+            decode_chunked(&encoded, encoded.len().max(1), input.len().max(1) + 64).unwrap();
+        assert_eq!(decoded, *input, "internal round-trip failed for {name}");
+    }
+}
+
+/// Streaming round-trip with 1-byte-on-both-sides buffers. The encoder
+/// must flush meta-blocks as input arrives, and the decoder must
+/// stream output back one byte at a time.
+#[test]
+fn compressed_encoder_streaming_one_byte() {
+    let cases: &[(&str, Vec<u8>)] = &[
+        ("hello world", b"hello world\n".to_vec()),
+        ("alphabet", (0..=255u8).collect()),
+        ("structured", {
+            let mut v = Vec::new();
+            for _ in 0..100 {
+                v.extend_from_slice(b"the quick brown fox jumps over the lazy dog\n");
+            }
+            v
+        }),
+    ];
+    for (name, input) in cases {
+        let encoded = encode_chunked(input, 1, 1).unwrap();
+        let decoded = decode_chunked(&encoded, 1, 1).unwrap();
+        assert_eq!(decoded, *input, "streaming round-trip failed for {name}");
+    }
+}
+
+/// Cross-validate our compressed-encoder output against the reference
+/// `brotli -d` CLI. Skipped when the CLI is unavailable.
+#[cfg(unix)]
+#[test]
+fn compressed_encoder_cross_validate_reference() {
+    let Some(brotli) = brotli_cli_available() else {
+        eprintln!("skipping: brotli CLI not available");
+        return;
+    };
+    let cases: &[(&str, Vec<u8>)] = &[
+        ("empty", Vec::new()),
+        ("single byte", b"a".to_vec()),
+        ("hello world", b"hello world\n".to_vec()),
+        ("4k lorem", {
+            let mut v = Vec::with_capacity(4096);
+            while v.len() < 4096 {
+                v.extend_from_slice(b"The quick brown fox jumps over the lazy dog.\n");
+            }
+            v.truncate(4096);
+            v
+        }),
+        ("16k lorem", lorem_16k()),
+        ("binary 0..255", (0..=255u8).collect()),
+        ("pseudo random 70k", {
+            let mut x: u32 = 0xdead_beef;
+            let mut v = vec![0u8; 70_000];
+            for slot in &mut v {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                *slot = x as u8;
+            }
+            v
+        }),
+    ];
+    for (name, input) in cases {
+        let encoded = encode_chunked(input, input.len().max(1), input.len().max(1) + 64).unwrap();
+        let decoded = brotli_decode(&brotli, &encoded);
+        assert_eq!(
+            decoded, *input,
+            "system brotli -d returned the wrong bytes for {name}"
+        );
+    }
+}
+
+/// Verify a stream that spans multiple compressed meta-blocks (one
+/// non-final block followed by the final). 200 000 bytes of repeated
+/// text exceeds the encoder's 64 KiB per-block cap.
+#[test]
+fn compressed_encoder_multi_block_round_trip() {
+    let mut input = Vec::with_capacity(200_000);
+    while input.len() < 200_000 {
+        input.extend_from_slice(
+            b"The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. ",
+        );
+    }
+    input.truncate(200_000);
+    let encoded = encode_chunked(&input, input.len(), input.len() + 64).unwrap();
+    let decoded = decode_chunked(&encoded, encoded.len(), input.len() + 64).unwrap();
+    assert_eq!(decoded, input);
+    // Also cross-check via the reference decoder.
+    if let Some(brotli) = brotli_cli_available() {
+        let ref_decoded = brotli_decode(&brotli, &encoded);
+        assert_eq!(ref_decoded, input);
+    }
+}
+
+/// Edge cases that exercise the encoder's degenerate-tree paths
+/// (NSYM=1 / NSYM=2 simple prefix codes vs the complex code path).
+#[test]
+fn compressed_encoder_degenerate_alphabets() {
+    let cases: &[(&str, Vec<u8>)] = &[
+        // Single distinct literal — literal tree degenerates to NSYM=1.
+        ("all zeros 4k", vec![0u8; 4096]),
+        ("all 0xff 16k", vec![0xffu8; 16384]),
+        ("repeating 'a' 1k", vec![b'a'; 1024]),
+        // Two distinct literals.
+        ("ab × 500", b"ab".repeat(500)),
+        (
+            "0 / 1 alternating",
+            (0..2048).map(|i| (i & 1) as u8).collect(),
+        ),
+        // Three distinct literals.
+        ("abc × 300", b"abc".repeat(300)),
+    ];
+    for (name, input) in cases {
+        let encoded = encode_chunked(input, input.len(), input.len() + 64).unwrap();
+        let decoded = decode_chunked(&encoded, encoded.len(), input.len() + 64).unwrap();
+        assert_eq!(decoded, *input, "internal round-trip failed for {name}");
+        if let Some(brotli) = brotli_cli_available() {
+            let ref_decoded = brotli_decode(&brotli, &encoded);
+            assert_eq!(ref_decoded, *input, "reference decoder failed for {name}");
+        }
+    }
+}
+
+/// Mixed structured + binary inputs that exercise both real LZ77
+/// match-finding and the literal path.
+#[test]
+fn compressed_encoder_mixed_inputs() {
+    let cases: &[(&str, Vec<u8>)] = &[
+        // Highly repetitive text.
+        ("repetitive sentence", b"This is a test. ".repeat(500)),
+        // A "file-like" mix.
+        (
+            "html-ish",
+            b"<html><head><title>x</title></head><body>".repeat(200),
+        ),
+        // Mix of structure and noise.
+        ("alpha + count", {
+            let mut v = Vec::new();
+            for i in 0..2000 {
+                v.extend_from_slice(format!("line {i}: hello world\n").as_bytes());
+            }
+            v
+        }),
+        // Zero-prefixed binary.
+        ("zeros + pattern", {
+            let mut v = vec![0u8; 1024];
+            v.extend_from_slice(b"the quick brown fox");
+            v.extend_from_slice(&vec![0u8; 1024]);
+            v
+        }),
+    ];
+    for (name, input) in cases {
+        let encoded = encode_chunked(input, input.len(), input.len() + 64).unwrap();
+        let decoded = decode_chunked(&encoded, encoded.len(), input.len() + 64).unwrap();
+        assert_eq!(decoded, *input, "internal round-trip failed for {name}");
+        if let Some(brotli) = brotli_cli_available() {
+            let ref_decoded = brotli_decode(&brotli, &encoded);
+            assert_eq!(ref_decoded, *input, "ref decode failed for {name}");
+        }
+    }
+}
+
+/// Fuzz: random inputs at varying lengths, all of which must
+/// internally round-trip and (when the CLI is available) decode
+/// correctly through the reference `brotli -d`.
+#[test]
+fn compressed_encoder_fuzz_round_trip() {
+    let mut state: u64 = 0x1234_5678_9abc_def0;
+    let brotli = brotli_cli_available();
+    for round in 0..80 {
+        // Pick a length in [0, 8192].
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let len = ((state >> 33) as usize) & 0x1FFF;
+        let mut input = vec![0u8; len];
+        for slot in input.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *slot = ((state >> 32) & 0xFF) as u8;
+        }
+        let encoded = encode_chunked(&input, len.max(1), len.max(1) + 64).unwrap();
+        let decoded = decode_chunked(&encoded, encoded.len().max(1), len.max(1) + 64).unwrap();
+        assert_eq!(
+            decoded, input,
+            "internal round-trip failed at round {round}"
+        );
+        if let Some(ref bin) = brotli {
+            let ref_decoded = brotli_decode(bin, &encoded);
+            assert_eq!(ref_decoded, input, "ref decode failed at round {round}");
+        }
+    }
+}
+
+/// Sanity: report our encoder's compression ratio on a few inputs.
+/// Not a strict assertion — only checks we don't catastrophically
+/// expand structured text. The floor+walls tier should at least beat
+/// "uncompressed" for non-trivial repetitive input.
+#[test]
+fn compressed_encoder_ratio_sanity() {
+    let lorem = lorem_16k();
+    let encoded = encode_chunked(&lorem, lorem.len(), lorem.len() + 64).unwrap();
+    eprintln!(
+        "compcol-brotli 16k lorem: {} → {} bytes ({:.1}%)",
+        lorem.len(),
+        encoded.len(),
+        100.0 * encoded.len() as f64 / lorem.len() as f64
+    );
+    // Lorem ipsum repeats every 446 bytes; back-references should
+    // compress it considerably below the input size.
+    assert!(
+        encoded.len() < lorem.len(),
+        "encoder expanded structured text: {} ≥ {}",
+        encoded.len(),
+        lorem.len()
+    );
+    // Report on a few other shapes too.
+    let cases: &[(&str, Vec<u8>)] = &[
+        ("all zeros 16k", vec![0u8; 16384]),
+        ("repetitive sentence 8k", b"This is a test. ".repeat(500)),
+        ("alphabet ×64", (0..=255u8).collect::<Vec<_>>().repeat(64)),
+    ];
+    for (name, input) in cases {
+        let encoded = encode_chunked(input, input.len(), input.len() + 64).unwrap();
+        eprintln!(
+            "compcol-brotli {}: {} → {} bytes ({:.1}%)",
+            name,
+            input.len(),
+            encoded.len(),
+            100.0 * encoded.len() as f64 / input.len() as f64
+        );
+    }
+}

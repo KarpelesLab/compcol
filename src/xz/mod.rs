@@ -25,10 +25,15 @@
 //! decoder is in [`lzma2_decoder`] and is adapted from this crate's
 //! `lzma` module.
 //!
-//! The encoder still emits only uncompressed chunks (type `0x01`) —
-//! real LZMA2 *compression* is not implemented in this module, only
-//! decompression. The encoder output remains wire-compatible with
-//! `xz`(1).
+//! The encoder emits LZMA-compressed LZMA2 chunks (control byte
+//! `0xE0` — compressed, with dictionary + properties + state reset on
+//! every chunk so each chunk is independently decodable). When
+//! compression would expand a chunk relative to its uncompressed
+//! input — which happens on already-random or already-compressed
+//! data — we fall back to an uncompressed chunk (control byte `0x01`).
+//! Real LZMA-compressed output is produced by [`lzma2_encoder`], which is
+//! a port of the `.lzma` encoder in `src/lzma/` adapted to emit a raw
+//! range-coded body (no header, no EOS marker).
 //!
 //! No dependency on the sibling `lzma` / `lzma2` modules: the small amount of
 //! LZMA2 framing we need (control byte, big-endian 16-bit size) and the
@@ -48,7 +53,9 @@ use crate::error::Error;
 use crate::traits::{Algorithm, Decoder as DecoderTrait, Encoder as EncoderTrait, Progress};
 
 mod lzma2_decoder;
+mod lzma2_encoder;
 use lzma2_decoder::{Lzma2Props, LzmaCore, lzma2_dict_size};
+use lzma2_encoder::{LZMA2_PROPS_BYTE, encode_lzma_chunk};
 
 // ─── constants ─────────────────────────────────────────────────────────────
 
@@ -62,14 +69,27 @@ const STREAM_FLAGS: [u8; 2] = [0x00, STREAM_FLAGS_CHECK_CRC32];
 /// Filter ID 0x21 = LZMA2.
 const FILTER_ID_LZMA2: u8 = 0x21;
 
-/// Dictionary-size flag byte. Bits 0..=5 encode dictionary size.
-/// Value 0 = 4 KiB. We pick a small but standard dictionary for the
-/// Filter Properties byte; the value doesn't actually constrain our
-/// uncompressed-only decoder (no LZMA window is materialised) but a real
-/// LZMA2 decoder reading our output will allocate this much.
-const LZMA2_DICT_FLAG: u8 = 0;
+/// Dictionary-size flag byte. Per the LZMA2 spec (xz-file-format.txt
+/// §5.3.1), values `0..=39` map to dictionary sizes via
+/// `(2 | (b & 1)) << (b/2 + 11)`, and `40` is the special "max" value
+/// (0xFFFFFFFF). `0x14` = 20 → `(2 | 0) << (10 + 11)` = `2 << 21` =
+/// 4 MiB, a standard mid-range choice that matches xz-utils' default
+/// for small files and bounds the decoder's window allocation
+/// predictably. Our compressed encoder uses this same value as the
+/// `dict_size` ceiling for match distances, so the produced LZMA2
+/// stream is self-consistent.
+const LZMA2_DICT_FLAG: u8 = 0x14;
 
-/// Maximum payload bytes per LZMA2 uncompressed chunk.
+/// Dictionary size in bytes derived from [`LZMA2_DICT_FLAG`]. Kept in
+/// sync manually: 0x14 → 4 MiB.
+const LZMA2_DICT_SIZE: u32 = 4 * 1024 * 1024;
+
+/// Maximum uncompressed payload bytes per LZMA2 chunk we emit. The
+/// uncompressed-chunk size field is 16-bit + 1, capping at 65_536. The
+/// compressed-chunk uncompressed-size field can carry up to 2_097_152
+/// (21-bit + 1), but capping at the same 65_536 keeps the chunk header
+/// shape uniform and bounds peak memory: with 96 MiB inputs we still
+/// allocate just one chunk's worth of working buffers.
 const LZMA2_CHUNK_MAX: usize = 65_536;
 
 // ─── inline CRC-32 ─────────────────────────────────────────────────────────
@@ -352,8 +372,6 @@ pub struct Encoder {
     compressed_payload_bytes: u64,
     /// Block Header byte length (known at construction).
     block_header_len: u64,
-    /// Per-Block flag: first chunk should reset the dictionary.
-    first_chunk: bool,
 }
 
 impl Encoder {
@@ -370,7 +388,6 @@ impl Encoder {
             uncompressed_total: 0,
             compressed_payload_bytes: 0,
             block_header_len: build_block_header().len() as u64,
-            first_chunk: true,
         }
     }
 
@@ -391,12 +408,82 @@ impl Encoder {
         }
     }
 
-    /// Stage an LZMA2 uncompressed chunk for emission. `data.len()` must be
-    /// in `1..=65536`.
+    /// Stage an LZMA2 chunk for emission, choosing between a compressed
+    /// chunk and an uncompressed fallback.
+    ///
+    /// We always use the "full reset" form of the chunk's control byte
+    /// (`0xE0` for compressed, `0x01` for uncompressed), so every chunk is
+    /// independently decodable. This is slightly less efficient than
+    /// reusing state across chunks but keeps the chunk header shape
+    /// uniform and matches xz-utils' default emission pattern when each
+    /// chunk straddles a dictionary reset.
+    ///
+    /// `data.len()` must be in `1..=LZMA2_CHUNK_MAX`. The compressed-chunk
+    /// path additionally requires the compressed payload to fit in
+    /// 65_536 bytes (the 16-bit + 1 size field); if it overflows or the
+    /// compressor's output isn't smaller than the input, we fall back to
+    /// emitting the uncompressed chunk.
     fn stage_chunk(&mut self, data: &[u8]) {
         debug_assert!(!data.is_empty() && data.len() <= LZMA2_CHUNK_MAX);
-        let control: u8 = if self.first_chunk { 0x01 } else { 0x02 };
-        self.first_chunk = false;
+        // Try LZMA-compressed first. Compressed size is bounded by both
+        // the chunk's 16-bit size field (max 65_536) and our heuristic:
+        // if the compressor expanded the data, we'd save nothing by
+        // emitting a compressed chunk — uncompressed is smaller.
+        let compressed = encode_lzma_chunk(data, LZMA2_DICT_SIZE);
+        let use_compressed =
+            !compressed.is_empty() && compressed.len() <= 65_536 && compressed.len() < data.len();
+
+        if use_compressed {
+            self.stage_compressed_chunk(data, &compressed);
+        } else {
+            self.stage_uncompressed_chunk(data);
+        }
+    }
+
+    /// Stage a compressed LZMA2 chunk: control byte `0xE0`-style header
+    /// with the uncompressed-size's top 5 bits embedded into bits 0..=4
+    /// of the control byte, followed by two big-endian uncompressed-size
+    /// continuation bytes, two big-endian compressed-size bytes, a
+    /// 1-byte LZMA properties byte (because we full-reset every chunk),
+    /// and the range-coded payload.
+    fn stage_compressed_chunk(&mut self, data: &[u8], compressed: &[u8]) {
+        debug_assert!(!data.is_empty() && data.len() <= LZMA2_CHUNK_MAX);
+        debug_assert!(!compressed.is_empty() && compressed.len() <= 65_536);
+
+        let uncomp_size_minus_1 = (data.len() - 1) as u32; // 0..=65535
+        let uncomp_top = ((uncomp_size_minus_1 >> 16) & 0x1F) as u8; // 0 here
+        // Control byte: `111x_xxxx` = compressed + dict reset + props reset
+        // + state reset (full reset). The low 5 bits carry the top 5 bits
+        // of (uncomp_size - 1). With our 65_536 cap those top 5 bits are
+        // always zero, yielding the exact value 0xE0.
+        let control: u8 = 0xE0 | uncomp_top;
+
+        let uncomp_mid = ((uncomp_size_minus_1 >> 8) & 0xFF) as u8;
+        let uncomp_lo = (uncomp_size_minus_1 & 0xFF) as u8;
+        let comp_size_minus_1 = (compressed.len() - 1) as u16;
+        let comp_hi = (comp_size_minus_1 >> 8) as u8;
+        let comp_lo = (comp_size_minus_1 & 0xFF) as u8;
+
+        // Header: 6 bytes (control + 2 uncomp + 2 comp + 1 props), then
+        // the compressed payload.
+        let header_len = 6usize;
+        self.pending.reserve(header_len + compressed.len());
+        self.pending.push(control);
+        self.pending.push(uncomp_mid);
+        self.pending.push(uncomp_lo);
+        self.pending.push(comp_hi);
+        self.pending.push(comp_lo);
+        self.pending.push(LZMA2_PROPS_BYTE);
+        self.pending.extend_from_slice(compressed);
+        self.pending_idx = 0;
+        self.compressed_payload_bytes += (header_len + compressed.len()) as u64;
+    }
+
+    /// Stage an LZMA2 uncompressed chunk (control byte 0x01 — dict reset,
+    /// for the simple case where compression wouldn't help).
+    fn stage_uncompressed_chunk(&mut self, data: &[u8]) {
+        debug_assert!(!data.is_empty() && data.len() <= LZMA2_CHUNK_MAX);
+        let control: u8 = 0x01; // full dict reset; safe for any position
         let size_minus_1 = (data.len() - 1) as u16;
         self.pending.reserve(3 + data.len());
         self.pending.push(control);

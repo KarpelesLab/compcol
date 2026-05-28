@@ -25,24 +25,28 @@ and a `compcol` binary turns the library into a Unix-style filter.
 
 ## Supported algorithms
 
-| Algorithm | Feature | Extension | Status |
-|---|---|---|---|
-| RLE | `rle`     | `.rle`     | full encoder + decoder |
-| Deflate (RFC 1951) | `deflate` | `.deflate` | full encoder + decoder (dynamic Huffman) |
-| Zlib (RFC 1950) | `zlib`    | `.zz`      | full encoder + decoder |
-| Gzip (RFC 1952) | `gzip`    | `.gz`      | full encoder + decoder |
-| LZ4 block format | `lz4`     | `.lz4`     | full encoder + decoder |
-| Snappy | `snappy`  | `.sz`      | full encoder + decoder (raw block format) |
-| LZW (compress(1) `.Z`) | `lzw`     | `.lzw`     | full encoder + decoder |
-| LZMA (legacy `.lzma`) | `lzma`    | `.lzma`    | full encoder + decoder, cross-validates with `python3 -m lzma` |
-| LZMA2 | `lzma2`   | `.lzma2`   | encoder uncompressed-only; decoder accepts compressed chunks |
-| xz | `xz`      | `.xz`      | encoder uncompressed-only; decoder accepts real `xz`-CLI output |
-| Zstandard (RFC 8478) | `zstd`    | `.zst`     | encoder Raw_Block-only; decoder accepts real `zstd`-CLI output |
-| Brotli (RFC 7932) | `brotli`  | `.br`      | encoder uncompressed-only; decoder accepts real `brotli`-CLI output |
+| Algorithm | Feature | Extension | Encoder | Decoder | Cross-validation |
+|---|---|---|---|---|---|
+| RLE | `rle`     | `.rle`     | full | full | — |
+| Deflate (RFC 1951) | `deflate` | `.deflate` | full (dynamic Huffman) | full | `python3 -c "import zlib"` |
+| Zlib (RFC 1950) | `zlib`    | `.zz`      | full | full | `python3 -c "import zlib"` |
+| Gzip (RFC 1952) | `gzip`    | `.gz`      | full | full | `gzip(1)` |
+| LZ4 block format | `lz4`     | `.lz4`     | LZ77 hash matcher | full | — |
+| Snappy | `snappy`  | `.sz`      | LZ77 hash matcher (raw block format) | full | — |
+| LZW (compress(1) `.Z`) | `lzw`     | `.lzw`     | full | full | `compress(1)` / `uncompress(1)` |
+| LZMA (legacy `.lzma`) | `lzma`    | `.lzma`    | full | full | `python3 -m lzma` (FORMAT_ALONE) |
+| LZMA2 | `lzma2`   | `.lzma2`   | LZMA-compressed chunks + uncompressed fallback | full (0xE0 + uncompressed) | `xz --format=raw --lzma2 -d` |
+| xz | `xz`      | `.xz`      | compressed-LZMA2 chunks + uncompressed fallback | full envelope + all reset variants | `xz(1)` both directions |
+| Zstandard (RFC 8478) | `zstd`    | `.zst`     | LZ77 + FSE sequences (Predefined tables) + Raw literals | full Compressed_Block | `zstd(1)` both directions |
+| Brotli (RFC 7932) | `brotli`  | `.br`      | LZ77 + length-limited Huffman trees + 704-symbol IC alphabet | full (with 122 KiB static dictionary) | `brotli(1)` both directions |
 
-Algorithms whose encoders are "uncompressed-only" or "Raw_Block-only"
-emit format-conformant streams that any reference decoder will accept;
-they just don't actually compress. Their decoders are full-featured.
+Every algorithm decodes real-world output from its reference toolchain
+and produces output that the same reference toolchain accepts. Some
+encoders (zstd, brotli) ship without Huffman-encoded literals or
+custom FSE tables — they emit valid compressed-format streams that are
+weaker on compression ratio than `zstd -1` / `brotli -q1` (typically
+within 1.3–1.5× on text, falling further behind on highly repetitive
+input where reference tools use RLE blocks).
 
 ## Library usage
 
@@ -290,7 +294,7 @@ cargo clippy --all-features --all-targets -- -D warnings         # lint clean
 cargo fmt --all --check                                          # format clean
 ```
 
-The crate currently ships with **~290 tests across 17 test binaries**,
+The crate currently ships with **~355 tests across 17 test binaries**,
 including round-trip tests for every algorithm, cross-validation
 against system `gzip` / `xz` / `zstd` / `brotli` / `compress`, and
 hand-crafted hex fixtures for known corner cases.

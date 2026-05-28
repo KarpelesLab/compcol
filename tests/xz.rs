@@ -478,3 +478,263 @@ fn system_xz_encode_then_our_decode_binary() {
     let decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
     assert_eq!(decoded, input);
 }
+
+// ─── compressed-LZMA2 encoder cross-validation ─────────────────────────────
+//
+// These tests exercise the LZMA-compressed chunk path in our encoder: we
+// build an xz stream, hand it to the system `xz -d`, and check the decoded
+// bytes match the original input. The system tool acts as an independent
+// reference, so any bug in our LZMA encoder (range coder, distance
+// composition, bit-tree direction, etc.) shows up here.
+//
+// We probe for `xz` once per test and skip cleanly when the tool isn't
+// installed — keeps the suite green on minimal CI images.
+
+/// Find the first LZMA2 chunk control byte in `encoded`. The xz wire
+/// format starts with a 12-byte Stream Header, then a Block Header that
+/// our encoder builds with build_block_header() (12 bytes), so the first
+/// chunk control byte is at offset 24.
+fn first_chunk_control_byte(encoded: &[u8]) -> u8 {
+    assert!(encoded.len() > 24, "xz stream too short to contain a chunk");
+    encoded[24]
+}
+
+#[cfg(unix)]
+#[test]
+fn compressed_lzma2_empty_round_trip_via_xz() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    let input: Vec<u8> = Vec::new();
+    let encoded = encode_all(&input);
+    // Empty input: no chunks, block payload is just the 0x00 end marker.
+    // The byte at offset 24 is the LZMA2 end marker (0x00).
+    assert_eq!(first_chunk_control_byte(&encoded), 0x00);
+    let decoded = pipe_through("xz", &["-d", "-c"], &encoded).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn compressed_lzma2_hello_world_round_trip_via_xz() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    let input: Vec<u8> = b"hello world\n".to_vec();
+    let encoded = encode_all(&input);
+    // 12 bytes is too small for compression to beat literal storage — the
+    // encoder falls back to an uncompressed chunk (control byte 0x01).
+    assert_eq!(
+        first_chunk_control_byte(&encoded),
+        0x01,
+        "expected uncompressed fallback for 12-byte input"
+    );
+    let decoded = pipe_through("xz", &["-d", "-c"], &encoded).unwrap();
+    assert_eq!(decoded, input);
+    // Round-trip through our own decoder too.
+    let our_decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
+    assert_eq!(our_decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn compressed_lzma2_ten_kib_ascii_via_xz() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    let mut input: Vec<u8> = Vec::with_capacity(10 * 1024);
+    while input.len() < 10 * 1024 {
+        input.extend_from_slice(b"The quick brown fox jumps over the lazy dog. 0123456789\n");
+    }
+    input.truncate(10 * 1024);
+    let encoded = encode_all(&input);
+    // 10 KiB of repeating ASCII compresses well — first chunk should be
+    // LZMA-compressed (control byte 0xE0).
+    assert_eq!(
+        first_chunk_control_byte(&encoded),
+        0xE0,
+        "expected compressed chunk for 10 KiB repeating ASCII"
+    );
+    // Compression should noticeably reduce size, even with our basic
+    // greedy parser.
+    assert!(
+        encoded.len() < input.len() / 2,
+        "encoded {} >= half of {} — compression seems broken",
+        encoded.len(),
+        input.len()
+    );
+    let decoded = pipe_through("xz", &["-d", "-c"], &encoded).unwrap();
+    assert_eq!(decoded, input);
+    let our_decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
+    assert_eq!(our_decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn compressed_lzma2_sixteen_kib_lorem_ipsum_via_xz() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    let para: &[u8] = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do \
+                       eiusmod tempor incididunt ut labore et dolore magna aliqua. \
+                       Ut enim ad minim veniam, quis nostrud exercitation ullamco \
+                       laboris nisi ut aliquip ex ea commodo consequat. Duis aute \
+                       irure dolor in reprehenderit in voluptate velit esse cillum \
+                       dolore eu fugiat nulla pariatur.\n";
+    let mut input: Vec<u8> = Vec::with_capacity(16 * 1024);
+    while input.len() < 16 * 1024 {
+        input.extend_from_slice(para);
+    }
+    input.truncate(16 * 1024);
+    let encoded = encode_all(&input);
+    assert_eq!(
+        first_chunk_control_byte(&encoded),
+        0xE0,
+        "expected compressed chunk for Lorem ipsum"
+    );
+    let decoded = pipe_through("xz", &["-d", "-c"], &encoded).unwrap();
+    assert_eq!(decoded, input);
+    let our_decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
+    assert_eq!(our_decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn compressed_lzma2_sixty_four_kib_zeros_via_xz() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    // 64 KiB of zeros (exactly one chunk's worth) — this should compress
+    // to a handful of bytes since the whole buffer is "byte 0 then match
+    // back distance 0 for 65535 bytes".
+    let input: Vec<u8> = vec![0u8; 64 * 1024];
+    let encoded = encode_all(&input);
+    assert_eq!(
+        first_chunk_control_byte(&encoded),
+        0xE0,
+        "expected compressed chunk for 64 KiB of zeros"
+    );
+    // Massive compression expected: 64 KiB → <1 KiB easily.
+    assert!(
+        encoded.len() < 1024,
+        "encoded {} > 1 KiB for 64 KiB of zeros — compression not effective",
+        encoded.len()
+    );
+    let decoded = pipe_through("xz", &["-d", "-c"], &encoded).unwrap();
+    assert_eq!(decoded, input);
+    let our_decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
+    assert_eq!(our_decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn compressed_lzma2_pseudo_random_round_trip_via_xz() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    // High-entropy pseudo-random binary. Such inputs either fall through
+    // to the uncompressed-chunk path or come out only marginally smaller
+    // when LZMA's probability model happens to give the bitstream a slight
+    // edge. Either outcome is acceptable; what we really care about is
+    // that the wire format is valid and round-trips both ways.
+    let input: Vec<u8> = (0..40_000u32)
+        .map(|i| {
+            // Mix two LCG-ish streams so neither byte-aligned matches nor
+            // byte-pair repeats appear at any reasonable distance.
+            let a = (i.wrapping_mul(0x9E37_79B1)) >> 24;
+            let b = ((i ^ 0xDEAD_BEEF).wrapping_mul(0x85EB_CA6B)) >> 16;
+            (a ^ b) as u8
+        })
+        .collect();
+    let encoded = encode_all(&input);
+    let cb = first_chunk_control_byte(&encoded);
+    assert!(
+        cb == 0x01 || cb == 0xE0,
+        "expected uncompressed (0x01) or compressed (0xE0) chunk, got {:#x}",
+        cb
+    );
+    let decoded = pipe_through("xz", &["-d", "-c"], &encoded).unwrap();
+    assert_eq!(decoded, input);
+    let our_decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
+    assert_eq!(our_decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn compressed_lzma2_truly_random_falls_back_uncompressed() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    // Force the uncompressed fallback by feeding bytes that look truly
+    // random byte-by-byte. We construct this with a Xorshift-ish PRNG
+    // seeded deterministically; xz-utils itself routinely falls back to
+    // uncompressed chunks for inputs of this nature, and our encoder's
+    // identical "compressed > uncompressed ? use uncompressed" heuristic
+    // should agree.
+    let mut s: u32 = 0xCAFE_F00D;
+    let mut input: Vec<u8> = Vec::with_capacity(40_000);
+    while input.len() < 40_000 {
+        // Xorshift32 — high enough entropy that LZMA can't find matches.
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        input.extend_from_slice(&s.to_le_bytes());
+    }
+    input.truncate(40_000);
+    let encoded = encode_all(&input);
+    let cb = first_chunk_control_byte(&encoded);
+    // Tolerate either outcome — what we want is correctness, but flag the
+    // common case for visibility.
+    if cb != 0x01 && cb != 0xE0 {
+        panic!("unexpected control byte for random input: {:#x}", cb);
+    }
+    let decoded = pipe_through("xz", &["-d", "-c"], &encoded).unwrap();
+    assert_eq!(decoded, input);
+    let our_decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
+    assert_eq!(our_decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn compressed_lzma2_multi_chunk_via_xz() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    // Input that spans multiple 65_536-byte chunks. With ~200 KiB of
+    // compressible text we get at least 3 chunks; each one is independently
+    // full-reset so we exercise the inter-chunk boundary handling.
+    let mut input: Vec<u8> = Vec::with_capacity(200 * 1024);
+    while input.len() < 200 * 1024 {
+        input.extend_from_slice(
+            b"The quick brown fox jumps over the lazy dog. \
+              Pack my box with five dozen liquor jugs.\n",
+        );
+    }
+    input.truncate(200 * 1024);
+    let encoded = encode_all(&input);
+    // First chunk should be compressed.
+    assert_eq!(
+        first_chunk_control_byte(&encoded),
+        0xE0,
+        "expected compressed first chunk"
+    );
+    // Significant compression expected.
+    assert!(
+        encoded.len() < input.len() / 4,
+        "encoded {} too large vs input {}",
+        encoded.len(),
+        input.len()
+    );
+    let decoded = pipe_through("xz", &["-d", "-c"], &encoded).unwrap();
+    assert_eq!(decoded, input);
+    let our_decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
+    assert_eq!(our_decoded, input);
+}

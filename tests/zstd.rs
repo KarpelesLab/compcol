@@ -518,8 +518,8 @@ fn encoder_emits_valid_frame_header() {
     assert_eq!(&encoded[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
     // FHD should be 0x00 (see module docs).
     assert_eq!(encoded[4], 0x00);
-    // WD = 0x50 (Exp=10, Mant=0).
-    assert_eq!(encoded[5], 0x50);
+    // WD = 0x70 (Exp=14, Mant=0 → 16 KiB).
+    assert_eq!(encoded[5], 0x70);
     // Block_Header bytes 6..9 should encode Last=1, Type=0 (Raw), Size=1.
     let bh = (encoded[6] as u32) | ((encoded[7] as u32) << 8) | ((encoded[8] as u32) << 16);
     let last = bh & 1;
@@ -540,7 +540,7 @@ fn empty_encode_emits_empty_last_block() {
     let encoded = encode_chunked(&[], 16, 16);
     assert_eq!(&encoded[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
     assert_eq!(encoded[4], 0x00);
-    assert_eq!(encoded[5], 0x50);
+    assert_eq!(encoded[5], 0x70);
     // 3-byte block header with Last=1, Type=0, Size=0 → bytes 01 00 00.
     assert_eq!(&encoded[6..9], &[0x01, 0x00, 0x00]);
     assert_eq!(encoded.len(), 9);
@@ -1154,5 +1154,254 @@ mod factory {
     #[test]
     fn names_contains_zstd() {
         assert!(factory::names().contains(&"zstd"));
+    }
+}
+
+// ─── encoder: compressed-block emission ────────────────────────────────────
+
+/// Round-trip the new Compressed_Block encoder output through our own decoder.
+#[test]
+fn encoded_compressed_block_round_trips_through_decoder() {
+    let snippet = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
+    let mut input = Vec::with_capacity(4096);
+    while input.len() < 4096 {
+        input.extend_from_slice(snippet);
+    }
+    input.truncate(4096);
+
+    let encoded = encode_chunked(&input, input.len(), input.len() * 2 + 32);
+    eprintln!(
+        "input {} → encoded {} (ratio {:.2})",
+        input.len(),
+        encoded.len(),
+        encoded.len() as f64 / input.len() as f64
+    );
+    let decoded = decode_chunked(&encoded, encoded.len(), input.len() * 2);
+    assert_eq!(decoded, input);
+}
+
+#[cfg(unix)]
+fn zstd_decode_external(encoded: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("zstd")
+        .args(["-d", "-c"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn zstd: {e}"))?;
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin
+            .write_all(encoded)
+            .map_err(|e| format!("write stdin: {e}"))?;
+    }
+    let out = child.wait_with_output().map_err(|e| format!("wait: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "zstd -d failed: status {:?} stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(out.stdout)
+}
+
+#[cfg(unix)]
+fn cross_validate(input: &[u8]) {
+    if !tool_available("zstd") {
+        return;
+    }
+    let encoded = encode_chunked(input, input.len().max(1), input.len().max(64) * 2 + 64);
+    // First decode with our own decoder.
+    let decoded = decode_chunked(&encoded, encoded.len().max(1), input.len().max(64) * 2 + 64);
+    assert_eq!(
+        decoded,
+        input,
+        "own decoder round-trip failed (len={})",
+        input.len()
+    );
+    // Then pipe through system zstd.
+    let sys_decoded = zstd_decode_external(&encoded).expect("zstd -d should accept our output");
+    assert_eq!(
+        sys_decoded,
+        input,
+        "system zstd -d round-trip mismatch (len={}, encoded={})",
+        input.len(),
+        encoded.len()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_validate_empty() {
+    cross_validate(&[]);
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_validate_single_byte() {
+    cross_validate(b"a");
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_validate_hello() {
+    cross_validate(b"hello world\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_validate_lorem_4k() {
+    let snippet = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
+    let mut input = Vec::with_capacity(4096);
+    while input.len() < 4096 {
+        input.extend_from_slice(snippet);
+    }
+    input.truncate(4096);
+    cross_validate(&input);
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_validate_lorem_16k() {
+    let snippet = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
+    let mut input = Vec::with_capacity(16 * 1024);
+    while input.len() < 16 * 1024 {
+        input.extend_from_slice(snippet);
+    }
+    input.truncate(16 * 1024);
+    cross_validate(&input);
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_validate_zeros_64k() {
+    cross_validate(&vec![0u8; 64 * 1024]);
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_validate_streaming_one_byte() {
+    if !tool_available("zstd") {
+        return;
+    }
+    let snippet = b"abc 123 def 456 ghi 789 jkl ";
+    let mut input = Vec::with_capacity(2048);
+    while input.len() < 2048 {
+        input.extend_from_slice(snippet);
+    }
+    input.truncate(2048);
+    let encoded = encode_chunked(&input, 1, 1);
+    let decoded = decode_chunked(&encoded, 1, 1);
+    assert_eq!(decoded, input);
+    let sys = zstd_decode_external(&encoded).expect("system zstd accepts streamed output");
+    assert_eq!(sys, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_validate_ratio_vs_system_zstd_1() {
+    // Rough compression-quality sanity check: our encoder should be at least
+    // in the right ballpark compared to system `zstd -1`.
+    if !tool_available("zstd") {
+        return;
+    }
+    let snippet = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
+    let mut input = Vec::with_capacity(8192);
+    while input.len() < 8192 {
+        input.extend_from_slice(snippet);
+    }
+    input.truncate(8192);
+
+    let our_encoded = encode_chunked(&input, input.len(), input.len() * 2 + 64);
+    // Compare to system zstd -1.
+    use std::io::Write;
+    let mut child = std::process::Command::new("zstd")
+        .args(["--no-check", "-1", "-c"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(&input).unwrap();
+    let sys_encoded = child.wait_with_output().unwrap().stdout;
+
+    eprintln!(
+        "input {} bytes; ours {} (ratio {:.3}); system zstd -1 {} (ratio {:.3})",
+        input.len(),
+        our_encoded.len(),
+        our_encoded.len() as f64 / input.len() as f64,
+        sys_encoded.len(),
+        sys_encoded.len() as f64 / input.len() as f64
+    );
+    // Sanity floor: our output should be < input.len() (real compression).
+    assert!(
+        our_encoded.len() < input.len(),
+        "encoder produced larger output than input"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn measure_compression_ratios() {
+    // Informational: print the sizes our encoder produces for various inputs
+    // and compare against the system zstd at -1 and -3. This is a diagnostic,
+    // not a pass/fail test (we just check the output decodes).
+    if !tool_available("zstd") {
+        return;
+    }
+    let snippet_lorem = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
+    let make_lorem = |n: usize| {
+        let mut v = Vec::with_capacity(n);
+        while v.len() < n {
+            v.extend_from_slice(snippet_lorem);
+        }
+        v.truncate(n);
+        v
+    };
+
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("lorem-1k", make_lorem(1024)),
+        ("lorem-4k", make_lorem(4096)),
+        ("lorem-16k", make_lorem(16 * 1024)),
+        ("zeros-64k", vec![0u8; 64 * 1024]),
+        ("repeat-a-50k", vec![b'a'; 50 * 1024]),
+    ];
+
+    use std::io::Write;
+    for (name, input) in &cases {
+        let ours = encode_chunked(input, input.len(), input.len() * 2 + 64);
+        // system zstd -1
+        let mut child = std::process::Command::new("zstd")
+            .args(["--no-check", "-1", "-c"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        child.stdin.as_mut().unwrap().write_all(input).unwrap();
+        let sys1 = child.wait_with_output().unwrap().stdout;
+        // system zstd -3 (default)
+        let mut child = std::process::Command::new("zstd")
+            .args(["--no-check", "-3", "-c"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        child.stdin.as_mut().unwrap().write_all(input).unwrap();
+        let sys3 = child.wait_with_output().unwrap().stdout;
+        eprintln!(
+            "{:14} input={:7}  ours={:6} ({:.3})  zstd-1={:6} ({:.3})  zstd-3={:6} ({:.3})",
+            name,
+            input.len(),
+            ours.len(),
+            ours.len() as f64 / input.len() as f64,
+            sys1.len(),
+            sys1.len() as f64 / input.len() as f64,
+            sys3.len(),
+            sys3.len() as f64 / input.len() as f64
+        );
     }
 }

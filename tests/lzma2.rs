@@ -176,7 +176,7 @@ fn pseudo_random_input() {
 
 #[test]
 fn long_input_forces_multiple_chunks() {
-    // 200_000 bytes — must be carried by at least 4 type-0x01 chunks
+    // 200_000 bytes — must be carried by at least 4 chunks
     // (each capped at 65_536 uncompressed bytes by the encoder).
     let mut input = Vec::with_capacity(200_000);
     for i in 0..200_000usize {
@@ -185,8 +185,9 @@ fn long_input_forces_multiple_chunks() {
     let encoded = encode_chunked(&input, input.len(), 4096);
 
     // Count the chunk headers we expect to see: 200_000 = 65_536 + 65_536 +
-    // 65_536 + 3_392, so 4 chunks. Each starts with 0x01 plus 2 size bytes.
-    // We just verify chunk count by walking the stream.
+    // 65_536 + 3_392, so 4 chunks. Each chunk is either a stored `0x01`
+    // (3-byte header + raw payload) or a compressed `0xE0..=0xFF` (5-byte
+    // header + LZMA payload). Walk the stream and count, recognising both.
     let mut chunks = 0;
     let mut i = 0;
     while i < encoded.len() {
@@ -195,10 +196,21 @@ fn long_input_forces_multiple_chunks() {
                 assert_eq!(i, encoded.len() - 1, "EOS marker should be last byte");
                 break;
             }
-            0x01 => {
+            0x01 | 0x02 => {
                 let size = ((encoded[i + 1] as u32) << 8 | encoded[i + 2] as u32) + 1;
                 chunks += 1;
                 i += 3 + size as usize;
+            }
+            0xE0..=0xFF => {
+                // unc top5 in bits 0..4 of ctrl, then 16 bits of unc-low,
+                // then 16 bits of cmp-size-1, then props.
+                let unc_top5 = (encoded[i] as u32) & 0x1F;
+                let unc_low = ((encoded[i + 1] as u32) << 8) | (encoded[i + 2] as u32);
+                let _unc = (unc_top5 << 16 | unc_low) + 1;
+                let cmp = ((encoded[i + 3] as u32) << 8 | encoded[i + 4] as u32) + 1;
+                chunks += 1;
+                // header(6) + payload(cmp).
+                i += 6 + cmp as usize;
             }
             other => panic!("unexpected control byte 0x{other:02X} at offset {i}"),
         }
@@ -305,18 +317,34 @@ fn encoder_reset_recycles_state() {
     let mut enc = Encoder::new();
     let mut out = [0u8; 32];
 
-    // Partially encode then reset.
+    // Partially encode then reset. The current encoder buffers input until a
+    // chunk is sealed, so `encode` here writes nothing — `reset` simply
+    // discards the buffered "abcd".
     let _ = enc.encode(b"abcd", &mut out).unwrap();
     enc.reset();
 
     // After reset, a fresh round-trip should work and produce *only* the new
-    // input's bytes — no leftovers from before the reset.
-    let _ = enc.encode(b"xy", &mut out).unwrap();
+    // input's bytes — no leftovers from before the reset. Two bytes pay too
+    // much range-coder overhead to actually compress, so the encoder's
+    // size-fallback kicks in and emits a stored `0x01` chunk.
     let mut total = Vec::new();
-    total.extend_from_slice(&out[..5]); // header(3) + payload(2)
-    let pf = enc.finish(&mut out).unwrap();
-    total.extend_from_slice(&out[..pf.written]);
-    assert!(pf.done);
+    loop {
+        let p = enc.encode(b"xy", &mut out).unwrap();
+        total.extend_from_slice(&out[..p.written]);
+        if p.consumed == 2 || (p.consumed == 0 && p.written == 0) {
+            break;
+        }
+    }
+    loop {
+        let pf = enc.finish(&mut out).unwrap();
+        total.extend_from_slice(&out[..pf.written]);
+        if pf.done {
+            break;
+        }
+        if pf.written == 0 {
+            panic!("encoder finish stalled");
+        }
+    }
     assert_eq!(total, vec![0x01, 0x00, 0x01, b'x', b'y', 0x00]);
 }
 
@@ -589,4 +617,293 @@ fn compressed_chunk_then_reset_recycles_inner_state() {
     let decoded2 = decode_all(&mut dec, HELLO_REPEATED_LZMA2);
     assert_eq!(decoded2.len(), 600);
     assert!(decoded2.starts_with(b"hello world "));
+}
+
+// ─── encoder: compressed-chunk path ───────────────────────────────────────
+
+/// Walk an LZMA2 stream and count, by chunk type, what kinds of chunks the
+/// encoder produced. Returns `(compressed_chunks, uncompressed_chunks)`.
+fn classify_chunks(encoded: &[u8]) -> (usize, usize) {
+    let mut comp = 0usize;
+    let mut uncomp = 0usize;
+    let mut i = 0;
+    while i < encoded.len() {
+        match encoded[i] {
+            0x00 => break,
+            0x01 | 0x02 => {
+                let size = ((encoded[i + 1] as u32) << 8 | encoded[i + 2] as u32) + 1;
+                uncomp += 1;
+                i += 3 + size as usize;
+            }
+            0xE0..=0xFF => {
+                let cmp = ((encoded[i + 3] as u32) << 8 | encoded[i + 4] as u32) + 1;
+                comp += 1;
+                i += 6 + cmp as usize;
+            }
+            other => panic!("unexpected control byte 0x{other:02X} at offset {i}"),
+        }
+    }
+    (comp, uncomp)
+}
+
+#[test]
+fn encoder_emits_compressed_chunk_for_repetitive_input() {
+    // Same payload as the imported hello-world fixture. The encoder should
+    // produce one compressed chunk (control byte in 0xE0..=0xFF) and the
+    // round-trip must succeed.
+    let input: Vec<u8> = "hello world "
+        .as_bytes()
+        .iter()
+        .cycle()
+        .take(600)
+        .copied()
+        .collect();
+    let encoded = encode_chunked(&input, input.len(), 4096);
+    let (comp, uncomp) = classify_chunks(&encoded);
+    assert_eq!(comp, 1, "expected exactly one compressed chunk");
+    assert_eq!(uncomp, 0, "expected no uncompressed chunks");
+    assert!(
+        encoded.len() < input.len(),
+        "compressed stream should be smaller than raw input"
+    );
+    let decoded = decode_chunked(&encoded, encoded.len(), 4096);
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn encoder_emits_compressed_chunk_for_4k_repeating_a() {
+    // 4 KiB of 'A' — a single-byte alphabet should compress to a few dozen
+    // bytes of LZMA after the initial literal.
+    let input = vec![b'A'; 4096];
+    let encoded = encode_chunked(&input, input.len(), 4096);
+    let (comp, uncomp) = classify_chunks(&encoded);
+    assert_eq!(comp, 1);
+    assert_eq!(uncomp, 0);
+    assert!(encoded.len() < 200, "expected very tight compression");
+    let decoded = decode_chunked(&encoded, encoded.len(), 4096);
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn encoder_falls_back_to_uncompressed_for_incompressible_input() {
+    // Pseudo-random bytes — LZMA's overhead won't pay off, so the encoder's
+    // compressed-vs-uncompressed picker should fall back to type-0x01
+    // chunks. Either way the round-trip must succeed.
+    let mut state: u32 = 0xC0FFEE42u32;
+    let mut input = Vec::with_capacity(2048);
+    for _ in 0..2048usize {
+        state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        input.push((state >> 16) as u8);
+    }
+    let encoded = encode_chunked(&input, input.len(), 256);
+    let (_comp, uncomp) = classify_chunks(&encoded);
+    // The pseudo-random input is genuinely incompressible at greedy LZMA, so
+    // we expect the fallback to kick in for at least one chunk.
+    assert!(
+        uncomp >= 1,
+        "expected at least one uncompressed fallback chunk for random data"
+    );
+    let decoded = decode_chunked(&encoded, encoded.len(), 256);
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn encoder_multi_chunk_compressed_round_trip() {
+    // Input larger than a single 64 KiB chunk, all compressible (lots of
+    // repetition). The encoder should split into multiple compressed chunks
+    // and the round-trip must reconstruct the exact input.
+    let unit = b"The quick brown fox jumps over the lazy dog. ";
+    let mut input = Vec::with_capacity(200_000);
+    while input.len() < 200_000 {
+        input.extend_from_slice(unit);
+    }
+    input.truncate(200_000);
+
+    let encoded = encode_chunked(&input, input.len(), 8192);
+    let (comp, _uncomp) = classify_chunks(&encoded);
+    assert!(
+        comp >= 4,
+        "expected at least 4 compressed chunks, got {comp}"
+    );
+    let decoded = decode_chunked(&encoded, encoded.len(), 8192);
+    assert_eq!(decoded.len(), input.len());
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn encoder_streaming_one_byte_buffers_compressed_round_trip() {
+    // 1-byte-on-both-sides streaming over compressible input. Forces the
+    // encoder to buffer up to a full chunk and then drain it through a
+    // tiny output buffer, and the decoder to reassemble through tiny
+    // buffers on its side too.
+    let mut input = Vec::with_capacity(4096);
+    let unit = b"abcdefghij";
+    while input.len() < 4096 {
+        input.extend_from_slice(unit);
+    }
+    input.truncate(4096);
+
+    let encoded = encode_chunked(&input, 1, 1);
+    // Should compress meaningfully — the round-trip is the load-bearing check.
+    assert!(
+        encoded.len() < input.len(),
+        "expected compression; encoded {} bytes, input {} bytes",
+        encoded.len(),
+        input.len()
+    );
+    let decoded = decode_chunked(&encoded, 1, 1);
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn encoder_just_over_64k_emits_two_chunks() {
+    // 65_537 bytes of compressible data: exactly one full 64 KiB chunk
+    // followed by a 1-byte tail chunk.
+    let mut input = Vec::with_capacity(65_537);
+    let unit = b"compressible payload! ";
+    while input.len() < 65_537 {
+        input.extend_from_slice(unit);
+    }
+    input.truncate(65_537);
+
+    let encoded = encode_chunked(&input, input.len(), 1024);
+    let (comp, uncomp) = classify_chunks(&encoded);
+    assert_eq!(comp + uncomp, 2, "expected exactly two chunks");
+    let decoded = decode_chunked(&encoded, encoded.len(), 1024);
+    assert_eq!(decoded, input);
+}
+
+// ─── xz-utils cross-validation ────────────────────────────────────────────
+//
+// These tests pipe our encoder output through `xz --format=raw
+// --lzma2=preset=6 -d` and check that xz reproduces the original input.
+// Gated on Unix + tool availability so the test suite still passes in
+// minimal environments.
+
+#[cfg(unix)]
+fn xz_available() -> bool {
+    use std::process::Command;
+    Command::new("xz")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn xz_decode(encoded: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("xz")
+        .args(["--format=raw", "--lzma2=preset=6", "-d", "-c"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn xz: {e}"))?;
+    {
+        let stdin = child.stdin.as_mut().ok_or("no stdin")?;
+        stdin
+            .write_all(encoded)
+            .map_err(|e| format!("write stdin: {e}"))?;
+    }
+    let out = child.wait_with_output().map_err(|e| format!("wait: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "xz exit {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(out.stdout)
+}
+
+#[cfg(unix)]
+#[test]
+fn xz_decodes_our_compressed_output_hello_world() {
+    if !xz_available() {
+        eprintln!("xz not available; skipping");
+        return;
+    }
+    let input: Vec<u8> = "hello world "
+        .as_bytes()
+        .iter()
+        .cycle()
+        .take(600)
+        .copied()
+        .collect();
+    let encoded = encode_chunked(&input, input.len(), 4096);
+    let xz_decoded = xz_decode(&encoded).expect("xz must accept our output");
+    assert_eq!(xz_decoded, input, "xz output differs from input");
+}
+
+#[cfg(unix)]
+#[test]
+fn xz_decodes_our_compressed_output_4k_repeating() {
+    if !xz_available() {
+        eprintln!("xz not available; skipping");
+        return;
+    }
+    let input = vec![b'A'; 4096];
+    let encoded = encode_chunked(&input, input.len(), 4096);
+    let xz_decoded = xz_decode(&encoded).expect("xz must accept our output");
+    assert_eq!(xz_decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn xz_decodes_our_multi_chunk_output() {
+    // Force multiple compressed chunks (input > 64 KiB) and verify xz
+    // recombines them losslessly. Reads the trickiest path: chunk boundaries
+    // plus state-reset on every chunk.
+    if !xz_available() {
+        eprintln!("xz not available; skipping");
+        return;
+    }
+    let unit = b"The quick brown fox jumps over the lazy dog. ";
+    let mut input = Vec::with_capacity(150_000);
+    while input.len() < 150_000 {
+        input.extend_from_slice(unit);
+    }
+    input.truncate(150_000);
+    let encoded = encode_chunked(&input, input.len(), 8192);
+    let xz_decoded = xz_decode(&encoded).expect("xz must accept our output");
+    assert_eq!(xz_decoded.len(), input.len());
+    assert_eq!(xz_decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn xz_decodes_our_incompressible_fallback() {
+    // Verify xz also accepts streams where the encoder falls back to
+    // uncompressed (0x01) chunks for random data — those chunks share the
+    // wire format with what xz itself emits for incompressible regions, so
+    // this just exercises the mixed-chunk case from xz's side.
+    if !xz_available() {
+        eprintln!("xz not available; skipping");
+        return;
+    }
+    let mut state: u32 = 0xFEEDFACEu32;
+    let mut input = Vec::with_capacity(2048);
+    for _ in 0..2048usize {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        input.push((state >> 24) as u8);
+    }
+    let encoded = encode_chunked(&input, input.len(), 256);
+    let xz_decoded = xz_decode(&encoded).expect("xz must accept our output");
+    assert_eq!(xz_decoded, input);
+}
+
+#[cfg(unix)]
+#[test]
+fn xz_decodes_our_empty_output() {
+    if !xz_available() {
+        eprintln!("xz not available; skipping");
+        return;
+    }
+    let encoded = encode_chunked(&[], 1, 16);
+    assert_eq!(encoded, vec![0x00]);
+    let xz_decoded = xz_decode(&encoded).expect("xz must accept our output");
+    assert!(xz_decoded.is_empty());
 }

@@ -4,10 +4,15 @@
 //!
 //! # Scope of this build
 //!
-//! - **Encoder**: emits uncompressed-only Brotli streams. Output is a
-//!   valid Brotli stream (the reference `brotli -d` accepts it) but is
-//!   literally larger than the input — uncompressed-only is a
-//!   correctness-first fallback, not a compression strategy.
+//! - **Encoder**: emits compressed Brotli meta-blocks with a single
+//!   block-type per category (NBLTYPESL/I/D = 1), one context (CMODE
+//!   = LSB6, NTREESL = 1), and the simplest distance parameter set
+//!   (NPOSTFIX = 0, NDIRECT = 0). Real LZ77 matches are found via a
+//!   hash-chain match finder; insert-and-copy commands use the full
+//!   704-symbol IC alphabet; Huffman trees are built from frequencies
+//!   via the length-limited package-merge algorithm. The encoder does
+//!   not yet exploit the static dictionary or emit multiple block
+//!   types — those land in the "roof" tier of the spec implementation.
 //!
 //! - **Decoder**: parses the stream header, walks the meta-block chain,
 //!   and decodes:
@@ -37,7 +42,8 @@
 //!
 //! - The large-window flag (WBITS first bit = 1, next 3 bits = 0,
 //!   next 3 bits = 1) is rejected as `Unsupported`.
-//! - Compressed-meta-block **encoding** (encoder stays uncompressed).
+//! - Encoder-side static dictionary references (decoder handles them).
+//! - Encoder-side multiple block types or non-trivial context maps.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -47,11 +53,16 @@ use crate::traits::{Algorithm, Decoder as DecoderTrait, Encoder as EncoderTrait,
 
 mod context;
 mod dictionary;
+mod encoder_huffman;
+mod encoder_iac;
+mod encoder_lz77;
 mod huffman;
 mod transforms;
 
 use context::ContextMode;
 use huffman::{BitSource, HuffmanDecoder};
+
+use encoder_huffman::reverse_bits;
 
 /// Zero-sized marker type implementing [`Algorithm`] for Brotli.
 #[derive(Debug, Clone, Copy, Default)]
@@ -116,11 +127,34 @@ impl BitWriter {
 
 // ─── encoder ────────────────────────────────────────────────────────────
 //
-// Wire format produced:
+// Wire format produced (per RFC 7932 §9.2):
 //
 //   WBITS = 16            (1 bit  = 0)
-//   [meta-block]*         (zero or more non-final uncompressed meta-blocks)
-//   ISLAST=1, ISLASTEMPTY=1, pad to byte
+//   [meta-block]*         (one compressed meta-block per ≤ MAX_BLOCK bytes
+//                          of input, plus an empty ISLAST=1/ISLASTEMPTY=1
+//                          terminator when input is empty)
+//
+// Per meta-block (compressed, single-block-type variant):
+//
+//   ISLAST                (1 bit, 1 on the last meta-block)
+//   ISLASTEMPTY           (1 bit, only when ISLAST; we never use this path
+//                          unless the entire stream is empty)
+//   MNIBBLES              (2 bits) — 0 = 4 nibbles (we always use 4)
+//   MLEN-1                (16 bits) — fits up to 65 536 in our chunks
+//   ISUNCOMPRESSED        (1 bit, omitted when ISLAST=1) — always 0 here
+//   NBLTYPESL/I/D         (1 bit each) — all "1 block type"
+//   NPOSTFIX (2), NDIRECT (4) — both zero
+//   CMODE[0]              (2 bits) — LSB6
+//   NTREESL               (1 bit) — 1 context, no literal context map
+//   NTREESD               (1 bit) — 1 distance tree, no distance context map
+//   <literal prefix code> — complex or simple-NSYM=1
+//   <IC prefix code>     — complex or simple-NSYM=1
+//   <distance prefix code> — complex or simple-NSYM=1
+//   <command stream>     — Huffman-coded commands + literals
+//
+// For empty input the encoder emits just the WBITS header + ISLAST=1 +
+// ISLASTEMPTY=1 + pad → a single 0x06 byte, preserving the wire output
+// the old uncompressed-only encoder produced for empty input.
 
 const MAX_BLOCK: usize = 1 << 16; // 65_536
 
@@ -139,6 +173,12 @@ pub struct Encoder {
     out_pos: usize,
     bw: BitWriter,
     stage: EncStage,
+    /// Whether we've ever pushed input. When `finish` is called and we
+    /// haven't pushed anything we emit the empty-stream terminator.
+    seen_any_input: bool,
+    /// Distance ring buffer, persistent across meta-blocks within a
+    /// single stream — must mirror the decoder's view.
+    ring: DistRing,
 }
 
 impl Encoder {
@@ -149,6 +189,8 @@ impl Encoder {
             out_pos: 0,
             bw: BitWriter::new(),
             stage: EncStage::NeedHeader,
+            seen_any_input: false,
+            ring: DistRing::new(),
         }
     }
 
@@ -181,34 +223,47 @@ impl Encoder {
         }
     }
 
-    fn emit_uncompressed_block(&mut self, mlen: usize) {
+    /// Emit one compressed meta-block. `is_last` controls the ISLAST
+    /// bit; when set, ISLASTEMPTY=0 and ISUNCOMPRESSED is omitted.
+    fn emit_compressed_block(&mut self, mlen: usize, is_last: bool) {
         debug_assert!((1..=MAX_BLOCK).contains(&mlen));
         debug_assert!(mlen <= self.pending.len());
-        self.bw.write(0, 1, &mut self.out);
-        self.bw.write(0, 2, &mut self.out);
-        let mlen_m1 = (mlen - 1) as u32;
-        self.bw.write(mlen_m1, 16, &mut self.out);
-        self.bw.write(1, 1, &mut self.out);
-        self.bw.align(&mut self.out);
-        self.out.extend_from_slice(&self.pending[..mlen]);
-        self.pending.drain(..mlen);
+        let payload: Vec<u8> = self.pending.drain(..mlen).collect();
+        encode_meta_block(
+            &mut self.bw,
+            &mut self.out,
+            &payload,
+            is_last,
+            &mut self.ring,
+        );
     }
 
+    /// Pre-emit any complete-and-not-possibly-last blocks. We keep the
+    /// final MAX_BLOCK bytes pending so `finish` can emit them with
+    /// ISLAST=1, avoiding an extra empty terminator block when input
+    /// size is an exact multiple of MAX_BLOCK.
     fn flush_full_blocks(&mut self) {
-        while self.pending.len() >= MAX_BLOCK {
-            self.emit_uncompressed_block(MAX_BLOCK);
+        while self.pending.len() > MAX_BLOCK {
+            self.emit_compressed_block(MAX_BLOCK, false);
         }
     }
 
+    /// Emit the stream tail. Three cases:
+    ///   - never saw any input → empty-stream terminator (single byte).
+    ///   - pending data left → emit it in one final compressed block.
+    ///   - pending is empty but we've emitted earlier non-final blocks
+    ///     → emit the empty-last terminator (ISLAST=1, ISLASTEMPTY=1).
     fn emit_terminator(&mut self) {
-        if !self.pending.is_empty() {
-            let n = self.pending.len();
-            debug_assert!(n < MAX_BLOCK);
-            self.emit_uncompressed_block(n);
+        if !self.seen_any_input || self.pending.is_empty() {
+            self.bw.write(1, 1, &mut self.out);
+            self.bw.write(1, 1, &mut self.out);
+            self.bw.align(&mut self.out);
+            debug_assert_eq!(self.bw.pending_bits(), 0);
+            return;
         }
-        self.bw.write(1, 1, &mut self.out);
-        self.bw.write(1, 1, &mut self.out);
-        self.bw.align(&mut self.out);
+        let n = self.pending.len();
+        debug_assert!(n <= MAX_BLOCK);
+        self.emit_compressed_block(n, true);
         debug_assert_eq!(self.bw.pending_bits(), 0);
     }
 }
@@ -237,6 +292,9 @@ impl EncoderTrait for Encoder {
         }
         self.compact_out();
         self.ensure_header();
+        if !input.is_empty() {
+            self.seen_any_input = true;
+        }
         self.pending.extend_from_slice(input);
         let consumed = input.len();
         self.flush_full_blocks();
@@ -294,6 +352,552 @@ impl EncoderTrait for Encoder {
         self.out_pos = 0;
         self.bw = BitWriter::new();
         self.stage = EncStage::NeedHeader;
+        self.seen_any_input = false;
+        self.ring = DistRing::new();
+    }
+}
+
+// ─── encoder helpers (compressed meta-block emission) ───────────────────
+
+/// Per-position output of the LZ77 pass: a literal byte or a back-
+/// reference match.
+#[derive(Clone, Copy)]
+enum LzAtom {
+    Literal(u8),
+    Match { len: u32, dist: u32 },
+}
+
+/// LZ77 pass over the payload. Produces a sequence of literals and
+/// matches in input order. Uses the hash-chain finder from
+/// `encoder_lz77`. Skipping is conservative: we insert into the hash
+/// chain at every position, including those covered by an emitted
+/// match.
+fn lz77_pass(payload: &[u8]) -> Vec<LzAtom> {
+    use encoder_lz77::{MAX_MATCH, MIN_MATCH, MatchFinder};
+    let mut mf = MatchFinder::new();
+    let mut out: Vec<LzAtom> = Vec::with_capacity(payload.len());
+    let mut pos = 0usize;
+    while pos < payload.len() {
+        mf.insert(payload, pos);
+        if pos + MIN_MATCH <= payload.len()
+            && let Some((len, dist)) = mf.find_match(payload, pos)
+        {
+            // Cap copy length so we don't run off the end (LZ77 stays
+            // within the input buffer; the decoder accepts any
+            // representable copy length).
+            let len = len.min(MAX_MATCH).min(payload.len() - pos);
+            // Make sure the match is at least MIN_MATCH after capping.
+            if len >= MIN_MATCH {
+                out.push(LzAtom::Match {
+                    len: len as u32,
+                    dist: dist as u32,
+                });
+                // Splice every covered position into the hash chain.
+                for j in 1..len {
+                    let p = pos + j;
+                    if p + MIN_MATCH <= payload.len() {
+                        mf.insert(payload, p);
+                    }
+                }
+                pos += len;
+                continue;
+            }
+        }
+        out.push(LzAtom::Literal(payload[pos]));
+        pos += 1;
+    }
+    out
+}
+
+/// Convert the per-position LZ77 stream into brotli commands. Each
+/// command consumes an insert-length run of literals followed (except
+/// possibly the last) by a copy.
+struct Command {
+    insert: Vec<u8>,
+    copy_len: u32,
+    distance: u32, // 0 if this command has no copy (last-only-literals case)
+    has_copy: bool,
+}
+
+fn commands_from_atoms(atoms: &[LzAtom]) -> Vec<Command> {
+    let mut cmds: Vec<Command> = Vec::new();
+    let mut pending: Vec<u8> = Vec::new();
+    for a in atoms {
+        match *a {
+            LzAtom::Literal(b) => pending.push(b),
+            LzAtom::Match { len, dist } => {
+                cmds.push(Command {
+                    insert: core::mem::take(&mut pending),
+                    copy_len: len,
+                    distance: dist,
+                    has_copy: true,
+                });
+            }
+        }
+    }
+    if !pending.is_empty() || cmds.is_empty() {
+        cmds.push(Command {
+            insert: pending,
+            copy_len: 0,
+            distance: 0,
+            has_copy: false,
+        });
+    }
+    cmds
+}
+
+/// Distance ring buffer used by the encoder to match short codes from
+/// the decoder's ring buffer. Initialised per §4 to `[16, 15, 11, 4]`.
+#[derive(Debug, Clone, Copy)]
+struct DistRing {
+    ring: [i32; 4],
+    idx: u32,
+}
+
+impl DistRing {
+    fn new() -> Self {
+        Self {
+            ring: [16, 15, 11, 4],
+            idx: 0,
+        }
+    }
+
+    /// Get the n-th most-recently-pushed distance (1..=4).
+    fn nth_last(&self, n: u32) -> i32 {
+        debug_assert!((1..=4).contains(&n));
+        self.ring[((self.idx.wrapping_add(4 - n)) & 3) as usize]
+    }
+
+    fn push(&mut self, d: i32) {
+        let slot = (self.idx & 3) as usize;
+        self.ring[slot] = d;
+        self.idx = self.idx.wrapping_add(1);
+    }
+
+    /// Try to map `distance` to a short-code 0..=15. Returns Some(code)
+    /// if a short code applies; code 0 does not push to the ring, others
+    /// do.
+    fn try_short_code(&self, distance: u32) -> Option<u32> {
+        let d = distance as i32;
+        let last = self.nth_last(1);
+        let last2 = self.nth_last(2);
+        // Code 0: most recent distance (no ring update).
+        if d == last {
+            return Some(0);
+        }
+        if d == self.nth_last(2) {
+            return Some(1);
+        }
+        if d == self.nth_last(3) {
+            return Some(2);
+        }
+        if d == self.nth_last(4) {
+            return Some(3);
+        }
+        // Codes 4..=9: last ± {1, 2, 3}.
+        if d > 0 {
+            if d == last - 1 {
+                return Some(4);
+            }
+            if d == last + 1 {
+                return Some(5);
+            }
+            if d == last - 2 {
+                return Some(6);
+            }
+            if d == last + 2 {
+                return Some(7);
+            }
+            if d == last - 3 {
+                return Some(8);
+            }
+            if d == last + 3 {
+                return Some(9);
+            }
+            // Codes 10..=15: last2 ± {1, 2, 3}.
+            if d == last2 - 1 {
+                return Some(10);
+            }
+            if d == last2 + 1 {
+                return Some(11);
+            }
+            if d == last2 - 2 {
+                return Some(12);
+            }
+            if d == last2 + 2 {
+                return Some(13);
+            }
+            if d == last2 - 3 {
+                return Some(14);
+            }
+            if d == last2 + 3 {
+                return Some(15);
+            }
+        }
+        None
+    }
+}
+
+/// Pre-computed per-command frequencies used to size the literal, IC,
+/// and distance Huffman trees.
+struct CmdEncoding {
+    /// IC command symbol per command (0..=703).
+    ic_sym: Vec<u32>,
+    /// Insert-length extra bits per command.
+    ins_extra: Vec<(u32, u32)>, // (bits, value)
+    /// Copy-length extra bits per command (0 bits when no copy).
+    copy_extra: Vec<(u32, u32)>,
+    /// Distance encoding per command. `None` means "no distance read"
+    /// (use_last_dist=true or no copy at all). `Some((dcode, nb,
+    /// dextra))` means write distance code `dcode` with `nb` extra
+    /// bits of value `dextra`.
+    dist_enc: Vec<Option<(u32, u32, u32)>>,
+}
+
+/// Plan how to encode each command: choose IC symbol, decide whether
+/// to use a short distance code, etc. Mutates the supplied ring buffer
+/// in-place so the encoder's view tracks the decoder's view across
+/// meta-block boundaries.
+fn plan_commands(cmds: &[Command], mlen: u32, ring: &mut DistRing) -> CmdEncoding {
+    use encoder_iac::{copy_to_code, distance_to_normal_code, ic_command_sym, insert_to_code};
+
+    let mut enc = CmdEncoding {
+        ic_sym: Vec::with_capacity(cmds.len()),
+        ins_extra: Vec::with_capacity(cmds.len()),
+        copy_extra: Vec::with_capacity(cmds.len()),
+        dist_enc: Vec::with_capacity(cmds.len()),
+    };
+    let mut emitted: u32 = 0;
+    for (i, c) in cmds.iter().enumerate() {
+        let is_last_cmd = i == cmds.len() - 1;
+        let insert_len = c.insert.len() as u32;
+        let (ins_code, ins_eb, ins_ev) = insert_to_code(insert_len);
+
+        // For commands without a copy (only happens on the last
+        // command), we still need to pick a copy code (the decoder
+        // reads its extra bits even if the copy is then skipped).
+        // Use copy code 0 (copy_len base 2, zero extra bits).
+        let (copy_code, copy_eb, copy_ev, use_last_dist, dist_enc) = if c.has_copy {
+            let (cc, ceb, cev) = copy_to_code(c.copy_len);
+            // Pick distance encoding. The use_last shortcut requires
+            // ins_code < 8 AND copy_code < 16, since only IC cells 0
+            // and 1 support use_last_dist=true. For larger inserts or
+            // copies, we must use the explicit distance encoding even
+            // if the distance happens to match the ring buffer.
+            let can_use_last = ins_code < 8 && cc < 16;
+            let short = ring.try_short_code(c.distance);
+            match short {
+                Some(0) if can_use_last => {
+                    // use_last_dist=true. No ring update (per §4 code 0).
+                    (cc, ceb, cev, true, None)
+                }
+                Some(0) => {
+                    // The IC cell forbids use_last_dist=true (ins_code
+                    // >= 8 or copy_code >= 16). Emit distance code 0
+                    // explicitly — the decoder resolves it to last_dist
+                    // and does NOT push to the ring (§4 code 0).
+                    (cc, ceb, cev, false, Some((0u32, 0u32, 0u32)))
+                }
+                Some(code) => {
+                    // Short code 1..=15. Pushes to the ring.
+                    ring.push(c.distance as i32);
+                    (cc, ceb, cev, false, Some((code, 0, 0)))
+                }
+                None => {
+                    let (dcode, ndistbits, dextra) =
+                        distance_to_normal_code(c.distance).expect("encodable distance");
+                    ring.push(c.distance as i32);
+                    (cc, ceb, cev, false, Some((dcode, ndistbits, dextra)))
+                }
+            }
+        } else {
+            // No copy. Pick any valid (copy_code, use_last) such that
+            // the resulting IC cmd is valid. The decoder breaks out
+            // of the loop before reading any distance once `emitted >=
+            // mlen`, so we don't write a distance regardless of
+            // use_last.
+            if ins_code < 8 {
+                (0, 0, 0, true, None)
+            } else {
+                // use_last_dist=false (we must, since cells 0/1 are
+                // out of range). Distance not emitted.
+                (0, 0, 0, false, None)
+            }
+        };
+
+        // Determine the IC command symbol.
+        // For commands without a copy that's the last command, we
+        // emit any valid IC cmd. But we must not pick a cell that's
+        // disallowed by the ins/copy code groupings. For ins_code in
+        // 0..7: cell 0 (with use_last=true, copy 0..7) works.
+        // For ins_code 8..15: cell 4 (with use_last=false, copy 0..7).
+        // For ins_code 16..23: cell 7 (with use_last=false, copy 0..7).
+        // We want use_last=true to skip distance reads, but cells
+        // 0/1 only support ins_code in 0..7. For ins_code >= 8 we
+        // MUST use use_last=false, which means the decoder WILL try
+        // to read a distance — UNLESS `emitted` >= mlen after inserts,
+        // in which case the loop breaks before the distance read.
+        //
+        // For the last command with insert covering remaining bytes,
+        // `emitted` reaches mlen after inserts, so the distance is
+        // skipped regardless of use_last_dist. Safe.
+        let use_last_for_ic = if is_last_cmd && !c.has_copy {
+            // The decoder will break before reading distance, so the
+            // value of use_last doesn't matter for correctness, but
+            // we must still pick a cell that exists.
+            ins_code < 8 // can use cell 0 if ins_code fits
+        } else {
+            use_last_dist
+        };
+        let ic_sym = ic_command_sym(ins_code, copy_code, use_last_for_ic);
+
+        enc.ic_sym.push(ic_sym);
+        enc.ins_extra.push((ins_eb, ins_ev));
+        enc.copy_extra.push((copy_eb, copy_ev));
+        enc.dist_enc.push(dist_enc);
+
+        emitted += insert_len;
+        if c.has_copy {
+            emitted += c.copy_len;
+        }
+    }
+    debug_assert!(
+        emitted == mlen,
+        "command emission ({emitted}) does not match mlen ({mlen})"
+    );
+    enc
+}
+
+/// Build the meta-block header bits *up to but not including* the
+/// prefix codes. `is_last` controls whether ISLAST/ISLASTEMPTY are
+/// emitted; on the last meta-block ISUNCOMPRESSED is omitted.
+fn write_meta_block_header(bw: &mut BitWriter, out: &mut Vec<u8>, mlen: u32, is_last: bool) {
+    debug_assert!(mlen >= 1 && mlen <= MAX_BLOCK as u32);
+    // ISLAST
+    bw.write(if is_last { 1 } else { 0 }, 1, out);
+    if is_last {
+        // ISLASTEMPTY = 0
+        bw.write(0, 1, out);
+    }
+    // MNIBBLES = 0 → 4 nibbles
+    bw.write(0, 2, out);
+    // MLEN - 1 in 4 nibbles = 16 bits
+    bw.write(mlen - 1, 16, out);
+    if !is_last {
+        // ISUNCOMPRESSED = 0
+        bw.write(0, 1, out);
+    }
+    // NBLTYPESL = 1 → "0" (1 bit)
+    bw.write(0, 1, out);
+    // NBLTYPESI = 1
+    bw.write(0, 1, out);
+    // NBLTYPESD = 1
+    bw.write(0, 1, out);
+    // NPOSTFIX = 0 (2 bits)
+    bw.write(0, 2, out);
+    // NDIRECT = 0 (4 bits)
+    bw.write(0, 4, out);
+    // CMODE[0] = 0 (LSB6). 2 bits per CMODE entry; NBLTYPESL = 1 so one entry.
+    bw.write(0, 2, out);
+    // NTREESL = 1 → "0"
+    bw.write(0, 1, out);
+    // (No literal context map since NTREESL = 1.)
+    // NTREESD = 1 → "0"
+    bw.write(0, 1, out);
+}
+
+/// Huffman strategy chosen for one alphabet.
+enum HuffStrategy {
+    /// One symbol used, zero bits per emission.
+    SingleSymbol(u32),
+    /// Two symbols used, one bit each. `(symbols, codes)` are aligned —
+    /// `codes[i]` is the 1-bit code for `symbols[i]`.
+    TwoSymbols { symbols: [u32; 2], codes: [u32; 2] },
+    /// General case: a code-length array per symbol of the alphabet.
+    Complex(Vec<u8>),
+}
+
+/// Choose a prefix-code strategy for an alphabet given symbol frequencies.
+///
+/// Simple-NSYM=1 / NSYM=2 are preferred over complex codes when the
+/// alphabet has only 1 or 2 distinct used symbols — both because they
+/// save bits and because they sidestep cl-cl edge cases where the
+/// RLE-encoded code lengths would lack the variety needed for a valid
+/// Kraft-balanced cl-cl tree.
+fn pick_huffman_strategy(freqs: &[u32], alphabet_size: usize) -> HuffStrategy {
+    let nonzero: Vec<usize> = freqs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &f)| if f > 0 { Some(i) } else { None })
+        .collect();
+    match nonzero.len() {
+        0 => HuffStrategy::SingleSymbol(0),
+        1 => HuffStrategy::SingleSymbol(nonzero[0] as u32),
+        2 => {
+            // Canonical NSYM=2: ascending order. The smaller symbol
+            // gets code 0; the larger gets code 1.
+            let a = nonzero[0] as u32;
+            let b = nonzero[1] as u32;
+            HuffStrategy::TwoSymbols {
+                symbols: [a, b],
+                codes: [0, 1],
+            }
+        }
+        _ => {
+            let lengths = encoder_huffman::build_huffman_lengths(freqs, alphabet_size);
+            HuffStrategy::Complex(lengths)
+        }
+    }
+}
+
+/// Encode a complete compressed meta-block carrying `payload` bytes.
+fn encode_meta_block(
+    bw: &mut BitWriter,
+    out: &mut Vec<u8>,
+    payload: &[u8],
+    is_last: bool,
+    ring: &mut DistRing,
+) {
+    let mlen = payload.len() as u32;
+    debug_assert!(mlen >= 1 && mlen <= MAX_BLOCK as u32);
+
+    // 1. Run LZ77 over the payload and build the command stream.
+    let atoms = lz77_pass(payload);
+    let cmds = commands_from_atoms(&atoms);
+    let enc = plan_commands(&cmds, mlen, ring);
+
+    // 2. Tally frequencies.
+    let mut lit_freq = vec![0u32; 256];
+    let mut ic_freq = vec![0u32; 704];
+    let mut dist_freq = vec![0u32; 64];
+    for (i, c) in cmds.iter().enumerate() {
+        for &b in &c.insert {
+            lit_freq[b as usize] += 1;
+        }
+        ic_freq[enc.ic_sym[i] as usize] += 1;
+        if let Some((dcode, _, _)) = enc.dist_enc[i] {
+            dist_freq[dcode as usize] += 1;
+        }
+    }
+
+    // 3. Pick Huffman strategies.
+    let lit_strategy = pick_huffman_strategy(&lit_freq, 256);
+    let ic_strategy = pick_huffman_strategy(&ic_freq, 704);
+    let dist_strategy = pick_huffman_strategy(&dist_freq, 64);
+
+    // 4. Write the meta-block header.
+    write_meta_block_header(bw, out, mlen, is_last);
+
+    // 5. Emit prefix codes.
+    let lit_codes = emit_prefix_code(bw, out, &lit_strategy, 256);
+    let ic_codes = emit_prefix_code(bw, out, &ic_strategy, 704);
+    let dist_codes = emit_prefix_code(bw, out, &dist_strategy, 64);
+
+    // 6. Emit the command stream.
+    for (i, c) in cmds.iter().enumerate() {
+        // IC command symbol.
+        let ic_sym = enc.ic_sym[i];
+        write_symbol(bw, out, &ic_strategy, &ic_codes, ic_sym);
+        // Insert extra bits.
+        let (ieb, iev) = enc.ins_extra[i];
+        if ieb > 0 {
+            bw.write(iev, ieb, out);
+        }
+        // Copy extra bits (decoder reads these even when copy is skipped).
+        let (ceb, cev) = enc.copy_extra[i];
+        if ceb > 0 {
+            bw.write(cev, ceb, out);
+        }
+        // Insert literals.
+        for &b in &c.insert {
+            write_symbol(bw, out, &lit_strategy, &lit_codes, b as u32);
+        }
+        // Distance code + extra bits, if the decoder is going to read them.
+        if let Some((dcode, ndb, dextra)) = enc.dist_enc[i] {
+            write_symbol(bw, out, &dist_strategy, &dist_codes, dcode);
+            if ndb > 0 {
+                bw.write(dextra, ndb, out);
+            }
+        }
+    }
+
+    // 7. Byte-align the stream at the end of the meta-block? Per RFC,
+    //    bit-alignment is NOT required between meta-blocks (only the
+    //    uncompressed type aligns). For ISLAST we DO align (to make
+    //    the stream a valid byte sequence). For non-last we don't
+    //    need to — bits flow into the next meta-block's header.
+    if is_last {
+        bw.align(out);
+    }
+}
+
+/// Emit the prefix-code header bits for one alphabet. Returns the
+/// per-symbol code values needed when later emitting data symbols.
+/// Caller uses these together with the original `HuffStrategy` to
+/// dispatch via `write_symbol`.
+///
+/// For NSYM=1 we return an empty vec — `write_symbol` ignores `codes`.
+/// For NSYM=2 we return a 2-entry vec aligned with `symbols` of the
+/// strategy. For complex codes we return the canonical (MSB-first)
+/// code table of size `alphabet_size`.
+fn emit_prefix_code(
+    bw: &mut BitWriter,
+    out: &mut Vec<u8>,
+    strategy: &HuffStrategy,
+    alphabet_size: u32,
+) -> Vec<u16> {
+    match strategy {
+        HuffStrategy::SingleSymbol(sym) => {
+            encoder_huffman::emit_simple_nsym1(bw, out, *sym, alphabet_size);
+            Vec::new()
+        }
+        HuffStrategy::TwoSymbols { symbols, .. } => {
+            let _codes = encoder_huffman::emit_simple_nsym2(bw, out, *symbols, alphabet_size);
+            // `codes` already matches `symbols` ordering; write_symbol
+            // looks them up directly from the strategy.
+            Vec::new()
+        }
+        HuffStrategy::Complex(lengths) => {
+            encoder_huffman::emit_complex_prefix_code(bw, out, lengths)
+        }
+    }
+}
+
+/// Emit one data symbol via the appropriate prefix code.
+///
+/// - NSYM=1: zero bits.
+/// - NSYM=2: one bit, looked up via the symbol pair.
+/// - Complex: bit-reverse the canonical MSB-first code for LSB-first
+///   emission.
+fn write_symbol(
+    bw: &mut BitWriter,
+    out: &mut Vec<u8>,
+    strategy: &HuffStrategy,
+    codes: &[u16],
+    sym: u32,
+) {
+    match strategy {
+        HuffStrategy::SingleSymbol(_) => { /* zero bits */ }
+        HuffStrategy::TwoSymbols { symbols, codes: tc } => {
+            // Find which slot `sym` occupies.
+            let slot = if sym == symbols[0] {
+                0
+            } else {
+                debug_assert!(sym == symbols[1], "symbol {sym} not in 2-symbol code");
+                1
+            };
+            bw.write(tc[slot], 1, out);
+        }
+        HuffStrategy::Complex(lengths) => {
+            let len = lengths[sym as usize] as u32;
+            debug_assert!(
+                len > 0,
+                "symbol {sym} has no complex-prefix-code entry (length 0)"
+            );
+            let code = codes[sym as usize];
+            let rev = reverse_bits(code as u32, len);
+            bw.write(rev, len, out);
+        }
     }
 }
 
