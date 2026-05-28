@@ -12,9 +12,11 @@
 //! - 5 bytes of range-coder flush.
 //!
 //! Header choices: `lc=3, lp=0, pb=2` (the standard preset, packed to 0x5d);
-//! dictionary size 1 MiB; uncompressed size left as `u64::MAX` so the EOS
-//! marker terminates the stream — matches what Python's `lzma.compress(...,
-//! format=lzma.FORMAT_ALONE)` produces.
+//! dictionary size derived from [`EncoderConfig::level`] (clamped to the
+//! input length rounded up to a power of two, so a short input never forces
+//! the decoder to allocate a huge window); uncompressed size left as
+//! `u64::MAX` so the EOS marker terminates the stream — matches what
+//! Python's `lzma.compress(..., format=lzma.FORMAT_ALONE)` produces.
 //!
 //! Quality: a greedy parser with a bounded hash-chain match search. Output is
 //! valid LZMA but noticeably weaker than xz at level 6 — there is no lazy
@@ -47,18 +49,138 @@ const ENC_LP: u32 = 0;
 const ENC_PB: u32 = 2;
 const ENC_PROPS_BYTE: u8 = (ENC_PB * 5 + ENC_LP) as u8 * 9 + ENC_LC as u8;
 
-/// 1 MiB dictionary advertised in the header. The encoder never actually
-/// needs to slide; matches are looked up against the whole buffered input.
-const ENC_DICT_SIZE: u32 = 1 << 20;
-
 const MAX_MATCH_LEN: u32 = 273; // 2 + 8 + 8 + 255 (LEN_LOW + LEN_MID + LEN_HIGH)
 
 // Hash chain match finder configuration.
 const HASH_BITS: u32 = 16;
 const HASH_SIZE: usize = 1 << HASH_BITS;
 const NIL: u32 = u32::MAX;
-const MAX_CHAIN: usize = 96;
-const NICE_MATCH: u32 = 192;
+
+/// Minimum advertised dictionary size. LZMA's decoder clamps below 4 KiB so
+/// the header must carry at least that much.
+const MIN_DICT_SIZE: u32 = 1 << 12; // 4 KiB
+
+// ─── compression level ──────────────────────────────────────────────────
+
+/// Tunables for the LZMA encoder.
+///
+/// `level` controls the speed/ratio trade-off. `0` is fastest and produces
+/// the largest output; `9` is slowest and produces the smallest. The default
+/// of `6` mirrors xz's default. Values outside `0..=9` are clamped at
+/// encoder construction time rather than rejected.
+///
+/// Internally `level` maps to the advertised dictionary size and the
+/// match-finder's chain budget / nice-match cutoff — the same quality knobs
+/// the xz reference encoder exposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncoderConfig {
+    /// Compression level in `0..=9`.
+    pub level: u8,
+}
+
+impl Default for EncoderConfig {
+    fn default() -> Self {
+        Self { level: 6 }
+    }
+}
+
+/// Per-level match-finder knobs. The table mirrors xz's preset table for the
+/// quality dimensions our encoder can vary: dictionary size (advertised in
+/// the header and used as `max_dist` in the match finder), how deep the hash
+/// chain walks, and when to stop probing.
+#[derive(Debug, Clone, Copy)]
+struct LevelParams {
+    /// Dictionary size advertised in the header (and the cap on `max_dist`
+    /// inside the match finder). Capped to 64 MiB so the decoder's
+    /// `DIC_SIZE_MAX` clamp doesn't kick in.
+    dict_size: u32,
+    /// Maximum number of hash-chain links the match finder walks per probe.
+    max_chain: usize,
+    /// Length at which the match finder stops looking for a longer candidate.
+    nice_match: u32,
+}
+
+impl LevelParams {
+    fn from_level(level: u8) -> Self {
+        let level = level.min(9);
+        // Mirrors xz's preset table for dictionary size, then a graduated
+        // chain budget / nice-match cutoff that grows with level. The
+        // numbers don't have to match xz precisely — what matters is that
+        // a higher level walks deeper chains and accepts longer matches.
+        match level {
+            0 => Self {
+                dict_size: 1 << 16, // 64 KiB
+                max_chain: 8,
+                nice_match: 8,
+            },
+            1 => Self {
+                dict_size: 1 << 20, // 1 MiB
+                max_chain: 16,
+                nice_match: 16,
+            },
+            2 => Self {
+                dict_size: 1 << 21, // 2 MiB
+                max_chain: 24,
+                nice_match: 32,
+            },
+            3 => Self {
+                dict_size: 1 << 22, // 4 MiB
+                max_chain: 32,
+                nice_match: 48,
+            },
+            4 => Self {
+                dict_size: 1 << 22, // 4 MiB
+                max_chain: 48,
+                nice_match: 64,
+            },
+            5 => Self {
+                dict_size: 1 << 23, // 8 MiB
+                max_chain: 64,
+                nice_match: 96,
+            },
+            6 => Self {
+                dict_size: 1 << 23, // 8 MiB
+                max_chain: 96,
+                nice_match: 128,
+            },
+            7 => Self {
+                dict_size: 1 << 24, // 16 MiB
+                max_chain: 192,
+                nice_match: 192,
+            },
+            8 => Self {
+                dict_size: 1 << 25, // 32 MiB
+                max_chain: 384,
+                nice_match: 256,
+            },
+            _ => Self {
+                dict_size: 1 << 26, // 64 MiB (level 9)
+                max_chain: 768,
+                nice_match: MAX_MATCH_LEN,
+            },
+        }
+    }
+
+    /// Compute the dict size actually written into the header for an input of
+    /// `input_len` bytes. We never claim more than what could possibly be
+    /// referenced, so a 1 KiB input doesn't force the decoder to allocate a
+    /// 64 MiB window. The advertised size is also clamped to the decoder's
+    /// minimum of 4 KiB.
+    fn effective_dict_size(&self, input_len: usize) -> u32 {
+        // Round `input_len` up to a power of two (clamped at u32::MAX). Empty
+        // input gets the minimum dict; `next_power_of_two` would panic on 0.
+        let needed = if input_len == 0 {
+            MIN_DICT_SIZE
+        } else {
+            let np2 = (input_len as u64)
+                .checked_next_power_of_two()
+                .unwrap_or(u32::MAX as u64);
+            np2.min(u32::MAX as u64) as u32
+        };
+        let needed = needed.max(MIN_DICT_SIZE);
+        needed.min(self.dict_size)
+    }
+}
 
 fn hash3(b0: u8, b1: u8, b2: u8) -> u32 {
     // Same rotated-xor shape as the deflate match finder; well-distributed
@@ -627,8 +749,16 @@ impl HashChain {
     }
 
     /// Find the longest match for `input[pos..]` against earlier positions,
-    /// bounded by `MAX_MATCH_LEN` and `MAX_CHAIN` chain steps.
-    fn find_longest(&self, input: &[u8], pos: usize, dict_size: u32) -> Option<(u32, u32)> {
+    /// bounded by `MAX_MATCH_LEN`, the per-level chain budget, and the
+    /// per-level "nice match" early-exit.
+    fn find_longest(
+        &self,
+        input: &[u8],
+        pos: usize,
+        dict_size: u32,
+        max_chain: usize,
+        nice_match: u32,
+    ) -> Option<(u32, u32)> {
         if pos + 3 > input.len() {
             return None;
         }
@@ -639,7 +769,7 @@ impl HashChain {
         let mut best_dist: u32 = 0;
         let mut cur = self.head[h];
         let mut steps = 0usize;
-        while cur != NIL && steps < MAX_CHAIN {
+        while cur != NIL && steps < max_chain {
             let cur_pos = cur as usize;
             if cur_pos >= pos {
                 cur = self.prev[cur_pos];
@@ -667,7 +797,7 @@ impl HashChain {
                 best_len = len;
                 // LZMA distances are 0-based.
                 best_dist = (dist - 1) as u32;
-                if len >= NICE_MATCH {
+                if len >= nice_match {
                     break;
                 }
             }
@@ -703,9 +833,10 @@ fn rep_match_len(input: &[u8], pos: usize, dist: u32) -> u32 {
 
 // ─── full encode pass ────────────────────────────────────────────────────
 
-fn encode_all(input: &[u8]) -> Vec<u8> {
+fn encode_all(input: &[u8], params: LevelParams) -> Vec<u8> {
     let mut core = LzmaEncCore::new();
     let mut hc = HashChain::new(input.len());
+    let dict_size = params.effective_dict_size(input.len());
 
     let mut pos = 0usize;
     while pos < input.len() {
@@ -718,7 +849,7 @@ fn encode_all(input: &[u8]) -> Vec<u8> {
         ];
 
         // Best new match from the hash chain.
-        let new_match = hc.find_longest(input, pos, ENC_DICT_SIZE);
+        let new_match = hc.find_longest(input, pos, dict_size, params.max_chain, params.nice_match);
 
         // Decide what to emit.
         let best_rep_len = rep_lens.iter().copied().max().unwrap_or(0);
@@ -778,7 +909,7 @@ fn encode_all(input: &[u8]) -> Vec<u8> {
     core.rc.flush();
     let mut out = Vec::with_capacity(13 + core.rc.out.len());
     out.push(ENC_PROPS_BYTE);
-    out.extend_from_slice(&ENC_DICT_SIZE.to_le_bytes());
+    out.extend_from_slice(&dict_size.to_le_bytes());
     out.extend_from_slice(&u64::MAX.to_le_bytes());
     out.extend_from_slice(&core.rc.out);
     out
@@ -794,21 +925,38 @@ fn encode_all(input: &[u8]) -> Vec<u8> {
 /// `encode` calls append to the buffer and never write output; `finish`
 /// builds the full output and then drains it across however many calls the
 /// caller's output buffer requires.
-#[derive(Default)]
 pub struct Encoder {
     input_buf: Vec<u8>,
     output_buf: Vec<u8>,
     output_pos: usize,
     finished: bool,
+    /// Match-finder tuning derived from [`EncoderConfig::level`]. Persisted
+    /// across `reset` since configuration is meant to survive resets.
+    params: LevelParams,
+}
+
+impl Default for Encoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Encoder {
-    pub const fn new() -> Self {
+    /// Build an encoder at the default compression level (6).
+    pub fn new() -> Self {
+        Self::with_config(EncoderConfig::default())
+    }
+
+    /// Build an encoder with explicit configuration. `config.level` is
+    /// clamped to `0..=9` internally — out-of-range values are snapped to
+    /// the nearest valid level rather than rejected.
+    pub fn with_config(config: EncoderConfig) -> Self {
         Self {
             input_buf: Vec::new(),
             output_buf: Vec::new(),
             output_pos: 0,
             finished: false,
+            params: LevelParams::from_level(config.level),
         }
     }
 }
@@ -829,7 +977,7 @@ impl RawEncoder for Encoder {
     fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         if !self.finished {
             // One-shot encode of everything we've buffered.
-            self.output_buf = encode_all(&self.input_buf);
+            self.output_buf = encode_all(&self.input_buf, self.params);
             self.output_pos = 0;
             self.finished = true;
         }
@@ -850,5 +998,6 @@ impl RawEncoder for Encoder {
         self.output_buf.clear();
         self.output_pos = 0;
         self.finished = false;
+        // Note: params is preserved per the trait contract.
     }
 }

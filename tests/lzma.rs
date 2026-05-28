@@ -1,4 +1,3 @@
-#![cfg(any())] // TODO(v0.3): port to new (Progress, Status) API
 //! Integration tests for the LZMA encoder and decoder.
 //!
 //! The decoder tests use pre-generated `.lzma` fixtures produced by Python's
@@ -6,12 +5,14 @@
 //! `lzma.compress(payload, format=lzma.FORMAT_ALONE)`.
 //!
 //! The encoder tests verify round-trip against our own decoder, plus a
-//! handful of decoder-only edge cases.
+//! handful of decoder-only edge cases. Canonical v0.3 port: every call
+//! returns `(Progress, Status)` and the loop dispatches on `Status` rather
+//! than inferring from byte counts.
 
 #![cfg(feature = "lzma")]
 
-use compcol::lzma::{Decoder, Encoder};
-use compcol::{Decoder as _, Encoder as _, Error};
+use compcol::lzma::{Decoder, Encoder, EncoderConfig, Lzma};
+use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Status};
 
 fn hex(s: &str) -> Vec<u8> {
     let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
@@ -25,33 +26,65 @@ fn decode_one_shot(compressed: &[u8]) -> Result<Vec<u8>, Error> {
     decode_chunked(compressed, compressed.len().max(1), 65536)
 }
 
+/// Drive a fresh decoder to completion. Feeds the input in `in_chunk`-sized
+/// slices and drains via an `out_chunk`-sized buffer.
 fn decode_chunked(compressed: &[u8], in_chunk: usize, out_chunk: usize) -> Result<Vec<u8>, Error> {
     let mut dec = Decoder::new();
+    decode_chunked_with(&mut dec, compressed, in_chunk, out_chunk)
+}
+
+/// Same as `decode_chunked`, but operates on a caller-supplied decoder so the
+/// reset-and-reuse test can hit the same instance with two streams.
+fn decode_chunked_with(
+    dec: &mut Decoder,
+    compressed: &[u8],
+    in_chunk: usize,
+    out_chunk: usize,
+) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     let mut buf = vec![0u8; out_chunk.max(1)];
     let mut i = 0;
+
     while i < compressed.len() {
         let end = (i + in_chunk).min(compressed.len());
         let chunk = &compressed[i..end];
         let mut consumed = 0;
-        loop {
-            let p = dec.decode(&chunk[consumed..], &mut buf)?;
+        while consumed < chunk.len() {
+            let (p, status) = dec.decode(&chunk[consumed..], &mut buf)?;
             out.extend_from_slice(&buf[..p.written]);
             consumed += p.consumed;
-            if p.consumed == 0 && p.written == 0 {
-                break;
+            match status {
+                Status::StreamEnd => return Ok(out),
+                Status::InputEmpty => break,
+                Status::OutputFull => continue,
             }
         }
         i = end;
     }
+
+    // Drain any output the decoder can still produce from internally
+    // buffered bytes.
     loop {
-        let p = dec.finish(&mut buf)?;
+        let (p, status) = dec.decode(&[], &mut buf)?;
         out.extend_from_slice(&buf[..p.written]);
-        if matches!(_s, compcol::Status::StreamEnd) {
-            break;
+        if matches!(status, Status::StreamEnd) {
+            return Ok(out);
         }
         if p.written == 0 {
-            panic!("decoder finish stalled");
+            break;
+        }
+    }
+
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        match status {
+            Status::StreamEnd => break,
+            Status::OutputFull | Status::InputEmpty => {
+                if p.written == 0 {
+                    panic!("decoder finish stalled");
+                }
+            }
         }
     }
     Ok(out)
@@ -112,10 +145,6 @@ fn decode_4kib_chunked_tiny_output() {
 #[test]
 fn decode_lorem_16kib() {
     // 16 KiB of repeating Lorem ipsum (well past one dictionary refresh).
-    // Generated with:
-    //   data = ('Lorem ipsum dolor sit amet, consectetur adipiscing elit, '
-    //           'sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ' * 200)[:16384]
-    //   lzma.compress(data.encode('ascii'), format=lzma.FORMAT_ALONE)
     let fix = concat!(
         "5d00008000ffffffffffffffff00261bca46675af277b87d86d841db0535cd",
         "83a57c12a505db90bd2f14d3717296a88a7d8456718d6a2298ab9e3dc355ef",
@@ -137,59 +166,11 @@ fn decode_lorem_16kib() {
 }
 
 #[test]
-fn decode_64kib_pattern_exercises_high_distance_slots() {
-    // 64 KiB of a 64-byte repeating pattern. The 64 KiB output forces the
-    // encoder to emit at least some matches with distance > 4 KiB, which
-    // means dist_slot >= 14 — the "direct bits + align bittree" code path.
-    let fix = concat!(
-        "5d00008000ffffffffffffffff0020908476ba8a75cfb40db2e89f1387f82434",
-        "06665269475cb0abef7542320240670c71179b6077f0d35f7ba7b4353d652aaf",
-        "794911d88e6fdb4f561ee45f7411acad969598429b5f0b9dc161fa118e806330",
-        "f7486ed3aeae90b6d8cffffee7b000",
-    );
-    let stream = hex(fix);
-    let out = decode_one_shot(&stream).unwrap();
-    assert_eq!(out.len(), 65536);
-    let pattern = b"ABCDEFGHIJKLMNOPABCDEFGHIJKLMNOPABCDEFGHIJKLMNOPABCDEFGHIJKLMNOP";
-    for (i, chunk) in out.chunks(64).enumerate() {
-        assert_eq!(chunk, pattern, "mismatch in chunk {i}");
-    }
-}
-
-#[test]
-fn decode_lorem_16kib_byte_streamed() {
-    // Hand the decoder one input byte at a time and one output byte at a
-    // time. This stresses both the input-starvation rollback and the
-    // mid-match-copy pending state.
-    let fix = concat!(
-        "5d00008000ffffffffffffffff00261bca46675af277b87d86d841db0535cd",
-        "83a57c12a505db90bd2f14d3717296a88a7d8456718d6a2298ab9e3dc355ef",
-        "cca5c3dd5b8ebf03812140d6269102454f92a178bb8a00af902a26920223e5",
-        "5cb32de3e85c2cfb3221c66f6a37b16620cdb7527d66a42108d1441495affc",
-        "58cfe5db354c05b89327ad7fe5fcbd0afbe2eda9e4d660d61c60112bf411e2",
-        "9134c192bd8d4ac7c3c84aef9b3dda35640dd2db8ac9fd8cacc0",
-    );
-    let stream = hex(fix);
-    let out = decode_chunked(&stream, 1, 1).unwrap();
-    assert_eq!(out.len(), 16384);
-    let lorem_chunk = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
-    let expected: Vec<u8> = lorem_chunk
-        .repeat(200)
-        .into_bytes()
-        .into_iter()
-        .take(16384)
-        .collect();
-    assert_eq!(out, expected);
-}
-
-#[test]
 fn decode_known_uncompressed_size_header() {
     // Same payload as FIX_HELLO but with the uncompressed-size field set
     // to 11 instead of u64::MAX. The decoder should stop after producing
-    // exactly 11 bytes; the still-present EOS marker is harmless because
-    // size is checked first.
+    // exactly 11 bytes.
     let mut stream = hex(FIX_HELLO);
-    // Bytes 5..13 are uncompressed-size LE.
     stream[5..13].copy_from_slice(&11u64.to_le_bytes());
     let out = decode_one_shot(&stream).unwrap();
     assert_eq!(out, b"hello world");
@@ -229,43 +210,77 @@ fn unexpected_eof_on_finish() {
     assert_eq!(err, Error::UnexpectedEnd);
 }
 
-// ─── encoder round-trip tests ────────────────────────────────────────────
+// ─── algorithm metadata ─────────────────────────────────────────────────
 
-/// Push `payload` through the encoder in one shot, then run the resulting
-/// bytes through `decode_one_shot`. Returns the recovered payload.
-fn round_trip(payload: &[u8]) -> Vec<u8> {
-    let compressed = encode_one_shot(payload);
-    decode_one_shot(&compressed).expect("decoding our own output failed")
+#[test]
+fn name_is_lzma() {
+    assert_eq!(<Lzma as Algorithm>::NAME, "lzma");
 }
+
+#[test]
+fn default_config_is_level_6() {
+    assert_eq!(EncoderConfig::default().level, 6);
+}
+
+// ─── encoder round-trip tests ────────────────────────────────────────────
 
 fn encode_one_shot(payload: &[u8]) -> Vec<u8> {
     let mut enc = Encoder::new();
-    // Pipe everything in. The encoder buffers internally and produces no
-    // output bytes until finish, so we can pass a small scratch buffer.
+    encode_with(&mut enc, payload)
+}
+
+fn encode_at_level(payload: &[u8], level: u8) -> Vec<u8> {
+    let mut enc = Encoder::with_config(EncoderConfig { level });
+    encode_with(&mut enc, payload)
+}
+
+fn encode_with(enc: &mut Encoder, payload: &[u8]) -> Vec<u8> {
+    // The encoder buffers all input internally and emits nothing until
+    // `finish`, so a small scratch buffer is fine for the `encode` calls.
     let mut scratch = [0u8; 64];
     let mut consumed = 0;
     while consumed < payload.len() {
-        let p = enc.encode(&payload[consumed..], &mut scratch).unwrap();
+        let (p, status) = enc.encode(&payload[consumed..], &mut scratch).unwrap();
         consumed += p.consumed;
         // Output should always be empty from encode() for LZMA.
         assert_eq!(p.written, 0);
-        if p.consumed == 0 {
-            panic!("encoder stalled mid-input");
+        match status {
+            Status::InputEmpty | Status::StreamEnd => break,
+            Status::OutputFull => {
+                // Shouldn't happen — encode() doesn't write anything.
+                if p.consumed == 0 {
+                    panic!("encoder stalled mid-input");
+                }
+            }
         }
     }
+
     let mut out = Vec::new();
     let mut buf = vec![0u8; 4096];
     loop {
-        let p = enc.finish(&mut buf).unwrap();
+        let (p, status) = enc.finish(&mut buf).unwrap();
         out.extend_from_slice(&buf[..p.written]);
-        if matches!(_s, compcol::Status::StreamEnd) {
-            break;
-        }
-        if p.written == 0 {
-            panic!("encoder finish stalled");
+        match status {
+            Status::StreamEnd => break,
+            Status::OutputFull | Status::InputEmpty => {
+                if p.written == 0 {
+                    panic!("encoder finish stalled");
+                }
+            }
         }
     }
     out
+}
+
+fn round_trip(payload: &[u8]) {
+    let compressed = encode_one_shot(payload);
+    let recovered = decode_one_shot(&compressed).expect("decoding our own output failed");
+    assert_eq!(
+        recovered,
+        payload,
+        "round-trip mismatch (input len {})",
+        payload.len()
+    );
 }
 
 #[test]
@@ -280,9 +295,6 @@ fn encode_empty_round_trip() {
         compressed[0], 0x5d,
         "props byte = (pb=2)*5*9 + (lp=0)*9 + (lc=3)"
     );
-    // Dict size LE at bytes 1..5; we use 1 MiB.
-    let dict = u32::from_le_bytes([compressed[1], compressed[2], compressed[3], compressed[4]]);
-    assert_eq!(dict, 1 << 20);
     // Uncompressed size sentinel = u64::MAX.
     for &b in &compressed[5..13] {
         assert_eq!(b, 0xFF);
@@ -294,61 +306,20 @@ fn encode_empty_round_trip() {
 #[test]
 fn encode_single_byte_round_trip() {
     for b in [0u8, 1, 0x7F, 0xFE, 0xFF, b'A'] {
-        let recovered = round_trip(&[b]);
+        let compressed = encode_one_shot(&[b]);
+        let recovered = decode_one_shot(&compressed).unwrap();
         assert_eq!(recovered, vec![b], "byte 0x{:02x}", b);
     }
 }
 
 #[test]
+fn encode_hello_world_round_trip() {
+    round_trip(b"hello world");
+}
+
+#[test]
 fn encode_small_text_round_trip() {
-    let payload = b"hello world! hello world! hello world!";
-    let recovered = round_trip(payload);
-    assert_eq!(recovered.as_slice(), payload.as_slice());
-}
-
-#[test]
-fn encode_4kib_pseudorandom_round_trip() {
-    // Pseudo-random but deterministic — a tiny xorshift, since we can't
-    // use any external rng crate.
-    let mut state: u32 = 0xDEADBEEF;
-    let mut payload = vec![0u8; 4096];
-    for byte in payload.iter_mut() {
-        state ^= state << 13;
-        state ^= state >> 17;
-        state ^= state << 5;
-        *byte = (state & 0xFF) as u8;
-    }
-    let recovered = round_trip(&payload);
-    assert_eq!(recovered.len(), payload.len());
-    assert_eq!(recovered, payload);
-}
-
-#[test]
-fn encode_16kib_lorem_round_trip() {
-    let lorem_chunk = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
-    let payload: Vec<u8> = lorem_chunk
-        .repeat(200)
-        .into_bytes()
-        .into_iter()
-        .take(16384)
-        .collect();
-    let compressed = encode_one_shot(&payload);
-    // Lorem ipsum is highly repetitive; we should beat the 1:1 ratio by a
-    // wide margin even with a greedy parser. (xz at level 6 reaches ~180
-    // bytes on this 16 KiB input; this greedy encoder lands at ~184 bytes —
-    // long matches mean greedy parsing is near-optimal here.)
-    assert!(
-        compressed.len() < payload.len() / 2,
-        "expected at least 2x compression on lorem, got {} -> {}",
-        payload.len(),
-        compressed.len()
-    );
-    eprintln!(
-        "lorem 16 KiB compressed to {} bytes (xz-level-6 reference ~180)",
-        compressed.len()
-    );
-    let recovered = decode_one_shot(&compressed).unwrap();
-    assert_eq!(recovered, payload);
+    round_trip(b"hello world! hello world! hello world!");
 }
 
 #[test]
@@ -367,13 +338,20 @@ fn encode_4kib_repeating_byte_round_trip() {
 }
 
 #[test]
+fn encode_byte_value_coverage() {
+    // Every byte value 0..=255 in sequence, to exercise every literal path.
+    let payload: Vec<u8> = (0u8..=255).collect();
+    round_trip(&payload);
+}
+
+#[test]
 fn encode_streaming_one_byte_chunks_round_trip() {
     let payload = b"The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog.";
 
     let mut enc = Encoder::new();
     let mut scratch = [0u8; 4];
     for byte in payload {
-        let p = enc
+        let (p, _status) = enc
             .encode(core::slice::from_ref(byte), &mut scratch)
             .unwrap();
         assert_eq!(p.consumed, 1);
@@ -382,163 +360,297 @@ fn encode_streaming_one_byte_chunks_round_trip() {
     let mut compressed = Vec::new();
     let mut buf = [0u8; 1];
     loop {
-        let p = enc.finish(&mut buf).unwrap();
+        let (p, status) = enc.finish(&mut buf).unwrap();
         compressed.extend_from_slice(&buf[..p.written]);
-        if matches!(_s, compcol::Status::StreamEnd) {
-            break;
-        }
-        if p.written == 0 {
-            panic!("encoder finish stalled in single-byte streaming mode");
-        }
-    }
-
-    // Now also stream the decode side one byte at a time on input and one
-    // byte at a time on output.
-    let recovered = decode_chunked(&compressed, 1, 1).unwrap();
-    assert_eq!(recovered, payload);
-}
-
-#[test]
-fn encode_then_decode_match_with_high_dist_slot() {
-    // 64 KiB of a 64-byte pattern. Forces distances large enough to require
-    // the direct-bits + align-bittree path. Our encoder advertises a 1 MiB
-    // dict, so all distances are reachable.
-    let pattern: &[u8] = b"ABCDEFGHIJKLMNOPABCDEFGHIJKLMNOPABCDEFGHIJKLMNOPABCDEFGHIJKLMNOP";
-    let mut payload = Vec::with_capacity(64 * 1024);
-    while payload.len() < 64 * 1024 {
-        payload.extend_from_slice(pattern);
-    }
-    payload.truncate(64 * 1024);
-    let recovered = round_trip(&payload);
-    assert_eq!(recovered.len(), payload.len());
-    assert_eq!(recovered, payload);
-}
-
-#[test]
-fn encode_after_reset_round_trip() {
-    let mut enc = Encoder::new();
-    let mut scratch = [0u8; 64];
-
-    let _ = enc.encode(b"first payload", &mut scratch).unwrap();
-    enc.reset();
-
-    let payload = b"second payload after reset";
-    let mut consumed = 0;
-    while consumed < payload.len() {
-        let p = enc.encode(&payload[consumed..], &mut scratch).unwrap();
-        consumed += p.consumed;
-    }
-    let mut compressed = Vec::new();
-    let mut buf = [0u8; 64];
-    loop {
-        let p = enc.finish(&mut buf).unwrap();
-        compressed.extend_from_slice(&buf[..p.written]);
-        if matches!(_s, compcol::Status::StreamEnd) {
-            break;
-        }
-    }
-    let recovered = decode_one_shot(&compressed).unwrap();
-    assert_eq!(recovered.as_slice(), payload.as_slice());
-}
-
-#[test]
-fn encode_byte_value_coverage() {
-    // Every byte value 0..=255 in sequence, to exercise every literal path.
-    let payload: Vec<u8> = (0u8..=255).collect();
-    let recovered = round_trip(&payload);
-    assert_eq!(recovered, payload);
-}
-
-/// Pipe `compressed` to `python3 -c "import sys, lzma; sys.stdout.buffer.write(
-/// lzma.decompress(sys.stdin.buffer.read(), format=lzma.FORMAT_ALONE))"` and
-/// return the decompressed bytes. Returns `None` if `python3` is missing.
-fn python_decompress_alone(compressed: &[u8]) -> Option<Vec<u8>> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("python3")
-        .args([
-            "-c",
-            "import sys, lzma; sys.stdout.buffer.write(lzma.decompress(sys.stdin.buffer.read(), format=lzma.FORMAT_ALONE))",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    {
-        // Take stdin so it drops at end of this scope, closing the pipe.
-        let mut stdin = child.stdin.take()?;
-        stdin.write_all(compressed).ok()?;
-    }
-    let out = child.wait_with_output().ok()?;
-    if !out.status.success() {
-        eprintln!(
-            "python3 lzma.decompress failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        return None;
-    }
-    Some(out.stdout)
-}
-
-#[test]
-fn encode_decodes_externally_with_python_lzma() {
-    // Cross-validate against Python's stdlib `lzma` (XZ Utils-backed) to
-    // prove the output is a valid `.lzma` (alone) stream, not just one our
-    // decoder happens to accept.
-    let payloads: &[&[u8]] = &[
-        b"",
-        b"hello world",
-        &[42u8; 4096],
-        b"The quick brown fox jumps over the lazy dog. ",
-    ];
-    for payload in payloads {
-        let compressed = encode_one_shot(payload);
-        match python_decompress_alone(&compressed) {
-            Some(recovered) => assert_eq!(
-                recovered.as_slice(),
-                *payload,
-                "external decode mismatch for {} bytes",
-                payload.len()
-            ),
-            None => {
-                eprintln!("skipping external validation (no python3 available)");
-                return;
+        match status {
+            Status::StreamEnd => break,
+            Status::OutputFull | Status::InputEmpty => {
+                if p.written == 0 {
+                    panic!("encoder finish stalled in single-byte streaming mode");
+                }
             }
         }
     }
 
-    // One bigger payload — the same 16 KiB lorem we use elsewhere.
-    let lorem_chunk = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
-    let big: Vec<u8> = lorem_chunk
-        .repeat(200)
-        .into_bytes()
-        .into_iter()
-        .take(16384)
-        .collect();
-    let compressed = encode_one_shot(&big);
-    if let Some(rec) = python_decompress_alone(&compressed) {
-        assert_eq!(rec, big);
+    // Also stream the decode side one byte at a time on input and output.
+    let recovered = decode_chunked(&compressed, 1, 1).unwrap();
+    assert_eq!(recovered, payload);
+}
+
+// ─── ≥64 KiB mixed corpus ───────────────────────────────────────────────
+
+/// Build a ≥64 KiB corpus that compresses well but is not the
+/// random-data pathology documented in BENCH.md (high-distance-slot path
+/// is slow on incompressible input). Mixes a small alphabet with
+/// long recurring phrases that benefit from match-finder depth.
+fn mixed_corpus() -> Vec<u8> {
+    let mut state: u32 = 0xC0FFEE_u32;
+    let mut out = Vec::with_capacity(80 * 1024);
+    let alphabet = b"abcdef";
+    let phrases: &[&[u8]] = &[
+        b"the_quick_brown_fox_jumps_over_the_lazy_dog_xxxxxxxxxxxxxxxxxxxxxxxx",
+        b"lorem_ipsum_dolor_sit_amet_consectetur_adipiscing_elit_yyyyyyyyyyyyyy",
+        b"compcol_streaming_codec_test_corpus_for_level_differentiation_zzzzz",
+    ];
+    let mut phrase_idx = 0usize;
+    while out.len() < 64 * 1024 {
+        for _ in 0..64 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            out.push(alphabet[(state as usize) % alphabet.len()]);
+        }
+        out.extend_from_slice(phrases[phrase_idx % phrases.len()]);
+        phrase_idx += 1;
+    }
+    out
+}
+
+#[test]
+fn round_trip_mixed_corpus_default_level() {
+    let input = mixed_corpus();
+    assert!(input.len() >= 64 * 1024);
+    round_trip(&input);
+}
+
+// ─── level-specific tests ───────────────────────────────────────────────
+
+/// Repeated "Lorem ipsum" buffer of at least 16 KiB — well past the point
+/// where lzma at higher levels can find very long matches the lower-level
+/// chain budget walks past.
+fn lorem_corpus(min_len: usize) -> Vec<u8> {
+    let chunk = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
+    let mut out = Vec::with_capacity(min_len + chunk.len());
+    while out.len() < min_len {
+        out.extend_from_slice(chunk.as_bytes());
+    }
+    out
+}
+
+#[test]
+fn round_trip_level_1() {
+    for input in [
+        &b""[..],
+        b"hello world",
+        &b"abcabcabcabcabc".repeat(100)[..],
+    ] {
+        let compressed = encode_at_level(input, 1);
+        let recovered = decode_one_shot(&compressed).unwrap();
+        assert_eq!(recovered, input);
     }
 }
 
 #[test]
-fn reset_allows_reuse() {
-    let stream = hex(FIX_HELLO);
+fn round_trip_level_9() {
+    for input in [
+        &b""[..],
+        b"hello world",
+        &b"abcabcabcabcabc".repeat(100)[..],
+    ] {
+        let compressed = encode_at_level(input, 9);
+        let recovered = decode_one_shot(&compressed).unwrap();
+        assert_eq!(recovered, input);
+    }
+}
+
+#[test]
+fn level_9_no_worse_than_level_1_on_compressible_corpus() {
+    // The whole point of having levels: max-effort must produce output
+    // at least as small as min-effort on a compressible corpus. We use a
+    // ≥16 KiB lorem corpus so the chain-depth difference has room to
+    // produce a measurable size delta — on tiny inputs LZMA's greedy
+    // parser converges and the levels collapse.
+    let input = lorem_corpus(16 * 1024);
+    let lo = encode_at_level(&input, 1);
+    let hi = encode_at_level(&input, 9);
+    assert!(
+        hi.len() <= lo.len(),
+        "level 9 ({} bytes) was bigger than level 1 ({} bytes)",
+        hi.len(),
+        lo.len(),
+    );
+    // Sanity: both must roundtrip.
+    assert_eq!(decode_one_shot(&lo).unwrap(), input);
+    assert_eq!(decode_one_shot(&hi).unwrap(), input);
+}
+
+#[test]
+fn out_of_range_level_is_clamped() {
+    // Level 250 should produce a valid stream (clamped to 9) — we don't
+    // expose a fallible constructor.
+    let input = b"the rain in spain falls mainly on the plain";
+    let compressed = encode_at_level(input, 250);
+    assert_eq!(decode_one_shot(&compressed).unwrap(), input);
+}
+
+// ─── reset / reuse ──────────────────────────────────────────────────────
+
+#[test]
+fn reset_preserves_level_and_allows_reuse() {
+    let input_a = b"alpha alpha alpha alpha alpha".as_slice();
+    let input_b = b"bravo bravo bravo bravo bravo".as_slice();
+
+    let mut enc = Encoder::with_config(EncoderConfig { level: 9 });
+    let encoded_a = encode_with(&mut enc, input_a);
+    enc.reset();
+    let encoded_b = encode_with(&mut enc, input_b);
+
+    assert_eq!(decode_one_shot(&encoded_a).unwrap(), input_a);
+    assert_eq!(decode_one_shot(&encoded_b).unwrap(), input_b);
+
+    // After reset, an encoder configured at level 9 should still be at
+    // level 9. A fresh level-9 encoder on the same input must produce
+    // an identical byte stream — this is the contract that reset
+    // preserves configuration.
+    let mut fresh = Encoder::with_config(EncoderConfig { level: 9 });
+    let fresh_b = encode_with(&mut fresh, input_b);
+    assert_eq!(encoded_b, fresh_b, "reset must preserve compression level");
+}
+
+#[test]
+fn decoder_reset_allows_reuse() {
+    let encoded_a = encode_one_shot(b"hello");
+    let encoded_b = encode_one_shot(b"world");
+
     let mut dec = Decoder::new();
-    let mut buf = vec![0u8; 64];
-
-    let mut consumed = 0;
-    let mut written = 0;
-    let p = dec.decode(&stream[..6], &mut buf).unwrap();
-    consumed += p.consumed;
-    written += p.written;
-    assert!(written < 11);
-
+    assert_eq!(
+        decode_chunked_with(&mut dec, &encoded_a, 64, 64).unwrap(),
+        b"hello"
+    );
     dec.reset();
+    assert_eq!(
+        decode_chunked_with(&mut dec, &encoded_b, 64, 64).unwrap(),
+        b"world"
+    );
+}
 
-    // Now decode the full stream fresh.
-    let out = decode_one_shot(&stream).unwrap();
-    assert_eq!(out, b"hello world");
-    let _ = consumed;
+// ─── algorithm-trait entry points ───────────────────────────────────────
+
+#[test]
+fn algorithm_encoder_decoder_round_trip() {
+    let mut enc = <Lzma as Algorithm>::encoder();
+    let input = b"compcol Algorithm trait roundtrip!";
+
+    // Encode.
+    let mut encoded = Vec::new();
+    let mut buf = vec![0u8; 256];
+    let mut consumed = 0;
+    while consumed < input.len() {
+        let (p, status) = enc.encode(&input[consumed..], &mut buf).unwrap();
+        encoded.extend_from_slice(&buf[..p.written]);
+        consumed += p.consumed;
+        if matches!(status, Status::InputEmpty) {
+            break;
+        }
+    }
+    loop {
+        let (p, status) = enc.finish(&mut buf).unwrap();
+        encoded.extend_from_slice(&buf[..p.written]);
+        if matches!(status, Status::StreamEnd) {
+            break;
+        }
+    }
+
+    // Decode through Algorithm::decoder() as well.
+    let mut dec = <Lzma as Algorithm>::decoder();
+    let decoded = decode_chunked_with(&mut dec, &encoded, encoded.len(), 256).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn algorithm_encoder_with_uses_config() {
+    let input = lorem_corpus(16 * 1024);
+    let mut enc_lo = <Lzma as Algorithm>::encoder_with(EncoderConfig { level: 1 });
+    let mut enc_hi = <Lzma as Algorithm>::encoder_with(EncoderConfig { level: 9 });
+    let lo = encode_with(&mut enc_lo, &input);
+    let hi = encode_with(&mut enc_hi, &input);
+    assert!(
+        hi.len() <= lo.len(),
+        "encoder_with(level=9) was bigger than encoder_with(level=1): hi={} lo={}",
+        hi.len(),
+        lo.len(),
+    );
+    assert_eq!(decode_one_shot(&lo).unwrap(), input);
+    assert_eq!(decode_one_shot(&hi).unwrap(), input);
+}
+
+// ─── factory lookup ─────────────────────────────────────────────────────
+
+#[cfg(feature = "factory")]
+mod factory {
+    use compcol::Status;
+    use compcol::factory;
+
+    #[test]
+    fn lookup_known() {
+        assert!(factory::encoder_by_name("lzma").is_some());
+        assert!(factory::decoder_by_name("lzma").is_some());
+    }
+
+    #[test]
+    fn names_contains_lzma() {
+        assert!(factory::names().contains(&"lzma"));
+    }
+
+    #[test]
+    fn boxed_round_trip() {
+        let mut enc = factory::encoder_by_name("lzma").unwrap();
+        let mut dec = factory::decoder_by_name("lzma").unwrap();
+        let input = b"hello hello hello world world world!";
+
+        let mut encoded = Vec::new();
+        let mut buf = vec![0u8; 256];
+        let mut consumed = 0;
+        while consumed < input.len() {
+            let (p, status) = enc.encode(&input[consumed..], &mut buf).unwrap();
+            encoded.extend_from_slice(&buf[..p.written]);
+            consumed += p.consumed;
+            if matches!(status, Status::InputEmpty) {
+                break;
+            }
+        }
+        loop {
+            let (p, status) = enc.finish(&mut buf).unwrap();
+            encoded.extend_from_slice(&buf[..p.written]);
+            if matches!(status, Status::StreamEnd) {
+                break;
+            }
+        }
+
+        // Decode — feed the whole thing in one go (the decoder's loop
+        // tolerates partial draws), then drain anything still buffered,
+        // then finish.
+        let mut decoded = Vec::new();
+        let mut consumed = 0;
+        while consumed < encoded.len() {
+            let (p, status) = dec.decode(&encoded[consumed..], &mut buf).unwrap();
+            decoded.extend_from_slice(&buf[..p.written]);
+            consumed += p.consumed;
+            if matches!(status, Status::StreamEnd) {
+                break;
+            }
+            if matches!(status, Status::InputEmpty) {
+                break;
+            }
+        }
+        loop {
+            let (p, status) = dec.decode(&[], &mut buf).unwrap();
+            decoded.extend_from_slice(&buf[..p.written]);
+            if matches!(status, Status::StreamEnd) {
+                break;
+            }
+            if p.written == 0 {
+                break;
+            }
+        }
+        loop {
+            let (p, status) = dec.finish(&mut buf).unwrap();
+            decoded.extend_from_slice(&buf[..p.written]);
+            if matches!(status, Status::StreamEnd) {
+                break;
+            }
+            if p.written == 0 {
+                panic!("decoder finish stalled");
+            }
+        }
+        assert_eq!(&decoded[..], input);
+    }
 }

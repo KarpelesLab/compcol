@@ -38,7 +38,7 @@ use crate::error::Error;
 use crate::traits::{Algorithm, RawDecoder, RawProgress};
 
 mod encoder;
-pub use encoder::Encoder;
+pub use encoder::{Encoder, EncoderConfig};
 
 // ─── algorithm marker ────────────────────────────────────────────────────
 
@@ -50,10 +50,10 @@ impl Algorithm for Lzma {
     const NAME: &'static str = "lzma";
     type Encoder = Encoder;
     type Decoder = Decoder;
-    type EncoderConfig = ();
+    type EncoderConfig = EncoderConfig;
     type DecoderConfig = ();
-    fn encoder_with(_: ()) -> Encoder {
-        Encoder::new()
+    fn encoder_with(c: Self::EncoderConfig) -> Encoder {
+        Encoder::with_config(c)
     }
     fn decoder_with(_: ()) -> Decoder {
         Decoder::new()
