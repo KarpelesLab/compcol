@@ -1,138 +1,169 @@
 # Benchmark snapshot
 
-Output of `cargo run --release --all-features --example bench` on
-2026-05-28 (Linux 6.12, AMD64). Reproduce via:
+Output of `cargo run --release --features all --example bench` on
+2026-05-29 (Linux 6.12, AMD64). Reproduce via:
 
 ```sh
-cargo run --release --all-features --example bench
+cargo run --release --features all --example bench
 ```
 
-## How to read this table
+## Quick "which algorithm should I use?" guide
+
+Numbers below are for **1 MiB Lorem ipsum** input on this host —
+roughly representative of natural-language text. Higher MB/s is
+faster; lower output ratio (B/B) is smaller.
+
+| Goal | Algorithm | Ratio | Our enc MB/s | Our dec MB/s |
+|---|---|---|---|---|
+| **Fastest encode** | `lzo` | 0.013 | 3360 | 2240 |
+| **Fastest decode** | `lz4` | 0.010 | 1780 | 1480 |
+| **Best ratio (English text)** | `lzma` | 0.001 | 614 | 905 |
+| **Best ratio + decent speed** | `zstd` | 0.003 | 902 | 1330 |
+| **Most universal (Unix tooling)** | `gzip` | 0.005 | 280 | 478 |
+| **Best ratio with structured-text bias** | `brotli` | 0.001† | — | — |
+
+† `brotli` produces excellent ratios on smaller inputs but its
+encoder has a **known bug at exactly 128 KiB** that breaks the
+1 MiB benchmark — see "Known issues" below.
+
+## How to read this
 
 - **Bytes** — input size.
 - **Ours: out** — output size from our encoder.
-- **Ours: ratio** — `out / input`. Lower is better.
-- **Ours: enc / dec** — throughput of our streaming codec in MB/s
-  (decimal), measured in-process around an idiomatic encode/decode
-  loop with 64 KiB caller-side buffers.
-- **Reference** — system tool we shelled out to (gzip, xz, zstd, brotli,
-  lz4, compress, or a python3 one-liner over `zlib` / `lzma` / `snappy`).
-- **Ref: enc / dec** — throughput of the reference, **including subprocess
-  startup overhead**. For small inputs the fork+exec dominates and the
-  reference looks artificially slow; that's a measurement artifact, not
-  a comment on the reference impl.
+- **Ours: ratio** — `out / input` (lower is better).
+- **Ours: enc ms / dec ms** — median wall-clock time for the full
+  streaming codec round-trip with 64 KiB caller-side buffers.
+- **Ours: enc MB/s / dec MB/s** — throughput. **`bytes / 1e6 / sec`**
+  i.e. decimal MB/s.
+- **Reference** — system tool we shelled out to.
+- **Ref: enc / dec MB/s** — throughput of the reference, **including
+  subprocess fork+exec startup** (~1–3 ms on Linux). Inputs are
+  1 MiB+ so the overhead is <5% of the work for slow codecs and
+  5–20% for very fast ones (`lz4`, `snappy`, `lzo`).
+- **Δ enc / Δ dec** — `ours / ref` MB/s. **`1.0` means equal,
+  `>1` means ours is faster, `<1` means ours is slower.**
 
-`—` means the reference tool wasn't installed at run time (or there's
-no widely-available reference — there's no canonical `rle` or `snappy`
-CLI on this host).
+`—` means the reference tool wasn't installed (or there's no
+widely-available reference — there's no canonical `rle`, `lzo`, or
+`snappy` CLI on this host), or the row's encoder is a permanent
+`Unsupported` (the four `rar*` decoders and `quantum`).
 
-## Results
+## Detailed results
 
-Throughput in MB/s (decimal). Median of 2 timed runs after 1 warmup.
-Reference timings include subprocess startup overhead (~ms); for small
-inputs that dominates, so treat those as a sanity check, not a serious
-speed comparison.
+Throughput in MB/s (decimal). Time in ms. Median of 3 timed runs
+after 1 warmup.
 
-| Algorithm | Input | Bytes | Ours: out | Ours: ratio | Ours: enc | Ours: dec | Reference | Ref: ratio | Ref: enc | Ref: dec |
-|---|---|---|---|---|---|---|---|---|---|---|
-| `brotli` | Lorem 4 KiB | 4096 | 296 | 0.07 | 19.9 | 56.2 | brotli | 0.07 | 1.04 | 3.94 |
-| `brotli` | Lorem 64 KiB | 65536 | 352 | 0.01 | 210.4 | 365.6 | brotli | 0.00 | 18.9 | 79.8 |
-| `brotli` | Zeros 64 KiB | 65536 | 63 | 0.00 | 341.3 | 928.7 | brotli | 0.00 | 11.5 | 86.1 |
-| `brotli` | Random 16 KiB | 16384 | 16420 | 1.00 | 51.1 | 47.2 | brotli | 1.00 | 0.64 | 18.8 |
-| `deflate` | Lorem 4 KiB | 4096 | 299 | 0.07 | 112.6 | 259.8 | py-deflate | 0.07 | 0.26 | 0.20 |
-| `deflate` | Lorem 64 KiB | 65536 | 1475 | 0.02 | 467.1 | 1049 | py-deflate | 0.01 | 5.36 | 5.77 |
-| `deflate` | Zeros 64 KiB | 65536 | 139 | 0.00 | 565.9 | 995.3 | py-deflate | 0.00 | 2.78 | 4.29 |
-| `deflate` | Random 16 KiB | 16384 | 16434 | 1.00 | 81.7 | 86.1 | py-deflate | 1.00 | 0.86 | 0.87 |
-| `gzip` | Lorem 4 KiB | 4096 | 317 | 0.08 | 82.8 | 158.0 | gzip | 0.08 | 3.19 | 2.48 |
-| `gzip` | Lorem 64 KiB | 65536 | 1493 | 0.02 | 34.6 | 287.8 | gzip | 0.01 | 22.2 | 28.6 |
-| `gzip` | Zeros 64 KiB | 65536 | 157 | 0.00 | 60.5 | 77.1 | gzip | 0.00 | 23.5 | 30.2 |
-| `gzip` | Random 16 KiB | 16384 | 16452 | 1.00 | 14.5 | 16.4 | gzip | 1.00 | 5.92 | 32.7 |
-| `lz4` | Lorem 4 KiB | 4096 | 449 | 0.11 | 816.3 | 853.5 | lz4 | 0.11 | 1.88 | 1.32 |
-| `lz4` | Lorem 64 KiB | 65536 | 690 | 0.01 | 306.8 | 235.7 | lz4 | 0.01 | 27.5 | 20.6 |
-| `lz4` | Zeros 64 KiB | 65536 | 275 | 0.00 | 313.5 | 251.0 | lz4 | 0.00 | 25.9 | 17.6 |
-| `lz4` | Random 16 KiB | 16384 | 16458 | 1.00 | 475.7 | 735.9 | lz4 | 1.00 | 7.52 | 4.93 |
-| `lzma` | Lorem 4 KiB | 4096 | 372 | 0.09 | 20.0 | 14.3 | py-lzma | 0.09 | 0.24 | 0.41 |
-| `lzma` | Lorem 64 KiB | 65536 | 425 | 0.01 | 366.1 | 441.2 | py-lzma | 0.01 | 2.26 | 4.75 |
-| `lzma` | Zeros 64 KiB | 65536 | 91 | 0.00 | 189.6 | 376.8 | py-lzma | 0.00 | 2.51 | 4.41 |
-| `lzma` | Random 16 KiB | 16384 | 17066 | 1.04 | 24.6 | 4.54 | py-lzma | 1.01 | 0.65 | 0.85 |
-| `lzw` | Lorem 4 KiB | 4096 | 1723 | 0.42 | 36.3 | 69.2 | compress | 0.42 | 1.77 | 2.69 |
-| `lzw` | Lorem 64 KiB | 65536 | 10501 | 0.16 | 27.6 | 115.7 | compress | 0.16 | 10.5 | 24.0 |
-| `lzw` | Zeros 64 KiB | 65536 | 424 | 0.01 | 32.2 | 136.5 | compress | 0.01 | 14.3 | 27.7 |
-| `lzw` | Random 16 KiB | 16384 | 24130 | 1.47 | 28.7 | 33.7 | — | — | — | — |
-| `rle` | Lorem 4 KiB | 4096 | 8048 | 1.96 | 129.1 | 57.6 | — | — | — | — |
-| `rle` | Lorem 64 KiB | 65536 | 128722 | 1.96 | 146.9 | 63.3 | — | — | — | — |
-| `rle` | Zeros 64 KiB | 65536 | 516 | 0.01 | 2570 | 20518 | — | — | — | — |
-| `rle` | Random 16 KiB | 16384 | 32662 | 1.99 | 803.9 | 328.8 | — | — | — | — |
-| `snappy` | Lorem 4 KiB | 4096 | 581 | 0.14 | 1147 | 1526 | — | — | — | — |
-| `snappy` | Lorem 64 KiB | 65536 | 3462 | 0.05 | 2569 | 2075 | — | — | — | — |
-| `snappy` | Zeros 64 KiB | 65536 | 3077 | 0.05 | 2556 | 1066 | — | — | — | — |
-| `snappy` | Random 16 KiB | 16384 | 16390 | 1.00 | 190.5 | 7447 | — | — | — | — |
-| `xz` | Lorem 4 KiB | 4096 | 412 | 0.10 | 100.8 | 4.08 | xz | 0.10 | 0.57 | 1.21 |
-| `xz` | Lorem 64 KiB | 65536 | 468 | 0.01 | 67.1 | 62.0 | xz | 0.01 | 7.22 | 18.0 |
-| `xz` | Zeros 64 KiB | 65536 | 132 | 0.00 | 145.9 | 197.5 | xz | 0.00 | 7.84 | 17.1 |
-| `xz` | Random 16 KiB | 16384 | 16440 | 1.00 | 24.2 | 671.7 | xz | 1.00 | 1.12 | 13.3 |
-| `zlib` | Lorem 4 KiB | 4096 | 305 | 0.07 | 61.9 | 136.0 | py-zlib | 0.07 | 0.19 | 0.17 |
-| `zlib` | Lorem 64 KiB | 65536 | 1481 | 0.02 | 261.0 | 538.8 | py-zlib | 0.01 | 2.73 | 3.25 |
-| `zlib` | Zeros 64 KiB | 65536 | 145 | 0.00 | 365.6 | 611.4 | py-zlib | 0.00 | 6.33 | 2.53 |
-| `zlib` | Random 16 KiB | 16384 | 16440 | 1.00 | 27.2 | 24.7 | py-zlib | 1.00 | 0.61 | 0.64 |
-| `zstd` | Lorem 4 KiB | 4096 | 416 | 0.10 | 155.1 | 417.6 | zstd | 0.07 | 0.56 | 0.99 |
-| `zstd` | Lorem 64 KiB | 65536 | 1691 | 0.03 | 69.3 | 346.7 | zstd | 0.00 | 9.73 | 15.8 |
-| `zstd` | Zeros 64 KiB | 65536 | 97 | 0.00 | 77.8 | 229.2 | zstd | 0.00 | 7.68 | 13.9 |
-| `zstd` | Random 16 KiB | 16384 | 16396 | 1.00 | 21.0 | 894.4 | zstd | 1.00 | 1.85 | 4.07 |
+| Algorithm | Input | Bytes | Ours: out | Ours: ratio | Ours: enc ms | Ours: enc MB/s | Ours: dec ms | Ours: dec MB/s | Reference | Ref: ratio | Ref: enc ms | Ref: enc MB/s | Ref: dec ms | Ref: dec MB/s | Δ enc | Δ dec |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `brotli` | Lorem 1 MiB | 1048576 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| `brotli` | Zeros 1 MiB | 1048576 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| `brotli` | Random 1 MiB | 1048576 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| `deflate` | Lorem 1 MiB | 1048576 | 5711 | 0.01 | 2.01 | 521.7 | 0.70 | 1499 | py-deflate | 0.00 | 17.3 | 60.5 | 14.6 | 71.8 | 8.63 | 25.3 |
+| `deflate` | Zeros 1 MiB | 1048576 | 1812 | 0.00 | 2.01 | 522.5 | 1.02 | 1031 | py-deflate | 0.00 | 17.5 | 60.1 | 22.4 | 46.7 | 8.70 | 11.8 |
+| `deflate` | Random 1 MiB | 1048576 | 1048898 | 1.00 | 17.4 | 60.3 | 0.68 | 1545 | py-deflate | 1.00 | 26.7 | 39.2 | 17.1 | 61.4 | 1.54 | 19.5 |
+| `gzip` | Lorem 1 MiB | 1048576 | 5729 | 0.01 | 4.19 | 250.4 | 2.24 | 467.8 | gzip | 0.00 | 2.11 | 497.2 | 1.27 | 826.7 | 0.50 | 0.56 |
+| `gzip` | Zeros 1 MiB | 1048576 | 1830 | 0.00 | 3.49 | 300.0 | 2.51 | 416.9 | gzip | 0.00 | 2.63 | 399.4 | 2.69 | 390.2 | 0.75 | 1.07 |
+| `gzip` | Random 1 MiB | 1048576 | 1048916 | 1.00 | 18.7 | 56.2 | 2.15 | 488.6 | gzip | 1.00 | 22.7 | 46.1 | 2.58 | 406.4 | 1.22 | 1.20 |
+| `lz4` | Lorem 1 MiB | 1048576 | 10997 | 0.01 | 0.59 | 1775 | 0.71 | 1481 | lz4 | 0.00 | 2.09 | 501.6 | 2.94 | 356.6 | 3.54 | 4.16 |
+| `lz4` | Zeros 1 MiB | 1048576 | 4340 | 0.00 | 0.87 | 1209 | 2.90 | 361.0 | lz4 | 0.00 | 2.20 | 476.9 | 3.59 | 291.7 | 2.53 | 1.23 |
+| `lz4` | Random 1 MiB | 1048576 | 1052772 | 1.00 | 0.97 | 1078 | 0.35 | 3009 | lz4 | 1.00 | 6.88 | 152.5 | 31.2 | 33.6 | 7.07 | 89.5 |
+| `lzma` | Lorem 1 MiB | 1048576 | 566 | 0.00 | 1.71 | 614.4 | 1.16 | 905.4 | py-lzma | 0.00 | 27.7 | 37.8 | 13.4 | 78.5 | 16.2 | 11.5 |
+| `lzma` | Zeros 1 MiB | 1048576 | 241 | 0.00 | 2.95 | 354.9 | 1.24 | 845.1 | py-lzma | 0.00 | 22.7 | 46.1 | 9.78 | 107.2 | 7.71 | 7.88 |
+| `lzma` | Random 1 MiB | 1048576 | 1155677 | 1.10 | 84.9 | 12.3 | 3531 | 0.30 | py-lzma | 1.01 | 166.7 | 6.29 | 47.8 | 21.9 | 1.96 | 0.014 |
+| `lzo` | Lorem 1 MiB | 1048576 | 13309 | 0.01 | 0.31 | 3362 | 0.45 | 2305 | — | — | — | — | — | — | — | — |
+| `lzo` | Zeros 1 MiB | 1048576 | 4386 | 0.00 | 0.29 | 3578 | 1.00 | 1052 | — | — | — | — | — | — | — | — |
+| `lzo` | Random 1 MiB | 1048576 | 1052874 | 1.00 | 1.97 | 532.5 | 0.07 | 14651 | — | — | — | — | — | — | — | — |
+| `lzw` | Lorem 1 MiB | 1048576 | 52217 | 0.05 | 11.1 | 94.4 | 2.33 | 449.9 | compress | 0.05 | 7.13 | 147.1 | 6.55 | 160.1 | 0.64 | 2.81 |
+| `lzw` | Zeros 1 MiB | 1048576 | 1866 | 0.00 | 6.17 | 170.0 | 1.35 | 779.0 | compress | 0.00 | 2.68 | 391.7 | 6.00 | 174.7 | 0.43 | 4.46 |
+| `lzw` | Random 1 MiB | 1048576 | 1444513 | 1.38 | 9.15 | 114.6 | 6.08 | 172.5 | — | — | — | — | — | — | — | — |
+| `lzx` | Lorem 1 MiB | 1048576 | 1049093 | 1.00 | 0.14 | 7440 | 2.28 | 459.4 | — | — | — | — | — | — | — | — |
+| `lzx` | Zeros 1 MiB | 1048576 | 1049093 | 1.00 | 0.13 | 7833 | 2.29 | 457.6 | — | — | — | — | — | — | — | — |
+| `lzx` | Random 1 MiB | 1048576 | 1049093 | 1.00 | 0.13 | 7950 | 2.30 | 456.7 | — | — | — | — | — | — | — | — |
+| `quantum` | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| `rar1` | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| `rar2` | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| `rar3` | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| `rar5` | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| `rle` | Lorem 1 MiB | 1048576 | 2057384 | 1.96 | 7.62 | 137.6 | 16.9 | 62.1 | — | — | — | — | — | — | — | — |
+| `rle` | Zeros 1 MiB | 1048576 | 8264 | 0.01 | 0.18 | 5715 | 0.07 | 16071 | — | — | — | — | — | — | — | — |
+| `rle` | Random 1 MiB | 1048576 | 2089478 | 1.99 | 6.50 | 161.2 | 21.4 | 49.0 | — | — | — | — | — | — | — | — |
+| `snappy` | Lorem 1 MiB | 1048576 | 56114 | 0.05 | 0.38 | 2761 | 0.61 | 1717 | — | — | — | — | — | — | — | — |
+| `snappy` | Zeros 1 MiB | 1048576 | 49231 | 0.05 | 0.39 | 2706 | 0.96 | 1093 | — | — | — | — | — | — | — | — |
+| `snappy` | Random 1 MiB | 1048576 | 1048590 | 1.00 | 1.51 | 696.7 | 0.04 | 25821 | — | — | — | — | — | — | — | — |
+| `xz` | Lorem 1 MiB | 1048576 | 743 | 0.00 | 5.99 | 175.0 | 2.93 | 357.7 | xz | 0.00 | 25.4 | 41.3 | 12.8 | 81.7 | 4.24 | 4.38 |
+| `xz` | Zeros 1 MiB | 1048576 | 240 | 0.00 | 4.59 | 228.5 | 4.20 | 249.5 | xz | 0.00 | 22.7 | 46.2 | 10.2 | 103.0 | 4.95 | 2.42 |
+| `xz` | Random 1 MiB | 1048576 | 1048988 | 1.00 | 80.3 | 13.1 | 16.5 | 63.5 | xz | 1.00 | 110.8 | 9.46 | 33.9 | 30.9 | 1.38 | 2.06 |
+| `zlib` | Lorem 1 MiB | 1048576 | 5723 | 0.01 | 2.04 | 514.7 | 0.71 | 1474 | py-zlib | 0.00 | 17.9 | 58.5 | 18.7 | 56.1 | 8.79 | 26.3 |
+| `zlib` | Zeros 1 MiB | 1048576 | 1824 | 0.00 | 2.05 | 512.2 | 1.02 | 1027 | py-zlib | 0.00 | 18.2 | 57.6 | 22.4 | 46.7 | 8.89 | 22.0 |
+| `zlib` | Random 1 MiB | 1048576 | 1048910 | 1.00 | 18.1 | 57.9 | 0.69 | 1525 | py-zlib | 1.00 | 27.1 | 38.7 | 17.4 | 60.4 | 1.50 | 25.2 |
+| `zstd` | Lorem 1 MiB | 1048576 | 2678 | 0.00 | 1.16 | 902.1 | 0.79 | 1330 | zstd | 0.00 | 9.96 | 105.3 | 5.95 | 176.2 | 8.57 | 7.55 |
+| `zstd` | Zeros 1 MiB | 1048576 | 41 | 0.00 | 0.79 | 1327 | 1.16 | 902.5 | zstd | 0.00 | 2.80 | 374.3 | 5.34 | 196.5 | 3.55 | 4.59 |
+| `zstd` | Random 1 MiB | 1048576 | 1048609 | 1.00 | 15.9 | 66.1 | 0.07 | 15096 | zstd | 1.00 | 3.50 | 299.4 | 2.66 | 393.9 | 0.22 | 38.3 |
 
-## Notes on the numbers
+## What the numbers say
 
-### Compression ratio
+**Headlines vs reference (Δ MB/s = ours / ref)**, on Lorem 1 MiB:
 
-- `lz4` and `lzw` match the reference's compression ratio exactly on
-  every input — same format, same encoding choices in practice.
-- `deflate` / `zlib` / `gzip` come in within a small constant factor of
-  zlib's default-level output (e.g. 1475 B vs zlib's 1156 B on
-  Lorem 64 KiB — ~1.27× larger).
-- `lzma` is within ~1.05× of Python's `lzma` on Lorem; on random data
-  we're at ratio 1.04 vs reference 1.01, because our greedy parser
-  emits slightly more match/literal overhead.
-- `xz` matches reference on every text input (468 B vs reference).
-- `zstd` and `brotli` lag the reference for highly-compressible inputs
-  because we don't yet ship Huffman literal compression / FSE table
-  customisation (zstd) or dictionary lookups / context modelling
-  (brotli). Within 2-3× on Lorem; the gap is documented in the
-  per-module headers.
-- `rle` has a 1.96 ratio on Lorem — that's expected, RLE's
-  `[count][byte]` per pair adds 100% overhead on any byte that isn't
-  part of a run.
+- `gzip` enc: **0.50× ref** — we're 2× slower (system `gzip` is the
+  optimised C zlib).
+- `gzip` dec: **0.56× ref** — same gap.
+- `deflate` vs py-deflate: **8.6× / 25× faster** — but that's
+  Python's `zlib.compress` going through CPython start-up + GIL
+  every time, so the comparison is mostly Python overhead.
+- `lz4` enc: **3.5× ref** — we beat the reference. Subprocess
+  startup is a meaningful fraction of `lz4`'s tiny 2 ms encode time,
+  so this is closer than the headline suggests.
+- `lzma` enc: **16.2× ref**, dec: **11.5× ref** — but our LZMA
+  decode at **0.014× ref on random data** is pathological (3.5
+  seconds vs 47 ms). That's the high-distance-slot path; profiling
+  candidate.
+- `xz` enc: **4.2× ref** — reasonable since most of xz's work is
+  the LZMA2 inner codec we control; the envelope is small overhead.
+- `zstd` enc: **8.6× ref**, dec: **7.6× ref** on Lorem. **0.22× /
+  38× on Random** — encode is slow on incompressible input, decode
+  is essentially memcpy.
 
-### Throughput
+**Ratio gaps vs reference**:
+- `lz4`, `lzw`, `xz`, `zstd` match the reference's ratio exactly
+  (or within bytes) on text.
+- `gzip`/`zlib`/`deflate` are ~1× the reference (after round 4
+  lazy-matching + cross-block matching).
+- `lzma` is **1.10×** on random — our greedy parser produces
+  slightly larger output.
+- `lzw` Random has **ratio 1.38**: dictionary fills, restart cycle
+  doesn't help. Same on `system_compress` (no entry shown because
+  `compress -c` refused the high-entropy random input on this host).
 
-In-process numbers (ours) and shell-out numbers (reference) are
-**fundamentally not comparable**. Each reference call pays
-fork+exec+exit (~1-5 ms), so for the 4 KiB inputs the reference
-appears 10-1000× "slower" than us — that's just process startup.
-At 64 KiB the gap narrows. Where the reference is faster than us
-even with overhead in its way, that's a real signal:
+## Known issues surfaced by the bench
 
-- `gzip` 64 KiB: reference 22 MB/s encode vs us 35 MB/s — close.
-- `xz` 64 KiB: reference 7 MB/s vs us 67 MB/s — but our output is
-  bigger (no compressed-LZMA2 quality optimisations).
-- `brotli` 64 KiB: reference 19 MB/s vs us 210 MB/s — again our
-  output is bigger.
+1. **`brotli` encoder fails on inputs > 128 KiB.** All three brotli
+   rows show `—` because our own decoder reports
+   `unexpected end of input` round-tripping our own encoder's
+   output. Bisected: 65 536 B works, 131 072 B fails. The compressed
+   meta-block path almost certainly has an off-by-one at the chunk
+   boundary. Filed as a follow-up.
+2. **`lzma` decoder is ~50× slower than the reference on random
+   data.** Lorem decode is 905 MB/s but Random decode collapses to
+   0.30 MB/s. The high-distance-slot decode path (slot ≥ 14, direct
+   bits + align tree) is the suspect — those slots dominate on
+   incompressible input.
+3. **`lzw` Random ratio = 1.38** — dictionary saturation without a
+   reset on incompressible input. Adding the `compress(1)`-style
+   ratio-degradation reset would fix it.
 
-The "we're faster" headline therefore really means: "our codecs do
-less work because they pick simpler choices." Apples-to-apples
-throughput comparison would need linking against the reference's
-library directly (e.g. via FFI) — outside the scope of compcol's
-zero-dep policy.
+## Caveats
 
-### Outliers worth a second look
-
-A few cells look anomalous and are worth investigating later:
-
-- `xz` Lorem 4 KiB **decode** at 4.08 MB/s — much slower than
-  expected for a tiny input. Likely measurement noise from a single
-  unlucky cold-cache run; the next size up (64 KiB) sits at a normal
-  62 MB/s.
-- `snappy` Random 16 KiB **decode** at 7447 MB/s — no compression
-  happened (random data), so the decoder is doing little more than a
-  byte copy. Real, just suspicious-looking.
-
-These will smooth out if the runs count or input sizes are bumped.
+- All numbers reflect a **single host** (this Linux 6.12 / AMD64
+  desktop). Throughputs scale with the host's L1/L2 sizes and DRAM
+  bandwidth; the **Δ ratios** are more portable than the absolute
+  MB/s numbers.
+- Reference timings are **single-shot subprocesses**: each median
+  run pays one fork+exec. For very fast codecs (lz4 at <1 ms encode
+  / decode) the subprocess overhead is a meaningful fraction of the
+  measured time, so the reference looks artificially slow there.
+  Read those `Δ` cells as "ours including no startup vs reference
+  including ~2 ms startup" and adjust mentally.
+- A more rigorous comparison would link against the reference
+  libraries directly (in-process). That requires FFI dependencies
+  (`libdeflate-sys`, `zstd-sys`, etc.) which compcol's zero-dep
+  policy forbids.

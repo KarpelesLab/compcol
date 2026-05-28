@@ -39,14 +39,14 @@ struct Input {
 }
 
 fn build_corpus() -> Vec<Input> {
-    // Sizes kept modest so even the slower encoders (lzma-family on random
-    // input, brotli, zstd) finish in a reasonable wall-clock time. Bump
-    // these for one-off deeper measurements; the medians stay representative.
+    // Sizes large enough that subprocess fork+exec (~1-3 ms on Linux) is
+    // amortised relative to actual codec work, so the "Ref enc / Ref dec"
+    // numbers reflect the reference impl's real throughput. Smaller inputs
+    // were dominated by subprocess startup time.
     vec![
-        text_input("Lorem 4 KiB", 4 * 1024),
-        text_input("Lorem 64 KiB", 64 * 1024),
-        zeros_input("Zeros 64 KiB", 64 * 1024),
-        random_input("Random 16 KiB", 16 * 1024, 0xDEAD_BEEF),
+        text_input("Lorem 1 MiB", 1 << 20),
+        zeros_input("Zeros 1 MiB", 1 << 20),
+        random_input("Random 1 MiB", 1 << 20, 0xDEAD_BEEF),
     ]
 }
 
@@ -79,7 +79,7 @@ fn random_input(name: &'static str, size: usize, seed: u32) -> Input {
 // ─── timing ─────────────────────────────────────────────────────────────
 
 const WARMUP_RUNS: usize = 1;
-const TIMED_RUNS: usize = 2;
+const TIMED_RUNS: usize = 3;
 
 fn median_of<F: FnMut()>(mut f: F) -> Duration {
     for _ in 0..WARMUP_RUNS {
@@ -234,6 +234,10 @@ const PY_SNAPPY_DEC: &str =
 
 /// Run the reference command end-to-end once and return its output. Used
 /// both for warmup (probing tool availability) and for timed runs.
+///
+/// Uses a dedicated thread to feed stdin so that the parent simultaneously
+/// drains stdout — without this, a 1 MiB payload deadlocks both pipes at
+/// the OS buffer (~64 KiB) limit.
 fn pipe_through(cmd: &[String], input: &[u8]) -> Result<Vec<u8>, String> {
     let mut child = Command::new(&cmd[0])
         .args(&cmd[1..])
@@ -242,14 +246,18 @@ fn pipe_through(cmd: &[String], input: &[u8]) -> Result<Vec<u8>, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn {}: {e}", cmd[0]))?;
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(input)
-        .map_err(|e| format!("write stdin: {e}"))?;
-    drop(child.stdin.take());
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let input_vec: Vec<u8> = input.to_vec();
+    let writer = std::thread::spawn(move || -> std::io::Result<()> {
+        stdin.write_all(&input_vec)?;
+        drop(stdin); // close so the child sees EOF
+        Ok(())
+    });
     let out = child.wait_with_output().map_err(|e| format!("wait: {e}"))?;
+    writer
+        .join()
+        .map_err(|_| "stdin writer thread panicked".to_string())?
+        .map_err(|e| format!("write stdin: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "{} failed: {}",
@@ -288,12 +296,30 @@ struct Row {
     input_bytes: usize,
     our_size: Cell,
     our_ratio: Cell,
+    our_enc_ms: Cell,
     our_enc_mb_s: Cell,
+    our_dec_ms: Cell,
     our_dec_mb_s: Cell,
     reference: String,
     ref_ratio: Cell,
+    ref_enc_ms: Cell,
     ref_enc_mb_s: Cell,
+    ref_dec_ms: Cell,
     ref_dec_mb_s: Cell,
+}
+
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
+
+/// Format a "ours/ref" speed ratio as a delta cell.
+fn delta(ours: Cell, refer: Cell) -> Cell {
+    match (ours, refer) {
+        (Cell::Value(o), Cell::Value(r)) if r > 0.0 && o.is_finite() && r.is_finite() => {
+            Cell::Value(o / r)
+        }
+        _ => Cell::Missing,
+    }
 }
 
 fn bench_one(algo: &str, input: &Input) -> Row {
@@ -303,11 +329,15 @@ fn bench_one(algo: &str, input: &Input) -> Row {
         input_bytes: input.data.len(),
         our_size: Cell::Missing,
         our_ratio: Cell::Missing,
+        our_enc_ms: Cell::Missing,
         our_enc_mb_s: Cell::Missing,
+        our_dec_ms: Cell::Missing,
         our_dec_mb_s: Cell::Missing,
         reference: "—".to_string(),
         ref_ratio: Cell::Missing,
+        ref_enc_ms: Cell::Missing,
         ref_enc_mb_s: Cell::Missing,
+        ref_dec_ms: Cell::Missing,
         ref_dec_mb_s: Cell::Missing,
     };
 
@@ -335,10 +365,12 @@ fn bench_one(algo: &str, input: &Input) -> Row {
     let enc_t = median_of(|| {
         let _ = our_encode(algo, &input.data).unwrap();
     });
+    row.our_enc_ms = Cell::Value(ms(enc_t));
     row.our_enc_mb_s = Cell::Value(throughput_mb_s(input.data.len(), enc_t));
     let dec_t = median_of(|| {
         let _ = our_decode(algo, &our_encoded).unwrap();
     });
+    row.our_dec_ms = Cell::Value(ms(dec_t));
     row.our_dec_mb_s = Cell::Value(throughput_mb_s(input.data.len(), dec_t));
 
     // Reference
@@ -352,10 +384,12 @@ fn bench_one(algo: &str, input: &Input) -> Row {
                     let renc_t = median_of(|| {
                         let _ = pipe_through(&r.encode, &input.data);
                     });
+                    row.ref_enc_ms = Cell::Value(ms(renc_t));
                     row.ref_enc_mb_s = Cell::Value(throughput_mb_s(input.data.len(), renc_t));
                     let rdec_t = median_of(|| {
                         let _ = pipe_through(&r.decode, &ref_encoded);
                     });
+                    row.ref_dec_ms = Cell::Value(ms(rdec_t));
                     row.ref_dec_mb_s = Cell::Value(throughput_mb_s(input.data.len(), rdec_t));
                 }
                 Ok(_) => {
@@ -386,33 +420,48 @@ fn main() {
     println!("# compcol benchmark");
     println!();
     println!(
-        "Throughput in MB/s (decimal). Median of {TIMED_RUNS} timed runs after {WARMUP_RUNS} \
-         warmup. Reference timings include subprocess startup overhead (~ms); for small inputs \
-         that dominates, so treat those as a sanity check, not a serious speed comparison."
+        "Throughput in MB/s (decimal). Time in ms. Median of {TIMED_RUNS} timed runs after \
+         {WARMUP_RUNS} warmup. Reference timings include subprocess startup overhead (~1–3 ms \
+         on Linux); inputs are 1 MiB+ so the overhead is < 5% of the work for slower codecs \
+         and 5–20% for very fast ones (lz4, snappy)."
     );
     println!();
     println!(
-        "| Algorithm | Input | Bytes | Ours: out | Ours: ratio | Ours: enc | Ours: dec | Reference \
-         | Ref: ratio | Ref: enc | Ref: dec |"
+        "**Δ enc / Δ dec columns** = `ours / ref` MB/s. `1.0` means equal, `>1` means ours is \
+         faster, `<1` means ours is slower."
     );
-    println!("|---|---|---|---|---|---|---|---|---|---|---|");
+    println!();
+    println!(
+        "| Algorithm | Input | Bytes | Ours: out | Ours: ratio | Ours: enc ms | Ours: enc MB/s \
+         | Ours: dec ms | Ours: dec MB/s | Reference | Ref: ratio | Ref: enc ms | Ref: enc MB/s \
+         | Ref: dec ms | Ref: dec MB/s | Δ enc | Δ dec |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
 
     for algo in &algos {
         for input in &corpus {
             let row = bench_one(algo, input);
+            let d_enc = delta(row.our_enc_mb_s, row.ref_enc_mb_s);
+            let d_dec = delta(row.our_dec_mb_s, row.ref_dec_mb_s);
             println!(
-                "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 row.algo,
                 row.input_name,
                 row.input_bytes,
                 row.our_size,
                 row.our_ratio,
+                row.our_enc_ms,
                 row.our_enc_mb_s,
+                row.our_dec_ms,
                 row.our_dec_mb_s,
                 row.reference,
                 row.ref_ratio,
+                row.ref_enc_ms,
                 row.ref_enc_mb_s,
+                row.ref_dec_ms,
                 row.ref_dec_mb_s,
+                d_enc,
+                d_dec,
             );
         }
     }
