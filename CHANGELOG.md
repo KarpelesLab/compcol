@@ -7,26 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- New `std` Cargo feature.
-- **`compcol::vec`** (`alloc`-gated) — four one-shot helpers for
-  callers that already have the payload in memory:
-  `compress_to_vec::<A>`, `compress_to_vec_with::<A>`,
-  `decompress_to_vec::<A>`, `decompress_to_vec_with::<A>`. Drive the
-  canonical `(Progress, Status)` loop with a 64 KiB scratch buffer
-  and return a `Vec<u8>`. No `std` required.
-- **`compcol::io`** (`std`-gated) — four `std::io::Read`/`Write`
-  adapters wrapping any `Encoder`/`Decoder`: `EncoderWriter`,
-  `EncoderReader`, `DecoderWriter`, `DecoderReader`. Single
-  `new(inner, codec)` constructor; writer adapters call `finish` on
-  `Drop` best-effort. Suitable for file, socket, or any
-  Read/Write source.
-- `impl std::error::Error for compcol::Error` and `From<Error> for
-  std::io::Error`, both gated on the `std` feature, so adapter code
-  and downstream callers can use `?` on either error type without
-  explicit `map_err`.
-
 ## [0.3.1](https://github.com/KarpelesLab/compcol/compare/v0.3.0...v0.3.1) - 2026-05-28
 
 ### Other
