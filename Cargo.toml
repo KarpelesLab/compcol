@@ -1,13 +1,25 @@
 [package]
-name        = "compcol"
-version     = "0.3.1"
-edition     = "2024"
-description = "A no_std collection of compression algorithms behind a uniform streaming trait, gated per-algorithm by Cargo features."
-license     = "MIT"
-repository  = "https://github.com/magicaltux/compcol"
-readme      = "README.md"
-keywords    = ["compression", "no_std", "embedded"]
-categories  = ["compression", "no-std"]
+name          = "compcol"
+version       = "0.3.1"
+edition       = "2024"
+# Edition 2024 stabilised in Rust 1.85. Code uses `let chains` (Rust 1.88)
+# inside the brotli encoder and the io adapters, so 1.88 is the real floor.
+rust-version  = "1.88"
+description   = "A no_std collection of compression algorithms behind a uniform streaming trait, gated per-algorithm by Cargo features."
+license       = "MIT"
+repository    = "https://github.com/magicaltux/compcol"
+documentation = "https://docs.rs/compcol"
+readme        = "README.md"
+keywords      = ["compression", "no_std", "embedded"]
+categories    = ["compression", "no-std"]
+
+# Tell docs.rs to build the doc set with every feature on. Without this
+# the rendered docs only show the default-feature surface (rle/deflate/
+# zlib/gzip/factory) — two thirds of the crate's public API would be
+# invisible to anyone reading docs.rs.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["alloc", "rle", "deflate", "zlib", "gzip", "factory"]
@@ -15,7 +27,7 @@ default = ["alloc", "rle", "deflate", "zlib", "gzip", "factory"]
 # `cargo build --all-features` at the CLI level; useful in downstream
 # Cargo.toml entries (`features = ["all"]`) instead of a 20-item list.
 all = [
-    "alloc", "factory",
+    "alloc", "std", "factory",
     "rle", "deflate", "zlib", "gzip",
     "lzma", "xz",
     "zstd", "brotli", "lz4", "snappy", "lzw",
