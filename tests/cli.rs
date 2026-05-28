@@ -360,7 +360,7 @@ fn output_decompresses_with_system_gunzip() {
 fn level_flag_round_trips_through_compression() {
     // Pick a reasonably-compressible payload (highly compressible data
     // collapses to the same few bytes at every level on small inputs).
-    let payload: Vec<u8> = (0..16 * 1024)
+    let payload: Vec<u8> = (0..16usize * 1024)
         .map(|i| (i.wrapping_mul(2654435761) >> 8) as u8)
         .collect();
     let (out, _err, code) = run_with_stdin(&["-t", "gzip", "-l", "9", "-c"], &payload);
