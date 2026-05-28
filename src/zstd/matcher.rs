@@ -3,7 +3,8 @@
 //! Per-block: at each input position we hash the next 4 bytes, splice the
 //! position into the per-hash chain, and (optionally) walk the chain to find
 //! the longest prior match within a back-reference window. The chain walk is
-//! bounded by [`MAX_CHAIN`] steps to cap the per-byte work.
+//! bounded by a runtime `max_chain` value (derived from the encoder's
+//! compression level) to cap the per-byte work.
 //!
 //! The design is a stripped-down variant of the deflate match finder at
 //! `src/deflate/lz77.rs`. Differences:
@@ -27,11 +28,6 @@ pub const MAX_MATCH: usize = 4096;
 /// Hash table size (must be a power of two).
 const HASH_BITS: u32 = 15;
 const HASH_SIZE: usize = 1 << HASH_BITS;
-/// Hash chain walk cap. 16 is a "fast" preset roughly comparable to zstd's
-/// level -1 strategy.
-const MAX_CHAIN: usize = 16;
-/// Stop searching once we find a match at least this long.
-const NICE_MATCH: usize = 64;
 /// "Empty" marker in the hash table.
 const NIL: u32 = u32::MAX;
 
@@ -106,7 +102,18 @@ impl MatchFinder {
 
     /// Find the longest match for `buffer[pos..]` against any earlier
     /// occurrence within the window.
-    pub fn find_match(&self, buffer: &[u8], pos: usize, window: usize) -> Option<Match> {
+    ///
+    /// `max_chain` caps the number of hash-chain links walked per probe;
+    /// `nice_match` short-circuits the search once a match of that length is
+    /// found. Both knobs come from [`super::encoder::EncoderConfig`].
+    pub fn find_match(
+        &self,
+        buffer: &[u8],
+        pos: usize,
+        window: usize,
+        max_chain: usize,
+        nice_match: usize,
+    ) -> Option<Match> {
         if pos + MIN_MATCH > buffer.len() {
             return None;
         }
@@ -126,7 +133,7 @@ impl MatchFinder {
         let mut cur = self.head[h];
         let mut steps = 0usize;
 
-        while cur != NIL && steps < MAX_CHAIN {
+        while cur != NIL && steps < max_chain {
             let cur_pos = cur as usize;
             if cur_pos >= pos {
                 cur = self.prev[cur_pos];
@@ -155,7 +162,7 @@ impl MatchFinder {
             if len >= MIN_MATCH && len > best_len {
                 best_len = len;
                 best_dist = dist;
-                if best_len >= NICE_MATCH {
+                if best_len >= nice_match {
                     break;
                 }
             }
@@ -186,7 +193,7 @@ mod tests {
             mf.insert(data, pos);
             if pos == 9 {
                 // First position where a match should be findable.
-                let m = mf.find_match(data, 9, data.len()).unwrap();
+                let m = mf.find_match(data, 9, data.len(), 16, 64).unwrap();
                 assert!(m.length >= 7);
                 assert_eq!(m.distance, 9);
             }
@@ -202,7 +209,7 @@ mod tests {
         mf.insert(data, 1);
         mf.insert(data, 2);
         mf.insert(data, 3);
-        let m = mf.find_match(data, 4, data.len());
+        let m = mf.find_match(data, 4, data.len(), 16, 64);
         // The 2-byte match "ab" is below MIN_MATCH; should be None.
         assert!(m.is_none());
     }

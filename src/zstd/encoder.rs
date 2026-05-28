@@ -61,6 +61,151 @@ const WD: u8 = 0x70;
 /// more sequences per block.
 const BLOCK_SIZE: usize = 128 * 1024;
 
+// ─── compression level ──────────────────────────────────────────────────
+
+/// Tunables for the Zstandard encoder.
+///
+/// `level` controls the speed/ratio trade-off, following Zstandard's own
+/// 1..=22 range with a default of `3`:
+///
+/// - Levels 1..=3 use a small chain budget and short "nice match" cutoff for
+///   maximum throughput (zstd's `fast`/`dfast` strategies, approximated).
+/// - Levels 4..=9 grow the chain budget and nice cutoff to find better
+///   matches at a moderate CPU cost (`greedy`/`lazy`/`lazy2` territory).
+/// - Levels 10..=19 walk deep chains and use a very high nice cutoff
+///   (`btlazy2`-ish behaviour without the actual binary-tree match finder).
+/// - Levels 20..=22 max out the chain budget (`btopt`/`btultra` territory).
+///   Our encoder still uses a hash chain, so the upside saturates well below
+///   the reference encoder's at those levels — but the size relation
+///   `level=9 ≤ level=1` continues to hold.
+///
+/// Values outside `1..=22` are clamped at encoder construction time rather
+/// than rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncoderConfig {
+    /// Compression level in `1..=22`. Defaults to `3`.
+    pub level: u8,
+}
+
+impl Default for EncoderConfig {
+    fn default() -> Self {
+        Self { level: 3 }
+    }
+}
+
+/// Internal expansion of [`EncoderConfig::level`] into the match-finder
+/// tuning knobs the LZ77 pass actually consults. Mirrors the shape of the
+/// reference Zstandard `ZSTD_compressionParameters` table: higher levels
+/// walk deeper chains and accept longer matches before bailing out.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LevelParams {
+    /// Maximum number of hash-chain links the match finder walks per probe.
+    pub max_chain: usize,
+    /// Length at which the match finder stops looking for a longer candidate.
+    pub nice_match: usize,
+}
+
+impl LevelParams {
+    /// Clamp `level` to `1..=22` and expand to match-finder tuning. The
+    /// table broadly tracks zstd's reference presets but doesn't try to
+    /// reproduce them exactly — the strategy here is always hash-chain
+    /// greedy parsing, so the gains saturate well before level 22.
+    pub(crate) fn from_level(level: u8) -> Self {
+        let level = level.clamp(1, 22);
+        match level {
+            1 => Self {
+                max_chain: 4,
+                nice_match: 8,
+            },
+            2 => Self {
+                max_chain: 8,
+                nice_match: 12,
+            },
+            3 => Self {
+                max_chain: 16,
+                nice_match: 16,
+            },
+            4 => Self {
+                max_chain: 24,
+                nice_match: 24,
+            },
+            5 => Self {
+                max_chain: 32,
+                nice_match: 32,
+            },
+            6 => Self {
+                max_chain: 48,
+                nice_match: 48,
+            },
+            7 => Self {
+                max_chain: 64,
+                nice_match: 64,
+            },
+            8 => Self {
+                max_chain: 96,
+                nice_match: 96,
+            },
+            9 => Self {
+                max_chain: 128,
+                nice_match: 128,
+            },
+            10 => Self {
+                max_chain: 192,
+                nice_match: 160,
+            },
+            11 => Self {
+                max_chain: 256,
+                nice_match: 192,
+            },
+            12 => Self {
+                max_chain: 384,
+                nice_match: 224,
+            },
+            13 => Self {
+                max_chain: 512,
+                nice_match: 256,
+            },
+            14 => Self {
+                max_chain: 768,
+                nice_match: 384,
+            },
+            15 => Self {
+                max_chain: 1024,
+                nice_match: 512,
+            },
+            16 => Self {
+                max_chain: 1536,
+                nice_match: 768,
+            },
+            17 => Self {
+                max_chain: 2048,
+                nice_match: 1024,
+            },
+            18 => Self {
+                max_chain: 3072,
+                nice_match: 1536,
+            },
+            19 => Self {
+                max_chain: 4096,
+                nice_match: 2048,
+            },
+            20 => Self {
+                max_chain: 6144,
+                nice_match: 3072,
+            },
+            21 => Self {
+                max_chain: 8192,
+                nice_match: 4096,
+            },
+            // 22 (and clamp-from-above)
+            _ => Self {
+                max_chain: 16384,
+                nice_match: super::matcher::MAX_MATCH,
+            },
+        }
+    }
+}
+
 /// Streaming Zstandard encoder.
 pub struct Encoder {
     state: State,
@@ -82,6 +227,9 @@ pub struct Encoder {
     /// skip the tree description entirely. `None` until at least one
     /// Compressed_Literals_Block has been emitted.
     prev_huff_lengths: Option<HuffLengths>,
+    /// Match-finder tuning derived from [`EncoderConfig::level`]. Persisted
+    /// across `reset` since configuration is meant to survive resets.
+    params: LevelParams,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -95,7 +243,15 @@ enum State {
 }
 
 impl Encoder {
+    /// Build an encoder at the default compression level (3).
     pub fn new() -> Self {
+        Self::with_config(EncoderConfig::default())
+    }
+
+    /// Build an encoder with explicit configuration. `config.level` is
+    /// clamped to `1..=22` internally — out-of-range values are snapped to
+    /// the nearest valid level rather than rejected.
+    pub fn with_config(config: EncoderConfig) -> Self {
         Self {
             state: State::Accepting,
             pending: Vec::with_capacity(BLOCK_SIZE),
@@ -105,6 +261,7 @@ impl Encoder {
             header_written: false,
             prev_offsets: [1, 4, 8],
             prev_huff_lengths: None,
+            params: LevelParams::from_level(config.level),
         }
     }
 
@@ -158,7 +315,13 @@ impl Encoder {
 
         while pos + MIN_MATCH < buffer.len() {
             self.matcher.insert(buffer, pos);
-            let m = self.matcher.find_match(buffer, pos, buffer.len());
+            let m = self.matcher.find_match(
+                buffer,
+                pos,
+                buffer.len(),
+                self.params.max_chain,
+                self.params.nice_match,
+            );
             if let Some(m) = m {
                 let literal_run = pos - lit_start;
                 let distance = m.distance;

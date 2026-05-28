@@ -82,7 +82,7 @@ mod matcher;
 mod sequences;
 
 pub use decoder::Decoder;
-pub use encoder::Encoder;
+pub use encoder::{Encoder, EncoderConfig};
 
 /// Internal helpers exposed for integration tests only. Not part of the
 /// public API; subject to change without notice.
@@ -168,11 +168,11 @@ impl Algorithm for Zstd {
     const NAME: &'static str = "zstd";
     type Encoder = Encoder;
     type Decoder = Decoder;
-    type EncoderConfig = ();
+    type EncoderConfig = EncoderConfig;
     type DecoderConfig = ();
 
-    fn encoder_with(_: ()) -> Encoder {
-        Encoder::new()
+    fn encoder_with(c: Self::EncoderConfig) -> Encoder {
+        Encoder::with_config(c)
     }
     fn decoder_with(_: ()) -> Decoder {
         Decoder::new()
