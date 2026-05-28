@@ -74,6 +74,9 @@ pub mod lzx;
 #[cfg(feature = "quantum")]
 pub mod quantum;
 
+#[cfg(feature = "lzfse")]
+pub mod lzfse;
+
 #[cfg(feature = "adc")]
 pub mod adc;
 
