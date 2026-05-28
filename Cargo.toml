@@ -42,6 +42,12 @@ lz4     = ["alloc"]
 snappy  = ["alloc"]
 # Lempel–Ziv–Welch (Unix compress / GIF).
 lzw     = ["alloc"]
+# LZO (Lempel–Ziv–Oberhumer), LZO1X-1 variant.
+lzo     = ["alloc"]
+# LZX (Microsoft CAB / WIM compression).
+lzx     = ["alloc"]
+# Quantum (Stac, old CAB format). Decoder-only target.
+quantum = ["alloc"]
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -65,5 +65,14 @@ pub mod snappy;
 #[cfg(feature = "lzw")]
 pub mod lzw;
 
+#[cfg(feature = "lzo")]
+pub mod lzo;
+
+#[cfg(feature = "lzx")]
+pub mod lzx;
+
+#[cfg(feature = "quantum")]
+pub mod quantum;
+
 #[cfg(feature = "factory")]
 pub mod factory;

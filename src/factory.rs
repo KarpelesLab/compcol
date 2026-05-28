@@ -42,6 +42,14 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         }
         #[cfg(feature = "lzw")]
         crate::lzw::Lzw::NAME => Some(Box::new(<crate::lzw::Lzw as Algorithm>::encoder())),
+        #[cfg(feature = "lzo")]
+        crate::lzo::Lzo::NAME => Some(Box::new(<crate::lzo::Lzo as Algorithm>::encoder())),
+        #[cfg(feature = "lzx")]
+        crate::lzx::Lzx::NAME => Some(Box::new(<crate::lzx::Lzx as Algorithm>::encoder())),
+        #[cfg(feature = "quantum")]
+        crate::quantum::Quantum::NAME => {
+            Some(Box::new(<crate::quantum::Quantum as Algorithm>::encoder()))
+        }
         _ => None,
     }
 }
@@ -78,6 +86,14 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         }
         #[cfg(feature = "lzw")]
         crate::lzw::Lzw::NAME => Some(Box::new(<crate::lzw::Lzw as Algorithm>::decoder())),
+        #[cfg(feature = "lzo")]
+        crate::lzo::Lzo::NAME => Some(Box::new(<crate::lzo::Lzo as Algorithm>::decoder())),
+        #[cfg(feature = "lzx")]
+        crate::lzx::Lzx::NAME => Some(Box::new(<crate::lzx::Lzx as Algorithm>::decoder())),
+        #[cfg(feature = "quantum")]
+        crate::quantum::Quantum::NAME => {
+            Some(Box::new(<crate::quantum::Quantum as Algorithm>::decoder()))
+        }
         _ => None,
     }
 }
@@ -123,6 +139,15 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     }
     if str_eq(name, "lzw") && cfg!(feature = "lzw") {
         return Some("lzw");
+    }
+    if str_eq(name, "lzo") && cfg!(feature = "lzo") {
+        return Some("lzo");
+    }
+    if str_eq(name, "lzx") && cfg!(feature = "lzx") {
+        return Some("lzx");
+    }
+    if str_eq(name, "quantum") && cfg!(feature = "quantum") {
+        return Some("q");
     }
     None
 }
@@ -170,5 +195,11 @@ pub const fn names() -> &'static [&'static str] {
         crate::snappy::Snappy::NAME,
         #[cfg(feature = "lzw")]
         crate::lzw::Lzw::NAME,
+        #[cfg(feature = "lzo")]
+        crate::lzo::Lzo::NAME,
+        #[cfg(feature = "lzx")]
+        crate::lzx::Lzx::NAME,
+        #[cfg(feature = "quantum")]
+        crate::quantum::Quantum::NAME,
     ]
 }
