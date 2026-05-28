@@ -74,5 +74,17 @@ pub mod lzx;
 #[cfg(feature = "quantum")]
 pub mod quantum;
 
+#[cfg(feature = "rar1")]
+pub mod rar1;
+
+#[cfg(feature = "rar2")]
+pub mod rar2;
+
+#[cfg(feature = "rar3")]
+pub mod rar3;
+
+#[cfg(feature = "rar5")]
+pub mod rar5;
+
 #[cfg(feature = "factory")]
 pub mod factory;

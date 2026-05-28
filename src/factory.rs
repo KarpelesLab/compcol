@@ -50,6 +50,14 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         crate::quantum::Quantum::NAME => {
             Some(Box::new(<crate::quantum::Quantum as Algorithm>::encoder()))
         }
+        #[cfg(feature = "rar1")]
+        crate::rar1::Rar1::NAME => Some(Box::new(<crate::rar1::Rar1 as Algorithm>::encoder())),
+        #[cfg(feature = "rar2")]
+        crate::rar2::Rar2::NAME => Some(Box::new(<crate::rar2::Rar2 as Algorithm>::encoder())),
+        #[cfg(feature = "rar3")]
+        crate::rar3::Rar3::NAME => Some(Box::new(<crate::rar3::Rar3 as Algorithm>::encoder())),
+        #[cfg(feature = "rar5")]
+        crate::rar5::Rar5::NAME => Some(Box::new(<crate::rar5::Rar5 as Algorithm>::encoder())),
         _ => None,
     }
 }
@@ -94,6 +102,14 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         crate::quantum::Quantum::NAME => {
             Some(Box::new(<crate::quantum::Quantum as Algorithm>::decoder()))
         }
+        #[cfg(feature = "rar1")]
+        crate::rar1::Rar1::NAME => Some(Box::new(<crate::rar1::Rar1 as Algorithm>::decoder())),
+        #[cfg(feature = "rar2")]
+        crate::rar2::Rar2::NAME => Some(Box::new(<crate::rar2::Rar2 as Algorithm>::decoder())),
+        #[cfg(feature = "rar3")]
+        crate::rar3::Rar3::NAME => Some(Box::new(<crate::rar3::Rar3 as Algorithm>::decoder())),
+        #[cfg(feature = "rar5")]
+        crate::rar5::Rar5::NAME => Some(Box::new(<crate::rar5::Rar5 as Algorithm>::decoder())),
         _ => None,
     }
 }
@@ -149,6 +165,21 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     if str_eq(name, "quantum") && cfg!(feature = "quantum") {
         return Some("q");
     }
+    // All RAR versions share the .rar extension; the version is in-band in
+    // the file header. The CLI's in-place mode will write to <input>.rar
+    // and strip .rar on decode for any rar* algorithm.
+    if str_eq(name, "rar1") && cfg!(feature = "rar1") {
+        return Some("rar");
+    }
+    if str_eq(name, "rar2") && cfg!(feature = "rar2") {
+        return Some("rar");
+    }
+    if str_eq(name, "rar3") && cfg!(feature = "rar3") {
+        return Some("rar");
+    }
+    if str_eq(name, "rar5") && cfg!(feature = "rar5") {
+        return Some("rar");
+    }
     None
 }
 
@@ -201,5 +232,13 @@ pub const fn names() -> &'static [&'static str] {
         crate::lzx::Lzx::NAME,
         #[cfg(feature = "quantum")]
         crate::quantum::Quantum::NAME,
+        #[cfg(feature = "rar1")]
+        crate::rar1::Rar1::NAME,
+        #[cfg(feature = "rar2")]
+        crate::rar2::Rar2::NAME,
+        #[cfg(feature = "rar3")]
+        crate::rar3::Rar3::NAME,
+        #[cfg(feature = "rar5")]
+        crate::rar5::Rar5::NAME,
     ]
 }

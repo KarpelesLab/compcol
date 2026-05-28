@@ -48,6 +48,13 @@ lzo     = ["alloc"]
 lzx     = ["alloc"]
 # Quantum (Stac, old CAB format). Decoder-only target.
 quantum = ["alloc"]
+# RAR decoders (rar1, rar2, rar3, rar5). Decoder-only — RARLAB's unRAR
+# license explicitly forbids re-creating the compression algorithm, so
+# the encoders permanently return `Error::Unsupported`.
+rar1    = ["alloc"]
+rar2    = ["alloc"]
+rar3    = ["alloc"]
+rar5    = ["alloc"]
 
 [lints.rust]
 unsafe_code = "forbid"

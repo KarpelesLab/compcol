@@ -63,7 +63,7 @@ jobs:
       - name: Build no_std with every algorithm feature
         run: |
           cargo build --no-default-features --features \
-            alloc,factory,rle,deflate,zlib,gzip,lzma,xz,zstd,brotli,lz4,snappy,lzw,lzo,lzx,quantum
+            alloc,factory,rle,deflate,zlib,gzip,lzma,xz,zstd,brotli,lz4,snappy,lzw,lzo,lzx,quantum,rar1,rar2,rar3,rar5
 
   narrow_clippy:
     # Catches dead-code lint regressions in the shared bits/checksum/huffman
