@@ -46,6 +46,47 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
     }
 }
 
+/// Conventional filename extension (without the leading `.`) for the given
+/// algorithm, or `None` if the algorithm isn't compiled in or has no
+/// conventional extension.
+///
+/// Used by the `compcol` CLI to derive `<input>.<ext>` output paths in
+/// gzip-style in-place mode.
+pub const fn extension(name: &str) -> Option<&'static str> {
+    // String literals match on byte-identical content, which `const fn`
+    // allows; can't use enum dispatch through trait objects in const context.
+    if str_eq(name, "rle") && cfg!(feature = "rle") {
+        return Some("rle");
+    }
+    if str_eq(name, "deflate") && cfg!(feature = "deflate") {
+        return Some("deflate");
+    }
+    if str_eq(name, "zlib") && cfg!(feature = "zlib") {
+        return Some("zz");
+    }
+    if str_eq(name, "gzip") && cfg!(feature = "gzip") {
+        return Some("gz");
+    }
+    None
+}
+
+/// Const-eval-friendly byte comparison.
+const fn str_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// The names of every algorithm compiled into the current build, in stable
 /// order. Useful for diagnostics, CLI `--list`, etc.
 pub const fn names() -> &'static [&'static str] {

@@ -10,7 +10,7 @@ keywords    = ["compression", "no_std", "embedded"]
 categories  = ["compression", "no-std"]
 
 [features]
-default = ["alloc", "rle", "deflate", "zlib", "gzip"]
+default = ["alloc", "rle", "deflate", "zlib", "gzip", "factory"]
 # Enables `alloc`-backed conveniences (e.g. the `factory` module). Pulled in
 # automatically by features that require heap allocation.
 alloc   = []
@@ -28,3 +28,8 @@ gzip    = ["deflate"]
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[[bin]]
+name             = "compcol"
+path             = "src/bin/compcol.rs"
+required-features = ["factory"]
