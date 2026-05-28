@@ -1,4 +1,3 @@
-#![cfg(any())] // TODO(v0.3): port to new (Progress, Status) API
 //! Streaming round-trip + decoder-fixture tests for LZX.
 //!
 //! The encoder in this build only emits uncompressed BLOCKTYPE=3 blocks, so
@@ -10,13 +9,16 @@
 //!
 //! Fixture-based decoder tests use bytes hand-built to exercise the verbatim
 //! and aligned-offset code paths that the encoder never produces.
+//!
+//! v0.3 port: every codec call returns `(Progress, Status)` and the loop
+//! dispatches on `Status` rather than inferring from byte counts.
 
 #![cfg(feature = "lzx")]
 
 use compcol::lzx::{Decoder, Encoder, Lzx};
-use compcol::{Algorithm, Decoder as _, Encoder as _, Error};
+use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Status};
 
-// ─── small chunked-IO helpers (mirroring the deflate/zstd tests) ────────
+// ─── small chunked-IO helpers ────────────────────────────────────────────
 
 fn encode_chunked(input: &[u8], in_chunk: usize, out_chunk: usize) -> Vec<u8> {
     let mut enc = Encoder::new();
@@ -27,28 +29,29 @@ fn encode_chunked(input: &[u8], in_chunk: usize, out_chunk: usize) -> Vec<u8> {
     while i < input.len() {
         let end = (i + in_chunk).min(input.len());
         let chunk = &input[i..end];
-        let mut consumed_in_chunk = 0;
-        while consumed_in_chunk < chunk.len() {
-            let p = enc.encode(&chunk[consumed_in_chunk..], &mut buf).unwrap();
+        let mut consumed = 0;
+        while consumed < chunk.len() {
+            let (p, status) = enc.encode(&chunk[consumed..], &mut buf).unwrap();
             encoded.extend_from_slice(&buf[..p.written]);
-            consumed_in_chunk += p.consumed;
-            if p.consumed == 0 && p.written == 0 {
-                // Encoder is buffering — that's fine for our uncompressed-only
-                // encoder, just move on.
-                break;
+            consumed += p.consumed;
+            match status {
+                Status::InputEmpty | Status::StreamEnd => break,
+                Status::OutputFull => continue,
             }
         }
         i = end;
     }
 
     loop {
-        let p = enc.finish(&mut buf).unwrap();
+        let (p, status) = enc.finish(&mut buf).unwrap();
         encoded.extend_from_slice(&buf[..p.written]);
-        if matches!(_s, compcol::Status::StreamEnd) {
-            break;
-        }
-        if p.written == 0 {
-            panic!("encoder finish stalled");
+        match status {
+            Status::StreamEnd => break,
+            Status::OutputFull | Status::InputEmpty => {
+                if p.written == 0 {
+                    panic!("encoder finish stalled");
+                }
+            }
         }
     }
     encoded
@@ -63,26 +66,29 @@ fn decode_chunked(encoded: &[u8], in_chunk: usize, out_chunk: usize) -> Vec<u8> 
     while i < encoded.len() {
         let end = (i + in_chunk).min(encoded.len());
         let chunk = &encoded[i..end];
-        let mut consumed_in_chunk = 0;
-        while consumed_in_chunk < chunk.len() {
-            let p = dec.decode(&chunk[consumed_in_chunk..], &mut buf).unwrap();
+        let mut consumed = 0;
+        while consumed < chunk.len() {
+            let (p, status) = dec.decode(&chunk[consumed..], &mut buf).unwrap();
             decoded.extend_from_slice(&buf[..p.written]);
-            consumed_in_chunk += p.consumed;
-            if p.consumed == 0 && p.written == 0 {
-                break;
+            consumed += p.consumed;
+            match status {
+                Status::InputEmpty | Status::StreamEnd => break,
+                Status::OutputFull => continue,
             }
         }
         i = end;
     }
 
     loop {
-        let p = dec.finish(&mut buf).unwrap();
+        let (p, status) = dec.finish(&mut buf).unwrap();
         decoded.extend_from_slice(&buf[..p.written]);
-        if matches!(_s, compcol::Status::StreamEnd) {
-            break;
-        }
-        if p.written == 0 {
-            panic!("decoder finish stalled (decoded {} so far)", decoded.len());
+        match status {
+            Status::StreamEnd => break,
+            Status::OutputFull | Status::InputEmpty => {
+                if p.written == 0 {
+                    panic!("decoder finish stalled (decoded {} so far)", decoded.len());
+                }
+            }
         }
     }
     decoded
@@ -180,8 +186,8 @@ fn invalid_window_bits_in_header() {
     let bad: &[u8] = &[9, 0, 0, 0, 0];
     let mut dec = Decoder::new();
     let mut out = [0u8; 16];
-    let res = dec.decode(bad, &mut out);
-    assert_eq!(res, Err(Error::Unsupported));
+    let err = dec.decode(bad, &mut out).unwrap_err();
+    assert_eq!(err, Error::Unsupported);
 }
 
 #[test]
@@ -191,11 +197,11 @@ fn truncated_stream_after_header() {
     let header: &[u8] = &[15, 10, 0, 0, 0]; // window=15, total=10
     let mut dec = Decoder::new();
     let mut out = [0u8; 16];
-    let p = dec.decode(header, &mut out).unwrap();
+    let (p, _status) = dec.decode(header, &mut out).unwrap();
     assert_eq!(p.consumed, 5);
     assert_eq!(p.written, 0);
-    let r = dec.finish(&mut out);
-    assert_eq!(r, Err(Error::UnexpectedEnd));
+    let err = dec.finish(&mut out).unwrap_err();
+    assert_eq!(err, Error::UnexpectedEnd);
 }
 
 #[test]
@@ -288,7 +294,7 @@ fn fixture_multi_block() {
     assert_eq!(decoded, data);
 }
 
-// ─── encoder reuse ───────────────────────────────────────────────────────
+// ─── reset ───────────────────────────────────────────────────────────────
 
 #[test]
 fn encoder_reset_round_trip() {
@@ -299,13 +305,13 @@ fn encoder_reset_round_trip() {
         enc.reset();
         let mut encoded = Vec::new();
         // Feed all at once.
-        let p = enc.encode(input, &mut buf).unwrap();
+        let (p, _status) = enc.encode(input, &mut buf).unwrap();
         encoded.extend_from_slice(&buf[..p.written]);
         assert_eq!(p.consumed, input.len());
         loop {
-            let p = enc.finish(&mut buf).unwrap();
+            let (p, status) = enc.finish(&mut buf).unwrap();
             encoded.extend_from_slice(&buf[..p.written]);
-            if matches!(_s, compcol::Status::StreamEnd) {
+            if matches!(status, Status::StreamEnd) {
                 break;
             }
         }
@@ -324,17 +330,84 @@ fn decoder_reset_round_trip() {
         let mut buf = vec![0u8; 1024];
         let mut i = 0;
         while i < encoded.len() {
-            let p = dec.decode(&encoded[i..], &mut buf).unwrap();
+            let (p, status) = dec.decode(&encoded[i..], &mut buf).unwrap();
             decoded.extend_from_slice(&buf[..p.written]);
             i += p.consumed;
-            if p.consumed == 0 && p.written == 0 {
-                break;
+            match status {
+                Status::InputEmpty | Status::StreamEnd => break,
+                Status::OutputFull => continue,
             }
         }
         loop {
-            let p = dec.finish(&mut buf).unwrap();
+            let (p, status) = dec.finish(&mut buf).unwrap();
             decoded.extend_from_slice(&buf[..p.written]);
-            if matches!(_s, compcol::Status::StreamEnd) {
+            if matches!(status, Status::StreamEnd) {
+                break;
+            }
+        }
+        assert_eq!(decoded, input);
+    }
+}
+
+// ─── factory ─────────────────────────────────────────────────────────────
+
+#[cfg(feature = "factory")]
+mod factory {
+    use compcol::Status;
+    use compcol::factory;
+
+    #[test]
+    fn lookup_known() {
+        assert!(factory::encoder_by_name("lzx").is_some());
+        assert!(factory::decoder_by_name("lzx").is_some());
+    }
+
+    #[test]
+    fn lookup_unknown() {
+        assert!(factory::encoder_by_name("does-not-exist").is_none());
+        assert!(factory::decoder_by_name("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn names_contains_lzx() {
+        assert!(factory::names().contains(&"lzx"));
+    }
+
+    #[test]
+    fn boxed_round_trip() {
+        // The fallback encoder emits uncompressed blocks; round-trip via the
+        // boxed trait objects to confirm the factory hooks up correctly.
+        let mut enc = factory::encoder_by_name("lzx").unwrap();
+        let mut dec = factory::decoder_by_name("lzx").unwrap();
+        let input = b"hello hello hello";
+        let mut buf = vec![0u8; 256];
+        let mut encoded = Vec::new();
+        let (p, _) = enc.encode(input, &mut buf).unwrap();
+        encoded.extend_from_slice(&buf[..p.written]);
+        assert_eq!(p.consumed, input.len());
+        loop {
+            let (pf, status) = enc.finish(&mut buf).unwrap();
+            encoded.extend_from_slice(&buf[..pf.written]);
+            if matches!(status, Status::StreamEnd) {
+                break;
+            }
+        }
+
+        let mut decoded = Vec::new();
+        let mut i = 0;
+        while i < encoded.len() {
+            let (pd, status) = dec.decode(&encoded[i..], &mut buf).unwrap();
+            decoded.extend_from_slice(&buf[..pd.written]);
+            i += pd.consumed;
+            match status {
+                Status::InputEmpty | Status::StreamEnd => break,
+                Status::OutputFull => continue,
+            }
+        }
+        loop {
+            let (pdf, status) = dec.finish(&mut buf).unwrap();
+            decoded.extend_from_slice(&buf[..pdf.written]);
+            if matches!(status, Status::StreamEnd) {
                 break;
             }
         }
