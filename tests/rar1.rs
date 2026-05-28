@@ -1,4 +1,3 @@
-#![cfg(any())] // TODO(v0.3): port to new (Progress, Status) API
 //! Integration tests for the RAR1 module.
 //!
 //! RAR1 (the 1995-1996 original Roshal Archive compression algorithm) has
@@ -17,6 +16,9 @@
 //!    publicly-observable behaviour those building blocks support
 //!    through the [`Decoder`] / [`Encoder`] API.
 //!
+//! Canonical v0.3 port: every codec call returns `(Progress, Status)` and
+//! the loop dispatches on `Status` rather than inferring from byte counts.
+//!
 //! Fixture famine: real RAR1 sample files are virtually non-existent on
 //! the open internet in 2026. If a future contributor turns one up, embed
 //! it as hex below and add a `decode_real_fixture` test pointing at it.
@@ -24,13 +26,19 @@
 #![cfg(feature = "rar1")]
 
 use compcol::rar1::{Decoder, Encoder, Rar1};
-use compcol::{Algorithm, Decoder as _, Encoder as _, Error};
+use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Status};
 
 // ─── algorithm identity ───────────────────────────────────────────────────
 
 #[test]
 fn name_is_rar1() {
     assert_eq!(<Rar1 as Algorithm>::NAME, "rar1");
+}
+
+#[test]
+fn algorithm_factory_produces_codec() {
+    let _enc = <Rar1 as Algorithm>::encoder();
+    let _dec = <Rar1 as Algorithm>::decoder();
 }
 
 #[test]
@@ -41,16 +49,18 @@ fn factory_returns_decoder() {
     let mut d = <Rar1 as Algorithm>::decoder();
     let mut out = [0u8; 1];
     // Empty input is permitted as a no-op.
-    let p = d.decode(&[], &mut out).unwrap();
+    let (p, status) = d.decode(&[], &mut out).unwrap();
     assert_eq!(p.consumed, 0);
     assert_eq!(p.written, 0);
+    // Empty input is "feed me more" — not stream end.
+    assert!(matches!(status, Status::InputEmpty));
 }
 
 #[test]
 fn factory_returns_encoder_that_errors() {
     let mut e = <Rar1 as Algorithm>::encoder();
     let mut out = [0u8; 1];
-    assert!(matches!(e.encode(b"x", &mut out), Err(Error::Unsupported)));
+    assert_eq!(e.encode(b"x", &mut out).unwrap_err(), Error::Unsupported);
 }
 
 // ─── encoder is permanently Unsupported ──────────────────────────────────
@@ -59,17 +69,17 @@ fn factory_returns_encoder_that_errors() {
 fn encoder_encode_is_unsupported() {
     let mut e = Encoder::new();
     let mut out = [0u8; 16];
-    assert!(matches!(
-        e.encode(b"hello world", &mut out),
-        Err(Error::Unsupported)
-    ));
+    assert_eq!(
+        e.encode(b"hello world", &mut out).unwrap_err(),
+        Error::Unsupported
+    );
 }
 
 #[test]
 fn encoder_finish_is_unsupported() {
     let mut e = Encoder::new();
     let mut out = [0u8; 16];
-    assert!(matches!(e.finish(&mut out), Err(Error::Unsupported)));
+    assert_eq!(e.finish(&mut out).unwrap_err(), Error::Unsupported);
 }
 
 #[test]
@@ -79,7 +89,7 @@ fn encoder_encode_with_empty_input_still_unsupported() {
     // immediately.
     let mut e = Encoder::new();
     let mut out = [0u8; 16];
-    assert!(matches!(e.encode(&[], &mut out), Err(Error::Unsupported)));
+    assert_eq!(e.encode(&[], &mut out).unwrap_err(), Error::Unsupported);
 }
 
 #[test]
@@ -88,7 +98,7 @@ fn encoder_reset_does_not_panic() {
     e.reset();
     // Still unsupported after reset.
     let mut out = [0u8; 16];
-    assert!(matches!(e.encode(b"x", &mut out), Err(Error::Unsupported)));
+    assert_eq!(e.encode(b"x", &mut out).unwrap_err(), Error::Unsupported);
 }
 
 // ─── decoder constructors ────────────────────────────────────────────────
@@ -127,10 +137,11 @@ fn decoder_with_unpack_size_large() {
 fn decode_empty_input_is_noop() {
     let mut d = Decoder::new();
     let mut out = [0u8; 4];
-    let p = d.decode(&[], &mut out).unwrap();
+    let (p, status) = d.decode(&[], &mut out).unwrap();
     assert_eq!(p.consumed, 0);
     assert_eq!(p.written, 0);
-    assert!(!matches!(_s, compcol::Status::StreamEnd));
+    // Empty input ⇒ codec is waiting for bytes, not at end-of-stream.
+    assert!(matches!(status, Status::InputEmpty));
 }
 
 #[test]
@@ -139,10 +150,10 @@ fn decode_empty_input_zero_output_is_noop() {
     // contract: no input, no output buffer, decoder shouldn't error.
     let mut d = Decoder::new();
     let mut out: [u8; 0] = [];
-    let p = d.decode(&[], &mut out).unwrap();
+    let (p, status) = d.decode(&[], &mut out).unwrap();
     assert_eq!(p.consumed, 0);
     assert_eq!(p.written, 0);
-    assert!(!matches!(_s, compcol::Status::StreamEnd));
+    assert!(matches!(status, Status::InputEmpty));
 }
 
 #[test]
@@ -151,10 +162,10 @@ fn decode_nonempty_input_returns_unsupported() {
     // docs) so any real input must be refused immediately.
     let mut d = Decoder::new();
     let mut out = [0u8; 16];
-    assert!(matches!(
-        d.decode(b"\xCA\xFE", &mut out),
-        Err(Error::Unsupported)
-    ));
+    assert_eq!(
+        d.decode(b"\xCA\xFE", &mut out).unwrap_err(),
+        Error::Unsupported
+    );
 }
 
 #[test]
@@ -163,30 +174,28 @@ fn decode_nonempty_input_with_unpack_size_still_unsupported() {
     // verdict — the algorithm is structurally not yet implemented.
     let mut d = Decoder::with_unpack_size(128);
     let mut out = [0u8; 16];
-    assert!(matches!(
-        d.decode(b"\x01", &mut out),
-        Err(Error::Unsupported)
-    ));
+    assert_eq!(d.decode(b"\x01", &mut out).unwrap_err(), Error::Unsupported);
 }
 
 #[test]
-fn finish_on_fresh_decoder_is_done() {
+fn finish_on_fresh_decoder_is_stream_end() {
     let mut d = Decoder::new();
     let mut out = [0u8; 4];
-    let p = d.finish(&mut out).unwrap();
-    assert!(matches!(_s, compcol::Status::StreamEnd));
+    let (p, status) = d.finish(&mut out).unwrap();
+    assert!(matches!(status, Status::StreamEnd));
     assert_eq!(p.consumed, 0);
     assert_eq!(p.written, 0);
 }
 
 #[test]
-fn finish_on_fresh_decoder_with_unpack_size_is_done() {
+fn finish_on_fresh_decoder_with_unpack_size_is_stream_end() {
     // Even if we declared an unpack size, an unstarted decoder is
     // trivially "done" — there is no in-flight data to flush.
     let mut d = Decoder::with_unpack_size(100);
     let mut out = [0u8; 4];
-    let p = d.finish(&mut out).unwrap();
-    assert!(matches!(_s, compcol::Status::StreamEnd));
+    let (p, status) = d.finish(&mut out).unwrap();
+    assert!(matches!(status, Status::StreamEnd));
+    assert_eq!(p.written, 0);
 }
 
 #[test]
@@ -197,26 +206,27 @@ fn reset_returns_to_initial_state() {
     let mut out = [0u8; 4];
     let _ = d.decode(&[0xFF], &mut out);
     d.reset();
-    // After reset: no declared unpack_size, finish reports done.
+    // After reset: no declared unpack_size, finish reports StreamEnd.
     assert_eq!(d.unpack_size(), None);
-    let p = d.finish(&mut out).unwrap();
-    assert!(matches!(_s, compcol::Status::StreamEnd));
+    let (_p, status) = d.finish(&mut out).unwrap();
+    assert!(matches!(status, Status::StreamEnd));
 }
 
 #[test]
-fn skip_default_implementation_does_not_panic() {
-    // The default `Decoder::skip` implementation drives `decode`. For our
-    // stub, that means the first non-empty `decode` call errors out and
-    // skip should propagate that error rather than spinning.
+fn skip_default_implementation_propagates_unsupported() {
+    // The default `Decoder::discard_output` implementation drives `decode`.
+    // For our stub, that means the first non-empty `decode` call errors
+    // out and `discard_output` should propagate that error rather than
+    // spinning.
     let mut d = Decoder::new();
     let result = d.discard_output(b"some-bytes", 100);
-    assert!(matches!(result, Err(Error::Unsupported)));
+    assert_eq!(result.unwrap_err(), Error::Unsupported);
 }
 
 #[test]
 fn skip_with_empty_input_returns_zero_progress() {
     let mut d = Decoder::new();
-    let p = d.discard_output(&[], 100).unwrap();
+    let (p, _status) = d.discard_output(&[], 100).unwrap();
     // The default impl breaks out of its loop when both consumed and
     // written stay zero. Skipping zero from empty input → zero progress.
     assert_eq!(p.consumed, 0);
@@ -226,20 +236,39 @@ fn skip_with_empty_input_returns_zero_progress() {
 // ─── decoder-as-trait-object ─────────────────────────────────────────────
 
 #[cfg(feature = "factory")]
-#[test]
-fn decoder_via_factory_by_name() {
-    use compcol::factory::decoder_by_name;
-    let mut d = decoder_by_name("rar1").expect("rar1 is in the factory");
-    let mut out = [0u8; 4];
-    // Same constraints apply via dyn dispatch.
-    assert!(matches!(d.decode(b"x", &mut out), Err(Error::Unsupported)));
-}
+mod factory {
+    use compcol::Error;
+    use compcol::factory;
 
-#[cfg(feature = "factory")]
-#[test]
-fn encoder_via_factory_by_name() {
-    use compcol::factory::encoder_by_name;
-    let mut e = encoder_by_name("rar1").expect("rar1 is in the factory");
-    let mut out = [0u8; 4];
-    assert!(matches!(e.encode(b"x", &mut out), Err(Error::Unsupported)));
+    #[test]
+    fn lookup_rar1_encoder_and_decoder() {
+        assert!(factory::encoder_by_name("rar1").is_some());
+        assert!(factory::decoder_by_name("rar1").is_some());
+    }
+
+    #[test]
+    fn lookup_unknown() {
+        assert!(factory::encoder_by_name("not-a-real-rar1").is_none());
+        assert!(factory::decoder_by_name("not-a-real-rar1").is_none());
+    }
+
+    #[test]
+    fn names_contains_rar1() {
+        assert!(factory::names().contains(&"rar1"));
+    }
+
+    #[test]
+    fn boxed_encoder_is_unsupported() {
+        let mut e = factory::encoder_by_name("rar1").expect("rar1 is in the factory");
+        let mut out = [0u8; 4];
+        assert_eq!(e.encode(b"x", &mut out).unwrap_err(), Error::Unsupported);
+    }
+
+    #[test]
+    fn boxed_decoder_is_unsupported_on_real_input() {
+        let mut d = factory::decoder_by_name("rar1").expect("rar1 is in the factory");
+        let mut out = [0u8; 4];
+        // Same constraints apply via dyn dispatch.
+        assert_eq!(d.decode(b"x", &mut out).unwrap_err(), Error::Unsupported);
+    }
 }
