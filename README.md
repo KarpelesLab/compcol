@@ -2,12 +2,13 @@
 
 A collection of compression algorithms in pure Rust.
 
-`compcol` puts every supported algorithm — RLE, deflate, zlib, gzip, LZMA,
-LZMA2, xz, Zstandard, Brotli, LZ4, Snappy, LZW — behind one uniform
-streaming trait, with each algorithm gated by its own Cargo feature so
-downstream crates only pay for what they pull in. A runtime by-name
-factory makes algorithms selectable from configuration or a CLI flag,
-and a `compcol` binary turns the library into a Unix-style filter.
+`compcol` puts every supported algorithm — RLE, deflate, zlib, gzip,
+LZMA, xz, Zstandard, Brotli, LZ4, Snappy, LZW, LZO, LZX, Quantum, plus
+decoders for RAR 1/2/3/5 — behind one uniform streaming trait, with
+each algorithm gated by its own Cargo feature so downstream crates
+only pay for what they pull in. A runtime by-name factory makes
+algorithms selectable from configuration or a CLI flag, and a
+`compcol` binary turns the library into a Unix-style filter.
 
 ## Design principles
 
@@ -22,30 +23,43 @@ and a `compcol` binary turns the library into a Unix-style filter.
   state across calls. Works in a 1-byte-on-both-sides streaming loop.
 - **Per-algorithm features.** `default = ["alloc", "rle", "deflate",
   "zlib", "gzip", "factory"]`. Everything else is opt-in.
+- **`all` meta-feature.** `features = ["all"]` is a single name that
+  enables every algorithm — useful for downstream crates and the CLI
+  install command instead of a 20-item feature list.
 
 ## Supported algorithms
 
 | Algorithm | Feature | Extension | Encoder | Decoder | Cross-validation |
 |---|---|---|---|---|---|
-| RLE | `rle`     | `.rle`     | full | full | — |
-| Deflate (RFC 1951) | `deflate` | `.deflate` | full (dynamic Huffman) | full | `python3 -c "import zlib"` |
-| Zlib (RFC 1950) | `zlib`    | `.zz`      | full | full | `python3 -c "import zlib"` |
-| Gzip (RFC 1952) | `gzip`    | `.gz`      | full | full | `gzip(1)` |
-| LZ4 block format | `lz4`     | `.lz4`     | LZ77 hash matcher | full | — |
-| Snappy | `snappy`  | `.sz`      | LZ77 hash matcher (raw block format) | full | — |
-| LZW (compress(1) `.Z`) | `lzw`     | `.lzw`     | full | full | `compress(1)` / `uncompress(1)` |
-| LZMA (legacy `.lzma`) | `lzma`    | `.lzma`    | full | full | `python3 -m lzma` (FORMAT_ALONE) |
-| xz | `xz`      | `.xz`      | compressed-LZMA2 chunks + uncompressed fallback | full envelope + all reset variants | `xz(1)` both directions |
-| Zstandard (RFC 8478) | `zstd`    | `.zst`     | LZ77 + FSE sequences (Predefined tables) + Raw literals | full Compressed_Block | `zstd(1)` both directions |
-| Brotli (RFC 7932) | `brotli`  | `.br`      | LZ77 + length-limited Huffman trees + 704-symbol IC alphabet | full (with 122 KiB static dictionary) | `brotli(1)` both directions |
+| RLE | `rle` | `.rle` | full | full | — |
+| Deflate (RFC 1951) | `deflate` | `.deflate` | full (lazy LZ77 + dynamic / fixed / stored Huffman; cross-block matching) | full | `python3 -c "import zlib"` |
+| Zlib (RFC 1950) | `zlib` | `.zz` | full | full | `python3 -c "import zlib"` |
+| Gzip (RFC 1952) | `gzip` | `.gz` | full | full | `gzip(1)` |
+| LZ4 block format | `lz4` | `.lz4` | LZ77 hash matcher | full | — |
+| Snappy | `snappy` | `.sz` | LZ77 hash matcher (raw block format) | full | — |
+| LZW (`compress(1)` `.Z`) | `lzw` | `.lzw` | full | full | `compress(1)` / `uncompress(1)` |
+| LZMA (legacy `.lzma`) | `lzma` | `.lzma` | full | full | `python3 -m lzma` (FORMAT_ALONE) |
+| xz | `xz` | `.xz` | compressed-LZMA2 chunks + uncompressed fallback | full envelope + all reset variants | `xz(1)` both directions |
+| Zstandard (RFC 8478) | `zstd` | `.zst` | LZ77 + Huffman literals + FSE_Compressed_Mode sequences + repeat offsets + RLE blocks | full Compressed_Block | `zstd(1)` both directions |
+| Brotli (RFC 7932) | `brotli` | `.br` | LZ77 + length-limited Huffman + 704-symbol IC alphabet + static-dictionary refs | full (with 122 KiB static dictionary) | `brotli(1)` both directions |
+| LZO (LZO1X-1) | `lzo` | `.lzo` | LZ77 hash matcher | full | `python3 -c "import lzo"` |
+| LZX (Microsoft CAB / WIM) | `lzx` | `.lzx` | uncompressed blocks only | full (verbatim + aligned-offset + uncompressed; E8 filter) | — |
+| Quantum (Stac, old CAB) | `quantum` | `.q` | `Unsupported` (no public encoder exists) | full (libmspack-equivalent) | libmspack regression fixtures |
+| RAR 1.x | `rar1` | `.rar` | `Unsupported` (license) | building blocks only (Huffman tables not license-clean) | — |
+| RAR 2.x | `rar2` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + audio predictor | real rar-2.60 fixtures |
+| RAR 3.x | `rar3` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + E8 filter; PPMd & VM filters refused | libarchive RAR3 fixtures |
+| RAR 5.x | `rar5` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + x86 filter; Delta/ARM refused | RARLAB-CLI fixtures |
 
-Every algorithm decodes real-world output from its reference toolchain
-and produces output that the same reference toolchain accepts. Some
-encoders (zstd, brotli) ship without Huffman-encoded literals or
-custom FSE tables — they emit valid compressed-format streams that are
-weaker on compression ratio than `zstd -1` / `brotli -q1` (typically
-within 1.3–1.5× on text, falling further behind on highly repetitive
-input where reference tools use RLE blocks).
+The RAR encoders are permanently `Unsupported` per RARLAB's unRAR
+license terms (every clean-room RAR reader — libarchive, The
+Unarchiver, 7-Zip — ships decoder-only for the same reason).
+
+Every other algorithm decodes real-world output from its reference
+toolchain and produces output that the same reference toolchain
+accepts. Some encoders (zstd, brotli) lag the reference's compression
+ratio because they skip features like FSE-compressed Huffman weight
+tables (zstd) or encoder-side static-dictionary lookups for non-English
+text (brotli); the wire format is always conformant.
 
 ## Library usage
 
@@ -170,10 +184,14 @@ without LZ77 expansion).
 The `compcol` binary ships with the crate. Install with:
 
 ```sh
-cargo install --path . --features "gzip,zlib,deflate,rle,lz4,snappy,lzw,xz,zstd,brotli,lzma,factory"
+cargo install --path . --features all
 ```
 
-(or pick whichever subset of algorithms you want).
+…or pick a subset:
+
+```sh
+cargo install --path . --features "gzip,zstd,brotli,lz4,factory"
+```
 
 ```text
 Usage: compcol -t ALGO [OPTIONS] [INPUT]
@@ -236,9 +254,16 @@ error.
 ```toml
 [features]
 default = ["alloc", "rle", "deflate", "zlib", "gzip", "factory"]
+# Meta-feature: pulls in every algorithm. Equivalent to `--all-features`.
+all     = ["alloc", "factory",
+           "rle", "deflate", "zlib", "gzip",
+           "lzma", "xz",
+           "zstd", "brotli", "lz4", "snappy", "lzw",
+           "lzo", "lzx", "quantum",
+           "rar1", "rar2", "rar3", "rar5"]
 alloc   = []
 factory = ["alloc"]            # by-name lookup, returns Box<dyn …>
-rle     = []                   # no_std clean
+rle     = []                   # no_std clean (alloc not required)
 deflate = ["alloc"]
 zlib    = ["deflate"]
 gzip    = ["deflate"]
@@ -249,13 +274,22 @@ brotli  = ["alloc"]
 lz4     = ["alloc"]
 snappy  = ["alloc"]
 lzw     = ["alloc"]
+lzo     = ["alloc"]
+lzx     = ["alloc"]
+quantum = ["alloc"]
+rar1    = ["alloc"]
+rar2    = ["alloc"]
+rar3    = ["alloc"]
+rar5    = ["alloc"]
 ```
 
 A bare `--no-default-features` build produces a library with just the
-trait surface and the RLE algorithm — useful for the most constrained
-embedded targets. Adding `factory` pulls in `alloc` and the runtime
-dispatch helpers; adding any individual algorithm feature pulls in
-whatever it needs.
+trait surface — useful for the most constrained embedded targets.
+Adding `rle` gives an algorithm that doesn't need `alloc`. Adding any
+other algorithm feature pulls in `alloc` and the codec.
+
+`features = ["all"]` enables every algorithm and is the most ergonomic
+choice when you don't know in advance which formats you'll see.
 
 The `compcol` binary is gated on `features = ["factory"]` so a
 `--no-default-features` library build doesn't try to compile it.
@@ -283,30 +317,31 @@ pub enum Error {
 ## Development
 
 ```sh
-cargo build                                                      # builds lib + bin
+cargo build                                                      # builds lib + bin (default features)
 cargo build --no-default-features                                # bare no_std lib
-cargo build --no-default-features --features <algo>              # narrow build
+cargo build --no-default-features --features rle                 # narrowest alloc-free build
+cargo build --no-default-features --features all                 # every algorithm, still no_std
 
 cargo test --all-features                                        # full test suite
 cargo clippy --all-features --all-targets -- -D warnings         # lint clean
 cargo fmt --all --check                                          # format clean
 ```
 
-The crate currently ships with **~355 tests across 17 test binaries**,
-including round-trip tests for every algorithm, cross-validation
-against system `gzip` / `xz` / `zstd` / `brotli` / `compress`, and
-hand-crafted hex fixtures for known corner cases.
+The crate currently ships with **~566 tests across 23 test binaries**,
+including round-trip tests for every algorithm with an encoder,
+cross-validation against system `gzip` / `xz` / `zstd` / `brotli` /
+`compress` / `lz4` / `python3 lzo` / `python3 lzma`, and hand-crafted
+hex fixtures for every decoder-only format (RAR 2/3/5, Quantum, LZX).
 
 A simple benchmark harness lives at `examples/bench.rs`. Run it with:
 
 ```sh
-cargo run --release --all-features --example bench
+cargo run --release --features all --example bench
 ```
 
 It measures each compiled-in algorithm's encoder/decoder throughput
 and compression ratio on a small fixed corpus and compares against
-the system reference (gzip, xz, zstd, brotli, lz4, compress, python's
-zlib / lzma / snappy) when one is installed. A snapshot of the output
+the system reference when one is installed. A snapshot of the output
 is kept in [`BENCH.md`](./BENCH.md).
 
 ## License

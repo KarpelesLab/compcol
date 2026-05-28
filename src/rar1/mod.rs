@@ -16,22 +16,22 @@
 //! Internally the module ships the well-defined building blocks any RAR1
 //! decoder needs:
 //!
-//! - [`bits::BitReader`] — MSB-first bit reader matching
+//! - `bits::BitReader` — MSB-first bit reader matching
 //!   `XADRAR15Handle.m`'s `CSInputNextBit`/`CSInputNextBitString` consumption
 //!   order (Huffman codes are flagged `shortestCodeIsZeros:YES`).
-//! - [`huffman::StaticHuffman`] — canonical Huffman decoder. RAR1's
+//! - `huffman::StaticHuffman` — canonical Huffman decoder. RAR1's
 //!   Huffman trees are **all static** — they're never transmitted — so this
 //!   takes pre-baked code-length arrays. Maximum code length is 12 bits;
 //!   the alphabet size is a const generic so the same type covers the
 //!   256-symbol length trees, the 257-symbol literal trees, and the small
 //!   short-match selector tables.
-//! - [`window::Window`] — 64 KiB LZSS sliding-window output buffer with
+//! - `window::Window` — 64 KiB LZSS sliding-window output buffer with
 //!   literal / match emission primitives and a drain cursor for streaming.
-//! - [`lookup::LookupTable`] — the self-adjusting 256-entry symbol cache
+//! - `lookup::LookupTable` — the self-adjusting 256-entry symbol cache
 //!   used as `flagtable` / `literaltable` / `offsettable` in the reference
 //!   implementation. Implements the reset / swap / rank-bump machinery
 //!   described by the reverse-engineered notes.
-//! - [`offset_history::OffsetHistory`] — the 4-deep ring of recent match
+//! - `offset_history::OffsetHistory` — the 4-deep ring of recent match
 //!   offsets plus the `lastoffset` / `lastlength` registers used by the
 //!   short-match selector branch.
 //!
@@ -52,7 +52,7 @@
 //! 2. A future change that introduces the static tables (either by
 //!    clean-room re-derivation, or by re-licensing under terms compatible
 //!    with the LGPL source) can wire them straight into
-//!    [`huffman::StaticHuffman::from_lengths`] and into a new `decode`
+//!    `huffman::StaticHuffman::from_lengths` and into a new `decode`
 //!    state machine — no rebuilding required.
 //! 3. Until then, there is no way to decode an actual RAR1 stream from
 //!    bytes alone.

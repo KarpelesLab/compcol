@@ -90,10 +90,10 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    /// Construct a decoder. Without [`with_unpack_size`] the decoder treats
-    /// the stream as zero-length — useful for the trait-default factory
-    /// path. Call [`set_unpack_size`] before `decode` to actually decompress
-    /// data.
+    /// Construct a decoder. Without [`Self::with_unpack_size`] the decoder
+    /// treats the stream as zero-length — useful for the trait-default
+    /// factory path. Call [`Self::set_unpack_size`] before `decode` to
+    /// actually decompress data.
     pub const fn new() -> Self {
         Self {
             unpack_size: 0,

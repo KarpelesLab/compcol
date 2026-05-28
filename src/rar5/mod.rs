@@ -29,7 +29,7 @@
 //!   main header, file headers, multi-volume continuations, encryption,
 //!   recovery records, …) is not decoded here. Callers extract the inner
 //!   compressed-data run from the container themselves and feed it to
-//!   [`Decoder::decode`].
+//!   the decoder's `decode()` method.
 //! - **No solid-archive cross-file dictionary sharing.** RAR5's solid mode
 //!   keeps the LZ window alive across consecutive file entries; this
 //!   decoder treats every stream independently.

@@ -19,7 +19,7 @@
 //!    text-heavy archives and `-m5` (best compression) runs.
 //!
 //! This build implements the **LZ77 + Huffman path** in full. PPMd-II blocks
-//! are refused with `Error::Unsupported` — see [`decoder`] for details and
+//! are refused with `Error::Unsupported` — see the private `decoder` submodule for details and
 //! limitations. The standalone E8/E9 (x86 near-call) post-pass filter can
 //! be enabled via [`Decoder::with_e8_filter`]; the in-band RarVM filter
 //! mechanism (main symbols 257..=261) is refused.

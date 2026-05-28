@@ -11,7 +11,7 @@
 //!   hash-chain match finder; insert-and-copy commands use the full
 //!   704-symbol IC alphabet; Huffman trees are built from frequencies
 //!   via the length-limited package-merge algorithm. **Static-dictionary
-//!   references** are emitted via [`encoder_dict::DictIndex`] when a
+//!   references** are emitted via the private `encoder_dict::DictIndex` when a
 //!   dictionary word (with one of the Identity or UppercaseFirst-ASCII
 //!   transforms) sits at the current input position and would beat the
 //!   in-window LZ77 match. The encoder still does not exploit multiple

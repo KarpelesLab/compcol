@@ -11,6 +11,17 @@ categories  = ["compression", "no-std"]
 
 [features]
 default = ["alloc", "rle", "deflate", "zlib", "gzip", "factory"]
+# Convenience meta-feature: every algorithm compiled in. Equivalent to
+# `cargo build --all-features` at the CLI level; useful in downstream
+# Cargo.toml entries (`features = ["all"]`) instead of a 20-item list.
+all = [
+    "alloc", "factory",
+    "rle", "deflate", "zlib", "gzip",
+    "lzma", "xz",
+    "zstd", "brotli", "lz4", "snappy", "lzw",
+    "lzo", "lzx", "quantum",
+    "rar1", "rar2", "rar3", "rar5",
+]
 # Enables `alloc`-backed conveniences (e.g. the `factory` module). Pulled in
 # automatically by features that require heap allocation.
 alloc   = []
@@ -62,4 +73,9 @@ unsafe_code = "forbid"
 [[bin]]
 name             = "compcol"
 path             = "src/bin/compcol.rs"
+required-features = ["factory"]
+
+[[example]]
+name             = "bench"
+path             = "examples/bench.rs"
 required-features = ["factory"]
