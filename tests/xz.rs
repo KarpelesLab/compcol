@@ -494,6 +494,7 @@ fn system_xz_encode_then_our_decode_binary() {
 /// format starts with a 12-byte Stream Header, then a Block Header that
 /// our encoder builds with build_block_header() (12 bytes), so the first
 /// chunk control byte is at offset 24.
+#[cfg(unix)]
 fn first_chunk_control_byte(encoded: &[u8]) -> u8 {
     assert!(encoded.len() > 24, "xz stream too short to contain a chunk");
     encoded[24]
