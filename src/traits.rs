@@ -294,6 +294,50 @@ impl<T: RawDecoder> Decoder for T {
     }
 }
 
+// ─── Box<dyn Encoder/Decoder> trait passthroughs ────────────────────────
+//
+// Without these blanket impls a `Box<dyn Encoder>` (e.g. the value
+// returned by `factory::encoder_by_name`) does not itself implement
+// `Encoder`, which means it cannot be handed to consumers like
+// `compcol::io::EncoderWriter::new(file, enc)` that take any `E: Encoder`
+// by value. The Box impls let runtime-selected algorithms compose with
+// the streaming adapters and any other generic code in the crate.
+//
+// Each method simply forwards through the Box's `DerefMut` to the inner
+// trait object's vtable.
+
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
+#[cfg(feature = "alloc")]
+impl Encoder for alloc::boxed::Box<dyn Encoder + '_> {
+    fn encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<(Progress, Status), Error> {
+        (**self).encode(input, output)
+    }
+    fn finish(&mut self, output: &mut [u8]) -> Result<(Progress, Status), Error> {
+        (**self).finish(output)
+    }
+    fn reset(&mut self) {
+        (**self).reset()
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl Decoder for alloc::boxed::Box<dyn Decoder + '_> {
+    fn decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<(Progress, Status), Error> {
+        (**self).decode(input, output)
+    }
+    fn finish(&mut self, output: &mut [u8]) -> Result<(Progress, Status), Error> {
+        (**self).finish(output)
+    }
+    fn reset(&mut self) {
+        (**self).reset()
+    }
+    fn discard_output(&mut self, input: &[u8], n: usize) -> Result<(Progress, Status), Error> {
+        (**self).discard_output(input, n)
+    }
+}
+
 // ─── Algorithm ───────────────────────────────────────────────────────────
 
 /// A compression algorithm: a name plus encoder/decoder factories plus
