@@ -34,9 +34,116 @@ const BLOCK_SIZE: usize = 16 * 1024;
 /// input, which amortises the memmove cost.
 const WINDOW_MAX: usize = 2 * WINDOW_SIZE;
 
-/// Threshold beyond which lazy matching skips the lookahead probe — at this
-/// length the literal we'd save can't outweigh the extra match symbol.
-const GOOD_MATCH: usize = 32;
+// ─── compression level ──────────────────────────────────────────────────
+
+/// Tunables for the deflate encoder.
+///
+/// `level` controls the speed/ratio trade-off: `1` is fastest and produces
+/// the largest output, `9` is slowest and produces the smallest output. The
+/// default of `6` mirrors zlib's default and is a reasonable starting point
+/// for most use cases.
+///
+/// Values outside `1..=9` are clamped at encoder construction time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncoderConfig {
+    /// Compression level in `1..=9`.
+    pub level: u8,
+}
+
+impl Default for EncoderConfig {
+    fn default() -> Self {
+        Self { level: 6 }
+    }
+}
+
+/// Internal expansion of [`EncoderConfig::level`] into the match-finder
+/// tuning knobs the LZ77 pass actually consults. The table mirrors zlib's
+/// `configuration_table`: higher levels widen the chain budget and raise
+/// the "nice match" / "good match" thresholds, trading CPU for ratio.
+#[derive(Debug, Clone, Copy)]
+struct LevelParams {
+    /// Maximum number of hash-chain links the match finder walks.
+    max_chain: usize,
+    /// Length at which the match finder stops looking for a longer candidate.
+    nice_match: usize,
+    /// Length at which lazy matching considers the current match "good
+    /// enough" and quarters the chain budget on the lookahead probe.
+    good_match: usize,
+    /// Whether to perform lazy matching at all. Levels 1..=3 skip it
+    /// entirely (greedy parsing) to save the per-position probe.
+    use_lazy: bool,
+}
+
+impl LevelParams {
+    /// Clamp `level` to `1..=9` and expand to the matching tuning knobs.
+    fn from_level(level: u8) -> Self {
+        // Clamp instead of returning Err — keeping the public surface
+        // infallible matches zlib's behaviour of silently snapping Z_BEST_*
+        // values into range.
+        let level = level.clamp(1, 9);
+        // Mirrors zlib's configuration_table: (good_length, max_lazy/nice,
+        // nice_length, max_chain) tuned per level. We collapse the
+        // greedy-vs-lazy switch into a single `use_lazy` flag; zlib does
+        // the same internally via `func == fast`.
+        match level {
+            1 => Self {
+                max_chain: 4,
+                nice_match: 8,
+                good_match: 4,
+                use_lazy: false,
+            },
+            2 => Self {
+                max_chain: 8,
+                nice_match: 16,
+                good_match: 5,
+                use_lazy: false,
+            },
+            3 => Self {
+                max_chain: 32,
+                nice_match: 32,
+                good_match: 6,
+                use_lazy: false,
+            },
+            4 => Self {
+                max_chain: 16,
+                nice_match: 16,
+                good_match: 4,
+                use_lazy: true,
+            },
+            5 => Self {
+                max_chain: 32,
+                nice_match: 32,
+                good_match: 8,
+                use_lazy: true,
+            },
+            6 => Self {
+                max_chain: 128,
+                nice_match: 128,
+                good_match: 16,
+                use_lazy: true,
+            },
+            7 => Self {
+                max_chain: 256,
+                nice_match: 128,
+                good_match: 32,
+                use_lazy: true,
+            },
+            8 => Self {
+                max_chain: 1024,
+                nice_match: 258,
+                good_match: 32,
+                use_lazy: true,
+            },
+            // 9 (and clamp-from-above)
+            _ => Self {
+                max_chain: 4096,
+                nice_match: 258,
+                good_match: 32,
+                use_lazy: true,
+            },
+        }
+    }
+}
 
 // ─── helpers for the length/distance -> code mapping ─────────────────────
 
@@ -224,10 +331,21 @@ pub struct Encoder {
     state: EncState,
     /// True once we've emitted a BFINAL=1 block; finish() will not produce more.
     final_emitted: bool,
+    /// Match-finder tuning derived from [`EncoderConfig::level`]. Persisted
+    /// across `reset` since configuration is meant to survive resets.
+    params: LevelParams,
 }
 
 impl Encoder {
+    /// Build an encoder at the default compression level (6).
     pub fn new() -> Self {
+        Self::with_config(EncoderConfig::default())
+    }
+
+    /// Build an encoder with explicit configuration. `config.level` is
+    /// clamped to `1..=9` internally — out-of-range values are snapped to
+    /// the nearest valid level rather than rejected.
+    pub fn with_config(config: EncoderConfig) -> Self {
         Self {
             window: Vec::with_capacity(WINDOW_MAX),
             cursor: 0,
@@ -240,6 +358,7 @@ impl Encoder {
             out_pos: 0,
             state: EncState::Accepting,
             final_emitted: false,
+            params: LevelParams::from_level(config.level),
         }
     }
 
@@ -268,16 +387,23 @@ impl Encoder {
         }
     }
 
-    /// Run LZ77 with lazy matching over `window[cursor..end]`, appending
-    /// the result to `block_symbols` and `block_bytes`. Advances `cursor`.
+    /// Run LZ77 over `window[cursor..end]`, appending the result to
+    /// `block_symbols` and `block_bytes`. Advances `cursor`. Uses greedy
+    /// parsing when `params.use_lazy` is false (low levels) and gzip-style
+    /// lazy matching otherwise.
     fn lz77_pass(&mut self, end: usize) {
         let abs_base = self.window_start_abs;
+        let max_chain = self.params.max_chain;
+        let nice_match = self.params.nice_match;
+        let good_match = self.params.good_match;
+        let use_lazy = self.params.use_lazy;
         let mut pos = self.cursor;
 
         // Lazy-matching state: at any iteration we may have a "pending"
         // best match starting at `prev_match_start` that we haven't
         // committed yet — we hold it back to see if the next position
-        // offers something strictly better.
+        // offers something strictly better. With greedy parsing
+        // (`use_lazy = false`) this branch is never taken.
         let mut have_pending = false;
         let mut prev_match_len: usize = 0;
         let mut prev_match_dist: usize = 0;
@@ -298,9 +424,18 @@ impl Encoder {
             // Find the best match at `pos`.
             let cur = if pos + MIN_MATCH <= end {
                 let abs = abs_base + pos as u64;
-                let good = if have_pending { GOOD_MATCH } else { 0 };
+                // If we already hold a long-enough pending match, the
+                // lookahead probe gets a smaller chain budget.
+                let have_good = have_pending && prev_match_len >= good_match;
                 self.match_finder
-                    .find_match(&self.window, pos, abs as u32, good)
+                    .find_match(
+                        &self.window,
+                        pos,
+                        abs as u32,
+                        have_good,
+                        max_chain,
+                        nice_match,
+                    )
                     .map(|(l, d)| (l as usize, d as usize))
             } else {
                 None
@@ -358,14 +493,8 @@ impl Encoder {
                     have_pending = false;
                 }
             } else if let Some((cl, cd)) = cur {
-                // Hold this match back as pending; try one more position
-                // to see if a longer match is available.
-                prev_match_len = cl;
-                prev_match_dist = cd;
-                prev_match_start = pos;
-                have_pending = true;
-                // If the match is already at NICE/MAX length, commit immediately.
-                if cl >= GOOD_MATCH.max(MAX_MATCH) || cl >= 258 {
+                if !use_lazy {
+                    // Greedy: commit this match immediately, no lookahead probe.
                     self.block_symbols.push(Symbol::Match {
                         length: cl as u16,
                         distance: cd as u16,
@@ -387,9 +516,41 @@ impl Encoder {
                         k += 1;
                     }
                     pos = match_end;
-                    have_pending = false;
                 } else {
-                    pos += 1;
+                    // Lazy: hold this match back as pending; try one more
+                    // position to see if a longer match is available.
+                    prev_match_len = cl;
+                    prev_match_dist = cd;
+                    prev_match_start = pos;
+                    have_pending = true;
+                    // If the match is already at MAX_MATCH there is no point
+                    // probing further; commit immediately.
+                    if cl >= MAX_MATCH {
+                        self.block_symbols.push(Symbol::Match {
+                            length: cl as u16,
+                            distance: cd as u16,
+                        });
+                        self.block_bytes
+                            .extend_from_slice(&self.window[pos..pos + cl]);
+                        let match_end = pos + cl;
+                        let mut k = pos + 1;
+                        while k < match_end {
+                            if k + 3 <= self.window.len() {
+                                let abs = abs_base + k as u64;
+                                self.match_finder.insert(
+                                    abs as u32,
+                                    self.window[k],
+                                    self.window[k + 1],
+                                    self.window[k + 2],
+                                );
+                            }
+                            k += 1;
+                        }
+                        pos = match_end;
+                        have_pending = false;
+                    } else {
+                        pos += 1;
+                    }
                 }
             } else {
                 // No match here. Emit a literal.

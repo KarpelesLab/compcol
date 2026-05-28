@@ -18,7 +18,7 @@ pub mod encoder;
 pub mod lz77;
 
 pub use decoder::Decoder;
-pub use encoder::Encoder;
+pub use encoder::{Encoder, EncoderConfig};
 
 use crate::traits::Algorithm;
 
@@ -30,11 +30,11 @@ impl Algorithm for Deflate {
     const NAME: &'static str = "deflate";
     type Encoder = Encoder;
     type Decoder = Decoder;
-    type EncoderConfig = ();
+    type EncoderConfig = EncoderConfig;
     type DecoderConfig = ();
 
-    fn encoder_with(_: ()) -> Encoder {
-        Encoder::new()
+    fn encoder_with(c: Self::EncoderConfig) -> Encoder {
+        Encoder::with_config(c)
     }
     fn decoder_with(_: ()) -> Decoder {
         Decoder::new()

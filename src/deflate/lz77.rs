@@ -14,14 +14,6 @@ use super::tables::{MAX_MATCH, MIN_MATCH, WINDOW_SIZE};
 pub const HASH_BITS: u32 = 15;
 pub const HASH_SIZE: usize = 1 << HASH_BITS;
 
-/// Stop searching once we've found a match this long.
-const NICE_MATCH: usize = 258;
-
-/// Maximum number of chain links the match finder walks before giving up.
-/// `128` is the value zlib uses at compression level 6 — a reasonable
-/// quality/speed trade-off.
-const MAX_CHAIN: usize = 128;
-
 /// Sentinel value meaning "no entry".
 const NIL: u32 = u32::MAX;
 
@@ -79,6 +71,12 @@ impl MatchFinder {
     /// plus the current lookahead, and `rel` is the index inside `window`
     /// corresponding to absolute position `abs_pos`.
     ///
+    /// `max_chain` caps how many hash-chain links we walk before giving up;
+    /// `nice_match` is the length at which we stop searching for a longer
+    /// candidate. When `have_good` is true we already hold a "good enough"
+    /// match elsewhere and quarter the chain budget — this is the lazy-match
+    /// speed-up.
+    ///
     /// Returns `Some((length, distance))` with `length ≥ MIN_MATCH` if a
     /// match was found within the 32 KiB deflate window, else `None`.
     pub fn find_match(
@@ -86,7 +84,9 @@ impl MatchFinder {
         window: &[u8],
         rel: usize,
         abs_pos: u32,
-        good_match: usize,
+        have_good: bool,
+        max_chain: usize,
+        nice_match: usize,
     ) -> Option<(u16, u16)> {
         if rel + MIN_MATCH > window.len() {
             return None;
@@ -104,12 +104,8 @@ impl MatchFinder {
         let mut best_dist: usize = 0;
 
         let mut cur = self.head[idx];
-        // If we already have a "good" match, halve the chain budget.
-        let mut chain_left = if good_match > 0 {
-            MAX_CHAIN / 4
-        } else {
-            MAX_CHAIN
-        };
+        // If we already have a "good" match, quarter the chain budget.
+        let mut chain_left = if have_good { max_chain / 4 } else { max_chain };
 
         while cur != NIL && chain_left > 0 {
             let cur_abs = cur as usize;
@@ -146,7 +142,7 @@ impl MatchFinder {
             if len >= MIN_MATCH && len > best_len {
                 best_len = len;
                 best_dist = dist;
-                if best_len >= NICE_MATCH {
+                if best_len >= nice_match {
                     break;
                 }
             }
