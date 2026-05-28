@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/KarpelesLab/compcol/compare/v0.3.0...v0.3.1) - 2026-05-28
+
+### Other
+
+- Remove stray src/brotli/mod.rs.orig (patch leftover)
+- fix "fails above 128 KiB" decoder bug
+- README + CHANGELOG: document new lzfse + adc features
+- Add LZFSE (Apple) decoder + LZVN sub-format
+- Add ADC (Apple Data Compression) algorithm
+
 ### Added
 
 - **LZFSE** (Apple's LZ77 + Finite State Entropy). Decoder-only; encoder
