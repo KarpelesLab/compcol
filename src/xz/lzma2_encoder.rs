@@ -97,8 +97,78 @@ const MAX_MATCH_LEN: u32 = 273; // 2 + 8 + 8 + 255 (LEN_LOW + LEN_MID + LEN_HIGH
 const HASH_BITS: u32 = 16;
 const HASH_SIZE: usize = 1 << HASH_BITS;
 const NIL: u32 = u32::MAX;
-const MAX_CHAIN: usize = 96;
-const NICE_MATCH: u32 = 192;
+
+/// Match-finder tuning expanded from the user-facing `level` byte. Higher
+/// levels widen `max_chain` (more hash-chain links walked per probe) and
+/// raise `nice_match` (the length at which the chain walk gives up and
+/// accepts the current match). This is the same speed-vs-ratio knob that
+/// xz-utils exposes — we just expose a small subset.
+#[derive(Clone, Copy)]
+pub(crate) struct EncoderParams {
+    pub max_chain: usize,
+    pub nice_match: u32,
+}
+
+impl EncoderParams {
+    /// Expand a `0..=9` level into match-finder knobs.
+    ///
+    /// The mapping is monotonic and centred on the default level 6 producing
+    /// the same `(96, 192)` numbers the previous fixed-tuning code used.
+    /// Values outside `0..=9` are clamped — we keep the public surface
+    /// infallible.
+    pub fn from_level(level: u8) -> Self {
+        let level = level.min(9);
+        // Hand-tuned table: low levels skip most of the chain walk so the
+        // greedy parser commits the first short match it finds; high levels
+        // walk wide chains and accept only long matches. The values aren't
+        // meant to mirror xz-utils' presets exactly — they just have to
+        // produce a measurably monotonic compressed size on a hash-
+        // collision-heavy corpus, which is what `tests/xz.rs` checks.
+        match level {
+            0 => Self {
+                max_chain: 2,
+                nice_match: 4,
+            },
+            1 => Self {
+                max_chain: 4,
+                nice_match: 8,
+            },
+            2 => Self {
+                max_chain: 8,
+                nice_match: 16,
+            },
+            3 => Self {
+                max_chain: 16,
+                nice_match: 32,
+            },
+            4 => Self {
+                max_chain: 32,
+                nice_match: 64,
+            },
+            5 => Self {
+                max_chain: 64,
+                nice_match: 128,
+            },
+            6 => Self {
+                max_chain: 96,
+                nice_match: 192,
+            },
+            7 => Self {
+                max_chain: 192,
+                nice_match: 224,
+            },
+            8 => Self {
+                max_chain: 384,
+                nice_match: 256,
+            },
+            // 9 (and clamp-from-above)
+            _ => Self {
+                max_chain: 768,
+                nice_match: 273, // MAX_MATCH_LEN
+            },
+        }
+    }
+}
 
 fn hash3(b0: u8, b1: u8, b2: u8) -> u32 {
     ((b0 as u32).wrapping_mul(2654435761)
@@ -578,7 +648,13 @@ impl HashChain {
         self.head[h] = pos as u32;
     }
 
-    fn find_longest(&self, input: &[u8], pos: usize, dict_size: u32) -> Option<(u32, u32)> {
+    fn find_longest(
+        &self,
+        input: &[u8],
+        pos: usize,
+        dict_size: u32,
+        params: EncoderParams,
+    ) -> Option<(u32, u32)> {
         if pos + 3 > input.len() {
             return None;
         }
@@ -589,7 +665,7 @@ impl HashChain {
         let mut best_dist: u32 = 0;
         let mut cur = self.head[h];
         let mut steps = 0usize;
-        while cur != NIL && steps < MAX_CHAIN {
+        while cur != NIL && steps < params.max_chain {
             let cur_pos = cur as usize;
             if cur_pos >= pos {
                 cur = self.prev[cur_pos];
@@ -615,7 +691,7 @@ impl HashChain {
             if len >= MATCH_LEN_MIN && len > best_len {
                 best_len = len;
                 best_dist = (dist - 1) as u32;
-                if len >= NICE_MATCH {
+                if len >= params.nice_match {
                     break;
                 }
             }
@@ -657,7 +733,10 @@ fn rep_match_len(input: &[u8], pos: usize, dist: u32) -> u32 {
 /// `dict_size` is the LZMA dictionary size to advertise. Match distances
 /// are bounded by this value. For LZMA2 the dict size is shared across
 /// all chunks of a block; pass a single value consistently.
-pub(crate) fn encode_lzma_chunk(input: &[u8], dict_size: u32) -> Vec<u8> {
+///
+/// `params` is the level-derived match-finder tuning; see
+/// [`EncoderParams::from_level`].
+pub(crate) fn encode_lzma_chunk(input: &[u8], dict_size: u32, params: EncoderParams) -> Vec<u8> {
     let mut core = LzmaEncCore::new();
     let mut hc = HashChain::new(input.len());
 
@@ -670,7 +749,7 @@ pub(crate) fn encode_lzma_chunk(input: &[u8], dict_size: u32) -> Vec<u8> {
             rep_match_len(input, pos, core.rep3),
         ];
 
-        let new_match = hc.find_longest(input, pos, dict_size);
+        let new_match = hc.find_longest(input, pos, dict_size, params);
 
         let best_rep_len = rep_lens.iter().copied().max().unwrap_or(0);
         let best_rep_idx = rep_lens

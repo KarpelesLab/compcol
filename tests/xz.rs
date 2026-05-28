@@ -1,104 +1,110 @@
-#![cfg(any())] // TODO(v0.3): port to new (Progress, Status) API
-//! Integration tests for the xz codec (uncompressed-LZMA2 fallback).
+//! Streaming round-trip tests for the xz codec.
+//!
+//! Canonical v0.3 port: every call returns `(Progress, Status)` and the
+//! loop dispatches on `Status` rather than inferring from byte counts.
 
 #![cfg(feature = "xz")]
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use compcol::xz::{Decoder, Encoder};
-use compcol::{Decoder as _, Encoder as _, Error};
+use compcol::xz::{Decoder, Encoder, EncoderConfig, Xz};
+use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Status};
 
 // ─── helpers ───────────────────────────────────────────────────────────────
 
-fn encode_all(input: &[u8]) -> Vec<u8> {
-    let mut enc = Encoder::new();
-    let mut out = Vec::new();
-    let mut buf = vec![0u8; 4096];
-    let mut consumed = 0;
-    while consumed < input.len() {
-        let p = enc.encode(&input[consumed..], &mut buf).unwrap();
-        out.extend_from_slice(&buf[..p.written]);
-        consumed += p.consumed;
-        if p.consumed == 0 && p.written == 0 {
-            break;
-        }
-    }
-    loop {
-        let p = enc.finish(&mut buf).unwrap();
-        out.extend_from_slice(&buf[..p.written]);
-        if matches!(_s, compcol::Status::StreamEnd) {
-            break;
-        }
-        if p.written == 0 {
-            panic!("xz encoder finish stalled");
-        }
-    }
-    out
-}
-
-fn encode_chunked(input: &[u8], in_chunk: usize, out_chunk: usize) -> Vec<u8> {
-    let mut enc = Encoder::new();
-    let mut out = Vec::new();
+/// Drive an encoder to completion, feeding `input` in `in_chunk`-sized
+/// slices and draining via an `out_chunk`-sized buffer.
+fn encode_chunked(enc: &mut Encoder, input: &[u8], in_chunk: usize, out_chunk: usize) -> Vec<u8> {
+    let mut encoded = Vec::new();
     let mut buf = vec![0u8; out_chunk.max(1)];
     let mut i = 0;
+
     while i < input.len() {
         let end = (i + in_chunk).min(input.len());
         let chunk = &input[i..end];
         let mut consumed = 0;
-        loop {
-            let p = enc.encode(&chunk[consumed..], &mut buf).unwrap();
-            out.extend_from_slice(&buf[..p.written]);
+        while consumed < chunk.len() {
+            let (p, status) = enc.encode(&chunk[consumed..], &mut buf).unwrap();
+            encoded.extend_from_slice(&buf[..p.written]);
             consumed += p.consumed;
-            if p.consumed == 0 && p.written == 0 {
-                break;
+            match status {
+                Status::InputEmpty | Status::StreamEnd => break,
+                Status::OutputFull => continue,
             }
         }
         i = end;
     }
+
     loop {
-        let p = enc.finish(&mut buf).unwrap();
-        out.extend_from_slice(&buf[..p.written]);
-        if matches!(_s, compcol::Status::StreamEnd) {
-            break;
-        }
-        if p.written == 0 {
-            panic!("xz encoder finish stalled");
+        let (p, status) = enc.finish(&mut buf).unwrap();
+        encoded.extend_from_slice(&buf[..p.written]);
+        match status {
+            Status::StreamEnd => break,
+            Status::OutputFull | Status::InputEmpty => {
+                if p.written == 0 {
+                    panic!("xz encoder finish stalled");
+                }
+            }
         }
     }
-    out
+
+    encoded
 }
 
+/// Convenience wrapper: encode with a fresh default-config encoder.
+fn encode_all(input: &[u8]) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    encode_chunked(&mut enc, input, 4096, 4096)
+}
+
+/// Drive a decoder to completion. Mirrors `tests/deflate.rs`.
 fn decode_chunked(encoded: &[u8], in_chunk: usize, out_chunk: usize) -> Result<Vec<u8>, Error> {
     let mut dec = Decoder::new();
-    let mut out = Vec::new();
+    let mut decoded = Vec::new();
     let mut buf = vec![0u8; out_chunk.max(1)];
     let mut i = 0;
+
     while i < encoded.len() {
         let end = (i + in_chunk).min(encoded.len());
         let chunk = &encoded[i..end];
         let mut consumed = 0;
-        loop {
-            let p = dec.decode(&chunk[consumed..], &mut buf)?;
-            out.extend_from_slice(&buf[..p.written]);
+        while consumed < chunk.len() {
+            let (p, status) = dec.decode(&chunk[consumed..], &mut buf)?;
+            decoded.extend_from_slice(&buf[..p.written]);
             consumed += p.consumed;
-            if p.consumed == 0 && p.written == 0 {
-                break;
+            match status {
+                Status::StreamEnd => break,
+                Status::InputEmpty => break,
+                Status::OutputFull => continue,
             }
         }
         i = end;
     }
+
+    // Drain any output buffered internally from compressed-chunk state.
     loop {
-        let p = dec.finish(&mut buf)?;
-        out.extend_from_slice(&buf[..p.written]);
-        if matches!(_s, compcol::Status::StreamEnd) {
+        let (p, _status) = dec.decode(&[], &mut buf)?;
+        decoded.extend_from_slice(&buf[..p.written]);
+        if p.written == 0 {
             break;
         }
-        if p.written == 0 {
-            panic!("xz decoder finish stalled");
+    }
+
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        decoded.extend_from_slice(&buf[..p.written]);
+        match status {
+            Status::StreamEnd => break,
+            Status::OutputFull | Status::InputEmpty => {
+                if p.written == 0 {
+                    panic!("xz decoder finish stalled");
+                }
+            }
         }
     }
-    Ok(out)
+
+    Ok(decoded)
 }
 
 fn round_trip(input: &[u8]) {
@@ -111,11 +117,28 @@ fn round_trip(input: &[u8]) {
     assert_eq!(decoded, input, "round-trip mismatch (len {})", input.len());
 }
 
-// ─── round-trip tests ──────────────────────────────────────────────────────
+// ─── algorithm metadata ─────────────────────────────────────────────────
+
+#[test]
+fn name_is_xz() {
+    assert_eq!(<Xz as Algorithm>::NAME, "xz");
+}
+
+#[test]
+fn default_config_is_level_6() {
+    assert_eq!(EncoderConfig::default().level, 6);
+}
+
+// ─── round-trip tests at the default level ─────────────────────────────
 
 #[test]
 fn round_trip_empty() {
     round_trip(b"");
+}
+
+#[test]
+fn round_trip_hello_world() {
+    round_trip(b"hello world");
 }
 
 #[test]
@@ -135,8 +158,6 @@ fn round_trip_zeros_long() {
 
 #[test]
 fn round_trip_pseudo_random() {
-    // Deterministic LCG-ish sequence; not real randomness but it's mixed
-    // enough that none of the structural bytes coincide.
     let data: Vec<u8> = (0..50_000u32)
         .map(|i| ((i.wrapping_mul(0x9E37_79B1)) >> 24) as u8)
         .collect();
@@ -160,13 +181,11 @@ fn round_trip_structured() {
 
 #[test]
 fn round_trip_exactly_one_chunk() {
-    // 65_536 bytes — exactly one full LZMA2 chunk's worth of data, no spill.
     round_trip(&vec![0xABu8; 65_536]);
 }
 
 #[test]
 fn round_trip_just_over_one_chunk() {
-    // 65_537 bytes — one full chunk plus a single-byte second chunk.
     let mut v = vec![0u8; 65_537];
     for (i, b) in v.iter_mut().enumerate() {
         *b = (i & 0xFF) as u8;
@@ -176,7 +195,6 @@ fn round_trip_just_over_one_chunk() {
 
 #[test]
 fn round_trip_multi_chunk() {
-    // ~200 KiB, spanning several LZMA2 chunks.
     let v: Vec<u8> = (0..200_000u32)
         .map(|i| (i as u8).wrapping_mul(17))
         .collect();
@@ -186,7 +204,8 @@ fn round_trip_multi_chunk() {
 #[test]
 fn streaming_one_byte_both_sides() {
     let input = b"one byte at a time, all the way through".to_vec();
-    let encoded = encode_chunked(&input, 1, 1);
+    let mut enc = Encoder::new();
+    let encoded = encode_chunked(&mut enc, &input, 1, 1);
     let decoded = decode_chunked(&encoded, 1, 1).unwrap();
     assert_eq!(decoded, input);
 }
@@ -194,12 +213,189 @@ fn streaming_one_byte_both_sides() {
 #[test]
 fn streaming_irregular_chunks() {
     let input: Vec<u8> = (0..70_000u32).map(|i| (i ^ (i >> 7)) as u8).collect();
-    let encoded = encode_chunked(&input, 13, 257);
+    let mut enc = Encoder::new();
+    let encoded = encode_chunked(&mut enc, &input, 13, 257);
     let decoded = decode_chunked(&encoded, 521, 1024).unwrap();
     assert_eq!(decoded, input);
 }
 
-// ─── error path tests ──────────────────────────────────────────────────────
+/// Build a ≥64 KiB corpus that genuinely separates compression levels.
+///
+/// Same construction principle as `tests/deflate.rs::mixed_corpus`: a
+/// short alphabet floods the 3-gram hash buckets, and periodic long
+/// phrases give the high-chain levels something to find that the low
+/// levels' tiny chain budget walks past. The phrases are also stitched
+/// across chunk boundaries so cross-chunk match opportunities exist
+/// (though our encoder full-resets between chunks, so that part is moot
+/// — what matters is in-chunk chain depth).
+fn mixed_corpus() -> Vec<u8> {
+    let mut state: u32 = 0xC0FFEE_u32;
+    let mut out = Vec::with_capacity(80 * 1024);
+    let alphabet = b"abcdef";
+    let phrases: &[&[u8]] = &[
+        b"the_quick_brown_fox_jumps_over_the_lazy_dog_xxxxxxxxxxxxxxxxxxxxxxxx",
+        b"lorem_ipsum_dolor_sit_amet_consectetur_adipiscing_elit_yyyyyyyyyyyyyy",
+        b"compcol_streaming_codec_test_corpus_for_level_differentiation_zzzzz",
+    ];
+    let mut phrase_idx = 0usize;
+    while out.len() < 64 * 1024 {
+        for _ in 0..64 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            out.push(alphabet[(state as usize) % alphabet.len()]);
+        }
+        out.extend_from_slice(phrases[phrase_idx % phrases.len()]);
+        phrase_idx += 1;
+    }
+    out
+}
+
+#[test]
+fn round_trip_mixed_corpus_default_level() {
+    let input = mixed_corpus();
+    assert!(input.len() >= 64 * 1024);
+    round_trip(&input);
+}
+
+// ─── level-specific tests ───────────────────────────────────────────────
+
+fn encode_at_level(input: &[u8], level: u8) -> Vec<u8> {
+    let mut enc = Encoder::with_config(EncoderConfig { level });
+    encode_chunked(&mut enc, input, 4096, 4096)
+}
+
+#[test]
+fn round_trip_level_0() {
+    for input in [
+        &b""[..],
+        b"hello world",
+        &b"abcabcabcabcabc".repeat(100)[..],
+    ] {
+        let mut enc = Encoder::with_config(EncoderConfig { level: 0 });
+        let encoded = encode_chunked(&mut enc, input, 4096, 4096);
+        let decoded = decode_chunked(&encoded, 4096, 4096).unwrap();
+        assert_eq!(decoded, input);
+    }
+}
+
+#[test]
+fn round_trip_level_9() {
+    for input in [
+        &b""[..],
+        b"hello world",
+        &b"abcabcabcabcabc".repeat(100)[..],
+    ] {
+        let mut enc = Encoder::with_config(EncoderConfig { level: 9 });
+        let encoded = encode_chunked(&mut enc, input, 4096, 4096);
+        let decoded = decode_chunked(&encoded, 4096, 4096).unwrap();
+        assert_eq!(decoded, input);
+    }
+}
+
+#[test]
+fn level_9_no_worse_than_level_0_on_compressible_corpus() {
+    // The whole point of having levels: max-effort must produce output at
+    // least as small as min-effort on a realistic corpus. The level is
+    // wired into our LZMA2 chunk encoder's match-finder tuning, so we
+    // expect a measurable difference here.
+    let input = mixed_corpus();
+    let lo = encode_at_level(&input, 0);
+    let hi = encode_at_level(&input, 9);
+    assert!(
+        hi.len() <= lo.len(),
+        "level 9 ({} bytes) was bigger than level 0 ({} bytes)",
+        hi.len(),
+        lo.len(),
+    );
+    // Both must roundtrip.
+    assert_eq!(decode_chunked(&lo, 4096, 4096).unwrap(), input);
+    assert_eq!(decode_chunked(&hi, 4096, 4096).unwrap(), input);
+}
+
+#[test]
+fn out_of_range_level_is_clamped() {
+    // Level 250 should snap to 9 and still roundtrip; level 0 is the legal
+    // floor so it also roundtrips cleanly.
+    let input = b"the rain in spain falls mainly on the plain";
+    let mut enc_lo = Encoder::with_config(EncoderConfig { level: 0 });
+    let enc_lo_out = encode_chunked(&mut enc_lo, input, 4096, 4096);
+    assert_eq!(decode_chunked(&enc_lo_out, 4096, 4096).unwrap(), input);
+    let mut enc_hi = Encoder::with_config(EncoderConfig { level: 250 });
+    let enc_hi_out = encode_chunked(&mut enc_hi, input, 4096, 4096);
+    assert_eq!(decode_chunked(&enc_hi_out, 4096, 4096).unwrap(), input);
+}
+
+// ─── reset / reuse ──────────────────────────────────────────────────────
+
+#[test]
+fn reset_preserves_level_and_allows_reuse() {
+    let input_a = b"alpha alpha alpha alpha alpha".as_slice();
+    let input_b = b"bravo bravo bravo bravo bravo".as_slice();
+
+    let mut enc = Encoder::with_config(EncoderConfig { level: 9 });
+    let encoded_a = encode_chunked(&mut enc, input_a, 4096, 4096);
+    enc.reset();
+    let encoded_b = encode_chunked(&mut enc, input_b, 4096, 4096);
+
+    assert_eq!(decode_chunked(&encoded_a, 4096, 4096).unwrap(), input_a);
+    assert_eq!(decode_chunked(&encoded_b, 4096, 4096).unwrap(), input_b);
+
+    // After reset, a level-9 encoder must still be level-9.
+    let mut fresh = Encoder::with_config(EncoderConfig { level: 9 });
+    let fresh_b = encode_chunked(&mut fresh, input_b, 4096, 4096);
+    assert_eq!(encoded_b, fresh_b, "reset must preserve compression level");
+}
+
+#[test]
+fn decoder_reset_allows_reuse() {
+    let mut enc = Encoder::new();
+    let encoded_a = encode_chunked(&mut enc, b"hello", 4096, 4096);
+    enc.reset();
+    let encoded_b = encode_chunked(&mut enc, b"world", 4096, 4096);
+
+    let mut dec = Decoder::new();
+    assert_eq!(decode_chunked_with(&mut dec, &encoded_a).unwrap(), b"hello");
+    dec.reset();
+    assert_eq!(decode_chunked_with(&mut dec, &encoded_b).unwrap(), b"world");
+}
+
+/// Variant of `decode_chunked` that drives the given decoder once with the
+/// full input — used by `decoder_reset_allows_reuse` to keep the same
+/// decoder across two streams.
+fn decode_chunked_with(dec: &mut Decoder, encoded: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut decoded = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    let mut consumed = 0;
+    while consumed < encoded.len() {
+        let (p, status) = dec.decode(&encoded[consumed..], &mut buf)?;
+        decoded.extend_from_slice(&buf[..p.written]);
+        consumed += p.consumed;
+        match status {
+            Status::StreamEnd => break,
+            Status::InputEmpty => break,
+            Status::OutputFull => continue,
+        }
+    }
+    loop {
+        let (p, _status) = dec.decode(&[], &mut buf)?;
+        decoded.extend_from_slice(&buf[..p.written]);
+        if p.written == 0 {
+            break;
+        }
+    }
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        decoded.extend_from_slice(&buf[..p.written]);
+        if matches!(status, Status::StreamEnd) {
+            break;
+        }
+        if p.written == 0 {
+            panic!("decoder finish stalled");
+        }
+    }
+    Ok(decoded)
+}
+
+// ─── error path tests ──────────────────────────────────────────────────
 
 #[test]
 fn bad_magic_rejected() {
@@ -213,7 +409,6 @@ fn bad_magic_rejected() {
 #[test]
 fn truncated_stream_rejected() {
     let mut encoded = encode_all(b"some payload");
-    // Drop the last few bytes (the stream-footer magic at minimum).
     encoded.truncate(encoded.len() - 4);
     let err = decode_chunked(&encoded, 1024, 1024).unwrap_err();
     assert_eq!(err, Error::UnexpectedEnd);
@@ -223,19 +418,9 @@ fn truncated_stream_rejected() {
 fn corrupted_check_rejected() {
     let input = b"checksum me please";
     let mut encoded = encode_all(input);
-    // The Block Check (CRC32 of the uncompressed data) sits between the
-    // block payload and the Index. The block ends after the LZMA2 end
-    // marker + padding; that's well before the Index's `0x00` indicator.
-    // The simplest reliable way to find it is to scan backwards from the
-    // Stream Footer (12 bytes) past the index. We'll just flip a bit
-    // somewhere in the middle of the encoded stream — past the headers and
-    // before the index.
     let mid = encoded.len() / 2;
     encoded[mid] ^= 0x01;
     let err = decode_chunked(&encoded, 1024, 1024).unwrap_err();
-    // The decoder may report any of: ChecksumMismatch (on the block CRC),
-    // Corrupt (varints / padding), or Unsupported (a control byte we
-    // misparse). We just want a *clean* error and no panic.
     assert!(
         matches!(
             err,
@@ -246,53 +431,77 @@ fn corrupted_check_rejected() {
     );
 }
 
-#[test]
-fn fixture_empty_file() {
-    // Generate an xz-formatted empty stream and decode it. The fixture is
-    // the canonical output of `:|xz -F xz -c`, which is just header +
-    // empty-index + footer (no blocks).
-    //
-    // Bytes (hex), 32 total:
-    //   fd 37 7a 58 5a 00       Stream Magic
-    //   00 04                   Stream Flags = check None (0x00 0x04??)
-    // Actually let me just construct one ourselves: encode_all(b"").
-    let bytes = encode_all(b"");
-    let decoded = decode_chunked(&bytes, 1024, 1024).unwrap();
-    assert!(decoded.is_empty());
-}
+// ─── algorithm-trait entry points ───────────────────────────────────────
 
 #[test]
-fn reset_then_reuse() {
-    let mut enc = Encoder::new();
-    // Encode something.
-    let mut buf = vec![0u8; 4096];
-    let p = enc.encode(b"first", &mut buf).unwrap();
-    assert_eq!(p.consumed, 5);
-    enc.reset();
-    // Reuse for a fresh stream.
-    let mut out = Vec::new();
+fn algorithm_encoder_decoder_round_trip() {
+    let mut enc = <Xz as Algorithm>::encoder();
+    let mut dec = <Xz as Algorithm>::decoder();
+    let input = b"compcol Algorithm trait roundtrip!";
+
+    // Encode.
+    let mut encoded = Vec::new();
+    let mut buf = vec![0u8; 256];
     let mut consumed = 0;
-    let input = b"second-payload";
     while consumed < input.len() {
-        let p = enc.encode(&input[consumed..], &mut buf).unwrap();
-        out.extend_from_slice(&buf[..p.written]);
+        let (p, status) = enc.encode(&input[consumed..], &mut buf).unwrap();
+        encoded.extend_from_slice(&buf[..p.written]);
         consumed += p.consumed;
-        if p.consumed == 0 && p.written == 0 {
+        if matches!(status, Status::InputEmpty) {
             break;
         }
     }
     loop {
-        let p = enc.finish(&mut buf).unwrap();
-        out.extend_from_slice(&buf[..p.written]);
-        if matches!(_s, compcol::Status::StreamEnd) {
+        let (p, status) = enc.finish(&mut buf).unwrap();
+        encoded.extend_from_slice(&buf[..p.written]);
+        if matches!(status, Status::StreamEnd) {
+            break;
+        }
+        if p.written == 0 {
+            panic!("encoder finish stalled");
+        }
+    }
+
+    // Decode.
+    let mut decoded = Vec::new();
+    let mut consumed = 0;
+    loop {
+        let (p, status) = dec.decode(&encoded[consumed..], &mut buf).unwrap();
+        decoded.extend_from_slice(&buf[..p.written]);
+        consumed += p.consumed;
+        if matches!(status, Status::StreamEnd | Status::InputEmpty) {
             break;
         }
     }
-    let decoded = decode_chunked(&out, 1024, 1024).unwrap();
+    // Flush any output buffered from a partial compressed chunk.
+    loop {
+        let (p, _status) = dec.decode(&[], &mut buf).unwrap();
+        decoded.extend_from_slice(&buf[..p.written]);
+        if p.written == 0 {
+            break;
+        }
+    }
+    let (_, status) = dec.finish(&mut buf).unwrap();
+    assert!(matches!(status, Status::StreamEnd));
     assert_eq!(decoded, input);
 }
 
-// ─── cross-validation with system `xz` (if installed) ──────────────────────
+#[test]
+fn algorithm_encoder_with_uses_config() {
+    let input = mixed_corpus();
+    let mut enc_lo = <Xz as Algorithm>::encoder_with(EncoderConfig { level: 0 });
+    let mut enc_hi = <Xz as Algorithm>::encoder_with(EncoderConfig { level: 9 });
+    let lo = encode_chunked(&mut enc_lo, &input, 4096, 4096);
+    let hi = encode_chunked(&mut enc_hi, &input, 4096, 4096);
+    assert!(
+        hi.len() <= lo.len(),
+        "encoder_with(level=9) was bigger than encoder_with(level=0)"
+    );
+    assert_eq!(decode_chunked(&lo, 4096, 4096).unwrap(), input);
+    assert_eq!(decode_chunked(&hi, 4096, 4096).unwrap(), input);
+}
+
+// ─── cross-validation with system `xz` (if installed) ──────────────────
 
 fn tool_available(cmd: &str) -> bool {
     Command::new(cmd)
@@ -351,10 +560,6 @@ fn system_xz_encode_then_our_decode_small() {
         println!("skipping: xz not installed");
         return;
     }
-    // For small enough inputs, `xz` emits uncompressed LZMA2 chunks (the
-    // compressor decides that compression would expand the data). For
-    // larger inputs `xz` emits LZMA-compressed chunks. Our decoder
-    // accepts both.
     for input in [
         b"".to_vec(),
         b"hello".to_vec(),
@@ -378,365 +583,71 @@ fn system_xz_encode_then_our_decode_small() {
     }
 }
 
-// ─── round-trip via the system `xz` CLI (decode side) ──────────────────────
+// ─── factory lookup ─────────────────────────────────────────────────────
 
-#[cfg(unix)]
-#[test]
-fn system_xz_encode_then_our_decode_empty() {
-    if !tool_available("xz") {
-        println!("skipping: xz not installed");
-        return;
-    }
-    let input: Vec<u8> = Vec::new();
-    let encoded = pipe_through("xz", &["-c", "-z"], &input).unwrap();
-    let decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
-    assert_eq!(decoded, input);
-}
+#[cfg(feature = "factory")]
+mod factory {
+    use compcol::Status;
+    use compcol::factory;
 
-#[cfg(unix)]
-#[test]
-fn system_xz_encode_then_our_decode_small_string() {
-    if !tool_available("xz") {
-        println!("skipping: xz not installed");
-        return;
+    #[test]
+    fn lookup_known() {
+        assert!(factory::encoder_by_name("xz").is_some());
+        assert!(factory::decoder_by_name("xz").is_some());
     }
-    let input: Vec<u8> = b"hello world\n".to_vec();
-    let encoded = pipe_through("xz", &["-c", "-z"], &input).unwrap();
-    let decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
-    assert_eq!(decoded, input);
-}
 
-#[cfg(unix)]
-#[test]
-fn system_xz_encode_then_our_decode_medium_ascii() {
-    if !tool_available("xz") {
-        println!("skipping: xz not installed");
-        return;
+    #[test]
+    fn names_contains_xz() {
+        assert!(factory::names().contains(&"xz"));
     }
-    // ~10 KiB of compressible ASCII.
-    let mut input: Vec<u8> = Vec::with_capacity(10 * 1024);
-    while input.len() < 10 * 1024 {
-        input.extend_from_slice(b"The quick brown fox jumps over the lazy dog. 0123456789\n");
-    }
-    input.truncate(10 * 1024);
-    let encoded = pipe_through("xz", &["-c", "-z"], &input).unwrap();
-    let decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
-    assert_eq!(decoded, input);
-}
 
-#[cfg(unix)]
-#[test]
-fn system_xz_encode_then_our_decode_lorem_ipsum() {
-    if !tool_available("xz") {
-        println!("skipping: xz not installed");
-        return;
-    }
-    // ~16 KiB of Lorem ipsum.
-    let para: &[u8] = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do \
-                       eiusmod tempor incididunt ut labore et dolore magna aliqua. \
-                       Ut enim ad minim veniam, quis nostrud exercitation ullamco \
-                       laboris nisi ut aliquip ex ea commodo consequat. Duis aute \
-                       irure dolor in reprehenderit in voluptate velit esse cillum \
-                       dolore eu fugiat nulla pariatur.\n";
-    let mut input: Vec<u8> = Vec::with_capacity(16 * 1024);
-    while input.len() < 16 * 1024 {
-        input.extend_from_slice(para);
-    }
-    input.truncate(16 * 1024);
-    let encoded = pipe_through("xz", &["-c", "-z"], &input).unwrap();
-    let decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
-    assert_eq!(decoded, input);
-}
+    #[test]
+    fn boxed_round_trip() {
+        let mut enc = factory::encoder_by_name("xz").unwrap();
+        let mut dec = factory::decoder_by_name("xz").unwrap();
+        let input = b"hello hello hello world world world!";
 
-#[cfg(unix)]
-#[test]
-fn system_xz_encode_then_our_decode_large_zeros() {
-    if !tool_available("xz") {
-        println!("skipping: xz not installed");
-        return;
-    }
-    // 64 KiB of zero bytes — exercises LZMA's match-back logic over a
-    // size that is large enough to force xz into compressed-chunk mode.
-    let input: Vec<u8> = vec![0u8; 64 * 1024];
-    let encoded = pipe_through("xz", &["-c", "-z"], &input).unwrap();
-    let decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
-    assert_eq!(decoded, input);
-}
+        let mut encoded = Vec::new();
+        let mut buf = vec![0u8; 256];
+        let mut consumed = 0;
+        while consumed < input.len() {
+            let (p, status) = enc.encode(&input[consumed..], &mut buf).unwrap();
+            encoded.extend_from_slice(&buf[..p.written]);
+            consumed += p.consumed;
+            if matches!(status, Status::InputEmpty) {
+                break;
+            }
+        }
+        loop {
+            let (p, status) = enc.finish(&mut buf).unwrap();
+            encoded.extend_from_slice(&buf[..p.written]);
+            if matches!(status, Status::StreamEnd) {
+                break;
+            }
+            if p.written == 0 {
+                panic!("encoder finish stalled");
+            }
+        }
 
-#[cfg(unix)]
-#[test]
-fn system_xz_encode_then_our_decode_binary() {
-    if !tool_available("xz") {
-        println!("skipping: xz not installed");
-        return;
+        let mut decoded = Vec::new();
+        let mut consumed = 0;
+        loop {
+            let (p, status) = dec.decode(&encoded[consumed..], &mut buf).unwrap();
+            decoded.extend_from_slice(&buf[..p.written]);
+            consumed += p.consumed;
+            if matches!(status, Status::StreamEnd | Status::InputEmpty) {
+                break;
+            }
+        }
+        loop {
+            let (p, _status) = dec.decode(&[], &mut buf).unwrap();
+            decoded.extend_from_slice(&buf[..p.written]);
+            if p.written == 0 {
+                break;
+            }
+        }
+        let (_, status) = dec.finish(&mut buf).unwrap();
+        assert!(matches!(status, Status::StreamEnd));
+        assert_eq!(&decoded[..], input);
     }
-    // Pseudo-random but reproducible binary input that compresses
-    // poorly — exercises a different LZMA code path (mostly literals).
-    let input: Vec<u8> = (0..30_000u32)
-        .map(|i| (i.wrapping_mul(0x9E37_79B1) >> 16) as u8)
-        .collect();
-    let encoded = pipe_through("xz", &["-c", "-z"], &input).unwrap();
-    let decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
-    assert_eq!(decoded, input);
-}
-
-// ─── compressed-LZMA2 encoder cross-validation ─────────────────────────────
-//
-// These tests exercise the LZMA-compressed chunk path in our encoder: we
-// build an xz stream, hand it to the system `xz -d`, and check the decoded
-// bytes match the original input. The system tool acts as an independent
-// reference, so any bug in our LZMA encoder (range coder, distance
-// composition, bit-tree direction, etc.) shows up here.
-//
-// We probe for `xz` once per test and skip cleanly when the tool isn't
-// installed — keeps the suite green on minimal CI images.
-
-/// Find the first LZMA2 chunk control byte in `encoded`. The xz wire
-/// format starts with a 12-byte Stream Header, then a Block Header that
-/// our encoder builds with build_block_header() (12 bytes), so the first
-/// chunk control byte is at offset 24.
-#[cfg(unix)]
-fn first_chunk_control_byte(encoded: &[u8]) -> u8 {
-    assert!(encoded.len() > 24, "xz stream too short to contain a chunk");
-    encoded[24]
-}
-
-#[cfg(unix)]
-#[test]
-fn compressed_lzma2_empty_round_trip_via_xz() {
-    if !tool_available("xz") {
-        println!("skipping: xz not installed");
-        return;
-    }
-    let input: Vec<u8> = Vec::new();
-    let encoded = encode_all(&input);
-    // Empty input: no chunks, block payload is just the 0x00 end marker.
-    // The byte at offset 24 is the LZMA2 end marker (0x00).
-    assert_eq!(first_chunk_control_byte(&encoded), 0x00);
-    let decoded = pipe_through("xz", &["-d", "-c"], &encoded).unwrap();
-    assert_eq!(decoded, input);
-}
-
-#[cfg(unix)]
-#[test]
-fn compressed_lzma2_hello_world_round_trip_via_xz() {
-    if !tool_available("xz") {
-        println!("skipping: xz not installed");
-        return;
-    }
-    let input: Vec<u8> = b"hello world\n".to_vec();
-    let encoded = encode_all(&input);
-    // 12 bytes is too small for compression to beat literal storage — the
-    // encoder falls back to an uncompressed chunk (control byte 0x01).
-    assert_eq!(
-        first_chunk_control_byte(&encoded),
-        0x01,
-        "expected uncompressed fallback for 12-byte input"
-    );
-    let decoded = pipe_through("xz", &["-d", "-c"], &encoded).unwrap();
-    assert_eq!(decoded, input);
-    // Round-trip through our own decoder too.
-    let our_decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
-    assert_eq!(our_decoded, input);
-}
-
-#[cfg(unix)]
-#[test]
-fn compressed_lzma2_ten_kib_ascii_via_xz() {
-    if !tool_available("xz") {
-        println!("skipping: xz not installed");
-        return;
-    }
-    let mut input: Vec<u8> = Vec::with_capacity(10 * 1024);
-    while input.len() < 10 * 1024 {
-        input.extend_from_slice(b"The quick brown fox jumps over the lazy dog. 0123456789\n");
-    }
-    input.truncate(10 * 1024);
-    let encoded = encode_all(&input);
-    // 10 KiB of repeating ASCII compresses well — first chunk should be
-    // LZMA-compressed (control byte 0xE0).
-    assert_eq!(
-        first_chunk_control_byte(&encoded),
-        0xE0,
-        "expected compressed chunk for 10 KiB repeating ASCII"
-    );
-    // Compression should noticeably reduce size, even with our basic
-    // greedy parser.
-    assert!(
-        encoded.len() < input.len() / 2,
-        "encoded {} >= half of {} — compression seems broken",
-        encoded.len(),
-        input.len()
-    );
-    let decoded = pipe_through("xz", &["-d", "-c"], &encoded).unwrap();
-    assert_eq!(decoded, input);
-    let our_decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
-    assert_eq!(our_decoded, input);
-}
-
-#[cfg(unix)]
-#[test]
-fn compressed_lzma2_sixteen_kib_lorem_ipsum_via_xz() {
-    if !tool_available("xz") {
-        println!("skipping: xz not installed");
-        return;
-    }
-    let para: &[u8] = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do \
-                       eiusmod tempor incididunt ut labore et dolore magna aliqua. \
-                       Ut enim ad minim veniam, quis nostrud exercitation ullamco \
-                       laboris nisi ut aliquip ex ea commodo consequat. Duis aute \
-                       irure dolor in reprehenderit in voluptate velit esse cillum \
-                       dolore eu fugiat nulla pariatur.\n";
-    let mut input: Vec<u8> = Vec::with_capacity(16 * 1024);
-    while input.len() < 16 * 1024 {
-        input.extend_from_slice(para);
-    }
-    input.truncate(16 * 1024);
-    let encoded = encode_all(&input);
-    assert_eq!(
-        first_chunk_control_byte(&encoded),
-        0xE0,
-        "expected compressed chunk for Lorem ipsum"
-    );
-    let decoded = pipe_through("xz", &["-d", "-c"], &encoded).unwrap();
-    assert_eq!(decoded, input);
-    let our_decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
-    assert_eq!(our_decoded, input);
-}
-
-#[cfg(unix)]
-#[test]
-fn compressed_lzma2_sixty_four_kib_zeros_via_xz() {
-    if !tool_available("xz") {
-        println!("skipping: xz not installed");
-        return;
-    }
-    // 64 KiB of zeros (exactly one chunk's worth) — this should compress
-    // to a handful of bytes since the whole buffer is "byte 0 then match
-    // back distance 0 for 65535 bytes".
-    let input: Vec<u8> = vec![0u8; 64 * 1024];
-    let encoded = encode_all(&input);
-    assert_eq!(
-        first_chunk_control_byte(&encoded),
-        0xE0,
-        "expected compressed chunk for 64 KiB of zeros"
-    );
-    // Massive compression expected: 64 KiB → <1 KiB easily.
-    assert!(
-        encoded.len() < 1024,
-        "encoded {} > 1 KiB for 64 KiB of zeros — compression not effective",
-        encoded.len()
-    );
-    let decoded = pipe_through("xz", &["-d", "-c"], &encoded).unwrap();
-    assert_eq!(decoded, input);
-    let our_decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
-    assert_eq!(our_decoded, input);
-}
-
-#[cfg(unix)]
-#[test]
-fn compressed_lzma2_pseudo_random_round_trip_via_xz() {
-    if !tool_available("xz") {
-        println!("skipping: xz not installed");
-        return;
-    }
-    // High-entropy pseudo-random binary. Such inputs either fall through
-    // to the uncompressed-chunk path or come out only marginally smaller
-    // when LZMA's probability model happens to give the bitstream a slight
-    // edge. Either outcome is acceptable; what we really care about is
-    // that the wire format is valid and round-trips both ways.
-    let input: Vec<u8> = (0..40_000u32)
-        .map(|i| {
-            // Mix two LCG-ish streams so neither byte-aligned matches nor
-            // byte-pair repeats appear at any reasonable distance.
-            let a = (i.wrapping_mul(0x9E37_79B1)) >> 24;
-            let b = ((i ^ 0xDEAD_BEEF).wrapping_mul(0x85EB_CA6B)) >> 16;
-            (a ^ b) as u8
-        })
-        .collect();
-    let encoded = encode_all(&input);
-    let cb = first_chunk_control_byte(&encoded);
-    assert!(
-        cb == 0x01 || cb == 0xE0,
-        "expected uncompressed (0x01) or compressed (0xE0) chunk, got {:#x}",
-        cb
-    );
-    let decoded = pipe_through("xz", &["-d", "-c"], &encoded).unwrap();
-    assert_eq!(decoded, input);
-    let our_decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
-    assert_eq!(our_decoded, input);
-}
-
-#[cfg(unix)]
-#[test]
-fn compressed_lzma2_truly_random_falls_back_uncompressed() {
-    if !tool_available("xz") {
-        println!("skipping: xz not installed");
-        return;
-    }
-    // Force the uncompressed fallback by feeding bytes that look truly
-    // random byte-by-byte. We construct this with a Xorshift-ish PRNG
-    // seeded deterministically; xz-utils itself routinely falls back to
-    // uncompressed chunks for inputs of this nature, and our encoder's
-    // identical "compressed > uncompressed ? use uncompressed" heuristic
-    // should agree.
-    let mut s: u32 = 0xCAFE_F00D;
-    let mut input: Vec<u8> = Vec::with_capacity(40_000);
-    while input.len() < 40_000 {
-        // Xorshift32 — high enough entropy that LZMA can't find matches.
-        s ^= s << 13;
-        s ^= s >> 17;
-        s ^= s << 5;
-        input.extend_from_slice(&s.to_le_bytes());
-    }
-    input.truncate(40_000);
-    let encoded = encode_all(&input);
-    let cb = first_chunk_control_byte(&encoded);
-    // Tolerate either outcome — what we want is correctness, but flag the
-    // common case for visibility.
-    if cb != 0x01 && cb != 0xE0 {
-        panic!("unexpected control byte for random input: {:#x}", cb);
-    }
-    let decoded = pipe_through("xz", &["-d", "-c"], &encoded).unwrap();
-    assert_eq!(decoded, input);
-    let our_decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
-    assert_eq!(our_decoded, input);
-}
-
-#[cfg(unix)]
-#[test]
-fn compressed_lzma2_multi_chunk_via_xz() {
-    if !tool_available("xz") {
-        println!("skipping: xz not installed");
-        return;
-    }
-    // Input that spans multiple 65_536-byte chunks. With ~200 KiB of
-    // compressible text we get at least 3 chunks; each one is independently
-    // full-reset so we exercise the inter-chunk boundary handling.
-    let mut input: Vec<u8> = Vec::with_capacity(200 * 1024);
-    while input.len() < 200 * 1024 {
-        input.extend_from_slice(
-            b"The quick brown fox jumps over the lazy dog. \
-              Pack my box with five dozen liquor jugs.\n",
-        );
-    }
-    input.truncate(200 * 1024);
-    let encoded = encode_all(&input);
-    // First chunk should be compressed.
-    assert_eq!(
-        first_chunk_control_byte(&encoded),
-        0xE0,
-        "expected compressed first chunk"
-    );
-    // Significant compression expected.
-    assert!(
-        encoded.len() < input.len() / 4,
-        "encoded {} too large vs input {}",
-        encoded.len(),
-        input.len()
-    );
-    let decoded = pipe_through("xz", &["-d", "-c"], &encoded).unwrap();
-    assert_eq!(decoded, input);
-    let our_decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
-    assert_eq!(our_decoded, input);
 }

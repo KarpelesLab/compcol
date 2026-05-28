@@ -56,7 +56,7 @@ use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
 mod lzma2_decoder;
 mod lzma2_encoder;
 use lzma2_decoder::{Lzma2Props, LzmaCore, lzma2_dict_size};
-use lzma2_encoder::{LZMA2_PROPS_BYTE, encode_lzma_chunk};
+use lzma2_encoder::{EncoderParams, LZMA2_PROPS_BYTE, encode_lzma_chunk};
 
 // ─── constants ─────────────────────────────────────────────────────────────
 
@@ -201,6 +201,34 @@ fn varint_decode(buf: &[u8], pos: &mut usize) -> Result<Option<u64>, Error> {
 
 // ─── Xz algorithm marker ───────────────────────────────────────────────────
 
+/// Tunables for the xz encoder.
+///
+/// `level` controls the speed/ratio trade-off of the inner LZMA2 chunk
+/// encoder: `0` is fastest and produces the largest output, `9` is slowest
+/// and produces the smallest. The default of `6` mirrors `xz-utils`' default
+/// preset.
+///
+/// Values outside `0..=9` are clamped at encoder construction time — the
+/// public surface is intentionally infallible.
+///
+/// Note: the level is fully threaded into our LZMA2 chunk encoder's
+/// match-finder tuning (chain budget + nice-match cutoff). It does not
+/// currently affect the dictionary size advertised in the Block Header
+/// (we stick with `LZMA2_DICT_SIZE` = 4 MiB regardless), nor the LZMA
+/// literal-context (`lc/lp/pb`) properties (we always emit the canonical
+/// `lc=3, lp=0, pb=2` triple).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncoderConfig {
+    /// Compression level in `0..=9`.
+    pub level: u8,
+}
+
+impl Default for EncoderConfig {
+    fn default() -> Self {
+        Self { level: 6 }
+    }
+}
+
 /// Zero-sized marker type implementing [`Algorithm`] for xz.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Xz;
@@ -209,10 +237,10 @@ impl Algorithm for Xz {
     const NAME: &'static str = "xz";
     type Encoder = Encoder;
     type Decoder = Decoder;
-    type EncoderConfig = ();
+    type EncoderConfig = EncoderConfig;
     type DecoderConfig = ();
-    fn encoder_with(_: ()) -> Encoder {
-        Encoder::new()
+    fn encoder_with(c: Self::EncoderConfig) -> Encoder {
+        Encoder::with_config(c)
     }
     fn decoder_with(_: ()) -> Decoder {
         Decoder::new()
@@ -375,10 +403,21 @@ pub struct Encoder {
     compressed_payload_bytes: u64,
     /// Block Header byte length (known at construction).
     block_header_len: u64,
+    /// Match-finder tuning, derived from [`EncoderConfig::level`]. Preserved
+    /// across `reset` per the trait contract that configuration survives
+    /// resets.
+    enc_params: EncoderParams,
 }
 
 impl Encoder {
+    /// Build an encoder at the default compression level (6).
     pub fn new() -> Self {
+        Self::with_config(EncoderConfig::default())
+    }
+
+    /// Build an encoder with explicit configuration. `config.level` is
+    /// clamped to `0..=9` internally — out-of-range values snap to 9.
+    pub fn with_config(config: EncoderConfig) -> Self {
         let header = build_stream_header();
         let mut pending = Vec::with_capacity(12);
         pending.extend_from_slice(&header);
@@ -391,6 +430,7 @@ impl Encoder {
             uncompressed_total: 0,
             compressed_payload_bytes: 0,
             block_header_len: build_block_header().len() as u64,
+            enc_params: EncoderParams::from_level(config.level),
         }
     }
 
@@ -432,7 +472,7 @@ impl Encoder {
         // the chunk's 16-bit size field (max 65_536) and our heuristic:
         // if the compressor expanded the data, we'd save nothing by
         // emitting a compressed chunk — uncompressed is smaller.
-        let compressed = encode_lzma_chunk(data, LZMA2_DICT_SIZE);
+        let compressed = encode_lzma_chunk(data, LZMA2_DICT_SIZE, self.enc_params);
         let use_compressed =
             !compressed.is_empty() && compressed.len() <= 65_536 && compressed.len() < data.len();
 
@@ -745,7 +785,23 @@ impl RawEncoder for Encoder {
     }
 
     fn raw_reset(&mut self) {
-        *self = Self::new();
+        // Preserve the configured match-finder tuning across reset, per the
+        // trait contract — only the streaming bookkeeping is wiped.
+        let params = self.enc_params;
+        let header = build_stream_header();
+        let mut pending = Vec::with_capacity(12);
+        pending.extend_from_slice(&header);
+        *self = Self {
+            phase: EncPhase::StreamHeader,
+            pending,
+            pending_idx: 0,
+            in_buf: Vec::new(),
+            check: Crc32::new(),
+            uncompressed_total: 0,
+            compressed_payload_bytes: 0,
+            block_header_len: build_block_header().len() as u64,
+            enc_params: params,
+        };
     }
 }
 
