@@ -19,7 +19,7 @@ all = [
     "rle", "deflate", "zlib", "gzip",
     "lzma", "xz",
     "zstd", "brotli", "lz4", "snappy", "lzw",
-    "lzo", "lzx", "quantum",
+    "lzo", "lzx", "quantum", "adc",
     "rar1", "rar2", "rar3", "rar5",
 ]
 # Enables `alloc`-backed conveniences (e.g. the `factory` module). Pulled in
@@ -59,6 +59,9 @@ lzo     = ["alloc"]
 lzx     = ["alloc"]
 # Quantum (Stac, old CAB format). Decoder-only target.
 quantum = ["alloc"]
+# ADC (Apple Data Compression) — the LZSS-like codec used in Apple DMG
+# disk images and HFS+ compressed resource forks.
+adc     = ["alloc"]
 # RAR decoders (rar1, rar2, rar3, rar5). Decoder-only — RARLAB's unRAR
 # license explicitly forbids re-creating the compression algorithm, so
 # the encoders permanently return `Error::Unsupported`.

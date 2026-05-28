@@ -50,6 +50,8 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         crate::quantum::Quantum::NAME => {
             Some(Box::new(<crate::quantum::Quantum as Algorithm>::encoder()))
         }
+        #[cfg(feature = "adc")]
+        crate::adc::Adc::NAME => Some(Box::new(<crate::adc::Adc as Algorithm>::encoder())),
         #[cfg(feature = "rar1")]
         crate::rar1::Rar1::NAME => Some(Box::new(<crate::rar1::Rar1 as Algorithm>::encoder())),
         #[cfg(feature = "rar2")]
@@ -102,6 +104,8 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         crate::quantum::Quantum::NAME => {
             Some(Box::new(<crate::quantum::Quantum as Algorithm>::decoder()))
         }
+        #[cfg(feature = "adc")]
+        crate::adc::Adc::NAME => Some(Box::new(<crate::adc::Adc as Algorithm>::decoder())),
         #[cfg(feature = "rar1")]
         crate::rar1::Rar1::NAME => Some(Box::new(<crate::rar1::Rar1 as Algorithm>::decoder())),
         #[cfg(feature = "rar2")]
@@ -164,6 +168,9 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     }
     if str_eq(name, "quantum") && cfg!(feature = "quantum") {
         return Some("q");
+    }
+    if str_eq(name, "adc") && cfg!(feature = "adc") {
+        return Some("adc");
     }
     // All RAR versions share the .rar extension; the version is in-band in
     // the file header. The CLI's in-place mode will write to <input>.rar
@@ -232,6 +239,8 @@ pub const fn names() -> &'static [&'static str] {
         crate::lzx::Lzx::NAME,
         #[cfg(feature = "quantum")]
         crate::quantum::Quantum::NAME,
+        #[cfg(feature = "adc")]
+        crate::adc::Adc::NAME,
         #[cfg(feature = "rar1")]
         crate::rar1::Rar1::NAME,
         #[cfg(feature = "rar2")]

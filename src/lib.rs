@@ -74,6 +74,9 @@ pub mod lzx;
 #[cfg(feature = "quantum")]
 pub mod quantum;
 
+#[cfg(feature = "adc")]
+pub mod adc;
+
 #[cfg(feature = "rar1")]
 pub mod rar1;
 
