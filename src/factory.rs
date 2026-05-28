@@ -66,6 +66,61 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
     }
 }
 
+/// Build an encoder for `name` configured at the supplied compression
+/// `level`.
+///
+/// For algorithms with a level/quality knob (`deflate`, `zlib`, `gzip`,
+/// `lzma`, `xz`, `zstd`, `brotli`) the level is plumbed into the
+/// `EncoderConfig` and clamped to that algorithm's valid range:
+///
+/// * `deflate`/`zlib`/`gzip`: 1..=9, default 6
+/// * `lzma`/`xz`: 0..=9, default 6
+/// * `zstd`: 1..=22, default 3
+/// * `brotli` quality: 0..=11, default 6
+///
+/// For algorithms without a level (everything else) the parameter is
+/// ignored and the default-config encoder is returned. The CLI uses
+/// this so a single `-l/--level N` flag works for every leveled
+/// algorithm without branching at the call site.
+pub fn encoder_by_name_with_level(name: &str, level: u8) -> Option<Box<dyn Encoder>> {
+    match name {
+        #[cfg(feature = "deflate")]
+        crate::deflate::Deflate::NAME => Some(Box::new(
+            <crate::deflate::Deflate as Algorithm>::encoder_with(crate::deflate::EncoderConfig {
+                level,
+            }),
+        )),
+        #[cfg(feature = "zlib")]
+        crate::zlib::Zlib::NAME => Some(Box::new(<crate::zlib::Zlib as Algorithm>::encoder_with(
+            crate::zlib::EncoderConfig { level },
+        ))),
+        #[cfg(feature = "gzip")]
+        crate::gzip::Gzip::NAME => Some(Box::new(<crate::gzip::Gzip as Algorithm>::encoder_with(
+            crate::gzip::EncoderConfig { level },
+        ))),
+        #[cfg(feature = "lzma")]
+        crate::lzma::Lzma::NAME => Some(Box::new(<crate::lzma::Lzma as Algorithm>::encoder_with(
+            crate::lzma::EncoderConfig { level },
+        ))),
+        #[cfg(feature = "xz")]
+        crate::xz::Xz::NAME => Some(Box::new(<crate::xz::Xz as Algorithm>::encoder_with(
+            crate::xz::EncoderConfig { level },
+        ))),
+        #[cfg(feature = "zstd")]
+        crate::zstd::Zstd::NAME => Some(Box::new(<crate::zstd::Zstd as Algorithm>::encoder_with(
+            crate::zstd::EncoderConfig { level },
+        ))),
+        #[cfg(feature = "brotli")]
+        crate::brotli::Brotli::NAME => Some(Box::new(
+            <crate::brotli::Brotli as Algorithm>::encoder_with(crate::brotli::EncoderConfig {
+                quality: level,
+            }),
+        )),
+        // Non-leveled algorithms: ignore `level`, return default encoder.
+        _ => encoder_by_name(name),
+    }
+}
+
 /// Build a decoder for the algorithm named `name`, or `None` if no algorithm
 /// is compiled in under that name.
 pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {

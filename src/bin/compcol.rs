@@ -34,6 +34,16 @@ Output (mutually exclusive):
                             <ext> on decompress; remove INPUT on success
     (default, no INPUT)     Read stdin, write stdout
 
+Compression tuning:
+    -l, --level N           Compression level for the encoder
+                            (ignored on decompress and on algorithms
+                            without a level knob):
+                              deflate/zlib/gzip: 1..=9, default 6
+                              lzma/xz:           0..=9, default 6
+                              zstd:              1..=22, default 3
+                              brotli quality:    0..=11, default 6
+                            Out-of-range values are clamped per algorithm.
+
 Misc:
     -k, --keep              Keep input file even in in-place mode
     -f, --force             Overwrite an existing output file
@@ -47,6 +57,7 @@ Examples:
     compcol -t gzip -k file.txt           # → file.txt.gz, keeps file.txt
     compcol -t gzip -c file.txt > out.gz  # explicit stdout
     compcol -t gzip -d file.txt.gz        # → file.txt, removes file.txt.gz
+    compcol -t zstd -l 19 file.bin        # high-ratio zstd encode
 ";
 
 // ─── argument parsing ────────────────────────────────────────────────────
@@ -62,6 +73,9 @@ struct Args {
     list: bool,
     version: bool,
     help: bool,
+    /// When `Some`, compression level passed to the encoder via
+    /// `factory::encoder_by_name_with_level`. Ignored on decompress.
+    level: Option<u8>,
     input: Option<PathBuf>,
 }
 
@@ -70,6 +84,7 @@ enum ParseError {
     MissingValue(&'static str),
     UnknownFlag(String),
     ExtraPositional(String),
+    BadLevel(String),
 }
 
 impl core::fmt::Display for ParseError {
@@ -78,6 +93,7 @@ impl core::fmt::Display for ParseError {
             Self::MissingValue(flag) => write!(f, "{flag} requires an argument"),
             Self::UnknownFlag(s) => write!(f, "unknown option: {s}"),
             Self::ExtraPositional(s) => write!(f, "unexpected extra argument: {s}"),
+            Self::BadLevel(s) => write!(f, "--level expects an integer in 0..=255, got '{s}'"),
         }
     }
 }
@@ -117,17 +133,33 @@ where
                 let v = iter.next().ok_or(ParseError::MissingValue("-o"))?;
                 args.output = Some(PathBuf::from(v));
             }
+            "-l" | "--level" => {
+                let v = iter
+                    .next()
+                    .ok_or(ParseError::MissingValue("-l"))?
+                    .to_string_lossy()
+                    .into_owned();
+                args.level = Some(v.parse().map_err(|_| ParseError::BadLevel(v))?);
+            }
             s if s.starts_with("--type=") => {
                 args.algorithm = Some(s["--type=".len()..].to_string());
             }
             s if s.starts_with("--output=") => {
                 args.output = Some(PathBuf::from(&s["--output=".len()..]));
             }
+            s if s.starts_with("--level=") => {
+                let v = &s["--level=".len()..];
+                args.level = Some(v.parse().map_err(|_| ParseError::BadLevel(v.to_string()))?);
+            }
             s if s.starts_with("-t") && s.len() > 2 => {
                 args.algorithm = Some(s[2..].to_string());
             }
             s if s.starts_with("-o") && s.len() > 2 => {
                 args.output = Some(PathBuf::from(&s[2..]));
+            }
+            s if s.starts_with("-l") && s.len() > 2 => {
+                let v = &s[2..];
+                args.level = Some(v.parse().map_err(|_| ParseError::BadLevel(v.to_string()))?);
             }
             s if s.starts_with('-') && s != "-" => {
                 return Err(ParseError::UnknownFlag(s.to_string()));
@@ -401,12 +433,22 @@ fn run(args: &Args, algo: &str) -> Result<(), RunError> {
     };
 
     let result = if args.decompress {
+        if args.level.is_some() {
+            // Decompressors don't have a level — flag it rather than
+            // silently ignore so users notice the mistake.
+            return Err(RunError::Usage(
+                "--level is only meaningful on compression (no -d)".into(),
+            ));
+        }
         let dec = factory::decoder_by_name(algo)
             .ok_or_else(|| RunError::Usage(format!("unknown algorithm: '{algo}' (use --list)")))?;
         stream_decode(dec, &mut *reader, &mut *writer)
     } else {
-        let enc = factory::encoder_by_name(algo)
-            .ok_or_else(|| RunError::Usage(format!("unknown algorithm: '{algo}' (use --list)")))?;
+        let enc = match args.level {
+            Some(level) => factory::encoder_by_name_with_level(algo, level),
+            None => factory::encoder_by_name(algo),
+        }
+        .ok_or_else(|| RunError::Usage(format!("unknown algorithm: '{algo}' (use --list)")))?;
         stream_encode(enc, &mut *reader, &mut *writer)
     };
 
