@@ -17,7 +17,8 @@
 //! v1 limitations:
 //! - Decoder ignores MTIME/XFL/OS and any optional metadata; it parses but
 //!   doesn't expose the filename or comment.
-//! - Encoder always emits a minimal 10-byte header (FLG = 0).
+//! - Encoder always emits a minimal 10-byte header (FLG = 0); the XFL byte
+//!   is filled in from [`EncoderConfig::level`] per RFC 1952 §2.3.1.
 //! - Concatenated gzip members are not supported — decoder stops at the
 //!   first member's trailer.
 
@@ -39,6 +40,28 @@ const FCOMMENT: u8 = 1 << 4;
 /// we don't understand.
 const FLG_RESERVED: u8 = !(FTEXT | FHCRC | FEXTRA | FNAME | FCOMMENT);
 
+/// Tunables for the gzip encoder.
+///
+/// `level` is forwarded to the inner deflate encoder, and also surfaces in
+/// the emitted gzip header's XFL (extra-flags) byte: per RFC 1952 §2.3.1,
+/// XFL=2 advertises "maximum compression / slowest algorithm" (level 9),
+/// XFL=4 advertises "fastest algorithm" (level 1), and any other level
+/// uses XFL=0.
+///
+/// The default of `6` matches gzip(1) and zlib's default. Values outside
+/// `1..=9` are clamped by the inner deflate encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncoderConfig {
+    /// Compression level in `1..=9`. Higher = smaller output, slower encode.
+    pub level: u8,
+}
+
+impl Default for EncoderConfig {
+    fn default() -> Self {
+        Self { level: 6 }
+    }
+}
+
 /// Zero-sized marker type implementing [`Algorithm`] for gzip.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Gzip;
@@ -47,11 +70,11 @@ impl Algorithm for Gzip {
     const NAME: &'static str = "gzip";
     type Encoder = Encoder;
     type Decoder = Decoder;
-    type EncoderConfig = ();
+    type EncoderConfig = EncoderConfig;
     type DecoderConfig = ();
 
-    fn encoder_with(_: ()) -> Encoder {
-        Encoder::new()
+    fn encoder_with(c: Self::EncoderConfig) -> Encoder {
+        Encoder::with_config(c)
     }
     fn decoder_with(_: ()) -> Decoder {
         Decoder::new()
@@ -438,42 +461,90 @@ enum EncPhase {
     Done,
 }
 
-/// Minimal 10-byte gzip header: magic, deflate method, no flags, MTIME=0,
-/// XFL=0, OS=0xFF (unknown).
-const FIXED_HEADER: [u8; 10] = [
-    MAGIC_ID1, MAGIC_ID2, CM_DEFLATE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
-];
+/// Map a clamped 1..=9 compression level to gzip's XFL byte
+/// (RFC 1952 §2.3.1):
+///   - level 9 → 2 ("maximum compression, slowest algorithm")
+///   - level 1 → 4 ("fastest algorithm")
+///   - anything else → 0
+fn xfl_for_level(level: u8) -> u8 {
+    let level = level.clamp(1, 9);
+    match level {
+        9 => 2,
+        1 => 4,
+        _ => 0,
+    }
+}
+
+/// Build the minimal 10-byte gzip header for a given compression level.
+///
+/// Bytes:
+///   0,1: ID1, ID2 magic           (0x1F, 0x8B)
+///   2:   CM = deflate             (0x08)
+///   3:   FLG = 0 (no optional fields)
+///   4..8: MTIME = 0 (no timestamp)
+///   8:   XFL = derived from level
+///   9:   OS = 0xFF (unknown)
+fn build_header(level: u8) -> [u8; 10] {
+    [
+        MAGIC_ID1,
+        MAGIC_ID2,
+        CM_DEFLATE,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        xfl_for_level(level),
+        0xFF,
+    ]
+}
 
 pub struct Encoder {
     inner: deflate::Encoder,
     crc: Crc32,
     isize_count: u32,
+    header: [u8; 10],
     header_idx: u8,
     trailer: [u8; 8],
     trailer_idx: u8,
     phase: EncPhase,
+    /// Saved configuration so `reset` can rebuild the header and the inner
+    /// deflate encoder with the same level.
+    config: EncoderConfig,
 }
 
 impl Encoder {
+    /// Build a gzip encoder at the default compression level (6).
     pub fn new() -> Self {
+        Self::with_config(EncoderConfig::default())
+    }
+
+    /// Build a gzip encoder with the supplied configuration. The level is
+    /// forwarded to the inner deflate encoder and surfaced in the emitted
+    /// XFL header byte.
+    pub fn with_config(config: EncoderConfig) -> Self {
         Self {
-            inner: deflate::Encoder::new(),
+            inner: deflate::Encoder::with_config(deflate::EncoderConfig {
+                level: config.level,
+            }),
             crc: Crc32::new(),
             isize_count: 0,
+            header: build_header(config.level),
             header_idx: 0,
             trailer: [0u8; 8],
             trailer_idx: 0,
             phase: EncPhase::Header,
+            config,
         }
     }
 
     fn drain_header(&mut self, output: &mut [u8], written: &mut usize) -> bool {
-        while (self.header_idx as usize) < FIXED_HEADER.len() && *written < output.len() {
-            output[*written] = FIXED_HEADER[self.header_idx as usize];
+        while (self.header_idx as usize) < self.header.len() && *written < output.len() {
+            output[*written] = self.header[self.header_idx as usize];
             *written += 1;
             self.header_idx += 1;
         }
-        self.header_idx as usize == FIXED_HEADER.len()
+        self.header_idx as usize == self.header.len()
     }
 
     fn drain_trailer(&mut self, output: &mut [u8], written: &mut usize) -> bool {
@@ -600,6 +671,9 @@ impl RawEncoder for Encoder {
         self.inner.raw_reset();
         self.crc.reset();
         self.isize_count = 0;
+        // Reset preserves configuration: rebuild the header from the saved
+        // level so the next stream advertises the same XFL.
+        self.header = build_header(self.config.level);
         self.header_idx = 0;
         self.trailer = [0u8; 8];
         self.trailer_idx = 0;
