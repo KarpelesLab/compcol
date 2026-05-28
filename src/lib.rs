@@ -47,9 +47,6 @@ pub mod gzip;
 #[cfg(feature = "lzma")]
 pub mod lzma;
 
-#[cfg(feature = "lzma2")]
-pub mod lzma2;
-
 #[cfg(feature = "xz")]
 pub mod xz;
 

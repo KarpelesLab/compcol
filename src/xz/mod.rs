@@ -36,10 +36,10 @@
 //! `src/lzma/` adapted to emit a raw range-coded body (no header, no
 //! EOS marker).
 //!
-//! No dependency on the sibling `lzma` / `lzma2` modules: the small amount of
-//! LZMA2 framing we need (control byte, big-endian 16-bit size) and the
-//! CRC-32 we use for the Block Check, Stream Header CRC, and Index CRC are
-//! all defined inline below.
+//! No dependency on the sibling `lzma` module: the small amount of LZMA2
+//! framing we need (control byte, big-endian 16-bit size) and the CRC-32 we
+//! use for the Block Check, Stream Header CRC, and Index CRC are all defined
+//! inline below.
 
 // The state machines in this file are written as a series of `match` arms
 // each containing an `if`/`else` that either makes progress or returns; the

@@ -35,7 +35,6 @@ and a `compcol` binary turns the library into a Unix-style filter.
 | Snappy | `snappy`  | `.sz`      | LZ77 hash matcher (raw block format) | full | — |
 | LZW (compress(1) `.Z`) | `lzw`     | `.lzw`     | full | full | `compress(1)` / `uncompress(1)` |
 | LZMA (legacy `.lzma`) | `lzma`    | `.lzma`    | full | full | `python3 -m lzma` (FORMAT_ALONE) |
-| LZMA2 | `lzma2`   | `.lzma2`   | LZMA-compressed chunks + uncompressed fallback | full (0xE0 + uncompressed) | `xz --format=raw --lzma2 -d` |
 | xz | `xz`      | `.xz`      | compressed-LZMA2 chunks + uncompressed fallback | full envelope + all reset variants | `xz(1)` both directions |
 | Zstandard (RFC 8478) | `zstd`    | `.zst`     | LZ77 + FSE sequences (Predefined tables) + Raw literals | full Compressed_Block | `zstd(1)` both directions |
 | Brotli (RFC 7932) | `brotli`  | `.br`      | LZ77 + length-limited Huffman trees + 704-symbol IC alphabet | full (with 122 KiB static dictionary) | `brotli(1)` both directions |
@@ -171,7 +170,7 @@ without LZ77 expansion).
 The `compcol` binary ships with the crate. Install with:
 
 ```sh
-cargo install --path . --features "gzip,zlib,deflate,rle,lz4,snappy,lzw,xz,zstd,brotli,lzma,lzma2,factory"
+cargo install --path . --features "gzip,zlib,deflate,rle,lz4,snappy,lzw,xz,zstd,brotli,lzma,factory"
 ```
 
 (or pick whichever subset of algorithms you want).
@@ -244,8 +243,7 @@ deflate = ["alloc"]
 zlib    = ["deflate"]
 gzip    = ["deflate"]
 lzma    = ["alloc"]
-lzma2   = ["lzma"]
-xz      = ["lzma2"]
+xz      = ["lzma"]
 zstd    = ["alloc"]
 brotli  = ["alloc"]
 lz4     = ["alloc"]

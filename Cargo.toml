@@ -28,10 +28,9 @@ gzip    = ["deflate"]
 # LZMA (Lempel–Ziv–Markov chain). Range-coded, depends on alloc for the
 # probability tables and the LZ window.
 lzma    = ["alloc"]
-# LZMA2 chunked wrapper.
-lzma2   = ["lzma"]
-# xz container around LZMA2 (RFC-style stream/block headers + check codes).
-xz      = ["lzma2"]
+# xz container (RFC-style stream/block headers + check codes; the inner
+# LZMA2 chunk codec is inlined inside `src/xz/`).
+xz      = ["lzma"]
 # Zstandard (RFC 8478).
 zstd    = ["alloc"]
 # Brotli (RFC 7932). Carries a 170 KiB built-in static dictionary when fully

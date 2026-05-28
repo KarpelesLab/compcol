@@ -55,10 +55,6 @@ speed comparison.
 | `lzma` | Lorem 64 KiB | 65536 | 425 | 0.01 | 366.1 | 441.2 | py-lzma | 0.01 | 2.26 | 4.75 |
 | `lzma` | Zeros 64 KiB | 65536 | 91 | 0.00 | 189.6 | 376.8 | py-lzma | 0.00 | 2.51 | 4.41 |
 | `lzma` | Random 16 KiB | 16384 | 17066 | 1.04 | 24.6 | 4.54 | py-lzma | 1.01 | 0.65 | 0.85 |
-| `lzma2` | Lorem 4 KiB | 4096 | 360 | 0.09 | 158.5 | 232.0 | xz-raw | 0.09 | 0.86 | 1.50 |
-| `lzma2` | Lorem 64 KiB | 65536 | 413 | 0.01 | 51.9 | 138.9 | xz-raw | 0.01 | 7.47 | 22.6 |
-| `lzma2` | Zeros 64 KiB | 65536 | 80 | 0.00 | 69.7 | 158.8 | xz-raw | 0.00 | 8.87 | 21.9 |
-| `lzma2` | Random 16 KiB | 16384 | 16388 | 1.00 | 7.31 | 6176 | xz-raw | 1.00 | 1.21 | 15.9 |
 | `lzw` | Lorem 4 KiB | 4096 | 1723 | 0.42 | 36.3 | 69.2 | compress | 0.42 | 1.77 | 2.69 |
 | `lzw` | Lorem 64 KiB | 65536 | 10501 | 0.16 | 27.6 | 115.7 | compress | 0.16 | 10.5 | 24.0 |
 | `lzw` | Zeros 64 KiB | 65536 | 424 | 0.01 | 32.2 | 136.5 | compress | 0.01 | 14.3 | 27.7 |
@@ -93,9 +89,9 @@ speed comparison.
 - `deflate` / `zlib` / `gzip` come in within a small constant factor of
   zlib's default-level output (e.g. 1475 B vs zlib's 1156 B on
   Lorem 64 KiB — ~1.27× larger).
-- `lzma` and `lzma2` are within ~1.05× of Python's `lzma`/`xz` for
-  Lorem; on random data we're at ratio 1.04 vs reference 1.01, because
-  our greedy parser emits slightly more match/literal overhead.
+- `lzma` is within ~1.05× of Python's `lzma` on Lorem; on random data
+  we're at ratio 1.04 vs reference 1.01, because our greedy parser
+  emits slightly more match/literal overhead.
 - `xz` matches reference on every text input (468 B vs reference).
 - `zstd` and `brotli` lag the reference for highly-compressible inputs
   because we don't yet ship Huffman literal compression / FSE table
@@ -131,14 +127,12 @@ zero-dep policy.
 
 A few cells look anomalous and are worth investigating later:
 
-- `lzma2` Random 16 KiB **decode** at 6176 MB/s — that's because the
-  encoder fell back to uncompressed chunks, so the decoder is doing
-  little more than a byte copy. Real, just suspicious-looking.
 - `xz` Lorem 4 KiB **decode** at 4.08 MB/s — much slower than
   expected for a tiny input. Likely measurement noise from a single
   unlucky cold-cache run; the next size up (64 KiB) sits at a normal
   62 MB/s.
-- `snappy` Random 16 KiB **decode** at 7447 MB/s — same pattern as
-  `lzma2` random: no compression happened, decoder is mostly a copy.
+- `snappy` Random 16 KiB **decode** at 7447 MB/s — no compression
+  happened (random data), so the decoder is doing little more than a
+  byte copy. Real, just suspicious-looking.
 
 These will smooth out if the runs count or input sizes are bumped.
