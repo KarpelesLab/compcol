@@ -1,4 +1,3 @@
-#![cfg(any())] // TODO(v0.3): port to new (Progress, Status) API
 //! Integration tests for the RAR5 decoder.
 //!
 //! Fixtures here are extracted from RAR5 archives produced by RARLAB's `rar`
@@ -16,41 +15,17 @@
 //!    block. That payload is what we embed below.
 //! 3. For our 128 KiB-window fixtures, `comp_info` bits 10..14 == 0 so
 //!    the window is `128 KiB << 0 = 128 KiB`.
+//!
+//! Canonical v0.3 port: every call returns `(Progress, Status)` and the
+//! loop dispatches on `Status` rather than inferring from byte counts.
+//! RAR5 is decoder-only — the encoder always returns `Error::Unsupported`.
 
 #![cfg(feature = "rar5")]
 
-use compcol::Decoder as DecoderTrait;
-use compcol::rar5::Decoder;
+use compcol::rar5::{Decoder, Encoder, Rar5};
+use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Status};
 
-/// Drive a freshly-constructed decoder to completion against a single input
-/// slice and return the produced bytes.
-fn decode_once(comp: &[u8], unpack: u64, window: usize) -> Result<Vec<u8>, compcol::Error> {
-    let mut dec = Decoder::with_unpack_size_and_window(unpack, window);
-    let mut out = vec![0u8; unpack as usize + 16];
-    let p = dec.decode(comp, &mut out)?;
-    let consumed = p.consumed;
-    let written = p.written;
-    // Try to drain any remaining buffered output via finish().
-    let mut total = written;
-    let mut tail = vec![0u8; 64];
-    loop {
-        let f = dec.finish(&mut tail)?;
-        if matches!(_s, compcol::Status::StreamEnd) {
-            // Append `f.written` bytes (if any) before stopping.
-            out[total..total + f.written].copy_from_slice(&tail[..f.written]);
-            total += f.written;
-            break;
-        }
-        if f.written == 0 {
-            break;
-        }
-        out[total..total + f.written].copy_from_slice(&tail[..f.written]);
-        total += f.written;
-    }
-    out.truncate(total);
-    let _ = consumed;
-    Ok(out)
-}
+// ─── fixtures ─────────────────────────────────────────────────────────────
 
 /// Fixture 1 — 200 copies of `'A'` followed by a single `'\n'` (201 bytes).
 ///
@@ -70,7 +45,7 @@ const FIXTURE_ABCABC_UNPACK: u64 = 301;
 /// Fixture 3 — a synthetic 1506-byte payload containing 50 `0xE8` x86-call
 /// opcodes (each followed by a 4-byte relative target) interleaved with
 /// zero padding. RAR5 auto-detects this content and activates the
-/// [`X86Call`] filter (type 1) during compression; the decoder must apply
+/// `X86Call` filter (type 1) during compression; the decoder must apply
 /// the inverse transform on the unpacked stream to reconstruct the original
 /// bytes verbatim. Method `-m5`.
 const FIXTURE_E8: &[u8] = &[
@@ -83,47 +58,186 @@ const FIXTURE_E8: &[u8] = &[
 ];
 const FIXTURE_E8_UNPACK: u64 = 1506;
 
+// ─── helpers ──────────────────────────────────────────────────────────────
+
+/// Drive a freshly-constructed decoder to completion against a single input
+/// slice and return the produced bytes.
+fn decode_once(comp: &[u8], unpack: u64, window: usize) -> Result<Vec<u8>, Error> {
+    let mut dec = Decoder::with_unpack_size_and_window(unpack, window);
+    let mut out = vec![0u8; unpack as usize];
+    let mut total = 0usize;
+
+    // Feed the input once.
+    let (p, status) = dec.decode(comp, &mut out[total..])?;
+    total += p.written;
+
+    // Drain any remaining buffered output by re-calling decode with no
+    // additional input until it stalls.
+    if !matches!(status, Status::StreamEnd) {
+        loop {
+            if total >= out.len() {
+                break;
+            }
+            let (p, status) = dec.decode(&[], &mut out[total..])?;
+            total += p.written;
+            if matches!(status, Status::StreamEnd) {
+                break;
+            }
+            if p.written == 0 {
+                break;
+            }
+        }
+    }
+
+    // Then finish to flush any tail bytes and observe StreamEnd.
+    loop {
+        if total >= out.len() {
+            // Even if the output buffer is full, finish into a scratch slot
+            // to confirm StreamEnd. If extra bytes appear, the unpack-size
+            // cap was wrong.
+            let mut scratch = [0u8; 16];
+            let (pf, status) = dec.finish(&mut scratch)?;
+            if pf.written != 0 {
+                // Surplus bytes — the test caller's expected length was too
+                // short; surface them so the assert can flag the mismatch.
+                out.extend_from_slice(&scratch[..pf.written]);
+                total += pf.written;
+            }
+            if matches!(status, Status::StreamEnd) {
+                break;
+            }
+            if pf.written == 0 {
+                break;
+            }
+            continue;
+        }
+        let (pf, status) = dec.finish(&mut out[total..])?;
+        total += pf.written;
+        if matches!(status, Status::StreamEnd) {
+            break;
+        }
+        if pf.written == 0 {
+            break;
+        }
+    }
+
+    out.truncate(total);
+    Ok(out)
+}
+
+/// Decode the same input fed byte-by-byte, draining through a small output
+/// buffer.
+fn decode_chunked(
+    comp: &[u8],
+    unpack: u64,
+    window: usize,
+    in_chunk: usize,
+    out_chunk: usize,
+) -> Result<Vec<u8>, Error> {
+    let mut dec = Decoder::with_unpack_size_and_window(unpack, window);
+    let mut decoded: Vec<u8> = Vec::with_capacity(unpack as usize);
+    let mut buf = vec![0u8; out_chunk.max(1)];
+    let mut i = 0usize;
+
+    while i < comp.len() {
+        let end = (i + in_chunk).min(comp.len());
+        let chunk = &comp[i..end];
+        let mut consumed = 0;
+        while consumed < chunk.len() {
+            let (p, status) = dec.decode(&chunk[consumed..], &mut buf)?;
+            decoded.extend_from_slice(&buf[..p.written]);
+            consumed += p.consumed;
+            match status {
+                Status::InputEmpty | Status::StreamEnd => break,
+                Status::OutputFull => continue,
+            }
+        }
+        i = end;
+        // After feeding, drain whatever is currently producible without
+        // additional input.
+        loop {
+            let (p, status) = dec.decode(&[], &mut buf)?;
+            decoded.extend_from_slice(&buf[..p.written]);
+            if matches!(status, Status::StreamEnd) {
+                break;
+            }
+            if p.written == 0 {
+                break;
+            }
+        }
+    }
+
+    // Finish: drain any tail and observe StreamEnd.
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        decoded.extend_from_slice(&buf[..p.written]);
+        if matches!(status, Status::StreamEnd) {
+            break;
+        }
+        if p.written == 0 {
+            break;
+        }
+    }
+
+    Ok(decoded)
+}
+
+// ─── algorithm metadata ──────────────────────────────────────────────────
+
 #[test]
-fn truncated_input_returns_error_or_no_output() {
-    // Half a header is not enough to do anything; the decoder should keep
-    // asking for more input rather than producing output.
-    let mut dec = Decoder::with_unpack_size_and_window(201, 128 * 1024);
-    let mut out = [0u8; 256];
-    let p = dec.decode(&FIXTURE_AAA[..1], &mut out).unwrap();
+fn algorithm_name_is_rar5() {
+    assert_eq!(<Rar5 as Algorithm>::NAME, "rar5");
+}
+
+#[test]
+fn rar5_algorithm_factory_produces_codec() {
+    let _enc = <Rar5 as Algorithm>::encoder();
+    let _dec = <Rar5 as Algorithm>::decoder();
+}
+
+// ─── encoder is permanently unsupported ──────────────────────────────────
+
+#[test]
+fn encoder_encode_is_unsupported() {
+    let mut enc = Encoder::new();
+    let mut out = [0u8; 16];
     assert_eq!(
-        p.written, 0,
-        "no output should be produced from a 1-byte input"
+        enc.encode(b"hello", &mut out).unwrap_err(),
+        Error::Unsupported
     );
 }
 
 #[test]
-fn invalid_block_header_checksum_is_rejected() {
-    // Flip a bit in the size field; the header checksum no longer matches.
-    let mut bad = FIXTURE_AAA.to_vec();
-    bad[2] ^= 0xFF;
-    let mut dec = Decoder::with_unpack_size_and_window(201, 128 * 1024);
-    let mut out = [0u8; 256];
-    let r = dec.decode(&bad, &mut out);
-    assert!(matches!(
-        r,
-        Err(compcol::Error::BadHeader) | Err(compcol::Error::Corrupt)
-    ));
+fn encoder_finish_is_unsupported() {
+    let mut enc = Encoder::new();
+    let mut out = [0u8; 16];
+    assert_eq!(enc.finish(&mut out).unwrap_err(), Error::Unsupported);
 }
+
+#[test]
+fn encoder_reset_is_a_no_op() {
+    let mut enc = Encoder::new();
+    enc.reset();
+    let mut out = [0u8; 4];
+    assert_eq!(enc.encode(b"x", &mut out).unwrap_err(), Error::Unsupported);
+}
+
+// ─── empty input ─────────────────────────────────────────────────────────
 
 #[test]
 fn empty_input_with_zero_unpack_size_finishes_cleanly() {
     let mut dec = Decoder::with_unpack_size_and_window(0, 128 * 1024);
     let mut out = [0u8; 16];
-    let f = dec.finish(&mut out).unwrap();
-    assert!(matches!(_s, compcol::Status::StreamEnd));
-    assert_eq!(f.written, 0);
+    let (p, status) = dec.finish(&mut out).unwrap();
+    assert_eq!(p.written, 0);
+    assert!(
+        matches!(status, Status::StreamEnd),
+        "expected StreamEnd on empty finish, got {:?}",
+        status
+    );
 }
 
-// The remaining decode round-trip tests are gated on the decoder actually
-// being able to traverse the real RAR5 wire format end-to-end. They are
-// best-effort: if a future fix breaks them, they fail loudly. If the
-// current decoder is incomplete and they panic, we tolerate that via
-// `decode_returns_something_or_errors_cleanly` below.
+// ─── real-world fixtures: byte-identical round-trips ─────────────────────
 
 #[test]
 fn decode_aaa_fixture() {
@@ -145,64 +259,6 @@ fn decode_abcabc_fixture() {
 }
 
 #[test]
-fn decode_chunked_input() {
-    // Same fixture fed one byte at a time. Verifies that the decoder's
-    // internal buffering correctly waits for whole blocks before
-    // proceeding.
-    let mut dec = Decoder::with_unpack_size_and_window(FIXTURE_AAA_UNPACK, 128 * 1024);
-    let mut out = vec![0u8; FIXTURE_AAA_UNPACK as usize];
-    let mut written = 0usize;
-    for chunk in FIXTURE_AAA.chunks(1) {
-        let p = dec.decode(chunk, &mut out[written..]).expect("decode");
-        written += p.written;
-    }
-    let f = dec.finish(&mut out[written..]).expect("finish");
-    written += f.written;
-    out.truncate(written);
-    let mut expected = vec![b'A'; 200];
-    expected.push(b'\n');
-    assert_eq!(out, expected);
-}
-
-#[test]
-fn decode_with_small_output_buffer() {
-    // Drain the decoder through a 32-byte output buffer to verify the
-    // streaming back-pressure on the `ready` queue.
-    let mut dec = Decoder::with_unpack_size_and_window(FIXTURE_AAA_UNPACK, 128 * 1024);
-    let mut chunk = [0u8; 32];
-    let mut produced = Vec::new();
-    // Feed input only once; pump output until the decoder signals done.
-    let mut input_offset = 0;
-    let mut feed_done = false;
-    loop {
-        let input_slice: &[u8] = if feed_done {
-            &[]
-        } else {
-            let s = &FIXTURE_AAA[input_offset..];
-            feed_done = true;
-            s
-        };
-        let p = dec.decode(input_slice, &mut chunk).expect("decode");
-        input_offset += p.consumed;
-        produced.extend_from_slice(&chunk[..p.written]);
-        if p.written == 0 && p.consumed == 0 {
-            // Try finish.
-            let f = dec.finish(&mut chunk).expect("finish");
-            produced.extend_from_slice(&chunk[..f.written]);
-            if matches!(_s, compcol::Status::StreamEnd) {
-                break;
-            }
-            if f.written == 0 {
-                break;
-            }
-        }
-    }
-    let mut expected = vec![b'A'; 200];
-    expected.push(b'\n');
-    assert_eq!(produced, expected);
-}
-
-#[test]
 fn decode_e8_filter_fixture() {
     // Round-trip the E8 fixture; the decoder must apply the inverse of
     // RAR5's x86 call-translation filter and recover the original bytes.
@@ -221,6 +277,69 @@ fn decode_e8_filter_fixture() {
     );
 }
 
+// ─── streaming variants ──────────────────────────────────────────────────
+
+#[test]
+fn decode_aaa_chunked_one_byte_at_a_time() {
+    // Same fixture fed one byte at a time. Verifies that the decoder's
+    // internal buffering correctly waits for whole blocks before
+    // proceeding.
+    let out = decode_chunked(FIXTURE_AAA, FIXTURE_AAA_UNPACK, 128 * 1024, 1, 64).expect("decode");
+    let mut expected = vec![b'A'; 200];
+    expected.push(b'\n');
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn decode_aaa_with_small_output_buffer() {
+    // Drain the decoder through a 32-byte output buffer to verify the
+    // streaming back-pressure on the `ready` queue.
+    let out = decode_chunked(
+        FIXTURE_AAA,
+        FIXTURE_AAA_UNPACK,
+        128 * 1024,
+        FIXTURE_AAA.len(),
+        32,
+    )
+    .expect("decode");
+    let mut expected = vec![b'A'; 200];
+    expected.push(b'\n');
+    assert_eq!(out, expected);
+}
+
+// ─── error handling ──────────────────────────────────────────────────────
+
+#[test]
+fn truncated_input_returns_error_or_no_output() {
+    // Half a header is not enough to do anything; the decoder should keep
+    // asking for more input rather than producing output.
+    let mut dec = Decoder::with_unpack_size_and_window(201, 128 * 1024);
+    let mut out = [0u8; 256];
+    let (p, _status) = dec.decode(&FIXTURE_AAA[..1], &mut out).unwrap();
+    assert_eq!(
+        p.written, 0,
+        "no output should be produced from a 1-byte input"
+    );
+    // finish() on truncated input must surface UnexpectedEnd.
+    let mut tail = [0u8; 16];
+    let err = dec.finish(&mut tail).unwrap_err();
+    assert_eq!(err, Error::UnexpectedEnd);
+}
+
+#[test]
+fn invalid_block_header_checksum_is_rejected() {
+    // Flip a bit in the size field; the header checksum no longer matches.
+    let mut bad = FIXTURE_AAA.to_vec();
+    bad[2] ^= 0xFF;
+    let mut dec = Decoder::with_unpack_size_and_window(201, 128 * 1024);
+    let mut out = [0u8; 256];
+    let r = dec.decode(&bad, &mut out);
+    assert!(matches!(
+        r,
+        Err(Error::BadHeader) | Err(Error::Corrupt) | Err(Error::InvalidHuffmanTree)
+    ));
+}
+
 #[test]
 fn decoder_does_not_panic_on_garbage() {
     // Fuzz-style smoke check: random-ish bytes should never panic.
@@ -228,4 +347,83 @@ fn decoder_does_not_panic_on_garbage() {
     let mut dec = Decoder::with_unpack_size_and_window(1024, 128 * 1024);
     let mut out = [0u8; 1024];
     let _ = dec.decode(&garbage, &mut out);
+}
+
+// ─── reset behaviour ─────────────────────────────────────────────────────
+
+#[test]
+fn reset_clears_state() {
+    let mut dec = Decoder::with_unpack_size_and_window(FIXTURE_AAA_UNPACK, 128 * 1024);
+    let mut out = vec![0u8; FIXTURE_AAA_UNPACK as usize];
+    let (p, _status) = dec.decode(FIXTURE_AAA, &mut out).unwrap();
+    let mut total = p.written;
+    while total < out.len() {
+        let (p, status) = dec.decode(&[], &mut out[total..]).unwrap();
+        total += p.written;
+        if matches!(status, Status::StreamEnd) || p.written == 0 {
+            break;
+        }
+    }
+    // Drain finish to reach StreamEnd before reset.
+    loop {
+        let mut scratch = [0u8; 16];
+        let (pf, status) = dec.finish(&mut scratch).unwrap();
+        let _ = pf;
+        if matches!(status, Status::StreamEnd) || pf.written == 0 {
+            break;
+        }
+    }
+
+    dec.reset();
+
+    // After reset, decoding the same input again should yield the same
+    // bytes — no stale window or table state leaking across.
+    let mut out2 = vec![0u8; FIXTURE_AAA_UNPACK as usize];
+    let (p, _status) = dec.decode(FIXTURE_AAA, &mut out2).unwrap();
+    let mut total2 = p.written;
+    while total2 < out2.len() {
+        let (p, status) = dec.decode(&[], &mut out2[total2..]).unwrap();
+        total2 += p.written;
+        if matches!(status, Status::StreamEnd) || p.written == 0 {
+            break;
+        }
+    }
+    let mut expected = vec![b'A'; 200];
+    expected.push(b'\n');
+    assert_eq!(&out2[..total2], expected.as_slice());
+}
+
+// ─── factory (only if the feature is enabled) ────────────────────────────
+
+#[cfg(feature = "factory")]
+mod factory {
+    use compcol::Error;
+    use compcol::factory;
+
+    #[test]
+    fn lookup_rar5_encoder_and_decoder() {
+        assert!(factory::encoder_by_name("rar5").is_some());
+        assert!(factory::decoder_by_name("rar5").is_some());
+    }
+
+    #[test]
+    fn lookup_unknown() {
+        assert!(factory::encoder_by_name("not-a-real-rar5").is_none());
+        assert!(factory::decoder_by_name("not-a-real-rar5").is_none());
+    }
+
+    #[test]
+    fn names_contains_rar5() {
+        assert!(factory::names().contains(&"rar5"));
+    }
+
+    #[test]
+    fn boxed_encoder_is_unsupported() {
+        let mut enc = factory::encoder_by_name("rar5").unwrap();
+        let mut out = [0u8; 16];
+        assert_eq!(
+            enc.encode(b"hello", &mut out).unwrap_err(),
+            Error::Unsupported
+        );
+    }
 }
