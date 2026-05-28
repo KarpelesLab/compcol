@@ -2,16 +2,6 @@
 //!
 //! Canonical v0.3 port: every call returns `(Progress, Status)` and the
 //! loop dispatches on `Status` rather than inferring from byte counts.
-//!
-//! ## Known issue (see `BENCH.md`)
-//!
-//! The encoder produces output that the matching decoder cannot decode
-//! once total input exceeds 128 KiB — the chunk-boundary path has an
-//! off-by-one. Until that's fixed, **encoder→decoder round-trip tests
-//! must stay at or below 64 KiB of input** so they exercise at most one
-//! full meta-block and don't trip the bug. A gated regression-marker
-//! test at the bottom of this file documents the limit so the fix can
-//! flip it on.
 
 #![cfg(feature = "brotli")]
 
@@ -130,11 +120,6 @@ fn decode_chunked_with(
 }
 
 fn round_trip(input: &[u8]) {
-    // Stay below the 128 KiB encoder-bug ceiling; see file-level comment.
-    assert!(
-        input.len() <= 64 * 1024,
-        "round_trip input must be ≤64 KiB to dodge the known encoder bug"
-    );
     let mut enc = Encoder::new();
     let encoded = encode_chunked(&mut enc, input, 4096, 4096);
     let decoded = decode_chunked(&encoded, 4096, 4096).unwrap();
@@ -298,8 +283,8 @@ fn round_trip_streaming_one_byte() {
 ///      budget walks past — only quality 11 finds them.
 ///
 /// The corpus is deliberately capped just under 64 KiB so it fits in one
-/// brotli meta-block and round-trips without tripping the >128 KiB
-/// encoder bug documented in BENCH.md.
+/// brotli meta-block — keeps the level-1 vs level-11 comparison clean of
+/// chunk-boundary effects.
 fn mixed_corpus() -> Vec<u8> {
     let mut state: u32 = 0xC0FFEE_u32;
     let mut out = Vec::with_capacity(64 * 1024);
@@ -580,24 +565,86 @@ mod factory {
     }
 }
 
-// ─── known-bug regression marker (gated) ────────────────────────────────
+// ─── large-input round-trip regression ────────────────────────────────
 //
-// The brotli encoder produces output that our own decoder rejects with
-// `UnexpectedEnd` once total input exceeds ~128 KiB (bisected: 65 536 B
-// round-trips, 131 072 B does not). See `BENCH.md` "Known issues". This
-// test is intentionally `#[cfg(any())]`-gated: when the underlying
-// chunk-boundary off-by-one is fixed, remove the gate to lock the
-// behaviour in.
+// Locks in the fix for the long-standing "fails above 128 KiB" report.
+// The actual bug turned out to live in the *decoder*'s `raw_finish`:
+// when the caller's output buffer filled mid-stream, `raw_decode`
+// returned early with meta-blocks still pending in `self.raw`, and
+// `raw_finish` then gave up immediately instead of draining and
+// processing them. Now finish loops the drain-and-process pair until
+// either the stream ends or output fills again.
 
-#[cfg(any())]
 #[test]
-fn encoder_above_128kib_known_bug() {
-    // 131 072 bytes — one byte past the 128 KiB threshold. This currently
-    // fails to round-trip. Once the encoder bug is fixed, ungate this
-    // test (and the corresponding paragraph in BENCH.md).
+fn encoder_above_128kib() {
+    // 131 072 bytes — one byte past the 128 KiB threshold called out in
+    // the original report. Used to fail; must round-trip now.
     let input: Vec<u8> = (0..131_072).map(|i| (i % 251) as u8).collect();
     let mut enc = Encoder::new();
     let encoded = encode_chunked(&mut enc, &input, 4096, 4096);
     let decoded = decode_chunked(&encoded, 4096, 4096).unwrap();
     assert_eq!(decoded, input);
+}
+
+#[test]
+fn roundtrip_above_old_buggy_size_with_full_buffer() {
+    // Regression for the >256 KiB decoder bug: when the caller's output
+    // buffer fills mid-stream, raw_decode returns early with bytes still
+    // pending in self.raw. The driver naturally calls finish next; finish
+    // used to give up immediately if state != Done, leaving every pending
+    // meta-block undecoded. Now finish processes pending meta-blocks
+    // until either the stream ends or the caller's buffer fills.
+    use compcol::brotli;
+    use compcol::{Decoder as _, Encoder as _, Status};
+
+    for &n in &[262_145usize, 1_000_000, 4 * 1024 * 1024] {
+        let input: Vec<u8> = (0..n)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 8) as u8)
+            .collect();
+        let mut enc = brotli::Encoder::new();
+        let mut compressed = Vec::new();
+        let mut buf = vec![0u8; 1 << 18];
+        let mut consumed = 0;
+        while consumed < input.len() {
+            let (p, _) = enc.encode(&input[consumed..], &mut buf).unwrap();
+            compressed.extend_from_slice(&buf[..p.written]);
+            consumed += p.consumed;
+            if p.consumed == 0 && p.written == 0 {
+                break;
+            }
+        }
+        loop {
+            let (p, s) = enc.finish(&mut buf).unwrap();
+            compressed.extend_from_slice(&buf[..p.written]);
+            if matches!(s, Status::StreamEnd) {
+                break;
+            }
+        }
+        let mut dec = brotli::Decoder::new();
+        let mut out = Vec::new();
+        let mut c2 = 0;
+        loop {
+            let (p, s) = dec.decode(&compressed[c2..], &mut buf).unwrap();
+            out.extend_from_slice(&buf[..p.written]);
+            c2 += p.consumed;
+            if matches!(s, Status::StreamEnd) {
+                break;
+            }
+            if matches!(s, Status::InputEmpty) && c2 == compressed.len() {
+                break;
+            }
+            if p.consumed == 0 && p.written == 0 {
+                break;
+            }
+        }
+        loop {
+            let (p, s) = dec.finish(&mut buf).unwrap();
+            out.extend_from_slice(&buf[..p.written]);
+            if matches!(s, Status::StreamEnd) {
+                break;
+            }
+        }
+        assert_eq!(out.len(), input.len(), "n={n}");
+        assert_eq!(out, input, "n={n}");
+    }
 }

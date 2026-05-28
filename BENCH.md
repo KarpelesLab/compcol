@@ -20,11 +20,10 @@ faster; lower output ratio (B/B) is smaller.
 | **Best ratio (English text)** | `lzma` | 0.001 | 614 | 905 |
 | **Best ratio + decent speed** | `zstd` | 0.003 | 902 | 1330 |
 | **Most universal (Unix tooling)** | `gzip` | 0.005 | 280 | 478 |
-| **Best ratio with structured-text bias** | `brotli` | 0.001† | — | — |
+| **Best ratio with structured-text bias** | `brotli` | 0.005 | 234 | 1058 |
 
-† `brotli` produces excellent ratios on smaller inputs but its
-encoder has a **known bug at exactly 128 KiB** that breaks the
-1 MiB benchmark — see "Known issues" below.
+(Previously this row showed `—` due to a decoder `raw_finish`
+bug — see the "Known issues" post-mortem below.)
 
 ## How to read this
 
@@ -55,9 +54,9 @@ after 1 warmup.
 
 | Algorithm | Input | Bytes | Ours: out | Ours: ratio | Ours: enc ms | Ours: enc MB/s | Ours: dec ms | Ours: dec MB/s | Reference | Ref: ratio | Ref: enc ms | Ref: enc MB/s | Ref: dec ms | Ref: dec MB/s | Δ enc | Δ dec |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `brotli` | Lorem 1 MiB | 1048576 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
-| `brotli` | Zeros 1 MiB | 1048576 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
-| `brotli` | Random 1 MiB | 1048576 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+| `brotli` | Lorem 1 MiB | 1048576 | 5643 | 0.01 | 4.48 | 233.9 | 0.99 | 1058 | brotli | 0.00 | 13.6 | 77.1 | 3.27 | 320.5 | 3.03 | 3.30 |
+| `brotli` | Zeros 1 MiB | 1048576 | 961 | 0.00 | 2.59 | 404.9 | 1.82 | 575.0 | brotli | 0.00 | 15.4 | 68.1 | 3.70 | 283.3 | 5.94 | 2.03 |
+| `brotli` | Random 1 MiB | 1048576 | 1049091 | 1.00 | 260.8 | 4.02 | 10.9 | 96.2 | brotli | 1.00 | 180.6 | 5.81 | 2.52 | 416.6 | 0.69 | 0.23 |
 | `deflate` | Lorem 1 MiB | 1048576 | 5711 | 0.01 | 2.01 | 521.7 | 0.70 | 1499 | py-deflate | 0.00 | 17.3 | 60.5 | 14.6 | 71.8 | 8.63 | 25.3 |
 | `deflate` | Zeros 1 MiB | 1048576 | 1812 | 0.00 | 2.01 | 522.5 | 1.02 | 1031 | py-deflate | 0.00 | 17.5 | 60.1 | 22.4 | 46.7 | 8.70 | 11.8 |
 | `deflate` | Random 1 MiB | 1048576 | 1048898 | 1.00 | 17.4 | 60.3 | 0.68 | 1545 | py-deflate | 1.00 | 26.7 | 39.2 | 17.1 | 61.4 | 1.54 | 19.5 |
@@ -136,12 +135,16 @@ after 1 warmup.
 
 ## Known issues surfaced by the bench
 
-1. **`brotli` encoder fails on inputs > 128 KiB.** All three brotli
-   rows show `—` because our own decoder reports
-   `unexpected end of input` round-tripping our own encoder's
-   output. Bisected: 65 536 B works, 131 072 B fails. The compressed
-   meta-block path almost certainly has an off-by-one at the chunk
-   boundary. Filed as a follow-up.
+1. **~~`brotli` encoder fails on inputs > 128 KiB.~~** *Fixed.* The
+   1 MiB rows now round-trip cleanly. The actual bug was in the
+   decoder's `raw_finish`, not the encoder: when the caller's output
+   slice filled mid-stream `raw_decode` returned early with
+   meta-blocks still pending in `self.raw`, and `raw_finish` then
+   gave up immediately instead of draining and processing them. The
+   "fails above 128 KiB" symptom showed up because that's roughly when
+   typical buffer sizes start hitting capacity. `raw_finish` now loops
+   the drain-and-process pair until the stream ends or the output
+   buffer fills again.
 2. **`lzma` decoder is ~50× slower than the reference on random
    data.** Lorem decode is 905 MB/s but Random decode collapses to
    0.30 MB/s. The high-distance-slot decode path (slot ≥ 14, direct

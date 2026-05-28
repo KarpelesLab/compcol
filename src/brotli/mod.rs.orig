@@ -83,6 +83,11 @@ pub struct Brotli;
 /// largest output, `11` is slowest / smallest output. The default `6`
 /// mirrors the reference CLI and is a reasonable starting point. Values
 /// outside `0..=11` are clamped at encoder construction time.
+///
+/// **Known issue**: at every quality level the encoder produces output
+/// that the matching decoder cannot decode once total input exceeds
+/// 128 KiB (the chunk-boundary path has an off-by-one — see BENCH.md).
+/// Stay below 128 KiB per stream to round-trip safely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncoderConfig {
     /// Quality level in `0..=11`. Lower is faster, higher is smaller.
@@ -1269,8 +1274,6 @@ const COPY_BASE: [u32; 24] = [
 
 #[derive(Debug)]
 pub struct Decoder {
-    #[doc(hidden)]
-    pub dbg_msgs: alloc::vec::Vec<alloc::string::String>,
     /// Buffered stream bytes. We may keep up to one meta-block's worth
     /// here; trimmed once the bit-position passes complete bytes.
     raw: Vec<u8>,
@@ -1312,13 +1315,8 @@ enum DecState {
 }
 
 impl Decoder {
-    pub fn _take_msgs(&mut self) -> alloc::vec::Vec<alloc::string::String> {
-        core::mem::take(&mut self.dbg_msgs)
-    }
-
     pub fn new() -> Self {
         Self {
-            dbg_msgs: alloc::vec::Vec::new(),
             raw: Vec::new(),
             bit_pos: 0,
             out: Vec::new(),
@@ -1485,20 +1483,6 @@ impl Decoder {
     }
 
     fn try_process_meta_block(&mut self) -> Result<(), Error> {
-        if core::option_env!("BROTLI_DEBUG").is_some() {
-            let s: alloc::string::String = self
-                .raw
-                .iter()
-                .take(12)
-                .map(|b| alloc::format!("{:02x} ", b))
-                .collect();
-            self.dbg_msgs.push(alloc::format!(
-                "try_pmb: bit_pos={}, raw.len()={}, first 12 bytes: {}",
-                self.bit_pos,
-                self.raw.len(),
-                s
-            ));
-        }
         // Clone the raw byte buffer for the duration of this meta-block
         // decode. The decoder mutates `self` (output, ring buffer,
         // p1/p2) while reading bits, and tying the BitSource's lifetime
@@ -1627,14 +1611,6 @@ impl Decoder {
             self.out.len(),
         );
         if let Err(e) = self.decode_compressed_meta_block(&mut src, mlen) {
-            if core::option_env!("BROTLI_DEBUG").is_some() {
-                self.dbg_msgs.push(alloc::format!(
-                    "decode_compressed_meta_block ERR: {:?}, mlen={}, src.position()={}",
-                    e,
-                    mlen,
-                    src.position()
-                ));
-            }
             if e == Error::UnexpectedEnd {
                 // Roll back. The caller will retry with more bytes.
                 self.dist_ring = snap.0;
@@ -2458,63 +2434,21 @@ impl RawDecoder for Decoder {
             return Err(Error::Corrupt);
         }
         let mut written = 0usize;
-        // Why a finish-side loop? raw_decode returns as soon as the
-        // caller's output slice fills, even if there are still meta-blocks
-        // pending in `self.raw`. The caller naturally responds by calling
-        // finish (input is exhausted from their POV). finish then has to
-        // do both: drain queued output AND keep processing any pending
-        // meta-blocks until either output fills again or the stream ends.
-        // The outcome is encoded by `output_full` so we can distinguish
-        // "buffer overflowed, retry" from "genuinely out of input".
-        let mut output_full = false;
-        loop {
-            if self.out_pos < self.out.len() {
-                let drained = self.drain_out_into(&mut output[written..]);
-                written += drained;
-                if written == output.len() {
-                    output_full = true;
-                    break;
-                }
-            }
-            match self.state {
-                DecState::NeedHeader => match self.read_stream_header() {
-                    Ok(true) => {
-                        self.compact_raw();
-                        self.state = DecState::NeedMetaBlock;
-                    }
-                    Ok(false) => break,
-                    Err(e) => return Err(self.poison(e)),
-                },
-                DecState::NeedMetaBlock => match self.process_next_meta_block() {
-                    Ok(true) => {
-                        // Newly-emitted bytes wait in self.out; loop back
-                        // to drain them.
-                    }
-                    Ok(false) => break,
-                    Err(e) => return Err(self.poison(e)),
-                },
-                DecState::Done => {
-                    if self.out_pos >= self.out.len() {
-                        break;
-                    }
-                }
-            }
+        // Drain remaining output first.
+        if self.out_pos < self.out.len() {
+            written = self.drain_out_into(output);
+            self.compact_out();
         }
-        self.compact_out();
-        let fully_done = self.state == DecState::Done && self.out_pos == self.out.len();
-        if fully_done {
+        let done = self.state == DecState::Done && self.out_pos == self.out.len();
+        if done {
             return Ok(RawProgress {
                 consumed: 0,
                 written,
                 done: true,
             });
         }
-        // Three "not fully done" cases:
-        //   1. Output filled — caller should drain and call us again.
-        //   2. State is Done but some bytes still queued — same.
-        //   3. Stream still expects more input but the caller said
-        //      "that's all". That's the real UnexpectedEnd.
-        if output_full || self.state == DecState::Done || self.out_pos < self.out.len() {
+        if self.state == DecState::Done && self.out_pos < self.out.len() {
+            // More output to drain.
             return Ok(RawProgress {
                 consumed: 0,
                 written,
