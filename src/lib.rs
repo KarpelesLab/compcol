@@ -42,5 +42,29 @@ pub mod zlib;
 #[cfg(feature = "gzip")]
 pub mod gzip;
 
+#[cfg(feature = "lzma")]
+pub mod lzma;
+
+#[cfg(feature = "lzma2")]
+pub mod lzma2;
+
+#[cfg(feature = "xz")]
+pub mod xz;
+
+#[cfg(feature = "zstd")]
+pub mod zstd;
+
+#[cfg(feature = "brotli")]
+pub mod brotli;
+
+#[cfg(feature = "lz4")]
+pub mod lz4;
+
+#[cfg(feature = "snappy")]
+pub mod snappy;
+
+#[cfg(feature = "lzw")]
+pub mod lzw;
+
 #[cfg(feature = "factory")]
 pub mod factory;

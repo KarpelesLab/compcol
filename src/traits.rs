@@ -50,6 +50,41 @@ pub trait Decoder {
     fn decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<Progress, Error>;
     fn finish(&mut self, output: &mut [u8]) -> Result<Progress, Error>;
     fn reset(&mut self);
+
+    /// Advance the decompressed stream by up to `n` bytes without emitting
+    /// them.
+    ///
+    /// Useful when a caller knows it doesn't care about a region of the
+    /// decompressed output — for example, listing files in a `.tar.gz`
+    /// without materialising their contents. The default implementation
+    /// just runs [`decode`](Decoder::decode) into a small scratch buffer
+    /// and discards the result; algorithms that can advance their internal
+    /// state faster (e.g. by short-circuiting through stored / uncompressed
+    /// blocks) are encouraged to override.
+    ///
+    /// Returns `Progress` where `consumed` is bytes read from `input`,
+    /// `written` is decompressed bytes actually skipped (≤ `n`), and `done`
+    /// is `false` (skip has the same "stalled when both zero" semantics
+    /// as `decode`).
+    fn skip(&mut self, input: &[u8], n: usize) -> Result<Progress, Error> {
+        let mut scratch = [0u8; 1024];
+        let mut consumed = 0usize;
+        let mut skipped = 0usize;
+        while skipped < n {
+            let want = (n - skipped).min(scratch.len());
+            let p = self.decode(&input[consumed..], &mut scratch[..want])?;
+            consumed += p.consumed;
+            skipped += p.written;
+            if p.consumed == 0 && p.written == 0 {
+                break;
+            }
+        }
+        Ok(Progress {
+            consumed,
+            written: skipped,
+            done: false,
+        })
+    }
 }
 
 /// A compression algorithm: a name plus encoder/decoder factories.

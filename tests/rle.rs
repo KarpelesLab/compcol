@@ -164,6 +164,31 @@ fn truncated_pair_rejected() {
 }
 
 #[test]
+fn skip_via_default_impl_advances_decoded_position() {
+    // Encode "aaabbbcccdddeeefffggg" then skip 9 decompressed bytes and read
+    // the next 6 — should give "dddeee".
+    let input = b"aaabbbcccdddeeefffggg";
+    let mut enc = Encoder::new();
+    let mut buf = [0u8; 64];
+    let mut encoded = Vec::new();
+    let p = enc.encode(input, &mut buf).unwrap();
+    encoded.extend_from_slice(&buf[..p.written]);
+    assert_eq!(p.consumed, input.len());
+    let p = enc.finish(&mut buf).unwrap();
+    encoded.extend_from_slice(&buf[..p.written]);
+    assert!(p.done);
+
+    let mut dec = Decoder::new();
+    // Feed the whole encoded payload and skip the first 9 bytes.
+    let p = dec.skip(&encoded, 9).unwrap();
+    assert_eq!(p.written, 9, "should have skipped 9 bytes");
+    // Continue decoding from where skip left off.
+    let mut out = [0u8; 6];
+    let p2 = dec.decode(&encoded[p.consumed..], &mut out).unwrap();
+    assert_eq!(&out[..p2.written], b"dddeee");
+}
+
+#[test]
 fn reset_clears_state() {
     let mut enc = Encoder::new();
     let mut out = [0u8; 16];

@@ -25,6 +25,24 @@ deflate = ["alloc"]
 zlib    = ["deflate"]
 # RFC 1952 gzip (deflate + CRC-32 + 10-byte header / 8-byte trailer).
 gzip    = ["deflate"]
+# LZMA (Lempel–Ziv–Markov chain). Range-coded, depends on alloc for the
+# probability tables and the LZ window.
+lzma    = ["alloc"]
+# LZMA2 chunked wrapper.
+lzma2   = ["lzma"]
+# xz container around LZMA2 (RFC-style stream/block headers + check codes).
+xz      = ["lzma2"]
+# Zstandard (RFC 8478).
+zstd    = ["alloc"]
+# Brotli (RFC 7932). Carries a 170 KiB built-in static dictionary when fully
+# implemented; expect a fat .rlib once it is.
+brotli  = ["alloc"]
+# LZ4 block format.
+lz4     = ["alloc"]
+# Google Snappy.
+snappy  = ["alloc"]
+# Lempel–Ziv–Welch (Unix compress / GIF).
+lzw     = ["alloc"]
 
 [lints.rust]
 unsafe_code = "forbid"

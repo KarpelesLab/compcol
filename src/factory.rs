@@ -24,6 +24,28 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         crate::zlib::Zlib::NAME => Some(Box::new(<crate::zlib::Zlib as Algorithm>::encoder())),
         #[cfg(feature = "gzip")]
         crate::gzip::Gzip::NAME => Some(Box::new(<crate::gzip::Gzip as Algorithm>::encoder())),
+        #[cfg(feature = "lzma")]
+        crate::lzma::Lzma::NAME => Some(Box::new(<crate::lzma::Lzma as Algorithm>::encoder())),
+        #[cfg(feature = "lzma2")]
+        crate::lzma2::Lzma2::NAME => {
+            Some(Box::new(<crate::lzma2::Lzma2 as Algorithm>::encoder()))
+        }
+        #[cfg(feature = "xz")]
+        crate::xz::Xz::NAME => Some(Box::new(<crate::xz::Xz as Algorithm>::encoder())),
+        #[cfg(feature = "zstd")]
+        crate::zstd::Zstd::NAME => Some(Box::new(<crate::zstd::Zstd as Algorithm>::encoder())),
+        #[cfg(feature = "brotli")]
+        crate::brotli::Brotli::NAME => {
+            Some(Box::new(<crate::brotli::Brotli as Algorithm>::encoder()))
+        }
+        #[cfg(feature = "lz4")]
+        crate::lz4::Lz4::NAME => Some(Box::new(<crate::lz4::Lz4 as Algorithm>::encoder())),
+        #[cfg(feature = "snappy")]
+        crate::snappy::Snappy::NAME => {
+            Some(Box::new(<crate::snappy::Snappy as Algorithm>::encoder()))
+        }
+        #[cfg(feature = "lzw")]
+        crate::lzw::Lzw::NAME => Some(Box::new(<crate::lzw::Lzw as Algorithm>::encoder())),
         _ => None,
     }
 }
@@ -42,6 +64,28 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         crate::zlib::Zlib::NAME => Some(Box::new(<crate::zlib::Zlib as Algorithm>::decoder())),
         #[cfg(feature = "gzip")]
         crate::gzip::Gzip::NAME => Some(Box::new(<crate::gzip::Gzip as Algorithm>::decoder())),
+        #[cfg(feature = "lzma")]
+        crate::lzma::Lzma::NAME => Some(Box::new(<crate::lzma::Lzma as Algorithm>::decoder())),
+        #[cfg(feature = "lzma2")]
+        crate::lzma2::Lzma2::NAME => {
+            Some(Box::new(<crate::lzma2::Lzma2 as Algorithm>::decoder()))
+        }
+        #[cfg(feature = "xz")]
+        crate::xz::Xz::NAME => Some(Box::new(<crate::xz::Xz as Algorithm>::decoder())),
+        #[cfg(feature = "zstd")]
+        crate::zstd::Zstd::NAME => Some(Box::new(<crate::zstd::Zstd as Algorithm>::decoder())),
+        #[cfg(feature = "brotli")]
+        crate::brotli::Brotli::NAME => {
+            Some(Box::new(<crate::brotli::Brotli as Algorithm>::decoder()))
+        }
+        #[cfg(feature = "lz4")]
+        crate::lz4::Lz4::NAME => Some(Box::new(<crate::lz4::Lz4 as Algorithm>::decoder())),
+        #[cfg(feature = "snappy")]
+        crate::snappy::Snappy::NAME => {
+            Some(Box::new(<crate::snappy::Snappy as Algorithm>::decoder()))
+        }
+        #[cfg(feature = "lzw")]
+        crate::lzw::Lzw::NAME => Some(Box::new(<crate::lzw::Lzw as Algorithm>::decoder())),
         _ => None,
     }
 }
@@ -66,6 +110,30 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     }
     if str_eq(name, "gzip") && cfg!(feature = "gzip") {
         return Some("gz");
+    }
+    if str_eq(name, "lzma") && cfg!(feature = "lzma") {
+        return Some("lzma");
+    }
+    if str_eq(name, "lzma2") && cfg!(feature = "lzma2") {
+        return Some("lzma2");
+    }
+    if str_eq(name, "xz") && cfg!(feature = "xz") {
+        return Some("xz");
+    }
+    if str_eq(name, "zstd") && cfg!(feature = "zstd") {
+        return Some("zst");
+    }
+    if str_eq(name, "brotli") && cfg!(feature = "brotli") {
+        return Some("br");
+    }
+    if str_eq(name, "lz4") && cfg!(feature = "lz4") {
+        return Some("lz4");
+    }
+    if str_eq(name, "snappy") && cfg!(feature = "snappy") {
+        return Some("sz");
+    }
+    if str_eq(name, "lzw") && cfg!(feature = "lzw") {
+        return Some("lzw");
     }
     None
 }
@@ -99,5 +167,21 @@ pub const fn names() -> &'static [&'static str] {
         crate::zlib::Zlib::NAME,
         #[cfg(feature = "gzip")]
         crate::gzip::Gzip::NAME,
+        #[cfg(feature = "lzma")]
+        crate::lzma::Lzma::NAME,
+        #[cfg(feature = "lzma2")]
+        crate::lzma2::Lzma2::NAME,
+        #[cfg(feature = "xz")]
+        crate::xz::Xz::NAME,
+        #[cfg(feature = "zstd")]
+        crate::zstd::Zstd::NAME,
+        #[cfg(feature = "brotli")]
+        crate::brotli::Brotli::NAME,
+        #[cfg(feature = "lz4")]
+        crate::lz4::Lz4::NAME,
+        #[cfg(feature = "snappy")]
+        crate::snappy::Snappy::NAME,
+        #[cfg(feature = "lzw")]
+        crate::lzw::Lzw::NAME,
     ]
 }
