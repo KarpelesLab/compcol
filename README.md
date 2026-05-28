@@ -108,11 +108,67 @@ pub trait Algorithm {
 }
 ```
 
-### Streaming a round-trip
+### One-shot helpers (`compcol::vec`)
+
+For callers that already have the whole payload in memory:
+
+```rust
+use compcol::gzip::Gzip;
+use compcol::vec::{compress_to_vec, decompress_to_vec, compress_to_vec_with};
+
+let plain = b"hello world hello world hello world";
+
+let compressed = compress_to_vec::<Gzip>(plain)?;
+let decoded    = decompress_to_vec::<Gzip>(&compressed)?;
+assert_eq!(decoded, plain);
+
+// With explicit config:
+let small = compress_to_vec_with::<Gzip>(
+    plain, compcol::gzip::EncoderConfig { level: 9 },
+)?;
+# Ok::<(), compcol::Error>(())
+```
+
+`compress_to_vec_with` / `decompress_to_vec_with` accept the
+algorithm's `EncoderConfig` / `DecoderConfig` for tuning (level,
+quality, etc.). Available under the `alloc` feature — no `std`
+required.
+
+### Streaming through `std::io` (`compcol::io`)
+
+For files, sockets, or any `Read`/`Write` source. All four
+directions are covered; pick by which side you control and which
+direction the bytes flow.
+
+```rust
+use std::io::{Read, Write};
+use compcol::{Algorithm, gzip::Gzip};
+use compcol::io::{EncoderWriter, DecoderReader};
+
+// Write plaintext, get a compressed file.
+let file = std::fs::File::create("hello.txt.gz")?;
+let mut w = EncoderWriter::new(file, Gzip::encoder());
+w.write_all(b"hello, gzip\n")?;
+let _file = w.finish()?;                  // returns the inner File
+
+// Read a compressed file as if it were plain text.
+let file = std::fs::File::open("hello.txt.gz")?;
+let mut r = DecoderReader::new(file, Gzip::decoder());
+let mut decoded = String::new();
+r.read_to_string(&mut decoded)?;
+# Ok::<(), std::io::Error>(())
+```
+
+`EncoderReader` (compressed source out of a plain reader) and
+`DecoderWriter` (plain output out of a compressed writer) round out
+the set. Writers call `finish` on `Drop` best-effort — call
+`finish()` explicitly to catch errors. Requires the `std` feature.
+
+### Driving the trait directly
 
 ```rust
 use compcol::gzip::{Encoder, Decoder};
-use compcol::{Encoder as _, Decoder as _};
+use compcol::{Encoder as _, Decoder as _, Status};
 
 let input = b"hello world hello world hello world";
 
@@ -120,23 +176,34 @@ let input = b"hello world hello world hello world";
 let mut enc = Encoder::new();
 let mut buf = [0u8; 256];
 let mut encoded = Vec::new();
-
-let p = enc.encode(input, &mut buf).unwrap();
-encoded.extend_from_slice(&buf[..p.written]);
-loop {
-    let p = enc.finish(&mut buf).unwrap();
+let mut consumed = 0;
+while consumed < input.len() {
+    let (p, status) = enc.encode(&input[consumed..], &mut buf).unwrap();
     encoded.extend_from_slice(&buf[..p.written]);
-    if p.done { break; }
+    consumed += p.consumed;
+    if matches!(status, Status::InputEmpty) { break; }
+}
+loop {
+    let (p, status) = enc.finish(&mut buf).unwrap();
+    encoded.extend_from_slice(&buf[..p.written]);
+    if matches!(status, Status::StreamEnd) { break; }
 }
 
 // Decode.
 let mut dec = Decoder::new();
 let mut decoded = Vec::new();
-let p = dec.decode(&encoded, &mut buf).unwrap();
-decoded.extend_from_slice(&buf[..p.written]);
-let p = dec.finish(&mut buf).unwrap();
-decoded.extend_from_slice(&buf[..p.written]);
-assert!(p.done);
+let mut c2 = 0;
+while c2 < encoded.len() {
+    let (p, status) = dec.decode(&encoded[c2..], &mut buf).unwrap();
+    decoded.extend_from_slice(&buf[..p.written]);
+    c2 += p.consumed;
+    if matches!(status, Status::StreamEnd | Status::InputEmpty) { break; }
+}
+loop {
+    let (p, status) = dec.finish(&mut buf).unwrap();
+    decoded.extend_from_slice(&buf[..p.written]);
+    if matches!(status, Status::StreamEnd) { break; }
+}
 assert_eq!(decoded, input);
 ```
 
@@ -264,6 +331,7 @@ all     = ["alloc", "factory",
            "lzo", "lzx", "quantum", "lzfse", "adc",
            "rar1", "rar2", "rar3", "rar5"]
 alloc   = []
+std     = ["alloc"]            # std::io::{Read,Write} adapters in compcol::io
 factory = ["alloc"]            # by-name lookup, returns Box<dyn …>
 rle     = []                   # no_std clean (alloc not required)
 deflate = ["alloc"]
@@ -291,6 +359,12 @@ A bare `--no-default-features` build produces a library with just the
 trait surface — useful for the most constrained embedded targets.
 Adding `rle` gives an algorithm that doesn't need `alloc`. Adding any
 other algorithm feature pulls in `alloc` and the codec.
+
+The `alloc` feature also enables `compcol::vec` (one-shot
+`compress_to_vec` / `decompress_to_vec` helpers). The `std` feature
+adds `compcol::io` (the `Read`/`Write` adapters) plus
+`From<Error> for std::io::Error` so adapter code can use `?`
+freely.
 
 `features = ["all"]` enables every algorithm and is the most ergonomic
 choice when you don't know in advance which formats you'll see.

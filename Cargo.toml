@@ -22,9 +22,14 @@ all = [
     "lzo", "lzx", "quantum", "lzfse", "adc",
     "rar1", "rar2", "rar3", "rar5",
 ]
-# Enables `alloc`-backed conveniences (e.g. the `factory` module). Pulled in
-# automatically by features that require heap allocation.
+# Enables `alloc`-backed conveniences (e.g. the `factory` module, the
+# `compcol::vec` one-shot helpers). Pulled in automatically by features
+# that require heap allocation.
 alloc   = []
+# Enables the `compcol::io` adapters that wrap `std::io::{Read, Write}`
+# around any `Encoder`/`Decoder`, plus `From<Error> for std::io::Error`
+# and `impl std::error::Error for Error`. Pulls in `alloc`.
+std     = ["alloc"]
 # Runtime by-name lookup that returns boxed trait objects. Requires `alloc`.
 factory = ["alloc"]
 # Run-length encoding.

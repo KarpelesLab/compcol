@@ -52,3 +52,20 @@ impl fmt::Display for Error {
         }
     }
 }
+
+// std-only interop. The `std` feature pulls `alloc` and gives us
+// `std::error::Error` plus a free conversion into `std::io::Error` so
+// the streaming adapters in `crate::io` can use `?` on either error
+// type without explicit `.map_err(...)`.
+#[cfg(feature = "std")]
+extern crate std;
+
+#[cfg(feature = "std")]
+impl std::error::Error for Error {}
+
+#[cfg(feature = "std")]
+impl From<Error> for std::io::Error {
+    fn from(e: Error) -> Self {
+        std::io::Error::other(e)
+    }
+}
