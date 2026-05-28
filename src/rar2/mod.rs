@@ -1,6 +1,19 @@
-//! RAR 2.x (1997-2002) — reverse-engineered — decoder-only stub.
+//! RAR 2.x (1997-2002) — reverse-engineered — decoder-only.
 //!
-//! Reference: <https://github.com/MacPaw/XADMaster>.
+//! Reference: The Unarchiver's `XADRAR20Handle` (LGPL — patterns copied,
+//! not code), at <https://github.com/MacPaw/XADMaster>.
+//!
+//! # Format overview
+//!
+//! RAR 2.x is an LZ77 codec with Huffman-coded literal/length/offset
+//! alphabets and an optional per-channel delta-prediction "audio" mode.
+//! Each compressed block carries its Huffman trees via a 19-symbol pretree
+//! plus delta-coded length values; the window is a fixed 1 MiB and offsets
+//! are LRU-tracked across symbols.
+//!
+//! Unlike RAR3/RAR5, the window size and bit format are constants — the
+//! container hands the decoder a raw byte stream and the unpacked length;
+//! everything else is inferred from the bitstream.
 //!
 //! # Encoder is intentionally unsupported
 //!
@@ -10,11 +23,43 @@
 //! decoder-only for that reason. The encoder in this module will
 //! permanently return [`Error::Unsupported`].
 //!
-//! The decoder is currently a stub returning [`Error::Unsupported`];
-//! the real implementation lands in a follow-up.
+//! # Decoder calling convention
+//!
+//! RAR2 streams do not carry an in-band decompressed length, so callers
+//! must supply it out of band:
+//!
+//! ```ignore
+//! use compcol::rar2::Decoder;
+//! use compcol::Decoder as _;
+//!
+//! let mut dec = Decoder::with_unpack_size(unpacked_len as u64);
+//! // feed compressed bytes via `decode(...)`, then drain via `finish(...)`.
+//! ```
+//!
+//! `decode` buffers input but never emits output; once the caller switches
+//! to `finish` the decoder runs the actual decompression in one shot and
+//! drains the result across however many `finish` calls the caller makes.
+//!
+//! # Fixture famine and verification scope
+//!
+//! Genuine RAR2 archives are very rare today and no public test vector
+//! suite exists. Each component (bit reader, Huffman decoder, audio
+//! predictor) is exercised by unit tests against hand-built inputs;
+//! end-to-end integration relies on assembled fixtures that exercise the
+//! literal-only and short-match paths. The audio block, long-match, and
+//! long-distance branches share infrastructure with the literal path but
+//! have not been verified against a known-good real-world RAR2 archive.
 
 use crate::error::Error;
-use crate::traits::{Algorithm, Decoder as DecoderTrait, Encoder as EncoderTrait, Progress};
+use crate::traits::{Algorithm, Encoder as EncoderTrait, Progress};
+
+mod audio;
+mod bitreader;
+mod decoder;
+mod huffman;
+mod tables;
+
+pub use decoder::Decoder;
 
 /// Zero-sized marker type implementing [`Algorithm`] for Rar2.
 #[derive(Debug, Clone, Copy, Default)]
@@ -24,29 +69,24 @@ impl Algorithm for Rar2 {
     const NAME: &'static str = "rar2";
     type Encoder = Encoder;
     type Decoder = Decoder;
-    fn encoder() -> Encoder { Encoder::new() }
-    fn decoder() -> Decoder { Decoder::new() }
+    fn encoder() -> Encoder {
+        Encoder::new()
+    }
+    fn decoder() -> Decoder {
+        Decoder::new()
+    }
 }
 
 /// Permanently-unsupported encoder. See module docs for the licence reason.
 #[derive(Debug, Default)]
 pub struct Encoder;
-impl Encoder { pub const fn new() -> Self { Self } }
+impl Encoder {
+    pub const fn new() -> Self {
+        Self
+    }
+}
 impl EncoderTrait for Encoder {
     fn encode(&mut self, _input: &[u8], _output: &mut [u8]) -> Result<Progress, Error> {
-        Err(Error::Unsupported)
-    }
-    fn finish(&mut self, _output: &mut [u8]) -> Result<Progress, Error> {
-        Err(Error::Unsupported)
-    }
-    fn reset(&mut self) {}
-}
-
-#[derive(Debug, Default)]
-pub struct Decoder;
-impl Decoder { pub const fn new() -> Self { Self } }
-impl DecoderTrait for Decoder {
-    fn decode(&mut self, _input: &[u8], _output: &mut [u8]) -> Result<Progress, Error> {
         Err(Error::Unsupported)
     }
     fn finish(&mut self, _output: &mut [u8]) -> Result<Progress, Error> {
