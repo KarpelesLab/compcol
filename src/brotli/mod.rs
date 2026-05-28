@@ -77,14 +77,85 @@ use encoder_huffman::reverse_bits;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Brotli;
 
+/// Tunables for the brotli encoder.
+///
+/// `quality` follows the reference brotli convention: `0` is fastest /
+/// largest output, `11` is slowest / smallest output. The default `6`
+/// mirrors the reference CLI and is a reasonable starting point. Values
+/// outside `0..=11` are clamped at encoder construction time.
+///
+/// **Known issue**: at every quality level the encoder produces output
+/// that the matching decoder cannot decode once total input exceeds
+/// 128 KiB (the chunk-boundary path has an off-by-one — see BENCH.md).
+/// Stay below 128 KiB per stream to round-trip safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncoderConfig {
+    /// Quality level in `0..=11`. Lower is faster, higher is smaller.
+    pub quality: u8,
+}
+
+impl Default for EncoderConfig {
+    fn default() -> Self {
+        Self { quality: 6 }
+    }
+}
+
+/// Internal expansion of [`EncoderConfig::quality`] into the match-
+/// finder tuning knobs and feature toggles the encoder actually
+/// consults. Higher quality widens the chain budget, raises the
+/// nice-match cutoff, and enables the static-dictionary path.
+#[derive(Debug, Clone, Copy)]
+struct LevelParams {
+    finder: encoder_lz77::FinderParams,
+    /// When `false`, the encoder skips the static-dictionary lookup
+    /// entirely (saves ~80 KiB of working memory + per-position probe
+    /// cost on the lowest quality settings).
+    use_dict: bool,
+}
+
+impl LevelParams {
+    /// Clamp `quality` to `0..=11` and expand to the matching tuning
+    /// knobs. Mirrors the spirit of the reference brotli quality table:
+    /// low quality → shallow chain, no dictionary; high quality → deep
+    /// chain, dictionary references, eager match acceptance.
+    const fn from_quality(quality: u8) -> Self {
+        // Clamp instead of returning Err — keeping the public surface
+        // infallible matches the reference brotli CLI's behaviour.
+        let q = if quality > 11 { 11 } else { quality };
+        // (max_chain, nice_match, use_dict)
+        let (max_chain, nice_match, use_dict) = match q {
+            0 => (2, 8, false),
+            1 => (4, 16, false),
+            2 => (8, 24, false),
+            3 => (16, 32, false),
+            4 => (24, 48, true),
+            5 => (48, 96, true),
+            6 => (64, 128, true),
+            7 => (96, 192, true),
+            8 => (160, 256, true),
+            9 => (256, 384, true),
+            10 => (512, 768, true),
+            // 11 (and clamp-from-above)
+            _ => (1024, 1024, true),
+        };
+        Self {
+            finder: encoder_lz77::FinderParams {
+                max_chain,
+                nice_match,
+            },
+            use_dict,
+        }
+    }
+}
+
 impl Algorithm for Brotli {
     const NAME: &'static str = "brotli";
     type Encoder = Encoder;
     type Decoder = Decoder;
-    type EncoderConfig = ();
+    type EncoderConfig = EncoderConfig;
     type DecoderConfig = ();
-    fn encoder_with(_: ()) -> Encoder {
-        Encoder::new()
+    fn encoder_with(c: EncoderConfig) -> Encoder {
+        Encoder::with_config(c)
     }
     fn decoder_with(_: ()) -> Decoder {
         Decoder::new()
@@ -200,10 +271,22 @@ pub struct Encoder {
     /// Cached identity-transform table (~64 entries). Used together with
     /// `dict_index` during the LZ77 pass.
     id_transforms: Option<Rc<Vec<IdTransform>>>,
+    /// Match-finder tuning + feature toggles derived from
+    /// [`EncoderConfig::quality`]. Persisted across `reset` since
+    /// configuration is meant to survive resets.
+    params: LevelParams,
 }
 
 impl Encoder {
+    /// Build an encoder at the default quality (6).
     pub fn new() -> Self {
+        Self::with_config(EncoderConfig::default())
+    }
+
+    /// Build an encoder with explicit configuration. `config.quality`
+    /// is clamped to `0..=11` internally — out-of-range values are
+    /// snapped to the nearest valid quality rather than rejected.
+    pub fn with_config(config: EncoderConfig) -> Self {
         Self {
             pending: Vec::new(),
             out: Vec::new(),
@@ -215,6 +298,7 @@ impl Encoder {
             prev_total_out: 0,
             dict_index: None,
             id_transforms: None,
+            params: LevelParams::from_quality(config.quality),
         }
     }
 
@@ -264,10 +348,14 @@ impl Encoder {
     fn emit_compressed_block(&mut self, mlen: usize, is_last: bool) {
         debug_assert!((1..=MAX_BLOCK).contains(&mlen));
         debug_assert!(mlen <= self.pending.len());
-        self.ensure_dict_index();
+        // Only pay the (~80 KiB) dictionary-index build cost on
+        // quality tiers that actually consult the dictionary.
+        if self.params.use_dict {
+            self.ensure_dict_index();
+        }
         let payload: Vec<u8> = self.pending.drain(..mlen).collect();
-        let dict_index = self.dict_index.as_ref().unwrap().clone();
-        let id_transforms = self.id_transforms.as_ref().unwrap().clone();
+        let dict_index = self.dict_index.clone();
+        let id_transforms = self.id_transforms.clone();
         encode_meta_block(
             &mut self.bw,
             &mut self.out,
@@ -275,8 +363,9 @@ impl Encoder {
             is_last,
             &mut self.ring,
             self.prev_total_out,
-            &dict_index,
-            &id_transforms,
+            dict_index.as_deref(),
+            id_transforms.as_deref().map(|v| v.as_slice()),
+            self.params,
         );
         self.prev_total_out += mlen as u64;
     }
@@ -398,8 +487,8 @@ impl RawEncoder for Encoder {
         self.seen_any_input = false;
         self.ring = DistRing::new();
         self.prev_total_out = 0;
-        // Keep `dict_index` and `id_transforms` — they're immutable
-        // tables we'd rebuild identically anyway.
+        // Keep `dict_index`, `id_transforms`, and `params` — they're
+        // immutable tables / configuration we'd rebuild identically.
     }
 }
 
@@ -457,11 +546,15 @@ fn distinct_bytes_low(payload: &[u8]) -> usize {
 /// `prev_total_out` is the number of bytes emitted in prior meta-blocks
 /// of the same stream; dictionary references are gated on the per-
 /// command `max_dist`, which depends on the running output total.
+///
+/// When `dict_index` / `id_transforms` are `None` (low quality tiers),
+/// the static-dictionary path is skipped entirely.
 fn lz77_pass(
     payload: &[u8],
-    dict_index: &encoder_dict::DictIndex,
-    id_transforms: &[encoder_dict::IdTransform],
+    dict_index: Option<&encoder_dict::DictIndex>,
+    id_transforms: Option<&[encoder_dict::IdTransform]>,
     prev_total_out: u64,
+    finder_params: encoder_lz77::FinderParams,
 ) -> Vec<LzAtom> {
     use encoder_lz77::{MAX_MATCH, MIN_MATCH, MatchFinder};
     let mut mf = MatchFinder::new();
@@ -471,7 +564,11 @@ fn lz77_pass(
     // entropy (≤ 4 distinct bytes). On such inputs the literal
     // Huffman tree collapses to NSYM=1/2 (≤ 1 bit per literal) and
     // any dict ref's IC+distance overhead is pure loss.
-    let use_dict = distinct_bytes_low(payload) >= 5;
+    //
+    // We also disable it when the caller passed no dictionary index
+    // (low quality tier).
+    let use_dict =
+        dict_index.is_some() && id_transforms.is_some() && distinct_bytes_low(payload) >= 5;
     // We mirror the decoder's `total_out`: it's `prev_total_out` plus
     // the number of input bytes encoded so far in this meta-block. For
     // dictionary references this drives `max_dist` so the chosen
@@ -484,7 +581,7 @@ fn lz77_pass(
 
         // 1) In-window LZ77 match.
         if pos + MIN_MATCH <= payload.len()
-            && let Some((len, dist)) = mf.find_match(payload, pos)
+            && let Some((len, dist)) = mf.find_match(payload, pos, finder_params)
         {
             let len = len.min(MAX_MATCH).min(payload.len() - pos);
             if len >= MIN_MATCH {
@@ -514,8 +611,8 @@ fn lz77_pass(
         };
         if use_dict
             && let Some(dm) = encoder_dict::find_dict_match(
-                dict_index,
-                id_transforms,
+                dict_index.unwrap(),
+                id_transforms.unwrap(),
                 payload,
                 pos,
                 dict_min_emit,
@@ -970,8 +1067,9 @@ fn encode_meta_block(
     is_last: bool,
     ring: &mut DistRing,
     prev_total_out: u64,
-    dict_index: &DictIndex,
-    id_transforms: &[IdTransform],
+    dict_index: Option<&DictIndex>,
+    id_transforms: Option<&[IdTransform]>,
+    level: LevelParams,
 ) {
     let mlen = payload.len() as u32;
     debug_assert!(mlen >= 1 && mlen <= MAX_BLOCK as u32);
@@ -979,7 +1077,13 @@ fn encode_meta_block(
     const WINDOW_SIZE: u32 = 1 << 16;
 
     // 1. Run LZ77 over the payload and build the command stream.
-    let atoms = lz77_pass(payload, dict_index, id_transforms, prev_total_out);
+    let atoms = lz77_pass(
+        payload,
+        dict_index,
+        id_transforms,
+        prev_total_out,
+        level.finder,
+    );
     let cmds = commands_from_atoms(&atoms);
     let enc = plan_commands(&cmds, mlen, ring, prev_total_out, WINDOW_SIZE);
 

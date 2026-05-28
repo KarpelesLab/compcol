@@ -11,6 +11,11 @@
 //!
 //! The window size is fixed at 64 KiB (WBITS=16, max-back-distance =
 //! 65520) to match the encoder's choice of stream header.
+//!
+//! The match-finder's `MAX_CHAIN` (chain depth) and `NICE_MATCH` (early
+//! exit threshold) are not compile-time constants — they're supplied by
+//! the caller as a `FinderParams` and ultimately driven by the encoder's
+//! quality knob.
 
 use alloc::boxed::Box;
 
@@ -32,22 +37,20 @@ const HASH_BITS: u32 = 15;
 const HASH_SIZE: usize = 1 << HASH_BITS;
 const NIL: u32 = u32::MAX;
 
-/// Stop searching once we hit this match length.
-const NICE_MATCH: usize = 128;
-
-/// Maximum chain depth.
-const MAX_CHAIN: usize = 64;
-
-/// Hash four bytes into a 15-bit bucket.
-fn hash4(b0: u8, b1: u8, b2: u8, b3: u8) -> u32 {
-    let v = (b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16) | ((b3 as u32) << 24);
-    // Knuth multiplicative hash, then take top HASH_BITS.
-    v.wrapping_mul(0x9E37_79B1) >> (32 - HASH_BITS)
-}
-
 /// Per-block buffer size — at most this many positions are tracked at
 /// once. The encoder feeds a fresh `MatchFinder` per meta-block.
 pub(crate) const BUFFER_SIZE: usize = 65_536;
+
+/// Tuning knobs for the hash-chain probe. Lower numbers go faster and
+/// produce larger output; higher numbers walk deeper and find longer
+/// matches at higher cost.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FinderParams {
+    /// Maximum number of hash-chain links the finder walks per probe.
+    pub max_chain: usize,
+    /// Length at which the finder stops looking for a longer candidate.
+    pub nice_match: usize,
+}
 
 pub(crate) struct MatchFinder {
     head: Box<[u32; HASH_SIZE]>,
@@ -81,7 +84,12 @@ impl MatchFinder {
 
     /// Find the longest prior occurrence of the bytes starting at `pos`.
     /// Returns Some((length, distance)) with length ≥ MIN_MATCH, or None.
-    pub(crate) fn find_match(&self, buffer: &[u8], pos: usize) -> Option<(usize, usize)> {
+    pub(crate) fn find_match(
+        &self,
+        buffer: &[u8],
+        pos: usize,
+        params: FinderParams,
+    ) -> Option<(usize, usize)> {
         if pos + MIN_MATCH > buffer.len() {
             return None;
         }
@@ -104,7 +112,7 @@ impl MatchFinder {
 
         let mut cur = self.head[idx];
         let mut steps = 0usize;
-        while cur != NIL && steps < MAX_CHAIN {
+        while cur != NIL && steps < params.max_chain {
             let cur_pos = cur as usize;
             if cur_pos >= pos {
                 cur = self.prev[cur_pos];
@@ -130,7 +138,7 @@ impl MatchFinder {
             if len >= MIN_MATCH && len > best_len {
                 best_len = len;
                 best_dist = dist;
-                if best_len >= NICE_MATCH {
+                if best_len >= params.nice_match {
                     break;
                 }
             }
@@ -150,4 +158,11 @@ impl Default for MatchFinder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Hash four bytes into a 15-bit bucket.
+fn hash4(b0: u8, b1: u8, b2: u8, b3: u8) -> u32 {
+    let v = (b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16) | ((b3 as u32) << 24);
+    // Knuth multiplicative hash, then take top HASH_BITS.
+    v.wrapping_mul(0x9E37_79B1) >> (32 - HASH_BITS)
 }
