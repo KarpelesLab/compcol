@@ -18,10 +18,55 @@ use crate::deflate;
 use crate::error::Error;
 use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
 
-/// Canonical "default compression" header, divisible by 31 with CINFO=7,
-/// FDICT=0, FLEVEL=2.
+/// CMF byte with CM=8 (deflate) and CINFO=7 (32 KiB window).
 const HEADER_CMF: u8 = 0x78;
-const HEADER_FLG: u8 = 0x9C;
+
+/// Tunables for the zlib encoder.
+///
+/// `level` controls the speed/ratio trade-off of the inner deflate encoder:
+/// `1` is fastest and produces the largest output, `9` is slowest and produces
+/// the smallest output. The default of `6` mirrors zlib's default. Values
+/// outside `1..=9` are clamped at encoder construction time (matching
+/// deflate's behaviour and zlib's `Z_BEST_*` snap-to-range semantics).
+///
+/// The chosen level is also reflected in the zlib header's two-bit `FLEVEL`
+/// field, per RFC 1950 §2.2:
+/// - level `1`         → FLEVEL = 0 (fastest)
+/// - levels `2..=5`    → FLEVEL = 1 (fast)
+/// - level `6`         → FLEVEL = 2 (default)
+/// - levels `7..=9`    → FLEVEL = 3 (maximum)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncoderConfig {
+    /// Compression level in `1..=9`.
+    pub level: u8,
+}
+
+impl Default for EncoderConfig {
+    fn default() -> Self {
+        Self { level: 6 }
+    }
+}
+
+/// Compute the two zlib header bytes for a given compression level.
+///
+/// Returns `(CMF, FLG)` where FLG is built from `FLEVEL << 6` plus the
+/// FCHECK bits required to make `CMF*256 + FLG` divisible by 31 (RFC 1950
+/// §2.2). FDICT is always 0.
+fn header_bytes(level: u8) -> (u8, u8) {
+    let level = level.clamp(1, 9);
+    let flevel: u8 = match level {
+        1 => 0,
+        2..=5 => 1,
+        6 => 2,
+        _ => 3, // 7..=9
+    };
+    let cmf = HEADER_CMF;
+    // FCHECK = -(CMF*256 + FLEVEL<<6) mod 31, packed into the low 5 bits of FLG.
+    let partial = ((cmf as u32) << 8) | ((flevel as u32) << 6);
+    let fcheck = (31 - (partial % 31)) % 31;
+    let flg = (flevel << 6) | (fcheck as u8);
+    (cmf, flg)
+}
 
 /// Zero-sized marker type implementing [`Algorithm`] for zlib.
 #[derive(Debug, Clone, Copy, Default)]
@@ -31,11 +76,11 @@ impl Algorithm for Zlib {
     const NAME: &'static str = "zlib";
     type Encoder = Encoder;
     type Decoder = Decoder;
-    type EncoderConfig = ();
+    type EncoderConfig = EncoderConfig;
     type DecoderConfig = ();
 
-    fn encoder_with(_: ()) -> Encoder {
-        Encoder::new()
+    fn encoder_with(c: Self::EncoderConfig) -> Encoder {
+        Encoder::with_config(c)
     }
     fn decoder_with(_: ()) -> Decoder {
         Decoder::new()
@@ -270,6 +315,10 @@ enum EncPhase {
 pub struct Encoder {
     inner: deflate::Encoder,
     adler: Adler32,
+    /// The two header bytes (CMF, FLG) we emit at the start of the stream;
+    /// derived from `config.level` at construction time and persisted across
+    /// `reset` so configuration survives.
+    header: [u8; 2],
     header_idx: u8,
     trailer: [u8; 4],
     trailer_idx: u8,
@@ -277,10 +326,22 @@ pub struct Encoder {
 }
 
 impl Encoder {
+    /// Build an encoder at the default compression level (6).
     pub fn new() -> Self {
+        Self::with_config(EncoderConfig::default())
+    }
+
+    /// Build an encoder with explicit configuration. `config.level` is
+    /// clamped to `1..=9` internally and propagated through to the inner
+    /// deflate encoder; the zlib header's FLEVEL bits are set accordingly.
+    pub fn with_config(config: EncoderConfig) -> Self {
+        let (cmf, flg) = header_bytes(config.level);
         Self {
-            inner: deflate::Encoder::new(),
+            inner: deflate::Encoder::with_config(deflate::EncoderConfig {
+                level: config.level,
+            }),
             adler: Adler32::new(),
+            header: [cmf, flg],
             header_idx: 0,
             trailer: [0u8; 4],
             trailer_idx: 0,
@@ -292,11 +353,7 @@ impl Encoder {
     /// Returns true if the header has been fully emitted.
     fn drain_header(&mut self, output: &mut [u8], written: &mut usize) -> bool {
         while self.header_idx < 2 && *written < output.len() {
-            output[*written] = if self.header_idx == 0 {
-                HEADER_CMF
-            } else {
-                HEADER_FLG
-            };
+            output[*written] = self.header[self.header_idx as usize];
             *written += 1;
             self.header_idx += 1;
         }
