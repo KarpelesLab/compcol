@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test & lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      - name: Format
+        if: runner.os == 'Linux' # formatting is platform-independent
+        run: cargo fmt --all --check
+
+      - name: Clippy (all features, warnings denied)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test (all features)
+        run: cargo test --all-features
+
+  no_std:
+    name: no_std builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build bare no_std (no default features, no alloc)
+        run: cargo build --no-default-features
+
+      - name: Build no_std with RLE only (alloc-free algorithm)
+        run: cargo build --no-default-features --features rle
+
+      - name: Build no_std with every algorithm feature
+        run: |
+          cargo build --no-default-features --features \
+            alloc,factory,rle,deflate,zlib,gzip,lzma,lzma2,xz,zstd,brotli,lz4,snappy,lzw
+
+  narrow_clippy:
+    # Catches dead-code lint regressions in the shared bits/checksum/huffman
+    # modules when only a non-deflate-family feature is enabled. (We hit this
+    # during the algorithm-by-algorithm landing; CI guards against
+    # reintroducing it.)
+    name: Clippy on a narrow feature subset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (lz4 only, warnings denied)
+        run: cargo clippy --no-default-features --features lz4 --all-targets -- -D warnings
+
+      - name: Clippy (zstd only, warnings denied)
+        run: cargo clippy --no-default-features --features zstd --all-targets -- -D warnings
+
+  docs:
+    name: Docs build (warnings denied)
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings -D rustdoc::broken-intra-doc-links
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo doc --no-deps --all-features
+        run: cargo doc --no-deps --all-features

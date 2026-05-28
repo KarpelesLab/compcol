@@ -36,7 +36,7 @@
 //! - **Content_Checksum_Flag** in the Frame_Header. The 4-byte trailer is the
 //!   low 32 bits of XXH64 over the decompressed data; we do not ship an
 //!   XXH64 implementation, so any frame that advertises a content checksum
-//!   is refused with [`Error::Unsupported`].
+//!   is refused with [`crate::Error::Unsupported`].
 //!
 //! - **Skippable_Frame** magic numbers (`0x184D2A50..=0x184D2A5F`) are
 //!   detected and rejected as unsupported rather than silently skipped.

@@ -24,7 +24,7 @@
 //! on the next call. This keeps the per-call buffers small while preserving
 //! the streaming `consumed`/`written` contract from `traits.rs`.
 //!
-//! The encoder lives in [`encoder`]. It accumulates input into a buffer and
+//! The encoder lives in the private `encoder` submodule. It accumulates input into a buffer and
 //! emits the entire compressed stream on `finish` — LZMA's range coder
 //! prevents a true byte-streaming output, and full-buffer encoding is by far
 //! the simplest correct strategy.

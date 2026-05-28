@@ -1,0 +1,79 @@
+name: Release-plz
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  # Open/update the release PR and create GitHub Releases.
+  contents: write
+  pull-requests: write
+  # `gh workflow run release-binaries.yml` (workflow_dispatch) needs this even
+  # with GITHUB_TOKEN.
+  actions: write
+
+# Don't run two release-plz jobs in parallel.
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-plz-release:
+    name: Release-plz release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz
+        id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      # release-plz creates the GitHub Release with the workflow's GITHUB_TOKEN.
+      # GitHub suppresses downstream workflow triggers for GITHUB_TOKEN-created
+      # events (anti-recursion), so `release: published` doesn't fire.
+      # workflow_dispatch is the exception — chain into release-binaries here.
+      - name: Trigger release-binaries for each new release
+        if: ${{ steps.release-plz.outputs.releases_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          # release-plz emits `.releases[].tag`; see
+          # https://release-plz.dev/docs/github/output for the schema.
+          echo "$RELEASES" | jq -r '.[].tag' | while read -r tag; do
+            if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+              continue
+            fi
+            echo "Dispatching release-binaries for $tag"
+            gh workflow run release-binaries.yml -f tag="$tag"
+          done
+
+  release-plz-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

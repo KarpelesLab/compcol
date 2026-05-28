@@ -4,7 +4,7 @@
 //! splice that position into the per-3-byte hash chain, then optionally
 //! calls [`MatchFinder::find_match`] to find the longest prior occurrence of
 //! the next 3+ bytes within the deflate window (32 KiB). The chain walk is
-//! bounded by [`MAX_CHAIN`] steps.
+//! bounded by `MAX_CHAIN` steps.
 
 use alloc::boxed::Box;
 

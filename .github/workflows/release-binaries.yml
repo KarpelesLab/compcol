@@ -1,0 +1,158 @@
+name: Release binaries
+
+# Fires whenever a GitHub Release is published. release-plz creates the
+# release on its own (see release-plz.yml); this workflow attaches the
+# cross-built CLI binary.
+#
+# Also exposed via workflow_dispatch so a failed asset upload can be
+# retried against an existing release without re-tagging.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to upload to (e.g. v0.0.3)"
+        required: true
+        type: string
+
+permissions:
+  # gh release upload needs to attach assets.
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Resolve the target tag once — `release` and `workflow_dispatch` use
+  # different paths in the event payload.
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            asset_suffix: linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            asset_suffix: linux-aarch64
+            apt_packages: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            asset_suffix: windows-x86_64
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            asset_suffix: windows-aarch64
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install cross compiler (Linux aarch64)
+        if: matrix.apt_packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_packages }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build CLI (all algorithms enabled)
+        shell: bash
+        env:
+          # Only set the linker env var when the matrix entry asks for one.
+          # GitHub Actions silently drops empty `env:` values, so this is
+          # a no-op for the native targets.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+        run: |
+          cargo build --release --bin compcol --all-features --target ${{ matrix.target }}
+
+      - name: Stage archive contents
+        shell: bash
+        run: |
+          mkdir -p staging/bin
+          cp README.md LICENSE staging/
+          td="target/${{ matrix.target }}/release"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "$td/compcol.exe" staging/bin/
+          else
+            cp "$td/compcol" staging/bin/
+          fi
+          ls -R staging
+
+      - name: Pack archive
+        id: pack
+        shell: bash
+        run: |
+          name="compcol-${TAG}-${{ matrix.asset_suffix }}"
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            asset="${name}.zip"
+            (cd staging && 7z a "../${asset}" *)
+          else
+            asset="${name}.tar.gz"
+            tar -C staging -czf "${asset}" .
+          fi
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${TAG}" "${{ steps.pack.outputs.asset }}" --clobber
+
+  build-macos-universal:
+    name: build macos universal
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-universal
+
+      - name: Build both Apple slices
+        run: |
+          for t in x86_64-apple-darwin aarch64-apple-darwin; do
+            cargo build --release --bin compcol --all-features --target "$t"
+          done
+
+      - name: Lipo into universal artifact
+        run: |
+          mkdir -p staging/bin
+          lipo -create -output staging/bin/compcol \
+            target/x86_64-apple-darwin/release/compcol \
+            target/aarch64-apple-darwin/release/compcol
+          cp README.md LICENSE staging/
+          file staging/bin/compcol
+
+      - name: Pack archive
+        id: pack
+        run: |
+          asset="compcol-${TAG}-macos-universal.tar.gz"
+          tar -C staging -czf "${asset}" .
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${TAG}" "${{ steps.pack.outputs.asset }}" --clobber

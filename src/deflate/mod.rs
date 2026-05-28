@@ -1,6 +1,6 @@
 //! RFC 1951 deflate.
 //!
-//! Streaming encoder + decoder behind a shared [`Algorithm`](crate::Algorithm)
+//! Streaming encoder + decoder behind a shared [`crate::Algorithm`]
 //! implementation. The encoder uses LZ77 (hash-chain match finder, lazy
 //! matching) followed by length-limited dynamic Huffman coding via the
 //! Larmore–Hirschberg package-merge algorithm. The decoder handles all

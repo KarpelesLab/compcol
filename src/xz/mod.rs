@@ -22,8 +22,8 @@
 //! (uncompressed + dictionary reset), `0x02` (uncompressed, no reset),
 //! and `0x80..=0xFF` (LZMA-compressed, with the spec's full matrix of
 //! state/properties/dictionary reset flags). The compressed-chunk
-//! decoder is in [`lzma2_decoder`] and is adapted from this crate's
-//! `lzma` module.
+//! decoder is in the private `lzma2_decoder` submodule and is adapted
+//! from this crate's `lzma` module.
 //!
 //! The encoder emits LZMA-compressed LZMA2 chunks (control byte
 //! `0xE0` — compressed, with dictionary + properties + state reset on
@@ -31,9 +31,10 @@
 //! compression would expand a chunk relative to its uncompressed
 //! input — which happens on already-random or already-compressed
 //! data — we fall back to an uncompressed chunk (control byte `0x01`).
-//! Real LZMA-compressed output is produced by [`lzma2_encoder`], which is
-//! a port of the `.lzma` encoder in `src/lzma/` adapted to emit a raw
-//! range-coded body (no header, no EOS marker).
+//! Real LZMA-compressed output is produced by the private
+//! `lzma2_encoder` submodule, which is a port of the `.lzma` encoder in
+//! `src/lzma/` adapted to emit a raw range-coded body (no header, no
+//! EOS marker).
 //!
 //! No dependency on the sibling `lzma` / `lzma2` modules: the small amount of
 //! LZMA2 framing we need (control byte, big-endian 16-bit size) and the
