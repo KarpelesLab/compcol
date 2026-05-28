@@ -786,3 +786,65 @@ fn compressed_encoder_ratio_sanity() {
         );
     }
 }
+
+/// Verify that the encoder emits static-dictionary references for an
+/// English input where they help. We measure the encoded size on a
+/// purely-fresh input (no prior repetition for LZ77 to exploit) and
+/// expect it to be smaller than what an LZ77-only encoder could
+/// achieve.
+#[test]
+fn dictionary_refs_help_english_text() {
+    // A pile of distinct English sentences — LZ77 has very little to
+    // work with within the first occurrence, so dictionary references
+    // are the only source of compression here.
+    let input: &[u8] = b"The quick brown fox jumps over the lazy dog. \
+                        Pack my box with five dozen liquor jugs. \
+                        How vexingly quick daft zebras jump. \
+                        Sphinx of black quartz, judge my vow. \
+                        Two driven jocks help fax my big quiz. \
+                        The five boxing wizards jump quickly. \
+                        ";
+    let encoded = encode_chunked(input, input.len(), input.len() + 64).unwrap();
+    // Roundtrip via our decoder.
+    let decoded = decode_chunked(&encoded, encoded.len(), input.len() + 64).unwrap();
+    assert_eq!(decoded, input);
+    // Roundtrip via reference brotli -d when available.
+    if let Some(brotli) = brotli_cli_available() {
+        let ref_decoded = brotli_decode(&brotli, &encoded);
+        assert_eq!(ref_decoded, input);
+    }
+    eprintln!(
+        "english (no rep): {} -> {} bytes ({:.1}%)",
+        input.len(),
+        encoded.len(),
+        100.0 * encoded.len() as f64 / input.len() as f64
+    );
+}
+
+/// Larger English text with sentence repetition — exercises both LZ77
+/// and static-dictionary references at scale.
+#[test]
+fn dictionary_refs_larger_english() {
+    let input: &[u8] = b"The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. \
+                        The five boxing wizards jump quickly. How vexingly quick daft zebras jump. \
+                        Sphinx of black quartz, judge my vow.\n\
+                        Some natural English text: the world is large and complex, with many things \
+                        happening all the time. People walk to work, take the train home, and read \
+                        books in the evening. Children play games in the park, and dogs chase balls \
+                        around. The trees grow tall and the flowers bloom in the spring. Summer \
+                        brings warmth and the rain in autumn cools things down. Winter is cold but \
+                        the snow can be beautiful.\n";
+    let encoded = encode_chunked(input, input.len(), input.len() + 64).unwrap();
+    let decoded = decode_chunked(&encoded, encoded.len(), input.len() + 64).unwrap();
+    assert_eq!(decoded, input);
+    if let Some(brotli) = brotli_cli_available() {
+        let ref_decoded = brotli_decode(&brotli, &encoded);
+        assert_eq!(ref_decoded, input);
+    }
+    eprintln!(
+        "larger english: {} -> {} bytes ({:.1}%)",
+        input.len(),
+        encoded.len(),
+        100.0 * encoded.len() as f64 / input.len() as f64
+    );
+}

@@ -10,9 +10,13 @@
 //!   (NPOSTFIX = 0, NDIRECT = 0). Real LZ77 matches are found via a
 //!   hash-chain match finder; insert-and-copy commands use the full
 //!   704-symbol IC alphabet; Huffman trees are built from frequencies
-//!   via the length-limited package-merge algorithm. The encoder does
-//!   not yet exploit the static dictionary or emit multiple block
-//!   types — those land in the "roof" tier of the spec implementation.
+//!   via the length-limited package-merge algorithm. **Static-dictionary
+//!   references** are emitted via [`encoder_dict::DictIndex`] when a
+//!   dictionary word (with one of the Identity or UppercaseFirst-ASCII
+//!   transforms) sits at the current input position and would beat the
+//!   in-window LZ77 match. The encoder still does not exploit multiple
+//!   block types or context modelling on the literal/distance side —
+//!   those would push us into the "roof" tier of the spec.
 //!
 //! - **Decoder**: parses the stream header, walks the meta-block chain,
 //!   and decodes:
@@ -42,8 +46,9 @@
 //!
 //! - The large-window flag (WBITS first bit = 1, next 3 bits = 0,
 //!   next 3 bits = 1) is rejected as `Unsupported`.
-//! - Encoder-side static dictionary references (decoder handles them).
 //! - Encoder-side multiple block types or non-trivial context maps.
+//! - Encoder-side static-dictionary transforms beyond `Identity` /
+//!   `UppercaseFirst` (ASCII). The decoder handles all 121 transforms.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -53,15 +58,19 @@ use crate::traits::{Algorithm, Decoder as DecoderTrait, Encoder as EncoderTrait,
 
 mod context;
 mod dictionary;
+mod encoder_dict;
 mod encoder_huffman;
 mod encoder_iac;
 mod encoder_lz77;
 mod huffman;
 mod transforms;
 
+use alloc::rc::Rc;
+
 use context::ContextMode;
 use huffman::{BitSource, HuffmanDecoder};
 
+use encoder_dict::{DictIndex, IdTransform};
 use encoder_huffman::reverse_bits;
 
 /// Zero-sized marker type implementing [`Algorithm`] for Brotli.
@@ -179,6 +188,16 @@ pub struct Encoder {
     /// Distance ring buffer, persistent across meta-blocks within a
     /// single stream — must mirror the decoder's view.
     ring: DistRing,
+    /// Total bytes ever emitted across all completed meta-blocks of
+    /// this stream. Mirrors the decoder's `total_out` and is used to
+    /// compute `max_dist` for static-dictionary references.
+    prev_total_out: u64,
+    /// Lazily built static-dictionary index for encoder-side dictionary
+    /// references. The index is ~80 KiB and is reused across meta-blocks.
+    dict_index: Option<Rc<DictIndex>>,
+    /// Cached identity-transform table (~64 entries). Used together with
+    /// `dict_index` during the LZ77 pass.
+    id_transforms: Option<Rc<Vec<IdTransform>>>,
 }
 
 impl Encoder {
@@ -191,6 +210,21 @@ impl Encoder {
             stage: EncStage::NeedHeader,
             seen_any_input: false,
             ring: DistRing::new(),
+            prev_total_out: 0,
+            dict_index: None,
+            id_transforms: None,
+        }
+    }
+
+    /// Build (or reuse) the dictionary index and identity-transform
+    /// table. Both are cached on the encoder so multi-meta-block streams
+    /// pay the build cost once.
+    fn ensure_dict_index(&mut self) {
+        if self.dict_index.is_none() {
+            self.dict_index = Some(Rc::new(DictIndex::build()));
+        }
+        if self.id_transforms.is_none() {
+            self.id_transforms = Some(Rc::new(encoder_dict::identity_transforms()));
         }
     }
 
@@ -228,14 +262,21 @@ impl Encoder {
     fn emit_compressed_block(&mut self, mlen: usize, is_last: bool) {
         debug_assert!((1..=MAX_BLOCK).contains(&mlen));
         debug_assert!(mlen <= self.pending.len());
+        self.ensure_dict_index();
         let payload: Vec<u8> = self.pending.drain(..mlen).collect();
+        let dict_index = self.dict_index.as_ref().unwrap().clone();
+        let id_transforms = self.id_transforms.as_ref().unwrap().clone();
         encode_meta_block(
             &mut self.bw,
             &mut self.out,
             &payload,
             is_last,
             &mut self.ring,
+            self.prev_total_out,
+            &dict_index,
+            &id_transforms,
         );
+        self.prev_total_out += mlen as u64;
     }
 
     /// Pre-emit any complete-and-not-possibly-last blocks. We keep the
@@ -354,59 +395,189 @@ impl EncoderTrait for Encoder {
         self.stage = EncStage::NeedHeader;
         self.seen_any_input = false;
         self.ring = DistRing::new();
+        self.prev_total_out = 0;
+        // Keep `dict_index` and `id_transforms` — they're immutable
+        // tables we'd rebuild identically anyway.
     }
 }
 
 // ─── encoder helpers (compressed meta-block emission) ───────────────────
 
-/// Per-position output of the LZ77 pass: a literal byte or a back-
-/// reference match.
+/// Per-position output of the LZ77 pass: a literal byte, a back-
+/// reference match, or a static-dictionary reference.
 #[derive(Clone, Copy)]
 enum LzAtom {
     Literal(u8),
-    Match { len: u32, dist: u32 },
+    Match {
+        len: u32,
+        dist: u32,
+    },
+    Dict {
+        /// Dictionary word length (4..=24); goes into the IC `copy_len`
+        /// field. This is the value the decoder will see; the actual
+        /// number of input bytes consumed is `emit_len` and may differ.
+        word_len: u8,
+        /// In-bucket word index.
+        word_idx: u32,
+        /// Transform id, in 0..121.
+        transform_id: u8,
+        /// Input bytes consumed by this dictionary reference (= prefix
+        /// length + word length + suffix length for identity transforms).
+        emit_len: u32,
+    },
 }
 
-/// LZ77 pass over the payload. Produces a sequence of literals and
-/// matches in input order. Uses the hash-chain finder from
-/// `encoder_lz77`. Skipping is conservative: we insert into the hash
-/// chain at every position, including those covered by an emitted
-/// match.
-fn lz77_pass(payload: &[u8]) -> Vec<LzAtom> {
+/// Count distinct literal bytes in `payload` (capped at 32 — we only
+/// need a rough proxy for "literal entropy is high enough to make
+/// dictionary references pay off").
+fn distinct_bytes_low(payload: &[u8]) -> usize {
+    let mut seen = [false; 256];
+    let mut n = 0usize;
+    for &b in payload {
+        let s = &mut seen[b as usize];
+        if !*s {
+            *s = true;
+            n += 1;
+            if n >= 32 {
+                return n;
+            }
+        }
+    }
+    n
+}
+
+/// LZ77 pass over the payload. Produces a sequence of literals,
+/// in-window matches, and static-dictionary references in input order.
+///
+/// At each position we consider both a real LZ77 match (via the
+/// hash-chain finder) and a static-dictionary reference (via
+/// [`encoder_dict::find_dict_match`]). The longer winner is emitted.
+/// `prev_total_out` is the number of bytes emitted in prior meta-blocks
+/// of the same stream; dictionary references are gated on the per-
+/// command `max_dist`, which depends on the running output total.
+fn lz77_pass(
+    payload: &[u8],
+    dict_index: &encoder_dict::DictIndex,
+    id_transforms: &[encoder_dict::IdTransform],
+    prev_total_out: u64,
+) -> Vec<LzAtom> {
     use encoder_lz77::{MAX_MATCH, MIN_MATCH, MatchFinder};
     let mut mf = MatchFinder::new();
     let mut out: Vec<LzAtom> = Vec::with_capacity(payload.len());
     let mut pos = 0usize;
+    // Disable dict-ref matching for inputs with very low literal
+    // entropy (≤ 4 distinct bytes). On such inputs the literal
+    // Huffman tree collapses to NSYM=1/2 (≤ 1 bit per literal) and
+    // any dict ref's IC+distance overhead is pure loss.
+    let use_dict = distinct_bytes_low(payload) >= 5;
+    // We mirror the decoder's `total_out`: it's `prev_total_out` plus
+    // the number of input bytes encoded so far in this meta-block. For
+    // dictionary references this drives `max_dist` so the chosen
+    // distance survives the magnitude comparison against `max_dist`.
     while pos < payload.len() {
         mf.insert(payload, pos);
+
+        let mut best_len: usize = 0;
+        let mut best_atom: Option<LzAtom> = None;
+
+        // 1) In-window LZ77 match.
         if pos + MIN_MATCH <= payload.len()
             && let Some((len, dist)) = mf.find_match(payload, pos)
         {
-            // Cap copy length so we don't run off the end (LZ77 stays
-            // within the input buffer; the decoder accepts any
-            // representable copy length).
             let len = len.min(MAX_MATCH).min(payload.len() - pos);
-            // Make sure the match is at least MIN_MATCH after capping.
             if len >= MIN_MATCH {
-                out.push(LzAtom::Match {
+                best_len = len;
+                best_atom = Some(LzAtom::Match {
                     len: len as u32,
                     dist: dist as u32,
                 });
-                // Splice every covered position into the hash chain.
-                for j in 1..len {
-                    let p = pos + j;
-                    if p + MIN_MATCH <= payload.len() {
-                        mf.insert(payload, p);
-                    }
-                }
-                pos += len;
-                continue;
             }
         }
+
+        // 2) Static-dictionary reference. Dictionary distances live in
+        //    the upper end of the 64-symbol alphabet (typically dcode
+        //    20..63 with 4..24 extra bits each), so a dict ref's full
+        //    cost is meaningfully higher than an in-window match's.
+        //
+        //    Heuristic: only consider dict refs when emitted length is
+        //    long enough to amortise the distance-code cost (≥ 5 bytes
+        //    with no LZ77 alternative, or ≥ best_len + 3 when LZ77
+        //    found something). The `use_dict` flag further skips
+        //    extremely low-entropy inputs (e.g. all-zeros) where any
+        //    literal is already nearly free.
+        let dict_min_emit = if best_len >= 4 {
+            (best_len + 3) as u32
+        } else {
+            6u32
+        };
+        if use_dict
+            && let Some(dm) = encoder_dict::find_dict_match(
+                dict_index,
+                id_transforms,
+                payload,
+                pos,
+                dict_min_emit,
+            )
+        {
+            // Make sure the encoded distance for this dictionary
+            // reference is going to survive the decoder's
+            // `distance <= max_dist` check.
+            let total_out_at_pos: u64 = prev_total_out + pos as u64;
+            let max_dist: u64 = core::cmp::min((1u64 << 16) - 16, total_out_at_pos);
+            // Compute the dictionary distance value we'd emit.
+            // distance = max_dist + 1 + word_idx + (transform_id << nwords_bits)
+            let len = dm.word_len as usize;
+            let nwords_bits = dictionary::SIZE_BITS_BY_LENGTH[len] as u32;
+            let off = (dm.word_idx as u64) | ((dm.transform_id as u64) << nwords_bits);
+            let distance = max_dist + 1 + off;
+            // Must be representable by the 64-symbol distance alphabet
+            // (NPOSTFIX=0, NDIRECT=0): max distance ≈ 67 M.
+            if distance <= u32::MAX as u64 && distance > 0 && (dm.emit_len as usize) > best_len {
+                best_len = dm.emit_len as usize;
+                best_atom = Some(LzAtom::Dict {
+                    word_len: dm.word_len,
+                    word_idx: dm.word_idx,
+                    transform_id: dm.transform_id,
+                    emit_len: dm.emit_len,
+                });
+            }
+        }
+
+        if let Some(atom) = best_atom {
+            // Splice every covered position into the hash chain.
+            for j in 1..best_len {
+                let p = pos + j;
+                if p + MIN_MATCH <= payload.len() {
+                    mf.insert(payload, p);
+                }
+            }
+            out.push(atom);
+            pos += best_len;
+            continue;
+        }
+
         out.push(LzAtom::Literal(payload[pos]));
         pos += 1;
     }
     out
+}
+
+/// What kind of copy the command carries.
+#[derive(Clone, Copy)]
+enum CopyKind {
+    /// No copy at all (only the last command can have this).
+    None,
+    /// Normal back-reference. `distance` is the back-distance in bytes.
+    Backref { distance: u32 },
+    /// Static-dictionary reference. The encoder will compute the actual
+    /// distance value at command-emit time using the running `total_out`
+    /// to derive `max_dist`. `emit_len` is the number of input bytes
+    /// consumed (used to advance the cursor, not the `copy_len` field).
+    Dict {
+        word_idx: u32,
+        transform_id: u8,
+        emit_len: u32,
+    },
 }
 
 /// Convert the per-position LZ77 stream into brotli commands. Each
@@ -414,9 +585,11 @@ fn lz77_pass(payload: &[u8]) -> Vec<LzAtom> {
 /// possibly the last) by a copy.
 struct Command {
     insert: Vec<u8>,
+    /// For Backref commands: copy length in bytes. For Dict commands:
+    /// the dictionary word length (4..=24). Both end up in the IC
+    /// command's copy-length field.
     copy_len: u32,
-    distance: u32, // 0 if this command has no copy (last-only-literals case)
-    has_copy: bool,
+    kind: CopyKind,
 }
 
 fn commands_from_atoms(atoms: &[LzAtom]) -> Vec<Command> {
@@ -429,8 +602,23 @@ fn commands_from_atoms(atoms: &[LzAtom]) -> Vec<Command> {
                 cmds.push(Command {
                     insert: core::mem::take(&mut pending),
                     copy_len: len,
-                    distance: dist,
-                    has_copy: true,
+                    kind: CopyKind::Backref { distance: dist },
+                });
+            }
+            LzAtom::Dict {
+                word_len,
+                word_idx,
+                transform_id,
+                emit_len,
+            } => {
+                cmds.push(Command {
+                    insert: core::mem::take(&mut pending),
+                    copy_len: word_len as u32,
+                    kind: CopyKind::Dict {
+                        word_idx,
+                        transform_id,
+                        emit_len,
+                    },
                 });
             }
         }
@@ -439,8 +627,7 @@ fn commands_from_atoms(atoms: &[LzAtom]) -> Vec<Command> {
         cmds.push(Command {
             insert: pending,
             copy_len: 0,
-            distance: 0,
-            has_copy: false,
+            kind: CopyKind::None,
         });
     }
     cmds
@@ -558,7 +745,19 @@ struct CmdEncoding {
 /// to use a short distance code, etc. Mutates the supplied ring buffer
 /// in-place so the encoder's view tracks the decoder's view across
 /// meta-block boundaries.
-fn plan_commands(cmds: &[Command], mlen: u32, ring: &mut DistRing) -> CmdEncoding {
+///
+/// `prev_total_out` is the number of bytes already emitted in prior
+/// meta-blocks of this stream. The encoder uses it together with the
+/// running per-meta-block emission count to compute `max_dist`, which
+/// determines the distance value for static-dictionary references and
+/// must agree exactly with what the decoder computes.
+fn plan_commands(
+    cmds: &[Command],
+    mlen: u32,
+    ring: &mut DistRing,
+    prev_total_out: u64,
+    window_size: u32,
+) -> CmdEncoding {
     use encoder_iac::{copy_to_code, distance_to_normal_code, ic_command_sym, insert_to_code};
 
     let mut enc = CmdEncoding {
@@ -577,74 +776,82 @@ fn plan_commands(cmds: &[Command], mlen: u32, ring: &mut DistRing) -> CmdEncodin
         // command), we still need to pick a copy code (the decoder
         // reads its extra bits even if the copy is then skipped).
         // Use copy code 0 (copy_len base 2, zero extra bits).
-        let (copy_code, copy_eb, copy_ev, use_last_dist, dist_enc) = if c.has_copy {
-            let (cc, ceb, cev) = copy_to_code(c.copy_len);
-            // Pick distance encoding. The use_last shortcut requires
-            // ins_code < 8 AND copy_code < 16, since only IC cells 0
-            // and 1 support use_last_dist=true. For larger inserts or
-            // copies, we must use the explicit distance encoding even
-            // if the distance happens to match the ring buffer.
-            let can_use_last = ins_code < 8 && cc < 16;
-            let short = ring.try_short_code(c.distance);
-            match short {
-                Some(0) if can_use_last => {
-                    // use_last_dist=true. No ring update (per §4 code 0).
-                    (cc, ceb, cev, true, None)
-                }
-                Some(0) => {
-                    // The IC cell forbids use_last_dist=true (ins_code
-                    // >= 8 or copy_code >= 16). Emit distance code 0
-                    // explicitly — the decoder resolves it to last_dist
-                    // and does NOT push to the ring (§4 code 0).
-                    (cc, ceb, cev, false, Some((0u32, 0u32, 0u32)))
-                }
-                Some(code) => {
-                    // Short code 1..=15. Pushes to the ring.
-                    ring.push(c.distance as i32);
-                    (cc, ceb, cev, false, Some((code, 0, 0)))
-                }
-                None => {
-                    let (dcode, ndistbits, dextra) =
-                        distance_to_normal_code(c.distance).expect("encodable distance");
-                    ring.push(c.distance as i32);
-                    (cc, ceb, cev, false, Some((dcode, ndistbits, dextra)))
+        let (copy_code, copy_eb, copy_ev, use_last_dist, dist_enc) = match c.kind {
+            CopyKind::Backref { distance } => {
+                let (cc, ceb, cev) = copy_to_code(c.copy_len);
+                // Pick distance encoding. The use_last shortcut requires
+                // ins_code < 8 AND copy_code < 16, since only IC cells 0
+                // and 1 support use_last_dist=true. For larger inserts or
+                // copies, we must use the explicit distance encoding even
+                // if the distance happens to match the ring buffer.
+                let can_use_last = ins_code < 8 && cc < 16;
+                let short = ring.try_short_code(distance);
+                match short {
+                    Some(0) if can_use_last => {
+                        // use_last_dist=true. No ring update (per §4 code 0).
+                        (cc, ceb, cev, true, None)
+                    }
+                    Some(0) => {
+                        // The IC cell forbids use_last_dist=true. Emit
+                        // distance code 0 explicitly — the decoder
+                        // resolves it to last_dist and does NOT push
+                        // to the ring (§4 code 0).
+                        (cc, ceb, cev, false, Some((0u32, 0u32, 0u32)))
+                    }
+                    Some(code) => {
+                        // Short code 1..=15. Pushes to the ring.
+                        ring.push(distance as i32);
+                        (cc, ceb, cev, false, Some((code, 0, 0)))
+                    }
+                    None => {
+                        let (dcode, ndistbits, dextra) =
+                            distance_to_normal_code(distance).expect("encodable distance");
+                        ring.push(distance as i32);
+                        (cc, ceb, cev, false, Some((dcode, ndistbits, dextra)))
+                    }
                 }
             }
-        } else {
-            // No copy. Pick any valid (copy_code, use_last) such that
-            // the resulting IC cmd is valid. The decoder breaks out
-            // of the loop before reading any distance once `emitted >=
-            // mlen`, so we don't write a distance regardless of
-            // use_last.
-            if ins_code < 8 {
-                (0, 0, 0, true, None)
-            } else {
-                // use_last_dist=false (we must, since cells 0/1 are
-                // out of range). Distance not emitted.
-                (0, 0, 0, false, None)
+            CopyKind::Dict {
+                word_idx,
+                transform_id,
+                ..
+            } => {
+                // Dictionary references: `copy_len` here is the word
+                // length (4..=24). The decoder will interpret the
+                // command's copy field as the word length to look up
+                // in the dictionary. We must emit an explicit distance
+                // (no use_last_dist, no short code), and that distance
+                // must be `> max_dist` at the decoder's read time.
+                let (cc, ceb, cev) = copy_to_code(c.copy_len);
+                let total_out_at_cmd: u64 = prev_total_out + emitted as u64 + insert_len as u64;
+                let max_dist: u64 =
+                    core::cmp::min(window_size.saturating_sub(16) as u64, total_out_at_cmd);
+                let nwords_bits = dictionary::SIZE_BITS_BY_LENGTH[c.copy_len as usize] as u32;
+                let off = (word_idx as u64) | ((transform_id as u64) << nwords_bits);
+                let distance: u64 = max_dist + 1 + off;
+                debug_assert!(distance <= u32::MAX as u64, "dictionary distance overflow");
+                let (dcode, ndistbits, dextra) =
+                    distance_to_normal_code(distance as u32).expect("encodable dict distance");
+                // Dictionary refs DO NOT push onto the ring buffer
+                // (per the decoder side).
+                (cc, ceb, cev, false, Some((dcode, ndistbits, dextra)))
+            }
+            CopyKind::None => {
+                // No copy. Pick any valid (copy_code, use_last) such that
+                // the resulting IC cmd is valid. The decoder breaks out
+                // of the loop before reading any distance once `emitted >=
+                // mlen`, so we don't write a distance regardless of
+                // use_last.
+                if ins_code < 8 {
+                    (0, 0, 0, true, None)
+                } else {
+                    // use_last_dist=false (cells 0/1 are out of range).
+                    (0, 0, 0, false, None)
+                }
             }
         };
 
-        // Determine the IC command symbol.
-        // For commands without a copy that's the last command, we
-        // emit any valid IC cmd. But we must not pick a cell that's
-        // disallowed by the ins/copy code groupings. For ins_code in
-        // 0..7: cell 0 (with use_last=true, copy 0..7) works.
-        // For ins_code 8..15: cell 4 (with use_last=false, copy 0..7).
-        // For ins_code 16..23: cell 7 (with use_last=false, copy 0..7).
-        // We want use_last=true to skip distance reads, but cells
-        // 0/1 only support ins_code in 0..7. For ins_code >= 8 we
-        // MUST use use_last=false, which means the decoder WILL try
-        // to read a distance — UNLESS `emitted` >= mlen after inserts,
-        // in which case the loop breaks before the distance read.
-        //
-        // For the last command with insert covering remaining bytes,
-        // `emitted` reaches mlen after inserts, so the distance is
-        // skipped regardless of use_last_dist. Safe.
-        let use_last_for_ic = if is_last_cmd && !c.has_copy {
-            // The decoder will break before reading distance, so the
-            // value of use_last doesn't matter for correctness, but
-            // we must still pick a cell that exists.
+        let use_last_for_ic = if is_last_cmd && matches!(c.kind, CopyKind::None) {
             ins_code < 8 // can use cell 0 if ins_code fits
         } else {
             use_last_dist
@@ -657,8 +864,10 @@ fn plan_commands(cmds: &[Command], mlen: u32, ring: &mut DistRing) -> CmdEncodin
         enc.dist_enc.push(dist_enc);
 
         emitted += insert_len;
-        if c.has_copy {
-            emitted += c.copy_len;
+        match c.kind {
+            CopyKind::Backref { .. } => emitted += c.copy_len,
+            CopyKind::Dict { emit_len, .. } => emitted += emit_len,
+            CopyKind::None => {}
         }
     }
     debug_assert!(
@@ -751,20 +960,26 @@ fn pick_huffman_strategy(freqs: &[u32], alphabet_size: usize) -> HuffStrategy {
 }
 
 /// Encode a complete compressed meta-block carrying `payload` bytes.
+#[allow(clippy::too_many_arguments)]
 fn encode_meta_block(
     bw: &mut BitWriter,
     out: &mut Vec<u8>,
     payload: &[u8],
     is_last: bool,
     ring: &mut DistRing,
+    prev_total_out: u64,
+    dict_index: &DictIndex,
+    id_transforms: &[IdTransform],
 ) {
     let mlen = payload.len() as u32;
     debug_assert!(mlen >= 1 && mlen <= MAX_BLOCK as u32);
+    // Window size = 1 << WBITS = 1 << 16 (the encoder always picks WBITS=16).
+    const WINDOW_SIZE: u32 = 1 << 16;
 
     // 1. Run LZ77 over the payload and build the command stream.
-    let atoms = lz77_pass(payload);
+    let atoms = lz77_pass(payload, dict_index, id_transforms, prev_total_out);
     let cmds = commands_from_atoms(&atoms);
-    let enc = plan_commands(&cmds, mlen, ring);
+    let enc = plan_commands(&cmds, mlen, ring, prev_total_out, WINDOW_SIZE);
 
     // 2. Tally frequencies.
     let mut lit_freq = vec![0u32; 256];

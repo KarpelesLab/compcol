@@ -276,3 +276,50 @@ fn encoder_output_decompresses_with_reference() {
     let decoded = decode_chunked(&encoded, 4096, 4096).unwrap();
     assert_eq!(decoded, input);
 }
+
+#[test]
+fn round_trip_cross_block_matches() {
+    // Construct an input where the second 16 KiB block contains a long
+    // verbatim copy of the first 16 KiB block. With cross-block matching
+    // this should compress to a tiny output (mostly back-references into
+    // the previous block).
+    let unique = b"The quick brown fox jumps over the lazy dog. ".repeat(370); // ~16.6 KiB
+    let mut input = Vec::new();
+    input.extend_from_slice(&unique);
+    input.extend_from_slice(&unique); // exact repeat → should be one big match
+    let encoded = encode_chunked(&input, 4096, 4096);
+    // With cross-block back-references, the second copy should compress
+    // to near-nothing (length codes only). Without, we'd pay a full
+    // dynamic header again. Expect <2 KiB total for ~33 KiB input.
+    assert!(
+        encoded.len() < 2048,
+        "cross-block matching not effective: {} -> {}",
+        input.len(),
+        encoded.len()
+    );
+    let decoded = decode_chunked(&encoded, 4096, 4096).unwrap();
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn round_trip_lorem_64k_compresses_well() {
+    // 64 KiB of Lorem ipsum (spans four 16 KiB blocks). With cross-block
+    // matching and lazy parsing we should be within ~5% of zlib level 6
+    // (which compresses this to ~602 bytes).
+    let pattern = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod \
+        tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis \
+        nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. ";
+    let mut input = Vec::with_capacity(65536);
+    while input.len() < 65536 {
+        input.extend_from_slice(pattern);
+    }
+    input.truncate(65536);
+    let encoded = encode_chunked(&input, 4096, 4096);
+    assert!(
+        encoded.len() < 1000,
+        "lorem 64K compressed worse than expected: {} bytes",
+        encoded.len()
+    );
+    let decoded = decode_chunked(&encoded, 4096, 4096).unwrap();
+    assert_eq!(decoded, input);
+}

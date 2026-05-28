@@ -24,12 +24,31 @@
 //!   Dictionary_ID field of 0/1/2/4 bytes, optional Frame_Content_Size of
 //!   0/1/2/4/8 bytes with the 2-byte FCS+256 quirk).
 //!
-//! - **Encoder**: emits a valid Zstd frame whose body is one or more
-//!   `Raw_Block`s. **No compression is actually performed** — every input
-//!   byte is copied into the output verbatim, wrapped in Zstd block headers.
-//!   This is the "fallback" encoder mode: it lets the decoder round-trip its
-//!   own output without bringing in the FSE/Huffman/LZ77 machinery that real
-//!   Zstd compression demands.
+//! - **Encoder**: emits a valid Zstd frame. Per-block, the encoder picks
+//!   between:
+//!     - `RLE_Block` (Block_Type=1) when every byte in the block is identical
+//!       (single payload byte; biggest win on long zero/one-byte runs).
+//!     - `Compressed_Block` (Block_Type=2) otherwise, with:
+//!         - **LZ77** match finding via a 4-byte hash-chain matcher.
+//!         - **Repeat offsets** (offset_value ∈ 1..=3) tracked in a ring
+//!           buffer carried across blocks per RFC 8478 §3.1.1.5.
+//!         - **Huffman literals** (RFC §4.2) — direct nibble-packed weight
+//!           encoding, 1-stream for blocks ≤ 1023 literals and 4-stream
+//!           otherwise. Emits `Compressed_Literals_Block` (fresh tree) when
+//!           the previous block's tree is missing or worse;
+//!           `Treeless_Literals_Block` when reusing the previous tree saves
+//!           tree-description bytes.
+//!         - **FSE_Compressed_Mode** for sequence tables when a custom
+//!           distribution measurably beats the predefined LL/OF/ML tables;
+//!           Predefined_Mode otherwise. The encoder does NOT currently emit
+//!           Repeat_Mode (per-table) or RLE_Mode for sequences.
+//!     - `Raw_Block` (Block_Type=0) as a fallback when neither RLE nor
+//!       Compressed beats the raw size.
+//!
+//!   What we still don't do: FSE-compressed Huffman weight tables (we cap
+//!   the alphabet at 128 weights for direct nibble encoding), Repeat_Mode /
+//!   RLE_Mode for sequence FSE tables, multi-frame output, content checksum,
+//!   or dictionaries.
 //!
 //! # What does NOT work
 //!
@@ -54,6 +73,7 @@ mod decoder;
 mod encoder;
 mod encoder_bitwriter;
 mod encoder_fse;
+mod encoder_huffman;
 mod encoder_seq;
 mod fse;
 mod huffman;

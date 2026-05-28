@@ -1,16 +1,15 @@
 //! Streaming RFC 1951 deflate encoder.
 //!
-//! Buffers input into 16 KiB blocks. For each block: runs LZ77 over the
-//! buffer to produce a sequence of literals and (length, distance) matches,
-//! tallies frequencies, builds three length-limited Huffman codes (literal/
-//! length, distance, and code-length), and emits a dynamic-Huffman block
-//! (BTYPE=10) per RFC 1951 §3.2.7.
+//! Maintains a sliding window of up to 32 KiB of history plus the current
+//! lookahead. Per block (target ~16 KiB of fresh input): runs LZ77 over the
+//! lookahead with **lazy matching** (gzip's `--max-lazy` heuristic) to
+//! produce a sequence of literals and (length, distance) matches; then
+//! chooses the cheapest of three block encodings (stored, fixed Huffman, or
+//! dynamic Huffman) and emits it.
 //!
-//! v1 limitation: each block resets the match finder, so back-references
-//! never cross block boundaries. Compression of data spanning blocks is
-//! consequently weaker than a slide-and-rehash encoder; the wire format is
-//! still valid deflate. Adding cross-block matching is a self-contained
-//! follow-up.
+//! Cross-block matching: the hash chain is keyed by absolute positions and
+//! is **not** reset between blocks, so back-references reach into earlier
+//! blocks (up to the 32 KiB window).
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -22,11 +21,22 @@ use crate::traits::{Encoder as EncoderTrait, Progress};
 
 use super::lz77::MatchFinder;
 use super::tables::{
-    CODE_LENGTH_ORDER, DIST_BASE, DIST_EXTRA, END_OF_BLOCK, LENGTH_BASE, LENGTH_EXTRA, MAX_MATCH,
-    MIN_MATCH,
+    CODE_LENGTH_ORDER, DIST_BASE, DIST_EXTRA, END_OF_BLOCK, FIXED_DIST_LENGTHS, FIXED_LIT_LENGTHS,
+    LENGTH_BASE, LENGTH_EXTRA, MAX_MATCH, MIN_MATCH, WINDOW_SIZE,
 };
 
+/// How many fresh bytes we try to gather before flushing a block. zlib uses
+/// a similar block-size target around 16 KiB.
 const BLOCK_SIZE: usize = 16 * 1024;
+
+/// Maximum size the window buffer is allowed to grow before we slide. Keeping
+/// up to 2×WINDOW_SIZE means we slide at most once per BLOCK_SIZE worth of
+/// input, which amortises the memmove cost.
+const WINDOW_MAX: usize = 2 * WINDOW_SIZE;
+
+/// Threshold beyond which lazy matching skips the lookahead probe — at this
+/// length the literal we'd save can't outweigh the extra match symbol.
+const GOOD_MATCH: usize = 32;
 
 // ─── helpers for the length/distance -> code mapping ─────────────────────
 
@@ -162,6 +172,29 @@ fn rle_encode_lengths(lengths: &[u8]) -> Vec<ClSymbol> {
     out
 }
 
+// ─── cost estimation (in bits) ──────────────────────────────────────────
+
+/// Estimate the bit cost of emitting `symbols` (plus EOB) with code lengths
+/// `lit_lengths` and `dist_lengths`. Used to compare encoding choices.
+fn payload_cost_bits(symbols: &[Symbol], lit_lengths: &[u8], dist_lengths: &[u8]) -> u64 {
+    let mut bits: u64 = 0;
+    for s in symbols {
+        match s {
+            Symbol::Literal(b) => {
+                bits += lit_lengths[*b as usize] as u64;
+            }
+            Symbol::Match { length, distance } => {
+                let (lc, _, leb) = length_to_code(*length);
+                bits += lit_lengths[lc as usize] as u64 + leb as u64;
+                let (dc, _, deb) = distance_to_code(*distance);
+                bits += dist_lengths[dc as usize] as u64 + deb as u64;
+            }
+        }
+    }
+    bits += lit_lengths[END_OF_BLOCK as usize] as u64;
+    bits
+}
+
 // ─── encoder state ───────────────────────────────────────────────────────
 
 enum EncState {
@@ -171,9 +204,20 @@ enum EncState {
 }
 
 pub struct Encoder {
-    buffer: Box<[u8; BLOCK_SIZE]>,
-    buffer_len: usize,
-    match_finder: MatchFinder,
+    /// Rolling buffer of input bytes since the last slide. Holds at most
+    /// `WINDOW_MAX` bytes; once the prefix older than the current cursor
+    /// exceeds WINDOW_SIZE, we drop bytes from the front.
+    window: Vec<u8>,
+    /// Index in `window` of the next byte to compress.
+    cursor: usize,
+    /// Absolute byte position corresponding to `window[0]`.
+    window_start_abs: u64,
+    match_finder: Box<MatchFinder>,
+    /// Pending symbols for the current block.
+    block_symbols: Vec<Symbol>,
+    /// Pending raw bytes (literals + match-expansion) for the current block,
+    /// kept so we can fall back to a stored encoding cheaply.
+    block_bytes: Vec<u8>,
     bit_writer: BitWriter,
     out_buffer: Vec<u8>,
     out_pos: usize,
@@ -185,9 +229,12 @@ pub struct Encoder {
 impl Encoder {
     pub fn new() -> Self {
         Self {
-            buffer: Box::new([0u8; BLOCK_SIZE]),
-            buffer_len: 0,
-            match_finder: MatchFinder::new(),
+            window: Vec::with_capacity(WINDOW_MAX),
+            cursor: 0,
+            window_start_abs: 0,
+            match_finder: Box::new(MatchFinder::new()),
+            block_symbols: Vec::new(),
+            block_bytes: Vec::new(),
             bit_writer: BitWriter::new(),
             out_buffer: Vec::new(),
             out_pos: 0,
@@ -207,81 +254,359 @@ impl Encoder {
         self.out_pos >= self.out_buffer.len()
     }
 
-    /// Compress whatever's in `self.buffer[..self.buffer_len]` into a single
-    /// block, appending the bytes to `self.out_buffer` via `self.bit_writer`.
-    /// If `bfinal` is true, sets BFINAL=1 and flushes the partial byte.
-    fn compress_current_block(&mut self, bfinal: bool) {
-        self.match_finder.reset();
+    /// Slide the window if we've accumulated too much history. Drops the
+    /// oldest prefix so the kept buffer is at most WINDOW_SIZE + lookahead.
+    fn maybe_slide(&mut self) {
+        // We slide once the back-history exceeds WINDOW_SIZE — keeping
+        // exactly WINDOW_SIZE bytes of history is enough for any in-window
+        // distance to be reachable.
+        if self.cursor > WINDOW_SIZE {
+            let drop = self.cursor - WINDOW_SIZE;
+            self.window.drain(..drop);
+            self.cursor -= drop;
+            self.window_start_abs += drop as u64;
+        }
+    }
 
-        // ── LZ77 pass ──
-        let buffer = &self.buffer[..self.buffer_len];
-        let mut symbols: Vec<Symbol> = Vec::with_capacity(buffer.len());
-        let mut pos = 0usize;
-        while pos < buffer.len() {
-            // Splice this position into the hash chain so future positions
-            // in this block can reference us.
-            self.match_finder.insert(buffer, pos);
+    /// Run LZ77 with lazy matching over `window[cursor..end]`, appending
+    /// the result to `block_symbols` and `block_bytes`. Advances `cursor`.
+    fn lz77_pass(&mut self, end: usize) {
+        let abs_base = self.window_start_abs;
+        let mut pos = self.cursor;
 
-            if pos + MIN_MATCH <= buffer.len()
-                && let Some((len, dist)) = self.match_finder.find_match(buffer, pos)
-            {
-                symbols.push(Symbol::Match {
-                    length: len,
-                    distance: dist,
-                });
-                // Also insert every position covered by the match so a
-                // later position can reference into the middle of it.
-                for j in 1..(len as usize) {
-                    let p = pos + j;
-                    if p + 3 <= buffer.len() {
-                        self.match_finder.insert(buffer, p);
+        // Lazy-matching state: at any iteration we may have a "pending"
+        // best match starting at `prev_match_start` that we haven't
+        // committed yet — we hold it back to see if the next position
+        // offers something strictly better.
+        let mut have_pending = false;
+        let mut prev_match_len: usize = 0;
+        let mut prev_match_dist: usize = 0;
+        let mut prev_match_start: usize = 0;
+
+        while pos < end {
+            // Splice the 3-gram starting at `pos` into the hash chain.
+            if pos + 3 <= self.window.len() {
+                let abs = abs_base + pos as u64;
+                self.match_finder.insert(
+                    abs as u32,
+                    self.window[pos],
+                    self.window[pos + 1],
+                    self.window[pos + 2],
+                );
+            }
+
+            // Find the best match at `pos`.
+            let cur = if pos + MIN_MATCH <= end {
+                let abs = abs_base + pos as u64;
+                let good = if have_pending { GOOD_MATCH } else { 0 };
+                self.match_finder
+                    .find_match(&self.window, pos, abs as u32, good)
+                    .map(|(l, d)| (l as usize, d as usize))
+            } else {
+                None
+            };
+
+            if have_pending {
+                // We have a match from `prev_match_start`. Decide whether
+                // to keep it or drop it in favour of `cur`.
+                let strictly_better = match cur {
+                    Some((cl, _)) => cl > prev_match_len,
+                    None => false,
+                };
+                if strictly_better {
+                    // Emit a literal at the previous position, advance one
+                    // byte, and replace pending with `cur`.
+                    let lit = self.window[prev_match_start];
+                    self.block_symbols.push(Symbol::Literal(lit));
+                    self.block_bytes.push(lit);
+                    // Drop the old pending; the new pending is `cur` at `pos`.
+                    let (cl, cd) = cur.unwrap();
+                    prev_match_len = cl;
+                    prev_match_dist = cd;
+                    prev_match_start = pos;
+                    have_pending = true;
+                    pos += 1;
+                } else {
+                    // Commit the pending match. Insert every interior
+                    // position of the match so later code can reference
+                    // into the middle, then jump past it.
+                    self.block_symbols.push(Symbol::Match {
+                        length: prev_match_len as u16,
+                        distance: prev_match_dist as u16,
+                    });
+                    self.block_bytes.extend_from_slice(
+                        &self.window[prev_match_start..prev_match_start + prev_match_len],
+                    );
+                    // Insert positions [prev_match_start+1 .. prev_match_start+prev_match_len)
+                    // We already inserted `prev_match_start` and `pos` (=prev_match_start+1).
+                    // So insert from `pos+1` upward.
+                    let match_end = prev_match_start + prev_match_len;
+                    let mut k = pos + 1;
+                    while k < match_end {
+                        if k + 3 <= self.window.len() {
+                            let abs = abs_base + k as u64;
+                            self.match_finder.insert(
+                                abs as u32,
+                                self.window[k],
+                                self.window[k + 1],
+                                self.window[k + 2],
+                            );
+                        }
+                        k += 1;
                     }
+                    pos = match_end;
+                    have_pending = false;
                 }
-                pos += len as usize;
-                continue;
+            } else if let Some((cl, cd)) = cur {
+                // Hold this match back as pending; try one more position
+                // to see if a longer match is available.
+                prev_match_len = cl;
+                prev_match_dist = cd;
+                prev_match_start = pos;
+                have_pending = true;
+                // If the match is already at NICE/MAX length, commit immediately.
+                if cl >= GOOD_MATCH.max(MAX_MATCH) || cl >= 258 {
+                    self.block_symbols.push(Symbol::Match {
+                        length: cl as u16,
+                        distance: cd as u16,
+                    });
+                    self.block_bytes
+                        .extend_from_slice(&self.window[pos..pos + cl]);
+                    let match_end = pos + cl;
+                    let mut k = pos + 1;
+                    while k < match_end {
+                        if k + 3 <= self.window.len() {
+                            let abs = abs_base + k as u64;
+                            self.match_finder.insert(
+                                abs as u32,
+                                self.window[k],
+                                self.window[k + 1],
+                                self.window[k + 2],
+                            );
+                        }
+                        k += 1;
+                    }
+                    pos = match_end;
+                    have_pending = false;
+                } else {
+                    pos += 1;
+                }
+            } else {
+                // No match here. Emit a literal.
+                let lit = self.window[pos];
+                self.block_symbols.push(Symbol::Literal(lit));
+                self.block_bytes.push(lit);
+                pos += 1;
             }
-            symbols.push(Symbol::Literal(buffer[pos]));
-            pos += 1;
         }
 
-        // ── tally frequencies ──
-        let mut lit_freq = [0u32; 286];
-        let mut dist_freq = [0u32; 30];
-        for s in &symbols {
-            match s {
-                Symbol::Literal(b) => lit_freq[*b as usize] += 1,
-                Symbol::Match { length, distance } => {
-                    let (lc, _, _) = length_to_code(*length);
-                    lit_freq[lc as usize] += 1;
-                    let (dc, _, _) = distance_to_code(*distance);
-                    dist_freq[dc as usize] += 1;
+        // Flush pending at end-of-block.
+        if have_pending {
+            // Commit the held-back match even though we ran out of lookahead.
+            self.block_symbols.push(Symbol::Match {
+                length: prev_match_len as u16,
+                distance: prev_match_dist as u16,
+            });
+            self.block_bytes.extend_from_slice(
+                &self.window[prev_match_start..prev_match_start + prev_match_len],
+            );
+            let match_end = prev_match_start + prev_match_len;
+            // All positions in [prev_match_start, end) were already inserted
+            // by the main loop. We only need to splice in the tail [end, match_end).
+            let mut k = end;
+            while k < match_end {
+                if k + 3 <= self.window.len() {
+                    let abs = abs_base + k as u64;
+                    self.match_finder.insert(
+                        abs as u32,
+                        self.window[k],
+                        self.window[k + 1],
+                        self.window[k + 2],
+                    );
                 }
+                k += 1;
             }
+            pos = match_end;
         }
-        lit_freq[END_OF_BLOCK as usize] += 1;
 
-        // ── build length-limited Huffman code lengths ──
-        // Sentinel: ensure at least two nonzero distance entries so package-
-        // merge produces a valid two-symbol code. If only one (or zero)
-        // distance code is needed, deflate spec §3.2.7 lets us signal "no
-        // distance codes used" by sending HDIST=0 with a single 0-length
-        // entry; package-merge naturally produces that since dist_freq is
-        // then all-zero. Same for literal/length: EOB is always present so
-        // there's at least one symbol.
-        let lit_lengths_vec = length_limited_huffman(&lit_freq, 15);
-        let dist_lengths_vec = length_limited_huffman(&dist_freq, 15);
+        self.cursor = pos;
+    }
+
+    /// Build code lengths from frequency histograms and return
+    /// `(lit_lengths, dist_lengths, header_bits, payload_bits)` for the
+    /// dynamic-Huffman encoding.
+    fn build_dynamic(
+        &self,
+        lit_freq: &[u32; 286],
+        dist_freq: &[u32; 30],
+    ) -> ([u8; 286], [u8; 30], u64, u64) {
+        let lit_lengths_vec = length_limited_huffman(lit_freq, 15);
+        let dist_lengths_vec = length_limited_huffman(dist_freq, 15);
 
         let mut lit_lengths = [0u8; 286];
         lit_lengths.copy_from_slice(&lit_lengths_vec);
         let mut dist_lengths = [0u8; 30];
         dist_lengths.copy_from_slice(&dist_lengths_vec);
 
-        // If we ended up with exactly one distance code, deflate requires us
-        // to bump it to a 1-bit code (so a 1-symbol prefix-code is valid).
-        // package-merge already returns length 1 for the single-symbol case.
-        // If zero distance codes are used, dist_lengths is all-zero; we'll
-        // send HDIST = 0 (one entry) with that 0 length to mark "no distances".
+        // Trim trailing zeros for HLIT/HDIST.
+        let mut hlit_count = 286usize;
+        while hlit_count > 257 && lit_lengths[hlit_count - 1] == 0 {
+            hlit_count -= 1;
+        }
+        let mut hdist_count = 30usize;
+        while hdist_count > 1 && dist_lengths[hdist_count - 1] == 0 {
+            hdist_count -= 1;
+        }
 
+        // RLE-encode the combined code-lengths.
+        let mut combined: Vec<u8> = Vec::with_capacity(hlit_count + hdist_count);
+        combined.extend_from_slice(&lit_lengths[..hlit_count]);
+        combined.extend_from_slice(&dist_lengths[..hdist_count]);
+        let rle = rle_encode_lengths(&combined);
+
+        // Code-length-code Huffman (max length 7).
+        let mut cl_freq = [0u32; 19];
+        for s in &rle {
+            cl_freq[s.sym as usize] += 1;
+        }
+        let cl_lengths_vec = length_limited_huffman(&cl_freq, 7);
+        let mut cl_lengths = [0u8; 19];
+        cl_lengths.copy_from_slice(&cl_lengths_vec);
+
+        // HCLEN: trim trailing zeros in CODE_LENGTH_ORDER permutation.
+        let mut hclen_count = 19usize;
+        while hclen_count > 4 && cl_lengths[CODE_LENGTH_ORDER[hclen_count - 1]] == 0 {
+            hclen_count -= 1;
+        }
+
+        // Header bits:
+        //   3 (BFINAL+BTYPE) + 5+5+4 (HLIT,HDIST,HCLEN) + 3·hclen_count
+        //   + sum_over_rle(cl_lengths[sym] + extra_bits)
+        let mut header_bits: u64 = 3 + 5 + 5 + 4 + 3 * hclen_count as u64;
+        for s in &rle {
+            header_bits += cl_lengths[s.sym as usize] as u64 + s.extra_bits as u64;
+        }
+
+        // Payload bits.
+        let payload_bits = payload_cost_bits(&self.block_symbols, &lit_lengths, &dist_lengths);
+
+        (lit_lengths, dist_lengths, header_bits, payload_bits)
+    }
+
+    /// Compute the bit cost of encoding `block_symbols` with the fixed
+    /// Huffman tables. Returns total bits including 3-bit block header.
+    fn fixed_cost_bits(&self) -> u64 {
+        let mut fixed_lit = [0u8; 286];
+        // Fixed table is over 288 symbols; we only need 286 because compcol's
+        // length_limited_huffman returns up to 286 — but here we just need
+        // the lengths for symbols 0..286 which is exactly FIXED_LIT_LENGTHS[..286].
+        fixed_lit.copy_from_slice(&FIXED_LIT_LENGTHS[..286]);
+        let mut fixed_dist = [0u8; 30];
+        fixed_dist.copy_from_slice(&FIXED_DIST_LENGTHS[..30]);
+        3 + payload_cost_bits(&self.block_symbols, &fixed_lit, &fixed_dist)
+    }
+
+    /// Compute the bit cost of encoding the current block as a single
+    /// stored block. Returns total bits including the byte-alignment pad.
+    /// Assumes block fits in 65535 bytes (it always does at BLOCK_SIZE=16K).
+    fn stored_cost_bits(&self) -> u64 {
+        // 3-bit header, pad to byte boundary, then 4 bytes (LEN, NLEN) + payload.
+        // The alignment pad varies depending on the current `bit_writer.pending_bits`.
+        let pending = self.bit_writer.pending_bits() as u64;
+        // After writing the 3-bit header, total bits since last byte boundary is
+        // (pending + 3) mod 8. Pad to next byte → add (8 - that) mod 8 bits.
+        let after_header = (pending + 3) & 7;
+        let pad = (8 - after_header) & 7;
+        3 + pad + 32 + (self.block_bytes.len() as u64) * 8
+    }
+
+    /// Encode the accumulated block to `out_buffer` using the fixed Huffman tables.
+    fn emit_fixed_block(&mut self, bfinal: bool) {
+        let bw = &mut self.bit_writer;
+        let out = &mut self.out_buffer;
+
+        bw.write(if bfinal { 1 } else { 0 }, 1, out);
+        bw.write(1, 2, out); // BTYPE = 01 (fixed Huffman)
+
+        let mut fixed_lit = [0u8; 286];
+        fixed_lit.copy_from_slice(&FIXED_LIT_LENGTHS[..286]);
+        let mut fixed_dist = [0u8; 30];
+        fixed_dist.copy_from_slice(&FIXED_DIST_LENGTHS[..30]);
+        // Build canonical codes for the full fixed tables (288/32) — needed
+        // for symbols 286/287 which can appear in length_to_code? No: length
+        // codes range 257..=285, so we never index those. Distance codes are
+        // 0..=29. We only ever index ≤285 for literals and ≤29 for distances.
+        let lit_codes_full = canonical_codes_from_lengths(&FIXED_LIT_LENGTHS);
+        let dist_codes_full = canonical_codes_from_lengths(&FIXED_DIST_LENGTHS);
+
+        for s in &self.block_symbols {
+            match s {
+                Symbol::Literal(b) => {
+                    let code = lit_codes_full[*b as usize];
+                    let len = FIXED_LIT_LENGTHS[*b as usize];
+                    let rev = reverse_bits(code as u32, len as u32);
+                    bw.write(rev, len as u32, out);
+                }
+                Symbol::Match { length, distance } => {
+                    let (lc, lex, leb) = length_to_code(*length);
+                    let code = lit_codes_full[lc as usize];
+                    let len = FIXED_LIT_LENGTHS[lc as usize];
+                    let rev = reverse_bits(code as u32, len as u32);
+                    bw.write(rev, len as u32, out);
+                    if leb > 0 {
+                        bw.write(lex as u32, leb as u32, out);
+                    }
+                    let (dc, dex, deb) = distance_to_code(*distance);
+                    let code = dist_codes_full[dc as usize];
+                    let len = FIXED_DIST_LENGTHS[dc as usize];
+                    let rev = reverse_bits(code as u32, len as u32);
+                    bw.write(rev, len as u32, out);
+                    if deb > 0 {
+                        bw.write(dex as u32, deb as u32, out);
+                    }
+                }
+            }
+        }
+        // End-of-block (symbol 256).
+        let code = lit_codes_full[END_OF_BLOCK as usize];
+        let len = FIXED_LIT_LENGTHS[END_OF_BLOCK as usize];
+        let rev = reverse_bits(code as u32, len as u32);
+        bw.write(rev, len as u32, out);
+
+        if bfinal {
+            bw.align(out);
+        }
+    }
+
+    /// Encode the accumulated block as a stored (uncompressed) block.
+    fn emit_stored_block(&mut self, bfinal: bool) {
+        let bw = &mut self.bit_writer;
+        let out = &mut self.out_buffer;
+
+        bw.write(if bfinal { 1 } else { 0 }, 1, out);
+        bw.write(0, 2, out); // BTYPE = 00
+        bw.align(out); // pad to byte boundary
+
+        let len = self.block_bytes.len() as u16;
+        let nlen = !len;
+        out.push((len & 0xff) as u8);
+        out.push((len >> 8) as u8);
+        out.push((nlen & 0xff) as u8);
+        out.push((nlen >> 8) as u8);
+        out.extend_from_slice(&self.block_bytes);
+        // Stored blocks naturally end on a byte boundary; if this is the
+        // final block we don't need an additional align.
+        let _ = bfinal;
+    }
+
+    /// Encode the accumulated block as a dynamic-Huffman block using the
+    /// precomputed code lengths.
+    fn emit_dynamic_block(
+        &mut self,
+        bfinal: bool,
+        lit_lengths: &[u8; 286],
+        dist_lengths: &[u8; 30],
+    ) {
         // ── determine HLIT / HDIST counts (trim trailing zeros) ──
         let mut hlit_count = 286usize;
         while hlit_count > 257 && lit_lengths[hlit_count - 1] == 0 {
@@ -310,19 +635,16 @@ impl Encoder {
         let mut cl_lengths = [0u8; 19];
         cl_lengths.copy_from_slice(&cl_lengths_vec);
 
-        // ── HCLEN: trim trailing zeros from cl_lengths in CODE_LENGTH_ORDER permutation ──
         let mut hclen_count = 19usize;
         while hclen_count > 4 && cl_lengths[CODE_LENGTH_ORDER[hclen_count - 1]] == 0 {
             hclen_count -= 1;
         }
         let hclen = (hclen_count - 4) as u8;
 
-        // ── canonical code values ──
-        let lit_codes = canonical_codes_from_lengths(&lit_lengths);
-        let dist_codes = canonical_codes_from_lengths(&dist_lengths);
+        let lit_codes = canonical_codes_from_lengths(lit_lengths);
+        let dist_codes = canonical_codes_from_lengths(dist_lengths);
         let cl_codes = canonical_codes_from_lengths(&cl_lengths);
 
-        // ── emit ──
         let bw = &mut self.bit_writer;
         let out = &mut self.out_buffer;
 
@@ -348,8 +670,7 @@ impl Encoder {
             }
         }
 
-        // Data symbols.
-        for s in &symbols {
+        for s in &self.block_symbols {
             match s {
                 Symbol::Literal(b) => {
                     let code = lit_codes[*b as usize];
@@ -388,9 +709,58 @@ impl Encoder {
         if bfinal {
             bw.align(out);
         }
+    }
 
-        // Block bytes are now ready in self.out_buffer for draining.
-        self.buffer_len = 0;
+    /// Run LZ77 over the bytes in `[cursor, end_rel)`, then emit a single
+    /// deflate block (choosing whichever of stored / fixed / dynamic is
+    /// cheapest). `bfinal` controls BFINAL on the emitted block.
+    fn compress_and_emit_block(&mut self, end_rel: usize, bfinal: bool) {
+        self.block_symbols.clear();
+        self.block_bytes.clear();
+
+        self.lz77_pass(end_rel);
+
+        // Tally frequencies.
+        let mut lit_freq = [0u32; 286];
+        let mut dist_freq = [0u32; 30];
+        for s in &self.block_symbols {
+            match s {
+                Symbol::Literal(b) => lit_freq[*b as usize] += 1,
+                Symbol::Match { length, distance } => {
+                    let (lc, _, _) = length_to_code(*length);
+                    lit_freq[lc as usize] += 1;
+                    let (dc, _, _) = distance_to_code(*distance);
+                    dist_freq[dc as usize] += 1;
+                }
+            }
+        }
+        lit_freq[END_OF_BLOCK as usize] += 1;
+
+        // Compute dynamic-Huffman cost.
+        let (lit_lengths, dist_lengths, dyn_header_bits, dyn_payload_bits) =
+            self.build_dynamic(&lit_freq, &dist_freq);
+        let dynamic_total = dyn_header_bits + dyn_payload_bits;
+
+        // Compute fixed-Huffman cost.
+        let fixed_total = self.fixed_cost_bits();
+
+        // Compute stored cost — only valid when the block fits in u16.
+        let stored_total = if self.block_bytes.len() <= u16::MAX as usize {
+            self.stored_cost_bits()
+        } else {
+            u64::MAX
+        };
+
+        // Pick the smallest.
+        if stored_total <= dynamic_total && stored_total <= fixed_total {
+            self.emit_stored_block(bfinal);
+        } else if fixed_total <= dynamic_total {
+            self.emit_fixed_block(bfinal);
+        } else {
+            self.emit_dynamic_block(bfinal, &lit_lengths, &dist_lengths);
+        }
+
+        self.maybe_slide();
     }
 }
 
@@ -411,7 +781,6 @@ impl EncoderTrait for Encoder {
         loop {
             if matches!(self.state, EncState::Emitting) {
                 if self.drain(output, &mut written) {
-                    // Block fully drained; clear buffer and go back to accepting.
                     self.out_buffer.clear();
                     self.out_pos = 0;
                     self.state = EncState::Accepting;
@@ -421,20 +790,30 @@ impl EncoderTrait for Encoder {
             }
 
             if matches!(self.state, EncState::Accepting) {
-                let space = BLOCK_SIZE - self.buffer_len;
+                // Copy as much input as we can — but cap so we keep some
+                // bounded buffer growth. Once we have ≥ BLOCK_SIZE bytes of
+                // fresh lookahead (cursor + BLOCK_SIZE <= window.len()),
+                // emit a block.
+                let space = WINDOW_MAX.saturating_sub(self.window.len());
                 let to_copy = (input.len() - consumed).min(space);
-                self.buffer[self.buffer_len..self.buffer_len + to_copy]
-                    .copy_from_slice(&input[consumed..consumed + to_copy]);
-                self.buffer_len += to_copy;
+                self.window
+                    .extend_from_slice(&input[consumed..consumed + to_copy]);
                 consumed += to_copy;
 
-                if self.buffer_len == BLOCK_SIZE {
-                    self.compress_current_block(false);
+                let lookahead = self.window.len() - self.cursor;
+                if lookahead >= BLOCK_SIZE {
+                    // We have a full block of lookahead. Compress
+                    // [cursor, cursor + BLOCK_SIZE). For lazy matching to
+                    // see one more byte beyond the end, we leave that
+                    // remaining lookahead in the window for the *next* block.
+                    let end_rel = self.cursor + BLOCK_SIZE;
+                    self.compress_and_emit_block(end_rel, false);
                     self.state = EncState::Emitting;
-                } else {
-                    // Input exhausted, buffer not yet full.
+                } else if to_copy == 0 {
+                    // Input exhausted and not enough for a full block.
                     break;
                 }
+                // Otherwise loop and grab more input.
             }
         }
 
@@ -475,9 +854,21 @@ impl EncoderTrait for Encoder {
             }
 
             if matches!(self.state, EncState::Accepting) {
-                self.compress_current_block(true);
-                self.final_emitted = true;
-                self.state = EncState::Emitting;
+                let remaining = self.window.len() - self.cursor;
+                if remaining >= BLOCK_SIZE {
+                    // Emit a non-final block, leave the rest for the next
+                    // (final) one.
+                    let end_rel = self.cursor + BLOCK_SIZE;
+                    self.compress_and_emit_block(end_rel, false);
+                    self.state = EncState::Emitting;
+                } else {
+                    // Last block. May be empty, in which case we still need
+                    // to emit a final empty stored block.
+                    let end_rel = self.window.len();
+                    self.compress_and_emit_block(end_rel, true);
+                    self.final_emitted = true;
+                    self.state = EncState::Emitting;
+                }
             }
         }
 
@@ -489,8 +880,12 @@ impl EncoderTrait for Encoder {
     }
 
     fn reset(&mut self) {
-        self.buffer_len = 0;
+        self.window.clear();
+        self.cursor = 0;
+        self.window_start_abs = 0;
         self.match_finder.reset();
+        self.block_symbols.clear();
+        self.block_bytes.clear();
         self.bit_writer = BitWriter::new();
         self.out_buffer.clear();
         self.out_pos = 0;

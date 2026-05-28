@@ -1,31 +1,36 @@
 //! Streaming Zstandard encoder.
 //!
-//! Emits a single Zstd frame whose body is one or more blocks. Block_Type is
-//! chosen per block:
+//! Emits a single Zstd frame whose body is one or more blocks. Per block we
+//! pick the smallest of three encodings:
 //!
-//! - `Raw_Block` (Block_Type=0) is used for very short inputs, the trailing
-//!   "Last_Block" sentinel when no payload is left, or whenever a
-//!   Compressed_Block would not actually save bytes.
-//! - `Compressed_Block` (Block_Type=2) is the typical path: literals are
-//!   emitted as `Raw_Literals_Block` (no Huffman compression) and sequences
-//!   use the **Predefined_Mode** FSE tables for LL, OF, and ML (so the
-//!   decoder gets the table distributions for free). The sequence bitstream
-//!   is written in reverse — last sequence first — via
-//!   [`RevBitWriter`](crate::zstd::encoder_bitwriter::RevBitWriter).
+//! - `RLE_Block` (Block_Type=1) when every byte of the pending block is the
+//!   same — costs just one payload byte regardless of block size.
+//! - `Compressed_Block` (Block_Type=2): runs the hash-chain LZ77 matcher
+//!   ([`crate::zstd::matcher`]) to produce literals + sequences. Literals are
+//!   coded as `Compressed_Literals_Block` (fresh canonical Huffman tree
+//!   built per block, encoded via direct nibble-packed weight encoding) or
+//!   `Treeless_Literals_Block` (reusing the previous block's tree when its
+//!   alphabet covers the current literals and skipping the tree saves
+//!   bytes), with the 1-stream layout for ≤1023 literals and the 4-stream
+//!   layout otherwise. Sequence tables (LL, OF, ML) are each independently
+//!   chosen between Predefined_Mode and FSE_Compressed_Mode based on
+//!   estimated FSE-bitstream byte count + custom-table header overhead.
+//! - `Raw_Block` (Block_Type=0) when neither of the above wins.
 //!
-//! Match finding is a hash-chain LZ77 ([`crate::zstd::matcher`]).
-//!
-//! Offsets are emitted as `offset_value = distance + 3` so we never hit the
-//! repeat-offset aliases (offset_value ∈ 1..=3) — keeping the encoder simple
-//! at a small compression cost (~ 1-2 extra bits per sequence).
+//! Offsets are encoded with repeat-offset awareness: when a match's distance
+//! equals one of the three most recent distinct distances, we emit
+//! `offset_value ∈ 1..=3` rather than `distance + 3`, with the
+//! `literal_length == 0` shifting rule per RFC 8478 §3.1.1.5. The
+//! `prev_offsets` ring is carried across blocks.
 //!
 //! Frame layout we emit:
 //! - 4 bytes magic (`0x28 0xB5 0x2F 0xFD`)
 //! - 1 byte Frame_Header_Descriptor = `0x00`
-//! - 1 byte Window_Descriptor = `0x70` (Exponent=14, Mantissa=0 → 16 KiB,
-//!   matching our max block size)
+//! - 1 byte Window_Descriptor = `0x70` (Window_Log = 24 → 16 MiB advertised
+//!   window). The actual block ceiling is 128 KiB (RFC 8478 cap).
 //! - One or more blocks; the last carries `Last_Block = 1`.
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
@@ -33,19 +38,28 @@ use crate::traits::{Encoder as EncoderTrait, Progress};
 use crate::zstd::encoder_bitwriter::RevBitWriter;
 use crate::zstd::encoder_fse::{
     DEFAULT_LL_ACCURACY_LOG, DEFAULT_LL_COUNTS, DEFAULT_ML_ACCURACY_LOG, DEFAULT_ML_COUNTS,
-    DEFAULT_OF_ACCURACY_LOG, DEFAULT_OF_COUNTS, FseEncoder,
+    DEFAULT_OF_ACCURACY_LOG, DEFAULT_OF_COUNTS, FseEncoder, build_normalised_counts,
+    encode_fse_table_header,
+};
+use crate::zstd::encoder_huffman::{
+    HuffLengths, build_huff_encoder, build_huff_lengths, encode_huff_4streams, encode_huff_stream,
+    encode_huff_tree_direct, histogram, lengths_to_weights, predicted_bits,
 };
 use crate::zstd::encoder_seq::{encode_sequence_count, ll_code, ml_code, of_code};
 use crate::zstd::matcher::{MIN_MATCH, MatchFinder};
 
 const MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 const FHD: u8 = 0x00;
-/// Window_Descriptor = 0x70: Exponent=14, Mantissa=0 → 16 KiB window.
+/// Window_Descriptor = 0x70: Exponent=14, Mantissa=0 → Window_Log = 24 →
+/// 16 MiB window. RFC 8478 caps block size at min(Window_Size, 128 KiB), so
+/// the effective block ceiling is 128 KiB.
 const WD: u8 = 0x70;
 
 /// Block size threshold. We emit one block per [`BLOCK_SIZE`] bytes (or
-/// whatever's left at `finish` time). 16 KiB matches the window we advertise.
-const BLOCK_SIZE: usize = 16 * 1024;
+/// whatever's left at `finish` time). 128 KiB is the per-block ceiling; using
+/// the max size amortises the literal-section and FSE-table overhead across
+/// more sequences per block.
+const BLOCK_SIZE: usize = 128 * 1024;
 
 /// Streaming Zstandard encoder.
 pub struct Encoder {
@@ -58,12 +72,16 @@ pub struct Encoder {
     out_idx: usize,
     /// Reusable matcher.
     matcher: MatchFinder,
-    /// FSE encoders for the three sequence streams. Built once and reused.
-    ll_enc: FseEncoder,
-    ml_enc: FseEncoder,
-    of_enc: FseEncoder,
     /// Have we written the frame header yet?
     header_written: bool,
+    /// Repeat-offset ring (last three distinct match distances), carried across
+    /// blocks. Initial state per RFC 8478 §3.1.1.5: `[1, 4, 8]`.
+    prev_offsets: [u32; 3],
+    /// Previous block's Huffman table (length array). When the next block's
+    /// literal frequencies are similar, we emit a Treeless_Literals_Block and
+    /// skip the tree description entirely. `None` until at least one
+    /// Compressed_Literals_Block has been emitted.
+    prev_huff_lengths: Option<HuffLengths>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -84,10 +102,9 @@ impl Encoder {
             out_buf: Vec::new(),
             out_idx: 0,
             matcher: MatchFinder::new(BLOCK_SIZE),
-            ll_enc: FseEncoder::from_normalized(&DEFAULT_LL_COUNTS, DEFAULT_LL_ACCURACY_LOG),
-            ml_enc: FseEncoder::from_normalized(&DEFAULT_ML_COUNTS, DEFAULT_ML_ACCURACY_LOG),
-            of_enc: FseEncoder::from_normalized(&DEFAULT_OF_COUNTS, DEFAULT_OF_ACCURACY_LOG),
             header_written: false,
+            prev_offsets: [1, 4, 8],
+            prev_huff_lengths: None,
         }
     }
 
@@ -118,6 +135,10 @@ impl Encoder {
     /// Try to encode `pending` as a Compressed_Block. Returns the block body
     /// (without the 3-byte block header) if successful and smaller than a
     /// Raw_Block; otherwise `None`.
+    ///
+    /// Side effect: on success, updates [`Self::prev_offsets`] from the
+    /// sequences emitted. On failure (return `None`), `prev_offsets` is left
+    /// unchanged so the next block sees the same pre-block state.
     fn try_compress_block(&mut self) -> Option<Vec<u8>> {
         if self.pending.len() < 16 {
             // Too small to bother — the framing overhead eats any savings.
@@ -126,30 +147,30 @@ impl Encoder {
         let buffer = self.pending.as_slice();
         self.matcher.resize_for(buffer.len());
 
-        // Run LZ77.
+        // Run LZ77 with repeat-offset awareness. We track a per-block ring
+        // copy of `prev_offsets` and rewrite each emitted match's offset
+        // through `assign_offset` so equal distances collapse to codes 1..=3.
         let mut sequences: Vec<Seq> = Vec::new();
         let mut literals: Vec<u8> = Vec::with_capacity(buffer.len());
         let mut lit_start: usize = 0;
         let mut pos: usize = 0;
+        let mut block_offsets = self.prev_offsets;
 
         while pos + MIN_MATCH < buffer.len() {
             self.matcher.insert(buffer, pos);
-            // Try to find a match.
             let m = self.matcher.find_match(buffer, pos, buffer.len());
             if let Some(m) = m {
                 let literal_run = pos - lit_start;
                 let distance = m.distance;
                 let match_len = m.length;
-                // Push literals from lit_start..pos.
+                let offset_value =
+                    assign_offset(distance as u32, literal_run as u32, &mut block_offsets);
                 literals.extend_from_slice(&buffer[lit_start..pos]);
                 sequences.push(Seq {
                     literal_length: literal_run as u32,
                     match_length: match_len as u32,
-                    distance: distance as u32,
+                    offset_value,
                 });
-                // Insert hash entries for the bytes we're skipping over (so
-                // future matches inside this match are findable). Skip the
-                // first one (already inserted above).
                 for skip_pos in (pos + 1)..(pos + match_len) {
                     self.matcher.insert(buffer, skip_pos);
                 }
@@ -167,9 +188,17 @@ impl Encoder {
         // Trailing literals: from lit_start to end of buffer.
         let trailing_literals = &buffer[lit_start..];
 
-        // Build literals section: Raw_Literals_Block.
-        let regen_size = literals.len() + trailing_literals.len();
-        let lit_section = build_raw_literals_section(&literals, trailing_literals);
+        // Build all literal bytes (LZ77 literals + trailing) for use in
+        // literals-section construction.
+        let mut all_literals: Vec<u8> =
+            Vec::with_capacity(literals.len() + trailing_literals.len());
+        all_literals.extend_from_slice(&literals);
+        all_literals.extend_from_slice(trailing_literals);
+
+        // Build literals section. Try Huffman first (with optional Treeless
+        // reuse of the previous block's tree); fall back to raw.
+        let (lit_section, new_lengths) =
+            build_literals_section(&all_literals, self.prev_huff_lengths.as_ref());
 
         // Build sequences section.
         let seq_section = self.build_sequences_section(&sequences);
@@ -179,7 +208,13 @@ impl Encoder {
         if total >= raw_size {
             return None; // Not worth compressing.
         }
-        let _ = regen_size;
+
+        // Commit the per-block offset history and (if we emitted a Huffman
+        // tree) the new lengths to the encoder state.
+        self.prev_offsets = block_offsets;
+        if let Some(lengths) = new_lengths {
+            self.prev_huff_lengths = Some(lengths);
+        }
 
         let mut body = Vec::with_capacity(total);
         body.extend_from_slice(&lit_section);
@@ -189,14 +224,13 @@ impl Encoder {
 
     /// Build the sequence section bytes: header (count + symbol-modes byte)
     /// followed by the FSE-encoded sequence bitstream.
+    ///
+    /// Per-table mode selection: for each of LL/OF/ML we try the predefined
+    /// distribution against a custom FSE_Compressed_Mode distribution built
+    /// from this block's actual code histogram. Whichever produces the
+    /// smaller estimated byte count wins.
     fn build_sequences_section(&self, sequences: &[Seq]) -> Vec<u8> {
         let n = sequences.len() as u32;
-        let mut out = encode_sequence_count(n);
-        // Symbol_Compression_Modes byte: bits [7:6]=LL_Mode, [5:4]=OF_Mode,
-        // [3:2]=ML_Mode, [1:0]=Reserved.
-        // 0b00 = Predefined_Mode. We use predefined for all three.
-        let modes: u8 = 0b00_00_00_00;
-        out.push(modes);
 
         // Pre-compute (code, extra_bits, extra_val) for each sequence.
         let mut ll_codes: Vec<u8> = Vec::with_capacity(sequences.len());
@@ -207,9 +241,7 @@ impl Encoder {
         let mut of_extras: Vec<(u32, u32)> = Vec::with_capacity(sequences.len());
 
         for s in sequences {
-            // We don't use repeat offsets — encode offset_value = distance + 3.
-            let offset_value = s.distance + 3;
-            let (oc, oe_bits, oe_val) = of_code(offset_value);
+            let (oc, oe_bits, oe_val) = of_code(s.offset_value);
             of_codes.push(oc);
             of_extras.push((oe_bits, oe_val));
 
@@ -222,14 +254,47 @@ impl Encoder {
             ml_extras.push((me_bits, me_val));
         }
 
+        // Pick per-table mode and build the encoders + any header bytes.
+        let (ll_enc, ll_mode, ll_header) = pick_table(
+            &ll_codes,
+            &DEFAULT_LL_COUNTS,
+            DEFAULT_LL_ACCURACY_LOG,
+            9,
+            35,
+        );
+        let (of_enc, of_mode, of_header) = pick_table(
+            &of_codes,
+            &DEFAULT_OF_COUNTS,
+            DEFAULT_OF_ACCURACY_LOG,
+            8,
+            31,
+        );
+        let (ml_enc, ml_mode, ml_header) = pick_table(
+            &ml_codes,
+            &DEFAULT_ML_COUNTS,
+            DEFAULT_ML_ACCURACY_LOG,
+            9,
+            52,
+        );
+
+        // Build the sequences-section bytes.
+        let mut out = encode_sequence_count(n);
+        // Symbol_Compression_Modes byte: bits [7:6]=LL_Mode, [5:4]=OF_Mode,
+        // [3:2]=ML_Mode, [1:0]=Reserved.
+        let modes: u8 = (ll_mode << 6) | (of_mode << 4) | (ml_mode << 2);
+        out.push(modes);
+        out.extend_from_slice(&ll_header);
+        out.extend_from_slice(&of_header);
+        out.extend_from_slice(&ml_header);
+
         // FSE-encode the symbol streams.
         let mut writer = RevBitWriter::new();
         let n_seq = sequences.len();
 
         // Reverse encoding pattern. Init states from the LAST sequence.
-        let mut ll_state = self.ll_enc.init_state(ll_codes[n_seq - 1] as usize);
-        let mut of_state = self.of_enc.init_state(of_codes[n_seq - 1] as usize);
-        let mut ml_state = self.ml_enc.init_state(ml_codes[n_seq - 1] as usize);
+        let mut ll_state = ll_enc.init_state(ll_codes[n_seq - 1] as usize);
+        let mut of_state = of_enc.init_state(of_codes[n_seq - 1] as usize);
+        let mut ml_state = ml_enc.init_state(ml_codes[n_seq - 1] as usize);
 
         // For each sequence (processed in reverse), write to the bitstream
         // in the EXACT REVERSE of the decoder's read order.
@@ -303,18 +368,9 @@ impl Encoder {
             if i == n_seq - 1 {
                 // No advance bits for the decoder's last sequence.
             } else {
-                // Advance bits for the transition seq i → seq i+1.
-                // Decoder reads in order LL, ML, OF; we write in reverse:
-                // OF first, then ML, then LL.
-                of_state = self
-                    .of_enc
-                    .encode_symbol(of_state, of_codes[i] as usize, &mut writer);
-                ml_state = self
-                    .ml_enc
-                    .encode_symbol(ml_state, ml_codes[i] as usize, &mut writer);
-                ll_state = self
-                    .ll_enc
-                    .encode_symbol(ll_state, ll_codes[i] as usize, &mut writer);
+                of_state = of_enc.encode_symbol(of_state, of_codes[i] as usize, &mut writer);
+                ml_state = ml_enc.encode_symbol(ml_state, ml_codes[i] as usize, &mut writer);
+                ll_state = ll_enc.encode_symbol(ll_state, ll_codes[i] as usize, &mut writer);
             }
             // Extras: decoder reads OF, ML, LL — write LL, ML, OF.
             writer.write_bits(ll_extras[i].1 as u64, ll_extras[i].0);
@@ -324,18 +380,28 @@ impl Encoder {
 
         // Write final FSE states (decoder reads these via init in order
         // LL, OF, ML — we write reverse: ML, OF, LL).
-        self.ml_enc.write_final_state(ml_state, &mut writer);
-        self.of_enc.write_final_state(of_state, &mut writer);
-        self.ll_enc.write_final_state(ll_state, &mut writer);
+        ml_enc.write_final_state(ml_state, &mut writer);
+        of_enc.write_final_state(of_state, &mut writer);
+        ll_enc.write_final_state(ll_state, &mut writer);
 
         let bitstream = writer.finish();
         out.extend_from_slice(&bitstream);
         out
     }
 
-    /// Flush `pending` as a single block (compressed if profitable, raw
-    /// otherwise). Sets `last` on the block header.
+    /// Flush `pending` as a single block (RLE / compressed / raw — whichever
+    /// is smallest). Sets `last` on the block header.
     fn flush_block(&mut self, last: bool) {
+        // RLE_Block: 4-byte total (3-byte header + 1 payload byte) iff every
+        // byte of `pending` is identical. A clear win on any single-byte run
+        // longer than 4 bytes.
+        if self.pending.len() >= 4 && all_same(&self.pending) {
+            let body_size = self.pending.len() as u32;
+            Self::push_block_header(&mut self.out_buf, body_size, 1, last);
+            self.out_buf.push(self.pending[0]);
+            self.pending.clear();
+            return;
+        }
         if let Some(body) = self.try_compress_block() {
             Self::push_block_header(&mut self.out_buf, body.len() as u32, 2, last);
             self.out_buf.extend_from_slice(&body);
@@ -368,38 +434,129 @@ impl Encoder {
     }
 }
 
-/// One LZ77 sequence in the compressor's internal form (uses real distance,
-/// not the encoded offset_value).
+/// Pick the best per-table FSE mode (Predefined or FSE_Compressed) given the
+/// codes used. Returns `(encoder, mode_bits, header_bytes)`. `mode_bits` is
+/// the 2-bit field stored in the Symbol_Compression_Modes byte
+/// (`0b00`=Predefined, `0b10`=FSE_Compressed). `header_bytes` is empty for
+/// Predefined.
+///
+/// We pick FSE_Compressed only when its predicted FSE-bitstream byte count
+/// plus header bytes is smaller than the predefined-table's predicted
+/// bitstream bytes by at least a 4-byte threshold (to avoid noisy wins from
+/// short blocks).
+fn pick_table(
+    codes: &[u8],
+    default_counts: &[i16],
+    default_al: u8,
+    max_al: u8,
+    max_symbol: u16,
+) -> (FseEncoder, u8, Vec<u8>) {
+    let alphabet = (max_symbol as usize) + 1;
+    let mut hist = vec![0u32; alphabet];
+    for &c in codes {
+        if (c as usize) < alphabet {
+            hist[c as usize] += 1;
+        }
+    }
+    let n = codes.len();
+
+    // Predicted bits using predefined distribution.
+    let pred_bits_default = predict_fse_bits(default_counts, &hist, default_al);
+
+    // Pick an accuracy_log for custom: roughly log2(n) but capped.
+    let mut al = max_al;
+    while al > 5 && (1u32 << al) > (n as u32) * 4 {
+        al -= 1;
+    }
+    if al < 5 {
+        al = 5;
+    }
+
+    // Try to build normalised counts.
+    let custom = build_normalised_counts(&hist, n as u32, al);
+    if let Some(counts) = custom {
+        let pred_bits_custom = predict_fse_bits(&counts, &hist, al);
+        let header = encode_fse_table_header(&counts, al);
+        let custom_bytes = (pred_bits_custom / 8 + 1) as usize + header.len();
+        let default_bytes = (pred_bits_default / 8 + 1) as usize;
+        // Threshold: only switch to custom if it saves at least 2 bytes (to
+        // pay for noise in the estimates without being too greedy).
+        if custom_bytes + 2 < default_bytes {
+            let enc = FseEncoder::from_normalized(&counts, al);
+            return (enc, 0b10, header);
+        }
+    }
+    let predef_enc = FseEncoder::from_normalized(default_counts, default_al);
+    (predef_enc, 0b00, Vec::new())
+}
+
+/// Predict the bit count of an FSE bitstream over `codes_hist` (per-code
+/// occurrence counts) under the distribution given by `counts` /
+/// `accuracy_log`.
+///
+/// For each code `s` with count `n_s` occurrences and normalised count
+/// `c_s`, the average FSE step uses `accuracy_log - floor(log2(c_s))` bits
+/// (with `c_s = -1` treated as a single state always reading
+/// `accuracy_log` bits). We just sum that across all occurrences.
+fn predict_fse_bits(counts: &[i16], hist: &[u32], accuracy_log: u8) -> u64 {
+    let mut total: u64 = 0;
+    for s in 0..hist.len().min(counts.len()) {
+        let n = hist[s] as u64;
+        if n == 0 {
+            continue;
+        }
+        let c = counts[s];
+        let bits = if c == -1 || c == 1 {
+            accuracy_log as u64
+        } else if c > 1 {
+            let log2 = 31u32 - (c as u32).leading_zeros();
+            (accuracy_log as u64).saturating_sub(log2 as u64)
+        } else {
+            // Code present in the stream but has count 0 in distribution —
+            // can't actually be FSE-encoded. Return a huge cost.
+            return u64::MAX;
+        };
+        total += n * bits;
+    }
+    total
+}
+
+/// Are all bytes of `s` the same value? Used to detect RLE_Block opportunities.
+fn all_same(s: &[u8]) -> bool {
+    if s.is_empty() {
+        return true;
+    }
+    let first = s[0];
+    s.iter().all(|&b| b == first)
+}
+
+/// One LZ77 sequence after repeat-offset assignment. `offset_value` is the
+/// number the FSE/extra-bits encoder will emit — either `distance + 3` for a
+/// fresh offset, or `1..=3` aliasing one of the three previous offsets.
 #[derive(Clone, Copy, Debug)]
 struct Seq {
     literal_length: u32,
     match_length: u32,
-    distance: u32,
+    offset_value: u32,
 }
 
 /// Build a Raw_Literals_Block section: literal-section header + raw bytes.
-fn build_raw_literals_section(literals: &[u8], trailing: &[u8]) -> Vec<u8> {
-    let regen = literals.len() + trailing.len();
+fn build_raw_literals_section_one(literals: &[u8]) -> Vec<u8> {
+    let regen = literals.len();
     let mut out = Vec::with_capacity(3 + regen);
-    // Choose size_format to fit `regen`. Raw_Literals_Block = type 0.
+    // Raw_Literals_Block = type 0. Choose Size_Format to fit `regen`.
     if regen < 32 {
-        // 1-byte header: SF=00, type=00.
-        // SF=00, type=00 → just the size in the upper 5 bits.
+        // 1-byte header: SF=00, type=00. Size in upper 5 bits.
         let hdr = (regen as u8) << 3;
         out.push(hdr);
     } else if regen < 4096 {
         // 2-byte header: SF=01, 12-bit regen.
-        // Layout: byte 0 = (regen[3:0] << 4) | (sf << 2) | type
-        //         byte 1 = regen[11:4]
         let byte0 = (((regen & 0xF) as u8) << 4) | (0b01 << 2);
         let byte1 = (regen >> 4) as u8;
         out.push(byte0);
         out.push(byte1);
     } else {
-        // 3-byte header: SF=11 (still raw), 20-bit regen.
-        // Layout: byte 0 = (regen[3:0] << 4) | (sf << 2) | type
-        //         byte 1 = regen[11:4]
-        //         byte 2 = regen[19:12]
+        // 3-byte header: SF=11, 20-bit regen.
         let byte0 = (((regen & 0xF) as u8) << 4) | (0b11 << 2);
         let byte1 = ((regen >> 4) & 0xFF) as u8;
         let byte2 = ((regen >> 12) & 0xFF) as u8;
@@ -408,8 +565,301 @@ fn build_raw_literals_section(literals: &[u8], trailing: &[u8]) -> Vec<u8> {
         out.push(byte2);
     }
     out.extend_from_slice(literals);
-    out.extend_from_slice(trailing);
     out
+}
+
+/// Build the literals section, choosing the smallest of: Compressed
+/// (Block_Type=10, fresh Huffman tree), Treeless (Block_Type=11, reusing
+/// `prev_lengths`), or Raw (Block_Type=00). Returns `(section_bytes, new_huff_lengths)`
+/// where `new_huff_lengths` is `Some` iff the picked section carries — or
+/// reuses — a Huffman tree (i.e. the next block could use Treeless from it).
+fn build_literals_section(
+    literals: &[u8],
+    prev_lengths: Option<&HuffLengths>,
+) -> (Vec<u8>, Option<HuffLengths>) {
+    let regen = literals.len();
+
+    let mut best: Option<(Vec<u8>, Option<HuffLengths>)> = None;
+    let raw_len = raw_literals_section_len(regen);
+
+    // Helper: keep the smallest candidate so far.
+    let take_candidate =
+        |section: Vec<u8>,
+         lengths: Option<HuffLengths>,
+         current: &mut Option<(Vec<u8>, Option<HuffLengths>)>| {
+            if section.len() < raw_len
+                && current
+                    .as_ref()
+                    .map(|(b, _)| section.len() < b.len())
+                    .unwrap_or(true)
+            {
+                *current = Some((section, lengths));
+            }
+        };
+
+    if regen >= 32 {
+        // Try Treeless (reuse) if we have a previous tree compatible with the
+        // current literal alphabet.
+        if let Some(prev) = prev_lengths {
+            let mut compatible = true;
+            for &b in literals {
+                if prev[b as usize] == 0 {
+                    compatible = false;
+                    break;
+                }
+            }
+            if compatible
+                && let Some(section) = try_build_huffman_literals_section_with(
+                    literals, prev, /* fresh_tree = */ false,
+                )
+            {
+                take_candidate(section, Some(*prev), &mut best);
+            }
+        }
+        // Try fresh tree. This also tells us the "new" tree for chaining.
+        let freq = histogram(literals);
+        if let Some(lengths) = build_huff_lengths(&freq)
+            && let Some(section) = try_build_huffman_literals_section_with(
+                literals, &lengths, /* fresh_tree = */ true,
+            )
+        {
+            take_candidate(section, Some(lengths), &mut best);
+        }
+    }
+
+    if let Some((section, lengths)) = best {
+        (section, lengths)
+    } else {
+        (build_raw_literals_section_one(literals), None)
+    }
+}
+
+/// Compute the byte size a Raw_Literals_Block section will take for `regen`
+/// bytes (header + payload).
+fn raw_literals_section_len(regen: usize) -> usize {
+    let header = if regen < 32 {
+        1
+    } else if regen < 4096 {
+        2
+    } else {
+        3
+    };
+    header + regen
+}
+
+/// Try building a literals section using a Huffman tree.
+///
+/// When `fresh_tree=true`, emits a Compressed_Literals_Block (Block_Type=10)
+/// whose payload starts with the tree description. When `fresh_tree=false`,
+/// emits a Treeless_Literals_Block (Block_Type=11): no tree bytes; the
+/// decoder is expected to reuse the previously transmitted tree (whose
+/// lengths must equal `lengths`). The caller is responsible for ensuring the
+/// previous-block tree is compatible with all bytes in `literals` and that
+/// at least one Compressed_Literals_Block has preceded this one in the
+/// stream.
+///
+/// Returns `Some(section_bytes)` if successful, or `None` if a structural
+/// limit is exceeded (alphabet too large for the direct nibble weight
+/// encoding, regen/comp size beyond 18 bits, etc.).
+fn try_build_huffman_literals_section_with(
+    literals: &[u8],
+    lengths: &HuffLengths,
+    fresh_tree: bool,
+) -> Option<Vec<u8>> {
+    let regen = literals.len();
+    if regen == 0 {
+        return None;
+    }
+    if regen > (1 << 18) - 1 {
+        return None; // Exceeds the SF=11 18-bit field.
+    }
+    let enc = build_huff_encoder(lengths);
+    // Compute or skip the tree-description bytes depending on `fresh_tree`.
+    let tree_bytes: Vec<u8> = if fresh_tree {
+        let (weights, _max_num_bits) = lengths_to_weights(lengths);
+        if weights.len() > 128 {
+            return None; // Direct nibble encoding cap.
+        }
+        encode_huff_tree_direct(&weights)
+    } else {
+        Vec::new()
+    };
+
+    // Quick reject: bits prediction + tree overhead vs. raw size.
+    let mut freq = [0u32; 256];
+    for &b in literals {
+        freq[b as usize] += 1;
+        // While iterating, also catch the "byte not in this tree" case for
+        // Treeless mode — the caller checked but be defensive.
+        if !fresh_tree && lengths[b as usize] == 0 {
+            return None;
+        }
+    }
+    let pred_bits = predicted_bits(lengths, &freq);
+    let est_payload = pred_bits.div_ceil(8) as usize + tree_bytes.len() + 8;
+    if est_payload >= regen + 3 {
+        return None;
+    }
+
+    // Encode the literal stream(s) and assemble the payload.
+    let (use_4_stream, streams): (bool, Vec<Vec<u8>>) = if regen <= 1023 {
+        (false, vec![encode_huff_stream(&enc, literals)])
+    } else {
+        let (s1, s2, s3, s4) = encode_huff_4streams(&enc, literals);
+        (true, vec![s1, s2, s3, s4])
+    };
+
+    let stream_total: usize = streams.iter().map(|s| s.len()).sum();
+    let jump_table_len = if use_4_stream { 6 } else { 0 };
+    let mut payload = Vec::with_capacity(tree_bytes.len() + jump_table_len + stream_total);
+    payload.extend_from_slice(&tree_bytes);
+    if use_4_stream {
+        let l1 = streams[0].len();
+        let l2 = streams[1].len();
+        let l3 = streams[2].len();
+        if l1 > 0xFFFF || l2 > 0xFFFF || l3 > 0xFFFF {
+            return None;
+        }
+        payload.push((l1 & 0xFF) as u8);
+        payload.push(((l1 >> 8) & 0xFF) as u8);
+        payload.push((l2 & 0xFF) as u8);
+        payload.push(((l2 >> 8) & 0xFF) as u8);
+        payload.push((l3 & 0xFF) as u8);
+        payload.push(((l3 >> 8) & 0xFF) as u8);
+        for s in &streams {
+            payload.extend_from_slice(s);
+        }
+    } else {
+        payload.extend_from_slice(&streams[0]);
+    }
+
+    let comp_size = payload.len();
+
+    // Pick Size_Format / header layout.
+    let (sf, header_bytes): (u8, usize) = if !use_4_stream {
+        if regen >= 1024 || comp_size >= 1024 {
+            return None;
+        }
+        (0b00, 3)
+    } else if regen < 1024 && comp_size < 1024 {
+        (0b01, 3)
+    } else if regen < 16384 && comp_size < 16384 {
+        (0b10, 4)
+    } else if regen < (1 << 18) && comp_size < (1 << 18) {
+        (0b11, 5)
+    } else {
+        return None;
+    };
+
+    let lit_block_type: u8 = if fresh_tree { 0b10 } else { 0b11 };
+    let lhd_low_4_bits = lit_block_type | (sf << 2); // bits 0..3 of byte 0.
+
+    let mut out = Vec::with_capacity(header_bytes + comp_size);
+    match (sf, header_bytes) {
+        (0b00, 3) | (0b01, 3) => {
+            // 24-bit field: [LHD low 4 = type+sf][regen 10][comp 10] = 24 bits.
+            // Layout (decoder formula):
+            //   byte0 = lhd_low_4 | ((regen & 0xF) << 4)
+            //   byte1 = (regen >> 4) | ((comp & 0x3) << 6)
+            //   byte2 = (comp >> 2)
+            let b0 = lhd_low_4_bits | (((regen & 0xF) as u8) << 4);
+            let b1 = ((regen >> 4) as u8 & 0x3F) | (((comp_size & 0x3) as u8) << 6);
+            let b2 = (comp_size >> 2) as u8;
+            out.push(b0);
+            out.push(b1);
+            out.push(b2);
+        }
+        (0b10, 4) => {
+            // 32-bit field: [LHD low 4][regen 14][comp 14].
+            //   byte0 = lhd_low_4 | ((regen & 0xF) << 4)
+            //   byte1 = (regen >> 4) & 0xFF
+            //   byte2 = ((regen >> 12) & 0x3) | ((comp & 0x3F) << 2)
+            //   byte3 = (comp >> 6)
+            let b0 = lhd_low_4_bits | (((regen & 0xF) as u8) << 4);
+            let b1 = ((regen >> 4) & 0xFF) as u8;
+            let b2 = (((regen >> 12) & 0x3) as u8) | (((comp_size & 0x3F) as u8) << 2);
+            let b3 = (comp_size >> 6) as u8;
+            out.push(b0);
+            out.push(b1);
+            out.push(b2);
+            out.push(b3);
+        }
+        (0b11, 5) => {
+            // 40-bit field: [LHD low 4][regen 18][comp 18].
+            // bits = byte0 | (byte1<<8) | (byte2<<16) | (byte3<<24) | (byte4<<32)
+            // regen = (bits >> 4) & 0x3FFFF
+            // comp  = (bits >> 22) & 0x3FFFF
+            let bits: u64 = (lhd_low_4_bits as u64)
+                | ((regen as u64 & 0x3_FFFF) << 4)
+                | ((comp_size as u64 & 0x3_FFFF) << 22);
+            out.push((bits & 0xFF) as u8);
+            out.push(((bits >> 8) & 0xFF) as u8);
+            out.push(((bits >> 16) & 0xFF) as u8);
+            out.push(((bits >> 24) & 0xFF) as u8);
+            out.push(((bits >> 32) & 0xFF) as u8);
+        }
+        _ => unreachable!(),
+    }
+    out.extend_from_slice(&payload);
+    Some(out)
+}
+
+/// Map an LZ77 (distance, literal_length) into the encoded `offset_value`
+/// the bitstream will carry, updating the per-block repeat-offset ring per
+/// RFC 8478 §3.1.1.5 ("Repeat Offsets").
+///
+/// For a distance equal to one of the three most recent offsets, we emit a
+/// code in 1..=3 — much shorter than `distance + 3` for any meaningful
+/// distance. The special case `LL == 0` makes code 1 alias the second offset
+/// (saving the slot when literal-less back-references repeat).
+fn assign_offset(distance: u32, literal_length: u32, prev: &mut [u32; 3]) -> u32 {
+    debug_assert!(distance > 0);
+    if literal_length > 0 {
+        // Normal case.
+        if distance == prev[0] {
+            // No history change.
+            return 1;
+        }
+        if distance == prev[1] {
+            prev.swap(0, 1);
+            return 2;
+        }
+        if distance == prev[2] {
+            // [prev[2], prev[0], prev[1]]
+            let tmp = prev[2];
+            prev[2] = prev[1];
+            prev[1] = prev[0];
+            prev[0] = tmp;
+            return 3;
+        }
+    } else {
+        // LL == 0: codes shift by one.
+        //   code 1 → prev[1]
+        //   code 2 → prev[2]
+        //   code 3 → prev[0] - 1
+        if distance == prev[1] {
+            prev.swap(0, 1);
+            return 1;
+        }
+        if distance == prev[2] {
+            let tmp = prev[2];
+            prev[2] = prev[1];
+            prev[1] = prev[0];
+            prev[0] = tmp;
+            return 2;
+        }
+        if prev[0] > 1 && distance == prev[0] - 1 {
+            prev[2] = prev[1];
+            prev[1] = prev[0];
+            prev[0] = distance;
+            return 3;
+        }
+    }
+    // No match → encode as a "literal" offset (distance + 3) and push it.
+    prev[2] = prev[1];
+    prev[1] = prev[0];
+    prev[0] = distance;
+    distance + 3
 }
 
 impl Default for Encoder {
@@ -532,5 +982,7 @@ impl EncoderTrait for Encoder {
         self.out_idx = 0;
         self.matcher = MatchFinder::new(BLOCK_SIZE);
         self.header_written = false;
+        self.prev_offsets = [1, 4, 8];
+        self.prev_huff_lengths = None;
     }
 }
