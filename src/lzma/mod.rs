@@ -959,12 +959,14 @@ impl Decoder {
         at_eof: bool,
     ) -> Result<(), Error> {
         loop {
-            if *written == output.len() {
-                return Ok(());
-            }
-
-            // 1) Drain a pending literal first.
+            // 1) Drain a pending literal first. If output is full, leave it
+            //    parked in `pending_literal` and bail — that's all we can do
+            //    in this iteration.
             if let Some(b) = self.pending_literal.take() {
+                if *written == output.len() {
+                    self.pending_literal = Some(b);
+                    return Ok(());
+                }
                 if let HeaderState::Active(ref mut core) = self.header_state {
                     core.dict_put(b);
                 }
@@ -1044,6 +1046,14 @@ impl Decoder {
             let outcome = core.step(&self.buf, at_eof)?;
             match outcome {
                 PacketOutcome::Literal(b) => {
+                    // If output is full, park the literal in pending_literal
+                    // and return. We mustn't repeat-decode the packet because
+                    // the range coder already advanced past it; pending_literal
+                    // exists for exactly this case.
+                    if *written == output.len() {
+                        self.pending_literal = Some(b);
+                        return Ok(());
+                    }
                     core.dict_put(b);
                     output[*written] = b;
                     *written += 1;

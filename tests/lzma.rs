@@ -654,3 +654,62 @@ mod factory {
         assert_eq!(&decoded[..], input);
     }
 }
+
+// ─── interop with system xz --format=lzma (issue #14) ───────────────────
+
+#[test]
+fn xz_format_lzma_round_trips_via_vec_helper() {
+    // Reporter's exact path: xz --format=lzma → vec::decompress_to_vec.
+    // We don't depend on `xz` being on PATH; instead we hard-code a
+    // small fixture produced offline by `echo "hello lzma alone" |
+    // xz --format=lzma -c | xxd -i` (echo appends a trailing newline).
+    const FIXTURE: &[u8] = &[
+        0x5d, 0x00, 0x00, 0x80, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x34,
+        0x19, 0x49, 0xee, 0x8d, 0xe9, 0x14, 0x8a, 0x6a, 0xa5, 0xd6, 0xb6, 0x11, 0x0a, 0xd7, 0x39,
+        0x16, 0x6a, 0x19, 0x15, 0x45, 0xff, 0xfe, 0x66, 0xec, 0x00,
+    ];
+    let decoded = compcol::vec::decompress_to_vec::<compcol::lzma::Lzma>(FIXTURE).unwrap();
+    assert_eq!(decoded, b"hello lzma alone\n");
+}
+
+#[test]
+fn limited_decoder_at_exact_budget_terminates_cleanly() {
+    // Used to fail with Error::OutputLimitExceeded because the decoder's
+    // raw_finish couldn't recognize EOS once the budget exhausted the
+    // output slice. The decoder produced exactly N bytes correctly but
+    // never returned StreamEnd — the EOS packet (which emits zero
+    // output bytes) wasn't being decoded inside drain_output. Fixed by
+    // restructuring drain_output so EOS / packet-with-no-output paths
+    // run regardless of remaining output capacity.
+    use compcol::Algorithm;
+    use compcol::limit::LimitedDecoder;
+    let original = vec![b'A'; 65536];
+    let compressed = compcol::vec::compress_to_vec::<compcol::lzma::Lzma>(&original).unwrap();
+
+    let mut dec = LimitedDecoder::new(compcol::lzma::Lzma::decoder(), original.len() as u64);
+    let mut buf = vec![0u8; 4096];
+    let mut decoded = Vec::new();
+    let mut consumed = 0;
+    while consumed < compressed.len() {
+        let (p, s) = dec.decode(&compressed[consumed..], &mut buf).unwrap();
+        decoded.extend_from_slice(&buf[..p.written]);
+        consumed += p.consumed;
+        if matches!(s, compcol::Status::StreamEnd) {
+            break;
+        }
+        if matches!(s, compcol::Status::InputEmpty) && consumed == compressed.len() {
+            break;
+        }
+        if p.consumed == 0 && p.written == 0 {
+            break;
+        }
+    }
+    loop {
+        let (p, s) = dec.finish(&mut buf).unwrap();
+        decoded.extend_from_slice(&buf[..p.written]);
+        if matches!(s, compcol::Status::StreamEnd) {
+            break;
+        }
+    }
+    assert_eq!(decoded, original);
+}
