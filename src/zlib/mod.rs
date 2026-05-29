@@ -74,12 +74,12 @@ fn header_bytes(level: u8) -> (u8, u8) {
 /// bit is set (RFC 1950 §2.2). If `FDICT=1` the wire format includes a
 /// 4-byte `DICTID` field — the Adler-32 of the dictionary — that the
 /// decoder verifies against the configured dictionary; mismatch surfaces
-/// as [`Error::ChecksumMismatch`](crate::Error::ChecksumMismatch). Streams
-/// with `FDICT=0` ignore `dictionary` entirely.
+/// as [`Error::ChecksumMismatch`]. Streams with `FDICT=0` ignore
+/// `dictionary` entirely.
 ///
 /// An empty dictionary (the default) preserves the older configless
 /// behaviour: `FDICT=0` streams decode normally, `FDICT=1` streams error
-/// out as [`Error::Unsupported`](crate::Error::Unsupported).
+/// out as [`Error::Unsupported`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DecoderConfig {
     /// Bytes to seed the underlying deflate window with when the stream's
