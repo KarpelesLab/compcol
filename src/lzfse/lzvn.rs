@@ -457,9 +457,19 @@ fn lz_copy(out: &mut Vec<u8>, d: usize, n: usize, start: usize) -> Result<(), Er
         return Err(Error::Corrupt);
     }
     let src_pos = out.len() - d;
-    for i in 0..n {
-        let b = out[src_pos + i];
-        out.push(b);
+    if d >= n {
+        // Non-overlapping: collapses to memcpy.
+        out.extend_from_within(src_pos..src_pos + n);
+    } else if d == 1 {
+        // Byte-splat.
+        let b = out[src_pos];
+        out.resize(out.len() + n, b);
+    } else {
+        // Self-overlap: replicate byte-by-byte.
+        for i in 0..n {
+            let b = out[src_pos + i];
+            out.push(b);
+        }
     }
     Ok(())
 }

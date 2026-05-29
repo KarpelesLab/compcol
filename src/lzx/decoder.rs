@@ -897,7 +897,41 @@ fn step_huff(ctx: &mut RunCtx) -> Result<bool, Error> {
                         return Err(Error::Corrupt);
                     }
                     let win_size = ctx.window.len();
-                    let src = (ctx.window_pos + win_size - distance as usize) % win_size;
+                    let frame_room = FRAME_SIZE - ctx.frame_buf.len();
+                    let avail = (length - copied) as usize;
+                    let chunk = avail.min(frame_room).min(remaining as usize);
+                    let dist = distance as usize;
+                    // Fast path: non-overlapping AND source range does not
+                    // wrap the circular window AND destination range does
+                    // not wrap either. We can slice-copy.
+                    if chunk > 1 && dist >= chunk {
+                        let src = (ctx.window_pos + win_size - dist) % win_size;
+                        if src != ctx.window_pos
+                            && src + chunk <= win_size
+                            && ctx.window_pos + chunk <= win_size
+                        {
+                            let (lo_start, dst_start) = (src, ctx.window_pos);
+                            let (lo, hi) = if lo_start < dst_start {
+                                let (a, b) = ctx.window.split_at_mut(dst_start);
+                                (&a[lo_start..lo_start + chunk], &mut b[..chunk])
+                            } else {
+                                // lo_start > dst_start: split at lo_start.
+                                let (a, b) = ctx.window.split_at_mut(lo_start);
+                                (&b[..chunk], &mut a[dst_start..dst_start + chunk])
+                            };
+                            hi.copy_from_slice(lo);
+                            ctx.frame_buf.extend_from_slice(hi);
+                            ctx.window_pos = (ctx.window_pos + chunk) % win_size;
+                            copied += chunk as u16;
+                            remaining -= chunk as u32;
+                            if remaining == 0 {
+                                ctx.block = BlockState::AwaitBlockHeader;
+                                return Ok(true);
+                            }
+                            continue;
+                        }
+                    }
+                    let src = (ctx.window_pos + win_size - dist) % win_size;
                     let b = ctx.window[src];
                     emit_window(ctx, b);
                     copied += 1;

@@ -312,12 +312,19 @@ pub fn decode_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
         }
         let match_len = MIN_MATCH + match_excess;
 
-        // Copy bytewise to correctly handle the LZ77 "overlapping match"
-        // case where match_len > offset (e.g. RLE of a long byte run).
+        // Non-overlapping match collapses to memcpy; offset==1 is a byte-splat;
+        // otherwise replicate byte-by-byte to handle LZ77 self-overlap.
         let start = out.len() - offset;
-        for i in 0..match_len {
-            let b = out[start + i];
-            out.push(b);
+        if offset >= match_len {
+            out.extend_from_within(start..start + match_len);
+        } else if offset == 1 {
+            let b = out[start];
+            out.resize(out.len() + match_len, b);
+        } else {
+            for i in 0..match_len {
+                let b = out[start + i];
+                out.push(b);
+            }
         }
     }
 }

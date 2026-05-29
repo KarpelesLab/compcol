@@ -462,6 +462,43 @@ impl LzmaCore {
         self.output_pos += 1;
     }
 
+    /// Bulk-copy `n` non-overlapping match bytes (distance >= n) from the
+    /// dictionary to `output[*written..]` and back into the dict. Caller
+    /// must guarantee `dict_has(distance)` and `n` bytes of output room.
+    /// Returns the number of bytes actually copied (may be less than `n`
+    /// when the source or destination range wraps the dict — caller falls
+    /// back to the per-byte loop for the remainder).
+    fn dict_copy_match_bulk(
+        &mut self,
+        distance: u32,
+        n: usize,
+        output: &mut [u8],
+        written: &mut usize,
+    ) -> usize {
+        let dist1 = distance as usize + 1;
+        let src = if self.dict_pos >= dist1 {
+            self.dict_pos - dist1
+        } else {
+            self.dict.len() - (dist1 - self.dict_pos)
+        };
+        let src_room = self.dict.len() - src;
+        let dst_room = self.dict.len() - self.dict_pos;
+        let chunk = n.min(src_room).min(dst_room);
+        if chunk == 0 {
+            return 0;
+        }
+        output[*written..*written + chunk].copy_from_slice(&self.dict[src..src + chunk]);
+        self.dict.copy_within(src..src + chunk, self.dict_pos);
+        *written += chunk;
+        self.dict_pos += chunk;
+        if self.dict_pos >= self.dict.len() {
+            self.dict_pos = 0;
+            self.dict_full = true;
+        }
+        self.output_pos += chunk as u64;
+        chunk
+    }
+
     fn dict_has(&self, distance: u32) -> bool {
         let n = if self.dict_full {
             self.dict.len()
@@ -978,6 +1015,24 @@ impl Decoder {
             // 2) Drain pending match bytes if any.
             if let Some(mut pm) = self.pending_match.take() {
                 if let HeaderState::Active(ref mut core) = self.header_state {
+                    // Fast path: non-overlapping bulk copy.
+                    if !core.dict_has(pm.distance) {
+                        return Err(Error::Corrupt);
+                    }
+                    let cap_by_size = match core.uncompressed_size {
+                        Some(t) => (t - core.output_pos) as usize,
+                        None => usize::MAX,
+                    };
+                    let out_room = output.len() - *written;
+                    let want = (pm.remaining as usize).min(out_room).min(cap_by_size);
+                    if want > 0 && (pm.distance as usize + 1) >= want {
+                        let did = core.dict_copy_match_bulk(pm.distance, want, output, written);
+                        pm.remaining -= did as u32;
+                        if matches!(core.uncompressed_size, Some(t) if core.output_pos >= t) {
+                            core.finished = true;
+                            pm.remaining = 0;
+                        }
+                    }
                     while pm.remaining > 0 && *written < output.len() {
                         if !core.dict_has(pm.distance) {
                             return Err(Error::Corrupt);
@@ -1064,6 +1119,24 @@ impl Decoder {
                 PacketOutcome::Match { length } => {
                     let mut remaining = length;
                     let distance = core.rep0;
+                    if !core.dict_has(distance) {
+                        return Err(Error::Corrupt);
+                    }
+                    // Fast path: non-overlapping bulk copy.
+                    let cap_by_size = match core.uncompressed_size {
+                        Some(t) => (t - core.output_pos) as usize,
+                        None => usize::MAX,
+                    };
+                    let out_room = output.len() - *written;
+                    let want = (remaining as usize).min(out_room).min(cap_by_size);
+                    if want > 0 && (distance as usize + 1) >= want {
+                        let did = core.dict_copy_match_bulk(distance, want, output, written);
+                        remaining -= did as u32;
+                        if matches!(core.uncompressed_size, Some(t) if core.output_pos >= t) {
+                            core.finished = true;
+                            remaining = 0;
+                        }
+                    }
                     while remaining > 0 && *written < output.len() {
                         if !core.dict_has(distance) {
                             return Err(Error::Corrupt);

@@ -532,10 +532,19 @@ fn copy_from_back(
         return Err(Error::Corrupt);
     }
     let start = out.len() - offset;
-    // Byte-by-byte so that self-overlapping copies replicate correctly.
-    for i in 0..length {
-        let b = out[start + i];
-        out.push(b);
+    if offset >= length {
+        // Non-overlapping: collapses to memcpy.
+        out.extend_from_within(start..start + length);
+    } else if offset == 1 {
+        // Byte-splat: replicate a single byte.
+        let b = out[start];
+        out.resize(out.len() + length, b);
+    } else {
+        // Self-overlapping (RLE-style) — must replicate byte-by-byte.
+        for i in 0..length {
+            let b = out[start + i];
+            out.push(b);
+        }
     }
     Ok(())
 }
