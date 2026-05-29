@@ -1289,8 +1289,13 @@ impl RawDecoder for Decoder {
                     //   00 → continuation (no resets).
                     let reset_bits = (control >> 5) & 0x03;
                     if reset_bits == 0b11 {
-                        // Full reset: re-create the LZMA core fresh, parsing
-                        // properties.
+                        // Full reset: equivalent to a fresh `LzmaCore`.
+                        // Reuse the existing instance — including its
+                        // (up to 4 MiB) dictionary allocation — when the
+                        // requested dictionary size matches, which is the
+                        // common case for streams produced by this crate
+                        // (every chunk is a full-reset chunk against a
+                        // fixed block dictionary).
                         let props_byte = self.scratch[5];
                         let props = match Lzma2Props::parse(props_byte) {
                             Ok(p) => p,
@@ -1300,7 +1305,14 @@ impl RawDecoder for Decoder {
                         // Cap at 128 MiB to bound memory; legitimate xz
                         // outputs almost never need more than 64 MiB.
                         let dict_size = dict_size.min(128 * 1024 * 1024);
-                        self.lzma_core = Some(Box::new(LzmaCore::new(props, dict_size)));
+                        match self.lzma_core.as_mut() {
+                            Some(core) if core.dict_capacity() == dict_size.max(1) => {
+                                core.reset_full(props);
+                            }
+                            _ => {
+                                self.lzma_core = Some(Box::new(LzmaCore::new(props, dict_size)));
+                            }
+                        }
                         self.last_props = props_byte;
                     } else if reset_bits == 0b10 {
                         // Props reset + state reset, dict carries over.

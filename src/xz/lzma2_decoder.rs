@@ -417,6 +417,27 @@ impl LzmaCore {
         }
     }
 
+    /// True iff the current dictionary buffer has the requested size, so
+    /// the caller can reuse this core for a full-reset chunk instead of
+    /// allocating a fresh `LzmaCore`.
+    pub fn dict_capacity(&self) -> usize {
+        self.dict.len()
+    }
+
+    /// Perform a "full reset" equivalent to constructing a new `LzmaCore`
+    /// with the given props, but reuse the existing dictionary allocation
+    /// (and the probability/literal table allocations where their sizes
+    /// match). The dictionary contents are cleared and the LZ window
+    /// position reset to zero. Caller must follow with `init_range` to
+    /// re-bind the range coder to the next chunk's payload.
+    pub fn reset_full(&mut self, props: Lzma2Props) {
+        self.replace_props(props);
+        self.dict_pos = 0;
+        self.dict_full = false;
+        self.output_pos = 0;
+        self.reset_state();
+    }
+
     /// Reset all probability tables and the LZ state, but keep the
     /// dictionary contents.
     pub fn reset_state(&mut self) {
