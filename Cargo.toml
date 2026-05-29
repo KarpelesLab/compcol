@@ -35,6 +35,7 @@ all = [
     "ppmd",
     "xpress_huffman",
     "lznt1",
+    "xpress",
     "rar1", "rar2", "rar3", "rar5",
 ]
 # Enables `alloc`-backed conveniences (e.g. the `factory` module, the
@@ -110,6 +111,9 @@ xpress_huffman = ["alloc"]
 # LZNT1 — NTFS native file compression. 4 KiB chunked LZ77, no entropy
 # coding. Per Microsoft MS-XCA section 2.5.
 lznt1   = ["alloc"]
+# Microsoft Xpress (Plain LZ77 variant from MS-XCA). Byte-aligned
+# LZ77 with no entropy coding; encoder and decoder both implemented.
+xpress  = ["alloc"]
 # RAR decoders (rar1, rar2, rar3, rar5). Decoder-only — RARLAB's unRAR
 # license explicitly forbids re-creating the compression algorithm, so
 # the encoders permanently return `Error::Unsupported`.
