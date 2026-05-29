@@ -1,0 +1,54 @@
+# Smoke fuzz: each decoder fuzz target gets a brief libfuzzer run on every
+# PR. 30 seconds × 9 targets ≈ 5 min wall-clock. Not a coverage campaign —
+# the goal is "do recent changes regress an obvious crash?". For deep
+# campaigns, run locally or wire OSS-Fuzz.
+
+name: Fuzz smoke
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'fuzz/**'
+      - '.github/workflows/fuzz.yml'
+  workflow_dispatch: {}
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - decoder_dispatch
+          - decoder_gzip
+          - decoder_zlib
+          - decoder_deflate
+          - decoder_zstd
+          - decoder_brotli
+          - decoder_lzma
+          - decoder_xz
+          - decoder_lz4
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: fuzz-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('fuzz/Cargo.toml') }}
+      - name: Run ${{ matrix.target }} for 30s
+        working-directory: fuzz
+        # rss_limit_mb caps each fuzz iteration's resident memory so a
+        # decoder coaxed into allocating gigabytes (via a maliciously-
+        # sized header field, say) is treated as a finding rather than
+        # killing the runner. malloc_limit_mb does the same for explicit
+        # allocations.
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=30 -rss_limit_mb=512 -malloc_limit_mb=512

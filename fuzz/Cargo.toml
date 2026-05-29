@@ -1,0 +1,81 @@
+[package]
+name           = "compcol-fuzz"
+version        = "0.0.0"
+edition        = "2024"
+authors        = ["compcol fuzz harness"]
+publish        = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.compcol]
+path     = ".."
+features = ["all"]
+
+# Each `[[bin]]` is a separate fuzz target. Per cargo-fuzz convention
+# they live under fuzz_targets/.
+[[bin]]
+name             = "decoder_dispatch"
+path             = "fuzz_targets/decoder_dispatch.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "decoder_gzip"
+path             = "fuzz_targets/decoder_gzip.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "decoder_zlib"
+path             = "fuzz_targets/decoder_zlib.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "decoder_deflate"
+path             = "fuzz_targets/decoder_deflate.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "decoder_zstd"
+path             = "fuzz_targets/decoder_zstd.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "decoder_brotli"
+path             = "fuzz_targets/decoder_brotli.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "decoder_lzma"
+path             = "fuzz_targets/decoder_lzma.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "decoder_xz"
+path             = "fuzz_targets/decoder_xz.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "decoder_lz4"
+path             = "fuzz_targets/decoder_lz4.rs"
+test             = false
+doc              = false
+bench            = false
