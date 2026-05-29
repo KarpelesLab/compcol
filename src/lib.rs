@@ -19,7 +19,7 @@ mod error;
 mod traits;
 
 pub use error::Error;
-pub use traits::{Algorithm, Decoder, Encoder, Progress, Status};
+pub use traits::{Algorithm, Decoder, Encoder, Flush, Progress, Status};
 
 pub mod limit;
 

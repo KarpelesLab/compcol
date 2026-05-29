@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use crate::checksum::Adler32;
 use crate::deflate;
 use crate::error::Error;
-use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
+use crate::traits::{Algorithm, Flush, RawDecoder, RawEncoder, RawProgress};
 
 /// CMF byte with CM=8 (deflate) and CINFO=7 (32 KiB window).
 const HEADER_CMF: u8 = 0x78;
@@ -481,5 +481,42 @@ impl RawEncoder for Encoder {
         self.trailer = [0u8; 4];
         self.trailer_idx = 0;
         self.phase = EncPhase::Header;
+    }
+
+    fn raw_flush(&mut self, output: &mut [u8], mode: Flush) -> Result<RawProgress, Error> {
+        let mut written = 0usize;
+
+        // Make sure the 2-byte header has been written before any deflate
+        // output. A caller that flushes immediately after construction
+        // still gets a valid zlib prefix; the deflate sync marker then
+        // follows once it fits.
+        if matches!(self.phase, EncPhase::Header) {
+            if !self.drain_header(output, &mut written) {
+                return Ok(RawProgress {
+                    consumed: 0,
+                    written,
+                    done: false,
+                });
+            }
+            self.phase = EncPhase::Deflate;
+        }
+
+        if !matches!(self.phase, EncPhase::Deflate) {
+            // Trailer / Done — flushing after finish() makes no sense.
+            return Err(Error::Corrupt);
+        }
+
+        let p = self.inner.raw_flush(&mut output[written..], mode)?;
+        written += p.written;
+        Ok(RawProgress {
+            consumed: 0,
+            written,
+            // Forward the deflate-layer flush-complete signal upwards so
+            // the bridge maps it to `Status::InputEmpty`. This is `done`
+            // in the `raw_flush` sense (marker fully drained) — **not**
+            // the stream-end sense; the zlib trailer is not emitted by
+            // a flush.
+            done: p.done,
+        })
     }
 }
