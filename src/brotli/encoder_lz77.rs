@@ -65,18 +65,23 @@ impl MatchFinder {
         }
     }
 
+    /// Reset the hash chains in place — cheaper than re-allocating a
+    /// fresh `MatchFinder` between meta-blocks. (Only `head` needs to
+    /// be cleared; `prev[pos]` is written before it is read.)
+    pub(crate) fn reset(&mut self) {
+        // Zeroing 32K * 4 = 128 KiB through `fill` lowers to a tight
+        // memset; cheaper than re-allocating the boxes.
+        self.head.fill(NIL);
+    }
+
     /// Splice position `pos` into the hash chain for the 4 bytes at
     /// `buffer[pos..pos+4]`.
+    #[inline]
     pub(crate) fn insert(&mut self, buffer: &[u8], pos: usize) {
         if pos + 4 > buffer.len() || pos >= BUFFER_SIZE {
             return;
         }
-        let h = hash4(
-            buffer[pos],
-            buffer[pos + 1],
-            buffer[pos + 2],
-            buffer[pos + 3],
-        );
+        let h = hash4_at(buffer, pos);
         let idx = (h as usize) & (HASH_SIZE - 1);
         self.prev[pos] = self.head[idx];
         self.head[idx] = pos as u32;
@@ -90,32 +95,43 @@ impl MatchFinder {
         pos: usize,
         params: FinderParams,
     ) -> Option<(usize, usize)> {
-        if pos + MIN_MATCH > buffer.len() {
+        let buf_len = buffer.len();
+        if pos + MIN_MATCH > buf_len {
             return None;
         }
-        let h = hash4(
-            buffer[pos],
-            buffer[pos + 1],
-            buffer[pos + 2],
-            buffer[pos + 3],
-        );
+        let h = hash4_at(buffer, pos);
         let idx = (h as usize) & (HASH_SIZE - 1);
 
         let max_dist = WINDOW_SIZE.min(pos);
-        let max_len = MAX_MATCH.min(buffer.len() - pos);
+        let max_len = MAX_MATCH.min(buf_len - pos);
         if max_len < MIN_MATCH {
             return None;
         }
+        // Cap nice_match so the inner compare loop bails at the slice
+        // end without needing a per-iteration bounds check on the tail.
+        let nice = params.nice_match.min(max_len);
+        let chain_cap = params.max_chain;
+        // Slice view starting at `pos` — lets LLVM hoist a single
+        // bounds check covering the whole comparison loop.
+        let target = &buffer[pos..pos + max_len];
 
         let mut best_len: usize = 0;
         let mut best_dist: usize = 0;
 
-        let mut cur = self.head[idx];
+        // Track the byte at `target[best_len]` separately so the
+        // "tail byte mismatch" fast path is a single byte compare with
+        // no slice indexing.
+        let mut best_tail: u8 = 0;
+
+        let prev = &self.prev[..];
+        let head = &self.head[..];
+        let mut cur = head[idx];
         let mut steps = 0usize;
-        while cur != NIL && steps < params.max_chain {
+        while cur != NIL && steps < chain_cap {
             let cur_pos = cur as usize;
             if cur_pos >= pos {
-                cur = self.prev[cur_pos];
+                // Stale chain entry (overran us); just keep walking.
+                cur = prev[cur_pos];
                 steps += 1;
                 continue;
             }
@@ -123,26 +139,76 @@ impl MatchFinder {
             if dist > max_dist {
                 break;
             }
-            if best_len > 0
-                && best_len < max_len
-                && buffer[cur_pos + best_len] != buffer[pos + best_len]
-            {
-                cur = self.prev[cur_pos];
+
+            // Fast reject: if we already have a match of length `best_len`,
+            // the new candidate must match at least `target[best_len]` to
+            // be a longer match.
+            if best_len > 0 && buffer[cur_pos + best_len] != best_tail {
+                cur = prev[cur_pos];
                 steps += 1;
                 continue;
             }
+
+            // Compare candidate (`buffer[cur_pos..]`) against `target`.
+            // `target` has length `max_len`, and the worst-case read is
+            // `cur_pos + max_len - 1` < `pos + max_len` ≤ `buf_len`
+            // so the candidate slice is also in-bounds.
+            let cand = &buffer[cur_pos..cur_pos + max_len];
             let mut len = 0usize;
-            while len < max_len && buffer[cur_pos + len] == buffer[pos + len] {
+            // Unrolled 4-byte compare: hot text strides 4 bytes per
+            // iteration on average. Each `<8>` LLVM lowers to a single
+            // 64-bit load + xor + tzcnt on x86-64; well beyond a
+            // bytewise compare's reach.
+            while len + 8 <= max_len {
+                // Read 8 bytes from each side; xor; first mismatch byte
+                // is `tz/8`. We rely on slice access here so LLVM can
+                // emit unaligned loads without an unsafe cast.
+                let a = u64::from_le_bytes([
+                    cand[len],
+                    cand[len + 1],
+                    cand[len + 2],
+                    cand[len + 3],
+                    cand[len + 4],
+                    cand[len + 5],
+                    cand[len + 6],
+                    cand[len + 7],
+                ]);
+                let b = u64::from_le_bytes([
+                    target[len],
+                    target[len + 1],
+                    target[len + 2],
+                    target[len + 3],
+                    target[len + 4],
+                    target[len + 5],
+                    target[len + 6],
+                    target[len + 7],
+                ]);
+                let diff = a ^ b;
+                if diff != 0 {
+                    len += (diff.trailing_zeros() / 8) as usize;
+                    break;
+                }
+                len += 8;
+            }
+            // Tail (< 8 bytes remaining).
+            while len < max_len && cand[len] == target[len] {
                 len += 1;
             }
+
             if len >= MIN_MATCH && len > best_len {
                 best_len = len;
                 best_dist = dist;
-                if best_len >= params.nice_match {
+                if best_len >= nice {
                     break;
                 }
+                // Refresh the tail byte for the next iteration's fast
+                // reject. `best_len < max_len` here because nice ≤ max_len
+                // and we would have broken otherwise.
+                if best_len < max_len {
+                    best_tail = target[best_len];
+                }
             }
-            cur = self.prev[cur_pos];
+            cur = prev[cur_pos];
             steps += 1;
         }
 
@@ -161,8 +227,13 @@ impl Default for MatchFinder {
 }
 
 /// Hash four bytes into a 15-bit bucket.
-fn hash4(b0: u8, b1: u8, b2: u8, b3: u8) -> u32 {
-    let v = (b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16) | ((b3 as u32) << 24);
+#[inline]
+fn hash4_at(buffer: &[u8], pos: usize) -> u32 {
+    debug_assert!(pos + 4 <= buffer.len());
+    // Read 4 bytes via slice access so LLVM can emit a single
+    // unaligned 32-bit load; per-byte hash dispatch is dead.
+    let b = &buffer[pos..pos + 4];
+    let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
     // Knuth multiplicative hash, then take top HASH_BITS.
     v.wrapping_mul(0x9E37_79B1) >> (32 - HASH_BITS)
 }
