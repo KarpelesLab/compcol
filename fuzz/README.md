@@ -49,26 +49,6 @@ or longer, or wire up an OSS-Fuzz integration. The CI run caps each
 fuzz iteration at 512 MiB resident so a decoder coaxed into allocating
 gigabytes (which is a finding) doesn't kill the runner.
 
-## Known findings (initial sweep)
-
-A 5-second per-target smoke run on the day this harness was added
-produced two **OOM artifacts**, both in the gigabyte-allocation
-category that `compcol::limit::LimitedDecoder` is designed to defend
-against at the application level:
-
-- `decoder_lz4`: a malformed LZ4 block header coaxes the decoder
-  into preallocating an output buffer from the declared decompressed
-  size without sanity-checking against input length.
-- `decoder_dispatch`: same class, surfaced through whichever
-  algorithm byte 0 selects.
-
-These are real bugs worth fixing in the decoders, but they are not
-unsoundness — no panic, no out-of-bounds, no UB. The OOM is the
-attack surface and it's flagged by the harness, which is what the
-harness is for. Track them as separate issues; the LimitedDecoder
-wrapper is a sufficient workaround for callers handling untrusted
-input today.
-
 ## Adding a target
 
 1. Drop a new file under `fuzz_targets/decoder_<algo>.rs` modeled on

@@ -340,6 +340,18 @@ impl RawDecoder for Decoder {
                             done: false,
                         });
                     }
+                    // Defend against malformed/malicious length prefixes
+                    // (see lz4's matching guard). Our encoder caps at
+                    // compress_bound(BLOCK_SIZE); double the cap for
+                    // headroom against foreign-encoder streams that
+                    // packed less efficiently.
+                    let max_block = block::compress_bound(BLOCK_SIZE)
+                        .saturating_add(4)
+                        .saturating_mul(2);
+                    if self.expected_len > max_block {
+                        self.poisoned = true;
+                        return Err(Error::Corrupt);
+                    }
                     self.compressed.clear();
                     self.compressed.reserve(self.expected_len);
                     self.phase = DecPhase::BlockData;
