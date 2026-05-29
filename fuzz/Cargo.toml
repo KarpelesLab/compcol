@@ -46,6 +46,13 @@ doc              = false
 bench            = false
 
 [[bin]]
+name             = "decoder_deflate64"
+path             = "fuzz_targets/decoder_deflate64.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
 name             = "decoder_zstd"
 path             = "fuzz_targets/decoder_zstd.rs"
 test             = false

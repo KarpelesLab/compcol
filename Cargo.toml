@@ -28,7 +28,7 @@ default = ["alloc", "rle", "deflate", "zlib", "gzip", "factory"]
 # Cargo.toml entries (`features = ["all"]`) instead of a 20-item list.
 all = [
     "alloc", "std", "tokio", "factory",
-    "rle", "deflate", "zlib", "gzip",
+    "rle", "deflate", "deflate64", "zlib", "gzip",
     "lzma", "xz",
     "zstd", "brotli", "lz4", "snappy", "lzw", "bzip2",
     "lzo", "lzx", "amiga_lzx", "quantum", "lzfse", "adc",
@@ -49,6 +49,10 @@ rle     = []
 # RFC 1951 raw deflate. Requires `alloc` for the 32 KiB sliding window and
 # the per-block symbol/bit buffers.
 deflate = ["alloc"]
+# PKWARE deflate64 (zip method 9). Same framing as deflate but a 64 KiB
+# window and an extended length/distance alphabet. Standalone module —
+# does not depend on the `deflate` feature.
+deflate64 = ["alloc"]
 # RFC 1950 zlib (deflate + Adler-32 + 2-byte header / 4-byte trailer).
 zlib    = ["deflate"]
 # RFC 1952 gzip (deflate + CRC-32 + 10-byte header / 8-byte trailer).

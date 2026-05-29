@@ -36,11 +36,11 @@ pub mod tokio_io;
 // surface that downstream crates see is the per-algorithm modules below.
 // Gated on the features that consume them so a narrow build (e.g. just
 // `lz4`) doesn't pull them in via `cfg(test)`.
-#[cfg(feature = "deflate")]
+#[cfg(any(feature = "deflate", feature = "deflate64"))]
 mod bits;
 #[cfg(any(feature = "zlib", feature = "gzip"))]
 mod checksum;
-#[cfg(feature = "deflate")]
+#[cfg(any(feature = "deflate", feature = "deflate64"))]
 mod huffman;
 
 #[cfg(feature = "rle")]
@@ -48,6 +48,9 @@ pub mod rle;
 
 #[cfg(feature = "deflate")]
 pub mod deflate;
+
+#[cfg(feature = "deflate64")]
+pub mod deflate64;
 
 #[cfg(feature = "zlib")]
 pub mod zlib;

@@ -20,6 +20,10 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         crate::deflate::Deflate::NAME => {
             Some(Box::new(<crate::deflate::Deflate as Algorithm>::encoder()))
         }
+        #[cfg(feature = "deflate64")]
+        crate::deflate64::Deflate64::NAME => Some(Box::new(
+            <crate::deflate64::Deflate64 as Algorithm>::encoder(),
+        )),
         #[cfg(feature = "zlib")]
         crate::zlib::Zlib::NAME => Some(Box::new(<crate::zlib::Zlib as Algorithm>::encoder())),
         #[cfg(feature = "gzip")]
@@ -100,6 +104,12 @@ pub fn encoder_by_name_with_level(name: &str, level: u8) -> Option<Box<dyn Encod
                 level,
             }),
         )),
+        #[cfg(feature = "deflate64")]
+        crate::deflate64::Deflate64::NAME => Some(Box::new(
+            <crate::deflate64::Deflate64 as Algorithm>::encoder_with(
+                crate::deflate64::EncoderConfig { level },
+            ),
+        )),
         #[cfg(feature = "zlib")]
         crate::zlib::Zlib::NAME => Some(Box::new(<crate::zlib::Zlib as Algorithm>::encoder_with(
             crate::zlib::EncoderConfig { level },
@@ -145,6 +155,10 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         crate::deflate::Deflate::NAME => {
             Some(Box::new(<crate::deflate::Deflate as Algorithm>::decoder()))
         }
+        #[cfg(feature = "deflate64")]
+        crate::deflate64::Deflate64::NAME => Some(Box::new(
+            <crate::deflate64::Deflate64 as Algorithm>::decoder(),
+        )),
         #[cfg(feature = "zlib")]
         crate::zlib::Zlib::NAME => Some(Box::new(<crate::zlib::Zlib as Algorithm>::decoder())),
         #[cfg(feature = "gzip")]
@@ -215,6 +229,9 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     }
     if str_eq(name, "deflate") && cfg!(feature = "deflate") {
         return Some("deflate");
+    }
+    if str_eq(name, "deflate64") && cfg!(feature = "deflate64") {
+        return Some("deflate64");
     }
     if str_eq(name, "zlib") && cfg!(feature = "zlib") {
         return Some("zz");
@@ -307,6 +324,8 @@ pub const fn names() -> &'static [&'static str] {
         crate::rle::Rle::NAME,
         #[cfg(feature = "deflate")]
         crate::deflate::Deflate::NAME,
+        #[cfg(feature = "deflate64")]
+        crate::deflate64::Deflate64::NAME,
         #[cfg(feature = "zlib")]
         crate::zlib::Zlib::NAME,
         #[cfg(feature = "gzip")]
