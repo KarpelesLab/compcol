@@ -187,7 +187,12 @@ impl<const N: usize> LzxHuffman<N> {
                 reader.drop_bits(len);
                 return Ok(Some(entry & LUT_SYM_MASK));
             }
-            // Long code — fall through to the slow path.
+            // Long code — fall through to the slow path. We still need at
+            // least `max` bits buffered to read the full long code; if we
+            // only had PRIMARY_BITS, ask for more input.
+            if available < max {
+                return Ok(None);
+            }
         } else if available < max {
             // Not enough bits to guarantee a full decode even in the worst
             // case.
