@@ -354,8 +354,32 @@ fn rle_encode_lengths_into(lengths: &[u8], out: &mut Vec<ClSymbol>) {
 
 // ─── cost estimation (in bits) ──────────────────────────────────────────
 
-/// Estimate the bit cost of emitting `symbols` (plus EOB) with code lengths
-/// `lit_lengths` and `dist_lengths`. Used to compare encoding choices.
+/// Estimate the Huffman bit cost of emitting a block given its symbol
+/// frequency histograms and code lengths: Σ freq·len over the lit/length
+/// alphabet plus Σ freq·len over the distance alphabet. The extra-bits term
+/// (length/distance suffix bits) is independent of the chosen Huffman
+/// encoding and is accumulated once during the LZ77 pass.
+#[inline]
+fn huffman_cost_from_histogram(
+    lit_freq: &[u32; 286],
+    dist_freq: &[u32; 30],
+    lit_lengths: &[u8],
+    dist_lengths: &[u8],
+) -> u64 {
+    let mut bits: u64 = 0;
+    for i in 0..286 {
+        bits += lit_freq[i] as u64 * lit_lengths[i] as u64;
+    }
+    for i in 0..30 {
+        bits += dist_freq[i] as u64 * dist_lengths[i] as u64;
+    }
+    bits
+}
+
+/// Slow reference version: walk the symbol stream and sum bit costs. Kept
+/// for debug-assert cross-checks against `huffman_cost_from_histogram` +
+/// the precomputed extra-bits total. Dead-code-eliminated in release.
+#[allow(dead_code)]
 fn payload_cost_bits(symbols: &[Symbol], lit_lengths: &[u8], dist_lengths: &[u8]) -> u64 {
     let mut bits: u64 = 0;
     for s in symbols {
@@ -712,8 +736,10 @@ impl Encoder {
     /// frequency histograms. Returns `(header_bits, payload_bits)`. The
     /// header preparation (RLE + code-length-code Huffman + HLIT/HDIST/HCLEN
     /// trims) is stashed on `self` so `emit_dynamic_block` can consume it
-    /// without redoing the work.
-    fn build_dynamic(&mut self) -> (u64, u64) {
+    /// without redoing the work. `extra_bits_total` is the per-symbol
+    /// length/distance extra-bits sum precomputed during the LZ77 pass;
+    /// it's the same regardless of which Huffman encoding is chosen.
+    fn build_dynamic(&mut self, extra_bits_total: u64) -> (u64, u64) {
         let lit_lengths_vec = length_limited_huffman(&self.lit_freq, 15);
         let dist_lengths_vec = length_limited_huffman(&self.dist_freq, 15);
 
@@ -769,24 +795,47 @@ impl Encoder {
             header_bits += self.cl_lengths[s.sym as usize] as u64 + s.extra_bits as u64;
         }
 
-        // Payload bits.
-        let payload_bits =
-            payload_cost_bits(&self.block_symbols, &self.lit_lengths, &self.dist_lengths);
+        // Payload bits: Σ freq·len over the lit/length and distance alphabets,
+        // plus the precomputed extra-bits total.
+        let payload_bits = huffman_cost_from_histogram(
+            &self.lit_freq,
+            &self.dist_freq,
+            &self.lit_lengths,
+            &self.dist_lengths,
+        ) + extra_bits_total;
+
+        debug_assert_eq!(
+            payload_bits,
+            payload_cost_bits(&self.block_symbols, &self.lit_lengths, &self.dist_lengths),
+        );
 
         (header_bits, payload_bits)
     }
 
     /// Compute the bit cost of encoding `block_symbols` with the fixed
     /// Huffman tables. Returns total bits including 3-bit block header.
-    fn fixed_cost_bits(&self) -> u64 {
-        // FIXED_LIT_LENGTHS / FIXED_DIST_LENGTHS are 288 / 32 long, but our
-        // payload_cost_bits only indexes [0, 286) / [0, 30) so taking a
-        // sub-slice is a zero-cost no-op.
-        3 + payload_cost_bits(
-            &self.block_symbols,
+    /// `extra_bits_total` is the length/distance extra-bits sum precomputed
+    /// during the LZ77 pass.
+    fn fixed_cost_bits(&self, extra_bits_total: u64) -> u64 {
+        // FIXED_LIT_LENGTHS / FIXED_DIST_LENGTHS are 288 / 32 long; only the
+        // first 286 / 30 entries are addressed by symbol histograms.
+        let payload_bits = huffman_cost_from_histogram(
+            &self.lit_freq,
+            &self.dist_freq,
             &FIXED_LIT_LENGTHS[..286],
             &FIXED_DIST_LENGTHS[..30],
-        )
+        ) + extra_bits_total;
+
+        debug_assert_eq!(
+            payload_bits,
+            payload_cost_bits(
+                &self.block_symbols,
+                &FIXED_LIT_LENGTHS[..286],
+                &FIXED_DIST_LENGTHS[..30],
+            ),
+        );
+
+        3 + payload_bits
     }
 
     /// Compute the bit cost of encoding the current block as a single
@@ -1007,21 +1056,26 @@ impl Encoder {
 
         self.lz77_pass(end_rel);
 
-        // Tally frequencies into the persistent scratch arrays.
+        // Tally frequencies into the persistent scratch arrays and accumulate
+        // the length/distance extra-bits total in the same pass. The extra-bits
+        // sum is independent of which Huffman encoding is chosen, so it's added
+        // equally to both the dynamic and fixed cost estimates.
         for f in self.lit_freq.iter_mut() {
             *f = 0;
         }
         for f in self.dist_freq.iter_mut() {
             *f = 0;
         }
+        let mut extra_bits_total: u64 = 0;
         for s in &self.block_symbols {
             match s {
                 Symbol::Literal(b) => self.lit_freq[*b as usize] += 1,
                 Symbol::Match { length, distance } => {
-                    let (lc, _, _) = length_to_code(*length);
+                    let (lc, _, leb) = length_to_code(*length);
                     self.lit_freq[lc as usize] += 1;
-                    let (dc, _, _) = distance_to_code(*distance);
+                    let (dc, _, deb) = distance_to_code(*distance);
                     self.dist_freq[dc as usize] += 1;
+                    extra_bits_total += leb as u64 + deb as u64;
                 }
             }
         }
@@ -1030,11 +1084,11 @@ impl Encoder {
         // Compute dynamic-Huffman cost. This also stashes the header preparation
         // (RLE, cl_lengths, hlit/hdist/hclen counts) on `self` so the subsequent
         // emit_dynamic_block call doesn't redo the work.
-        let (dyn_header_bits, dyn_payload_bits) = self.build_dynamic();
+        let (dyn_header_bits, dyn_payload_bits) = self.build_dynamic(extra_bits_total);
         let dynamic_total = dyn_header_bits + dyn_payload_bits;
 
         // Compute fixed-Huffman cost.
-        let fixed_total = self.fixed_cost_bits();
+        let fixed_total = self.fixed_cost_bits(extra_bits_total);
 
         // Compute stored cost — only valid when the block fits in u16.
         let stored_total = if self.block_bytes.len() <= u16::MAX as usize {
