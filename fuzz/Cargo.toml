@@ -93,3 +93,10 @@ path             = "fuzz_targets/decoder_bzip2.rs"
 test             = false
 doc              = false
 bench            = false
+
+[[bin]]
+name             = "decoder_amiga_lzx"
+path             = "fuzz_targets/decoder_amiga_lzx.rs"
+test             = false
+doc              = false
+bench            = false

@@ -79,8 +79,16 @@ pub mod lzw;
 #[cfg(feature = "lzo")]
 pub mod lzo;
 
-#[cfg(feature = "lzx")]
+// The `amiga_lzx` codec reuses the `tables`/`bitreader`/`huffman` submodules
+// of `lzx`, so the lzx module is declared whenever either feature is enabled.
+// When `lzx` itself is disabled, only the shared internals are compiled in
+// (the public `Lzx`, `Decoder`, `Encoder`, and the verbose decoder/encoder
+// state machines remain gated on `feature = "lzx"` inside `lzx/mod.rs`).
+#[cfg(any(feature = "lzx", feature = "amiga_lzx"))]
 pub mod lzx;
+
+#[cfg(feature = "amiga_lzx")]
+pub mod amiga_lzx;
 
 #[cfg(feature = "quantum")]
 pub mod quantum;

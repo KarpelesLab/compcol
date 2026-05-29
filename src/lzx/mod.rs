@@ -46,21 +46,28 @@
 //! When the decoder has emitted `total uncompressed length` bytes it
 //! transitions to a Done state and ignores any trailing bits.
 
-mod bitreader;
+pub(crate) mod bitreader;
+#[cfg(feature = "lzx")]
 pub mod decoder;
+#[cfg(feature = "lzx")]
 pub mod encoder;
-mod huffman;
-mod tables;
+pub(crate) mod huffman;
+pub(crate) mod tables;
 
+#[cfg(feature = "lzx")]
 pub use decoder::Decoder;
+#[cfg(feature = "lzx")]
 pub use encoder::Encoder;
 
+#[cfg(feature = "lzx")]
 use crate::traits::Algorithm;
 
 /// Zero-sized marker type implementing [`Algorithm`] for LZX.
+#[cfg(feature = "lzx")]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Lzx;
 
+#[cfg(feature = "lzx")]
 impl Algorithm for Lzx {
     const NAME: &'static str = "lzx";
     type Encoder = Encoder;

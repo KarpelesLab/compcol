@@ -29,6 +29,10 @@ pub const PRETREE_NUM_ELEMENTS: usize = 20;
 pub const ALIGNED_NUM_ELEMENTS: usize = 8;
 
 /// All frames are 32 KiB except possibly the last in a stream.
+///
+/// Only consumed by the MS-CAB profile (`crate::lzx`); the Amiga profile in
+/// `crate::amiga_lzx` does not chunk its bitstream.
+#[cfg(feature = "lzx")]
 pub const FRAME_SIZE: usize = 32_768;
 
 /// Smallest supported window (per CAB LZX).
@@ -36,6 +40,10 @@ pub const MIN_WINDOW_BITS: u8 = 15;
 
 /// Largest supported window (per CAB LZX). LZX DELTA goes higher but we stick
 /// to the CAB profile.
+///
+/// Only consumed by the MS-CAB profile (`crate::lzx`); the Amiga profile uses
+/// a fixed `window_bits = 16` and does not range-check.
+#[cfg(feature = "lzx")]
 pub const MAX_WINDOW_BITS: u8 = 21;
 
 // ─── Block types (3-bit field at the start of every block) ──────────────
