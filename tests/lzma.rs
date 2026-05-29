@@ -788,3 +788,120 @@ fn limited_decoder_at_exact_budget_terminates_cleanly() {
     }
     assert_eq!(decoded, original);
 }
+
+/// Direction of the wire-level uniform "direct bits" used by long-distance
+/// matches (slot >= 14): liblzma encodes MSB-first, and so must we. Issue
+/// #14 was a regression where both encoder and decoder used LSB-first
+/// internally — round-tripping cleanly with each other, but producing
+/// streams `xz --format=lzma -d` mis-decoded the moment any match landed
+/// in a slot >= 14 (i.e. distance >= 128).
+///
+/// The minimal repro from the issue is a 472-byte LCG pseudo-random
+/// stream: incompressible enough that the encoder is forced to emit a
+/// new MATCH at a high distance, which lands the encoder in the
+/// direct-bits path. A separate 4 000-line test exercises the original
+/// reporter's pattern (highly-compressible text with long-range
+/// repetitions).
+///
+/// We don't shell out to `xz` here (no infrastructure dependency) — the
+/// round-trip through our own decoder is sufficient *once both sides are
+/// wire-correct*: the encoder writing MSB-first to a probability table
+/// the decoder reads back identically is what proves the bug fixed,
+/// because the only way the original LSB-first round-trip stayed green
+/// was that BOTH sides shared the bug.
+#[test]
+fn encoder_round_trips_472_byte_lcg_pseudo_random() {
+    // 472-byte minimal repro for #14. Encoding this with the old LSB-first
+    // encoder produced a stream `xz -d` could not finish.
+    let mut data = Vec::with_capacity(472);
+    let mut state: u32 = 2_882_400_000;
+    for _ in 0..472 {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        data.push(((state >> 16) & 0xFF) as u8);
+    }
+    let compressed = encode_one_shot(&data);
+    let decoded = decode_one_shot(&compressed).expect("decode after #14 fix");
+    assert_eq!(decoded, data);
+}
+
+#[test]
+fn encoder_round_trips_4000_line_long_range_text() {
+    // 4 000 lines of "line NNNNN the quick brown fox жжж\n" — the original
+    // reporter's pattern. Long-range repetitions push matches into slot >= 14,
+    // which is exactly where the direct-bits LSB/MSB confusion bit.
+    let mut data = Vec::new();
+    for n in 0..4000u32 {
+        // Match the reporter's exact bytes (Cyrillic жжж = 6 UTF-8 bytes).
+        data.extend_from_slice(format!("line {n} the quick brown fox жжж\n").as_bytes());
+    }
+    let compressed = encode_one_shot(&data);
+    let decoded = decode_one_shot(&compressed).expect("decode after #14 fix");
+    assert_eq!(
+        decoded.len(),
+        data.len(),
+        "length mismatch after round-trip"
+    );
+    assert_eq!(decoded, data);
+}
+
+/// Pin the direction of `decode_direct_bits_msb` independently of the
+/// encoder by feeding an actual liblzma-produced stream that forces a
+/// match into a high distance slot. The encoder's direction could in
+/// theory regress in lockstep with the decoder and a pure round-trip
+/// test wouldn't catch that — this fixture makes the decoder face
+/// MSB-first direct bits no matter what the encoder does.
+///
+/// Fixture built offline from Python's stdlib:
+/// ```python
+/// import lzma
+/// data = bytes(b for _ in range(4) for b in range(256))  # 1024 bytes
+/// data = data + b'X' * 64 + data                         # 2112 bytes
+/// compressed = lzma.compress(data, format=lzma.FORMAT_ALONE, preset=6)
+/// ```
+/// The 64-byte 'X' run pushes the second 1 024-byte block far enough
+/// from its first occurrence (>= 1024 bytes) that liblzma emits a match
+/// with `slot >= 14` — exactly the code path that uses the direct-bits
+/// uniform encoding that issue #14 had backwards.
+#[test]
+fn decoder_handles_liblzma_long_distance_slot() {
+    const LIBLZMA_LONGDIST: &[u8] = &[
+        0x5d, 0x00, 0x00, 0x80, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00,
+        0x00, 0x52, 0x50, 0x0a, 0x84, 0xf9, 0x9b, 0xb2, 0x80, 0x21, 0xa9, 0x69, 0xd6, 0x27, 0xe0,
+        0x3e, 0x06, 0x5a, 0x5f, 0x04, 0x8d, 0x53, 0xd4, 0x04, 0xba, 0x39, 0x57, 0x05, 0x09, 0xc1,
+        0x55, 0x24, 0xde, 0x9d, 0xb8, 0x71, 0x59, 0x31, 0x60, 0xa1, 0x9f, 0xf9, 0x6f, 0x49, 0x73,
+        0xf2, 0xc8, 0xea, 0x8c, 0xba, 0x1a, 0x8b, 0x29, 0x69, 0x21, 0x80, 0xfe, 0x33, 0x83, 0x66,
+        0xaf, 0x46, 0x6d, 0xec, 0x9e, 0x89, 0x8a, 0x0b, 0x83, 0xf0, 0x3c, 0x0e, 0x89, 0x8e, 0x3f,
+        0xed, 0x5f, 0xe7, 0x9e, 0x90, 0xd9, 0x1c, 0xff, 0x32, 0xf4, 0xb2, 0xe0, 0x39, 0x51, 0xb2,
+        0xd2, 0x14, 0x15, 0xb4, 0xc5, 0x71, 0xba, 0xdb, 0x06, 0xe3, 0x79, 0x9a, 0x9f, 0xbb, 0x38,
+        0xc1, 0xb0, 0x00, 0xac, 0x93, 0x0b, 0xaa, 0x06, 0x19, 0x03, 0x12, 0x08, 0x15, 0x5b, 0x9b,
+        0xc8, 0x48, 0xf0, 0x32, 0x2e, 0xfe, 0x2d, 0xa0, 0x87, 0xc8, 0xf0, 0xa4, 0xe0, 0xd2, 0x51,
+        0xeb, 0x8d, 0x67, 0x56, 0x92, 0xb2, 0x4d, 0x84, 0xc5, 0xf1, 0x86, 0x31, 0xdf, 0x6a, 0x62,
+        0x5b, 0xc2, 0x79, 0x2d, 0xd9, 0xf7, 0x3c, 0x73, 0xba, 0x74, 0x74, 0x07, 0xd8, 0x3c, 0xa9,
+        0x56, 0x22, 0x24, 0xa1, 0x66, 0xf8, 0x5a, 0x84, 0x5f, 0x30, 0x67, 0xd2, 0xf6, 0x4b, 0x49,
+        0x2e, 0x7f, 0x20, 0xeb, 0xdb, 0xf8, 0x10, 0x0e, 0x94, 0x78, 0x77, 0xc7, 0x3f, 0x6b, 0xef,
+        0xb4, 0xcd, 0x95, 0xe2, 0x6f, 0xf6, 0x44, 0x6e, 0x06, 0xcf, 0x0b, 0x82, 0x1a, 0xcb, 0xdb,
+        0x7a, 0xf0, 0x57, 0x8d, 0x98, 0xff, 0x90, 0xc0, 0x3e, 0xe6, 0xc1, 0x12, 0x41, 0x75, 0xee,
+        0x03, 0x28, 0x96, 0xeb, 0x13, 0xfb, 0xa7, 0x28, 0xcc, 0xaf, 0x2c, 0xd5, 0x1d, 0xc8, 0x66,
+        0x34, 0x99, 0x5b, 0x10, 0x51, 0x43, 0x31, 0x0f, 0xae, 0xbb, 0x9f, 0xff, 0xf7, 0x85, 0x07,
+        0xc5,
+    ];
+
+    // Reconstruct the expected plaintext: 0..=255 cycled to 1024 bytes,
+    // 64 'X', then the same 1024 bytes again.
+    let mut expected: Vec<u8> = Vec::with_capacity(2112);
+    for _ in 0..4 {
+        for b in 0u8..=255 {
+            expected.push(b);
+        }
+    }
+    expected.extend(core::iter::repeat_n(b'X', 64));
+    for _ in 0..4 {
+        for b in 0u8..=255 {
+            expected.push(b);
+        }
+    }
+
+    let decoded = decode_one_shot(LIBLZMA_LONGDIST).expect("decode liblzma high-slot fixture");
+    assert_eq!(decoded.len(), expected.len(), "length mismatch");
+    assert_eq!(decoded, expected);
+}
