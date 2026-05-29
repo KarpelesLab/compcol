@@ -24,7 +24,7 @@
 //! - [`rle`](self#rle) — RLE-1 (raw-byte pre-pass, runs of 4+
 //!   compressed into 4 copies + count) and RLE-2 (post-MTF zero-run
 //!   coding via RUNA/RUNB).
-//! - [`encoder`] / [`decoder`] — the streaming state machines.
+//! - `encoder` / `decoder` — the streaming state machines.
 //!
 //! ## Round-trip status
 //!
