@@ -730,7 +730,36 @@ impl Decoder {
                                 work.phase = HuffmanPhase::NextSymbol;
                                 continue;
                             }
-                            // Copy one byte from window per output slot.
+                            // Bulk-copy the non-overlapping run; fall back
+                            // to the byte loop for overlap (distance < remaining)
+                            // and wrap-spanning chunks.
+                            let d = distance as usize;
+                            let out_room = output.len() - *written;
+                            let mut chunk = (remaining as usize).min(out_room);
+                            if chunk > 0 && d >= chunk {
+                                let src = (self.window_pos + WINDOW_SIZE - d) % WINDOW_SIZE;
+                                // Limit chunk so source and destination
+                                // ranges do not wrap the circular window.
+                                let src_room = WINDOW_SIZE - src;
+                                let dst_room = WINDOW_SIZE - self.window_pos;
+                                chunk = chunk.min(src_room).min(dst_room);
+                                if chunk > 0 {
+                                    // Copy to output.
+                                    output[*written..*written + chunk]
+                                        .copy_from_slice(&self.window[src..src + chunk]);
+                                    // Copy to window via copy_within (src and dst
+                                    // don't overlap because d >= chunk).
+                                    self.window.copy_within(src..src + chunk, self.window_pos);
+                                    *written += chunk;
+                                    self.window_pos = (self.window_pos + chunk) % WINDOW_SIZE;
+                                    if self.window_size < WINDOW_SIZE {
+                                        self.window_size =
+                                            (self.window_size + chunk).min(WINDOW_SIZE);
+                                    }
+                                    remaining -= chunk as u16;
+                                    progress = true;
+                                }
+                            }
                             while remaining > 0 && *written < output.len() {
                                 let d = distance as usize;
                                 let src = (self.window_pos + WINDOW_SIZE - d) % WINDOW_SIZE;
