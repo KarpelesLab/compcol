@@ -19,6 +19,18 @@ use alloc::vec::Vec;
 
 use crate::error::Error;
 
+/// Primary-LUT width for the fast-path symbol lookup. Codes of length
+/// ≤ `PRIMARY_BITS` resolve in O(1); longer codes fall back to the
+/// per-bit walk.
+const PRIMARY_BITS: u32 = 9;
+const PRIMARY_SIZE: usize = 1 << PRIMARY_BITS;
+
+/// Packed (symbol, length) entry in the primary LUT. The low 16 bits hold
+/// the symbol (brotli alphabets fit in 16 bits) and the top 5 bits hold
+/// the code length. A length of 0 marks "long code -- take the slow path".
+const LUT_LEN_SHIFT: u32 = 16;
+const LUT_SYM_MASK: u32 = (1 << LUT_LEN_SHIFT) - 1;
+
 /// Canonical Huffman decoder for one Brotli prefix code.
 #[derive(Debug, Clone)]
 pub(crate) struct HuffmanDecoder {
@@ -38,6 +50,11 @@ pub(crate) struct HuffmanDecoder {
     /// Set when there is exactly one defined symbol; that symbol is
     /// returned without consuming any bits (length-0 case from §3.4).
     single_symbol: Option<u32>,
+    /// Primary lookup table: indexed by the next `PRIMARY_BITS` LSB-first
+    /// stream bits. Each slot packs `(symbol, length)`; a length of 0
+    /// means the code is longer than `PRIMARY_BITS` and the slow path
+    /// has to walk per-bit.
+    lut: alloc::boxed::Box<[u32; PRIMARY_SIZE]>,
 }
 
 impl HuffmanDecoder {
@@ -51,6 +68,7 @@ impl HuffmanDecoder {
             first_idx: [0; 16],
             max_length: 0,
             single_symbol: Some(sym),
+            lut: alloc::boxed::Box::new([0u32; PRIMARY_SIZE]),
         }
     }
 
@@ -107,6 +125,30 @@ impl HuffmanDecoder {
             next[len as usize] += 1;
         }
 
+        // Build the primary LUT. Brotli's Huffman codes are MSB-first
+        // within the LSB-first bit stream (same convention as deflate),
+        // so a canonical code value `c` of length `L` appears in the
+        // stream as `reverse_bits(c, L)`. Each symbol of length
+        // L ≤ PRIMARY_BITS populates every entry whose low L bits match
+        // its reversed code value.
+        let mut lut = alloc::boxed::Box::new([0u32; PRIMARY_SIZE]);
+        let mut next_code = first_code;
+        for &(sym, len) in &owned {
+            let code = next_code[len as usize];
+            next_code[len as usize] += 1;
+            if (len as u32) > PRIMARY_BITS {
+                continue;
+            }
+            let reversed = reverse_bits_lo(code, len as u32);
+            let entry = sym | ((len as u32) << LUT_LEN_SHIFT);
+            let stride = 1usize << len;
+            let mut slot = reversed as usize;
+            while slot < PRIMARY_SIZE {
+                lut[slot] = entry;
+                slot += stride;
+            }
+        }
+
         Ok(Self {
             counts,
             symbols,
@@ -114,6 +156,7 @@ impl HuffmanDecoder {
             first_idx,
             max_length,
             single_symbol: None,
+            lut,
         })
     }
 
@@ -174,6 +217,20 @@ impl HuffmanDecoder {
             return Err(Error::InvalidHuffmanTree);
         }
         let max = self.max_length as u32;
+
+        // Fast path: peek PRIMARY_BITS bits, index the LUT, advance the
+        // bit position by the actual code length.
+        if br.remaining() >= PRIMARY_BITS as usize {
+            let idx = br.peek_bits(PRIMARY_BITS) as usize;
+            let entry = self.lut[idx];
+            let len = entry >> LUT_LEN_SHIFT;
+            if len > 0 {
+                br.set_position(br.position() + len as usize);
+                return Ok(entry & LUT_SYM_MASK);
+            }
+            // Long code (> PRIMARY_BITS) -- fall through to the slow path.
+        }
+
         let mut code: u32 = 0;
         for length in 1..=max {
             let bit = br.read_bit()?;
@@ -189,6 +246,19 @@ impl HuffmanDecoder {
         }
         Err(Error::InvalidHuffmanTree)
     }
+}
+
+/// Reverse the lowest `n` bits of `v`. Used at LUT-build time so the
+/// table can be indexed directly by the next `n` LSB-first stream bits.
+const fn reverse_bits_lo(mut v: u32, n: u32) -> u32 {
+    let mut out = 0u32;
+    let mut i = 0;
+    while i < n {
+        out = (out << 1) | (v & 1);
+        v >>= 1;
+        i += 1;
+    }
+    out
 }
 
 /// Synchronous bit source that the synchronous Huffman decoder reads
@@ -231,6 +301,31 @@ impl<'a> BitSource<'a> {
         let bit = (byte >> (self.pos & 7)) & 1;
         self.pos += 1;
         Ok(bit as u32)
+    }
+
+    /// Peek `n` bits (0 < n ≤ 32) without advancing. Caller must
+    /// guarantee `n <= remaining()`.
+    pub(crate) fn peek_bits(&self, n: u32) -> u32 {
+        debug_assert!(n > 0 && n <= 32);
+        debug_assert!(n as usize <= self.remaining());
+        let mut acc: u32 = 0;
+        let mut got: u32 = 0;
+        let mut pos = self.pos;
+        while got < n {
+            let byte_pos = pos >> 3;
+            let bit_off = (pos & 7) as u32;
+            let take = (8 - bit_off).min(n - got);
+            let mask: u32 = if take == 32 {
+                u32::MAX
+            } else {
+                (1u32 << take) - 1
+            };
+            let chunk = ((self.data[byte_pos] as u32) >> bit_off) & mask;
+            acc |= chunk << got;
+            got += take;
+            pos += take as usize;
+        }
+        acc
     }
 
     /// Read `n` bits (0..=32) as a little-endian integer.
