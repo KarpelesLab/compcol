@@ -14,6 +14,18 @@ use crate::error::Error;
 
 use super::bits::BitBuf;
 
+/// Primary-LUT width for the fast-path symbol lookup. Codes of length
+/// ≤ `PRIMARY_BITS` resolve in O(1); longer codes fall back to the
+/// per-length walk.
+const PRIMARY_BITS: u32 = 9;
+const PRIMARY_SIZE: usize = 1 << PRIMARY_BITS;
+
+/// Packed (symbol, length) entry in the primary LUT. The low 11 bits hold
+/// the symbol; the top 5 bits hold the code length. A length of 0 marks
+/// "long code -- take the slow path".
+const LUT_LEN_SHIFT: u32 = 11;
+const LUT_SYM_MASK: u16 = (1 << LUT_LEN_SHIFT) - 1;
+
 #[derive(Debug, Clone)]
 pub struct Huffman {
     /// `counts[l]` = number of symbols with code-length `l`. `counts[0]` is
@@ -27,6 +39,11 @@ pub struct Huffman {
     first_idx: [u16; 17],
     /// Largest code length actually used (0 for an empty table).
     max_length: u8,
+    /// Primary lookup table: indexed by the top `PRIMARY_BITS` MSB-first
+    /// stream bits (peek16 >> (16 - PRIMARY_BITS)). Each slot holds a
+    /// packed `(symbol, length)` for codes of length ≤ `PRIMARY_BITS`,
+    /// or `0` to signal the slow path.
+    lut: alloc::boxed::Box<[u16; PRIMARY_SIZE]>,
 }
 
 impl Huffman {
@@ -55,6 +72,7 @@ impl Huffman {
                 first_code: [0u32; 17],
                 first_idx: [0u16; 17],
                 max_length: 0,
+                lut: alloc::boxed::Box::new([0u16; PRIMARY_SIZE]),
             });
         }
 
@@ -89,12 +107,37 @@ impl Huffman {
             }
         }
 
+        // Build the primary LUT. RAR5 reads MSB-first, so the top
+        // PRIMARY_BITS bits of peek16 give the index directly. A code
+        // value `c` of length `L ≤ PRIMARY_BITS` occupies the index
+        // range `[c << (PRIMARY_BITS-L), (c+1) << (PRIMARY_BITS-L))`.
+        let mut lut = alloc::boxed::Box::new([0u16; PRIMARY_SIZE]);
+        let mut next_code = first_code;
+        for (sym, &len) in code_lengths.iter().enumerate() {
+            if len == 0 {
+                continue;
+            }
+            let code = next_code[len as usize];
+            next_code[len as usize] = next_code[len as usize].wrapping_add(1);
+            if (len as u32) > PRIMARY_BITS {
+                continue;
+            }
+            let shift = PRIMARY_BITS - len as u32;
+            let start = (code << shift) as usize;
+            let end = start + (1usize << shift);
+            let entry = (sym as u16) | ((len as u16) << LUT_LEN_SHIFT);
+            for slot in lut.iter_mut().take(end).skip(start) {
+                *slot = entry;
+            }
+        }
+
         Ok(Self {
             counts,
             symbols,
             first_code,
             first_idx,
             max_length,
+            lut,
         })
     }
 
@@ -113,6 +156,20 @@ impl Huffman {
         // after we've identified the matching length so that a corrupted
         // table can't silently consume bits we don't have.
         let look = br.peek16() as u32;
+
+        // Fast path: top PRIMARY_BITS of peek16 index the LUT. Codes ≤
+        // PRIMARY_BITS resolve here; longer codes fall through.
+        let idx = (look >> (16 - PRIMARY_BITS)) as usize;
+        let entry = self.lut[idx];
+        let len = (entry >> LUT_LEN_SHIFT) as u32;
+        if len > 0 {
+            if br.bits_remaining() < len {
+                return Err(Error::UnexpectedEnd);
+            }
+            br.skip(len);
+            return Ok(entry & LUT_SYM_MASK);
+        }
+
         for length in 1..=self.max_length as u32 {
             let code = look >> (16 - length);
             let count = self.counts[length as usize] as u32;
