@@ -28,6 +28,7 @@ use crate::error::Error;
 use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
 
 pub mod block;
+pub mod frame;
 
 /// Raw-input block size. 64 KiB is the canonical LZ4 block size and the
 /// largest value for which the 16-bit back-reference offset can address the

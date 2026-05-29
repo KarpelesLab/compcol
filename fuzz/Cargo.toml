@@ -81,6 +81,13 @@ doc              = false
 bench            = false
 
 [[bin]]
+name             = "decoder_lz4_frame"
+path             = "fuzz_targets/decoder_lz4_frame.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
 name             = "decoder_bzip2"
 path             = "fuzz_targets/decoder_bzip2.rs"
 test             = false

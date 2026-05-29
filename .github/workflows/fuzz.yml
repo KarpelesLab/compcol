@@ -30,6 +30,7 @@ jobs:
           - decoder_lzma
           - decoder_xz
           - decoder_lz4
+          - decoder_lz4_frame
           - decoder_bzip2
     steps:
       - uses: actions/checkout@v6
