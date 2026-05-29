@@ -30,7 +30,7 @@ use alloc::vec::Vec;
 use crate::error::Error;
 use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
 
-mod block;
+pub mod block;
 
 /// Raw-input block size. Capped at 48 KiB so the encoder's worst-case
 /// back-reference distance fits within the LZO1X format's `M4_MAX_DISTANCE`
