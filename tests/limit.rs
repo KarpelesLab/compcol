@@ -6,6 +6,9 @@ use compcol::gzip::Gzip;
 use compcol::limit::LimitedDecoder;
 use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Status};
 
+#[cfg(feature = "bzip2")]
+use compcol::bzip2::Bzip2;
+
 /// Compress `input` once with default-config gzip and return the bytes.
 fn gzip_compress(input: &[u8]) -> Vec<u8> {
     let mut enc = Gzip::encoder();
@@ -165,4 +168,59 @@ fn composes_with_io_decoder_reader() {
     let inner = err.into_inner().expect("inner error");
     let parsed = inner.downcast::<Error>().expect("compcol::Error downcast");
     assert_eq!(*parsed, Error::OutputLimitExceeded);
+}
+
+// ─── #26: trailer-consuming step at the exact-budget boundary ────────────
+
+/// Regression for KarpelesLab/compcol#26 — bzip2's per-block CRC/footer
+/// step emits zero output but still has to run to reach `StreamEnd`.
+/// Wrapping the decoder in `LimitedDecoder` with a cap equal to the
+/// *exact* output size used to starve that step: cap was 0 by the time
+/// the trailer call ran, the inner saw a 0-length output slice, blanket
+/// `decode` derived `Status::OutputFull` from byte counts, and the
+/// wrapper interpreted that as a bomb. The fix is a 1-byte probe buffer
+/// when the budget is exhausted: zero-output steps complete normally,
+/// while any actual over-budget write still aborts.
+#[cfg(feature = "bzip2")]
+#[test]
+fn bzip2_exact_budget_completes_through_trailer() {
+    let input = b"hello world\n";
+    let mut enc = Bzip2::encoder();
+    let mut compressed = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    let mut consumed = 0;
+    while consumed < input.len() {
+        let (p, _s) = enc.encode(&input[consumed..], &mut buf).unwrap();
+        compressed.extend_from_slice(&buf[..p.written]);
+        consumed += p.consumed;
+    }
+    loop {
+        let (p, s) = enc.finish(&mut buf).unwrap();
+        compressed.extend_from_slice(&buf[..p.written]);
+        if matches!(s, Status::StreamEnd) {
+            break;
+        }
+    }
+
+    // Budget = exact output size. Before #26's fix this errored with
+    // OutputLimitExceeded; after the fix it round-trips cleanly.
+    let mut dec = LimitedDecoder::new(Bzip2::decoder(), input.len() as u64);
+    let decoded = drain(&mut dec, &compressed).expect("exact budget should succeed");
+    assert_eq!(&decoded[..], input);
+}
+
+/// Over-budget on a larger stream — confirms the relaxation in
+/// `LimitedDecoder` doesn't silently let extra bytes through when the
+/// inner has a lot more output to emit than the budget allows. Uses
+/// gzip so the inner's status reflects "OutputFull, more pending"
+/// cleanly (bzip2's per-block CRC step has a separate truncation-vs-
+/// over-budget ambiguity at the exact boundary that's unrelated to
+/// this regression).
+#[test]
+fn over_budget_large_stream_errors_with_output_limit_exceeded() {
+    let payload = vec![0u8; 64 * 1024];
+    let compressed = gzip_compress(&payload);
+    let mut dec = LimitedDecoder::new(Gzip::decoder(), 8 * 1024);
+    let err = drain(&mut dec, &compressed).unwrap_err();
+    assert_eq!(err, Error::OutputLimitExceeded);
 }

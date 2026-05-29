@@ -95,30 +95,60 @@ impl<D: Decoder> LimitedDecoder<D> {
 impl<D: Decoder> Decoder for LimitedDecoder<D> {
     fn decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<(Progress, Status), Error> {
         let remaining = self.remaining();
-        // Cap the slice we hand the inner decoder to whatever budget
-        // is left. If `output.len()` is already below remaining, this is
-        // a no-op; if it isn't, the inner sees a tighter ceiling than
-        // the caller actually offered.
+        if remaining == 0 {
+            // Budget exhausted. A decoder whose plaintext is already fully
+            // emitted may still need one or more calls to consume the
+            // stream's trailer (block CRC / footer / EOS marker) and reach
+            // StreamEnd. Those calls emit zero output. Capping the output
+            // slice to 0 would force codecs like bzip2 — whose blanket
+            // `decode` derives status purely from byte counts — to report
+            // OutputFull, which we'd then mis-translate as a bomb.
+            //
+            // Probe the inner with a 1-byte private scratch buffer: if it
+            // doesn't write, we forward the status (lets the trailer-
+            // consuming step finish). If it tries to write, we abort —
+            // the probe byte stays in our local scratch and never reaches
+            // the caller's slice, so no over-budget bytes leak out.
+            let mut probe = [0u8; 1];
+            let (p, status) = self.inner.decode(input, &mut probe)?;
+            if p.written > 0 {
+                return Err(Error::OutputLimitExceeded);
+            }
+            return Ok((
+                Progress {
+                    consumed: p.consumed,
+                    written: 0,
+                },
+                status,
+            ));
+        }
         let cap = core::cmp::min(remaining as usize, output.len());
         let (p, status) = self.inner.decode(input, &mut output[..cap])?;
         self.written = self.written.saturating_add(p.written as u64);
-        // If the budget is exhausted and the inner still wants to emit
-        // more bytes (it returned OutputFull on a zero-length output —
-        // because cap was zero), the caller is staring at a bomb.
-        if remaining == 0 && matches!(status, Status::OutputFull) {
-            return Err(Error::OutputLimitExceeded);
-        }
         Ok((p, status))
     }
 
     fn finish(&mut self, output: &mut [u8]) -> Result<(Progress, Status), Error> {
         let remaining = self.remaining();
+        if remaining == 0 {
+            // Same trailer-consume probe as decode(). Mirrors the rationale
+            // above for codecs whose finish path emits zero output.
+            let mut probe = [0u8; 1];
+            let (p, status) = self.inner.finish(&mut probe)?;
+            if p.written > 0 {
+                return Err(Error::OutputLimitExceeded);
+            }
+            return Ok((
+                Progress {
+                    consumed: 0,
+                    written: 0,
+                },
+                status,
+            ));
+        }
         let cap = core::cmp::min(remaining as usize, output.len());
         let (p, status) = self.inner.finish(&mut output[..cap])?;
         self.written = self.written.saturating_add(p.written as u64);
-        if remaining == 0 && matches!(status, Status::OutputFull) {
-            return Err(Error::OutputLimitExceeded);
-        }
         Ok((p, status))
     }
 
