@@ -362,28 +362,20 @@ impl<'a> BitSource<'a> {
     }
 
     /// Peek `n` bits (0 < n ≤ 32) without advancing. Caller must
-    /// guarantee `n <= remaining()`.
-    pub(crate) fn peek_bits(&self, n: u32) -> u32 {
+    /// guarantee `n <= remaining()`. Refills the internal accumulator if
+    /// fewer than `n` bits are buffered.
+    pub(crate) fn peek_bits(&mut self, n: u32) -> u32 {
         debug_assert!(n > 0 && n <= 32);
         debug_assert!(n as usize <= self.remaining());
-        let mut acc: u32 = 0;
-        let mut got: u32 = 0;
-        let mut pos = self.pos;
-        while got < n {
-            let byte_pos = pos >> 3;
-            let bit_off = (pos & 7) as u32;
-            let take = (8 - bit_off).min(n - got);
-            let mask: u32 = if take == 32 {
-                u32::MAX
-            } else {
-                (1u32 << take) - 1
-            };
-            let chunk = ((self.data[byte_pos] as u32) >> bit_off) & mask;
-            acc |= chunk << got;
-            got += take;
-            pos += take as usize;
+        if self.nbits < n {
+            self.refill();
         }
-        acc
+        debug_assert!(self.nbits >= n);
+        if n == 32 {
+            self.acc as u32
+        } else {
+            (self.acc & ((1u64 << n) - 1)) as u32
+        }
     }
 
     /// Read `n` bits (0..=32) as a little-endian integer.
