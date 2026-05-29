@@ -12,6 +12,19 @@ use crate::error::Error;
 
 use super::bitreader::BitReader;
 
+/// Primary-LUT width for the fast-path symbol lookup. Codes of length
+/// ≤ `PRIMARY_BITS` resolve in O(1); longer codes fall back to the
+/// per-bit walk.
+const PRIMARY_BITS: u32 = 10;
+const PRIMARY_SIZE: usize = 1 << PRIMARY_BITS;
+
+/// Packed (symbol, length) entry in the primary LUT. The low 11 bits hold
+/// the symbol (LZX MAIN alphabet is 656 symbols ≤ 2^10) and the top 5
+/// bits hold the code length. A length of 0 marks "long code — take the
+/// slow path".
+const LUT_LEN_SHIFT: u32 = 11;
+const LUT_SYM_MASK: u16 = (1 << LUT_LEN_SHIFT) - 1;
+
 /// Fixed-capacity canonical Huffman decoder.
 ///
 /// `N` is the alphabet size; for LZX trees it's MAIN_TREE_MAX (656),
@@ -25,6 +38,10 @@ pub struct LzxHuffman<const N: usize> {
     first_code: [u32; 17],
     first_idx: [u16; 17],
     max_length: u8,
+    /// Primary lookup table: indexed by the next `PRIMARY_BITS` MSB-first
+    /// stream bits. Each slot holds a packed `(symbol, length)` for codes
+    /// of length ≤ `PRIMARY_BITS`, or `0` to signal the slow path.
+    lut: [u16; PRIMARY_SIZE],
 }
 
 impl<const N: usize> LzxHuffman<N> {
@@ -57,6 +74,7 @@ impl<const N: usize> LzxHuffman<N> {
                 first_code: [0u32; 17],
                 first_idx: [0u16; 17],
                 max_length: 0,
+                lut: [0u16; PRIMARY_SIZE],
             });
         }
 
@@ -94,12 +112,37 @@ impl<const N: usize> LzxHuffman<N> {
             }
         }
 
+        // Build the primary LUT. LZX bits are consumed MSB-first, so the
+        // top `PRIMARY_BITS` bits of the accumulator give the index into
+        // the table directly. A code value `c` of length `L ≤ PRIMARY_BITS`
+        // occupies the range `[c << (PRIMARY_BITS-L), (c+1) << (PRIMARY_BITS-L))`.
+        let mut lut = [0u16; PRIMARY_SIZE];
+        let mut next_code = first_code;
+        for (sym, &len) in code_lengths.iter().enumerate() {
+            if len == 0 {
+                continue;
+            }
+            let code = next_code[len as usize];
+            next_code[len as usize] += 1;
+            if (len as u32) > PRIMARY_BITS {
+                continue;
+            }
+            let shift = PRIMARY_BITS - len as u32;
+            let start = (code << shift) as usize;
+            let end = start + (1usize << shift);
+            let entry = (sym as u16) | ((len as u16) << LUT_LEN_SHIFT);
+            for slot in lut.iter_mut().take(end).skip(start) {
+                *slot = entry;
+            }
+        }
+
         Ok(Self {
             counts,
             symbols,
             first_code,
             first_idx,
             max_length,
+            lut,
         })
     }
 
@@ -115,17 +158,43 @@ impl<const N: usize> LzxHuffman<N> {
             return Err(Error::InvalidHuffmanTree);
         }
 
+        let available = reader.bits_available();
         let max = self.max_length as u32;
-        if reader.bits_available() < max {
+
+        // Fast path: if the max code length fits in PRIMARY_BITS, every
+        // symbol resolves through a single lookup. The empty-LUT slot (0)
+        // can only collide with a real entry when sym=0 and len=0, which
+        // means the table has no length-0 codes — guaranteed by the
+        // length-zero filter at build time.
+        if max <= PRIMARY_BITS && available >= max {
+            let idx = (reader.peek(max) << (PRIMARY_BITS - max)) as usize;
+            let entry = self.lut[idx];
+            let len = (entry >> LUT_LEN_SHIFT) as u32;
+            if len > 0 {
+                reader.drop_bits(len);
+                return Ok(Some(entry & LUT_SYM_MASK));
+            }
+            return Err(Error::InvalidHuffmanTree);
+        }
+
+        // Fast path for the common case (≥ PRIMARY_BITS bits buffered):
+        // peek PRIMARY_BITS, index the LUT, drop the code's length.
+        if available >= PRIMARY_BITS {
+            let idx = reader.peek(PRIMARY_BITS) as usize;
+            let entry = self.lut[idx];
+            let len = (entry >> LUT_LEN_SHIFT) as u32;
+            if len > 0 {
+                reader.drop_bits(len);
+                return Ok(Some(entry & LUT_SYM_MASK));
+            }
+            // Long code — fall through to the slow path.
+        } else if available < max {
             // Not enough bits to guarantee a full decode even in the worst
-            // case. We could still try if the symbol's actual length happens
-            // to be shorter, but checking up-front simplifies the code path
-            // and never costs more than one extra refill.
+            // case.
             return Ok(None);
         }
 
-        // Read `max` bits in MSB-first order, then walk code lengths 1..=max
-        // by stripping off the topmost bits one at a time.
+        // Slow path: walk lengths against the next `max` bits.
         let lookahead = reader.peek(max);
         for length in 1..=max {
             // The first `length` MSB-first bits of `lookahead` (which is
