@@ -50,9 +50,11 @@ jobs:
           key: fuzz-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('fuzz/Cargo.toml') }}
       - name: Run ${{ matrix.target }} for 30s
         working-directory: fuzz
-        # rss_limit_mb caps each fuzz iteration's resident memory so a
-        # decoder coaxed into allocating gigabytes (via a maliciously-
-        # sized header field, say) is treated as a finding rather than
-        # killing the runner. malloc_limit_mb does the same for explicit
-        # allocations.
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=30 -rss_limit_mb=512 -malloc_limit_mb=512
+        # rss_limit_mb caps the fuzzer's total resident memory. The
+        # earlier 512 MiB cap caught real OOM bugs (lz4/lzo/snappy's
+        # unbounded length-prefix reserves) but also tripped on brotli's
+        # glibc-arena growth across ~500k iterations — not a real
+        # finding, just allocator fragmentation. 2 GiB is well within
+        # the runner's ~7 GiB while staying small enough that a decoder
+        # genuinely allocating gigabytes per iteration is still flagged.
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=30 -rss_limit_mb=2048 -malloc_limit_mb=2048
