@@ -158,3 +158,56 @@ fn decoder_reader_handles_small_read_buffers() {
     }
     assert_eq!(decoded, input);
 }
+
+// Regression for https://github.com/KarpelesLab/compcol/issues/17 — a tiny,
+// highly-compressible zlib payload that fits its entire compressed form in
+// the adapter's first refill. deflate's bit-reader absorbs every input byte
+// into its accumulator on the first decode call, so the wrapping decoder
+// reports `in_consumed == in_filled` immediately while still holding nearly
+// all of the expansion as pending output. The adapter has to keep calling
+// decode() — even with an empty input slice — to drain that pending output;
+// the previous code skipped decode in this state and gave up to finish(),
+// which errored with `UnexpectedEnd`.
+#[cfg(feature = "zlib")]
+#[test]
+fn decoder_reader_drains_pending_output_when_input_exhausted_zlib() {
+    use compcol::zlib::Zlib;
+    let input = b"hello hfsplus decmpfs world!".repeat(8); // 224 bytes
+    let compressed = compcol::vec::compress_to_vec::<Zlib>(&input).unwrap();
+    assert!(compressed.len() < 64); // fits in one inner read
+
+    let mut r = DecoderReader::new(Cursor::new(&compressed), Zlib::decoder());
+    let mut decoded = Vec::new();
+    let mut buf = [0u8; 32];
+    loop {
+        let n = r.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        decoded.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(decoded, input);
+}
+
+// Same shape as the zlib regression but for raw deflate — the underlying
+// bit-reader is the same, so the bug surfaces identically once any wrapper
+// no longer leaves trailer/header bytes hanging in the input slice.
+#[cfg(feature = "deflate")]
+#[test]
+fn decoder_reader_drains_pending_output_when_input_exhausted_deflate() {
+    use compcol::deflate::Deflate;
+    let input = b"hello hfsplus decmpfs world!".repeat(8);
+    let compressed = compcol::vec::compress_to_vec::<Deflate>(&input).unwrap();
+
+    let mut r = DecoderReader::new(Cursor::new(&compressed), Deflate::decoder());
+    let mut decoded = Vec::new();
+    let mut buf = [0u8; 32];
+    loop {
+        let n = r.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        decoded.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(decoded, input);
+}

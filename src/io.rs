@@ -416,28 +416,29 @@ impl<R: Read, D: Decoder> Read for DecoderReader<R, D> {
             if self.finished {
                 return Ok(0);
             }
-            // Drain any buffered compressed input through decode() first.
-            if self.in_consumed < self.in_filled {
-                let (p, status) = self
-                    .dec
-                    .decode(&self.in_buf[self.in_consumed..self.in_filled], buf)?;
-                self.in_consumed += p.consumed;
-                if matches!(status, Status::StreamEnd) {
-                    self.finished = true;
-                }
-                if p.written > 0 {
-                    return Ok(p.written);
-                }
-                if matches!(status, Status::OutputFull) {
-                    return Ok(0);
-                }
-                if self.finished {
-                    return Ok(0);
-                }
-                // Otherwise: input fully consumed, no output this round —
-                // refill.
+            // Call decode() unconditionally — even when `in_buf` is empty.
+            // Some decoders (notably deflate-family) eagerly absorb input
+            // into a private bit-reader before emitting all of the output
+            // it expands to, so the next read may need to drain that
+            // pending output without supplying any new compressed bytes.
+            // Passing an empty input slice when there's nothing buffered
+            // is a no-op for decoders that don't carry internal state.
+            let (p, status) = self
+                .dec
+                .decode(&self.in_buf[self.in_consumed..self.in_filled], buf)?;
+            self.in_consumed += p.consumed;
+            if matches!(status, Status::StreamEnd) {
+                self.finished = true;
             }
-            // Refill if possible.
+            if p.written > 0 {
+                return Ok(p.written);
+            }
+            if self.finished {
+                return Ok(0);
+            }
+            // No output this round. If decode reported InputEmpty we can
+            // try to refill; OutputFull is impossible here because `buf`
+            // is non-empty and we just wrote zero bytes into it.
             if !self.inner_eof {
                 self.in_consumed = 0;
                 self.in_filled = self.inner.read(&mut self.in_buf)?;
@@ -446,7 +447,9 @@ impl<R: Read, D: Decoder> Read for DecoderReader<R, D> {
                 }
                 continue;
             }
-            // No more bytes coming. Drain the decoder's tail.
+            // Inner exhausted and decoder produced nothing — wrap up via
+            // finish(). A well-formed stream reaches StreamEnd; a
+            // truncated one surfaces UnexpectedEnd from the codec.
             let (p, status) = self.dec.finish(buf)?;
             if matches!(status, Status::StreamEnd) {
                 self.finished = true;
