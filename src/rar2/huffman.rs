@@ -25,6 +25,18 @@ use super::bitreader::BitReader;
 /// XADRAR20Handle.m).
 pub const MAX_BITS: u32 = 15;
 
+/// Primary-LUT width for the fast-path symbol lookup. Codes of length
+/// ≤ `PRIMARY_BITS` resolve in O(1); longer codes fall back to the
+/// per-length walk.
+const PRIMARY_BITS: u32 = 9;
+const PRIMARY_SIZE: usize = 1 << PRIMARY_BITS;
+
+/// Packed (symbol, length) entry in the primary LUT. The low 11 bits hold
+/// the symbol; the top 5 bits hold the code length. A length of 0 marks
+/// "long code -- take the slow path".
+const LUT_LEN_SHIFT: u32 = 11;
+const LUT_SYM_MASK: u16 = (1 << LUT_LEN_SHIFT) - 1;
+
 /// Canonical Huffman decoder over an alphabet of up to `N` symbols.
 #[derive(Debug, Clone)]
 pub struct Rar2Huffman<const N: usize> {
@@ -38,6 +50,10 @@ pub struct Rar2Huffman<const N: usize> {
     first_idx: [u16; (MAX_BITS as usize) + 1],
     max_length: u8,
     n_symbols: u16,
+    /// Primary lookup table: indexed by the next `PRIMARY_BITS` MSB-first
+    /// stream bits. Each slot holds a packed `(symbol, length)` for codes
+    /// of length ≤ `PRIMARY_BITS`, or `0` to signal the slow path.
+    lut: [u16; PRIMARY_SIZE],
 }
 
 impl<const N: usize> Rar2Huffman<N> {
@@ -73,6 +89,7 @@ impl<const N: usize> Rar2Huffman<N> {
                 first_idx: [0u16; (MAX_BITS as usize) + 1],
                 max_length: 0,
                 n_symbols: n as u16,
+                lut: [0u16; PRIMARY_SIZE],
             });
         }
 
@@ -106,6 +123,30 @@ impl<const N: usize> Rar2Huffman<N> {
             }
         }
 
+        // Build the primary LUT. RAR2 consumes MSB-first, and `peek_up_to`
+        // returns the top `PRIMARY_BITS` bits right-justified at width
+        // PRIMARY_BITS, so a code value `c` of length `L ≤ PRIMARY_BITS`
+        // owns the index range `[c << (PRIMARY_BITS-L), (c+1) << (PRIMARY_BITS-L))`.
+        let mut lut = [0u16; PRIMARY_SIZE];
+        let mut next_code = first_code;
+        for (sym, &len) in code_lengths.iter().enumerate() {
+            if len == 0 {
+                continue;
+            }
+            let code = next_code[len as usize];
+            next_code[len as usize] += 1;
+            if (len as u32) > PRIMARY_BITS {
+                continue;
+            }
+            let shift = PRIMARY_BITS - len as u32;
+            let start = (code << shift) as usize;
+            let end = start + (1usize << shift);
+            let entry = (sym as u16) | ((len as u16) << LUT_LEN_SHIFT);
+            for slot in lut.iter_mut().take(end).skip(start) {
+                *slot = entry;
+            }
+        }
+
         Ok(Self {
             counts,
             symbols,
@@ -113,6 +154,7 @@ impl<const N: usize> Rar2Huffman<N> {
             first_idx,
             max_length,
             n_symbols: n as u16,
+            lut,
         })
     }
 
@@ -129,13 +171,27 @@ impl<const N: usize> Rar2Huffman<N> {
             return Err(Error::InvalidHuffmanTree);
         }
         let max = self.max_length as u32;
+
+        // Fast path: when at least PRIMARY_BITS bits are buffered, a
+        // single LUT lookup resolves any code of length ≤ PRIMARY_BITS.
+        let (peeked_primary, have_primary) = reader.peek_up_to(PRIMARY_BITS, input);
+        if have_primary >= PRIMARY_BITS {
+            let entry = self.lut[peeked_primary as usize];
+            let len = (entry >> LUT_LEN_SHIFT) as u32;
+            if len > 0 {
+                reader.drop_bits(len);
+                return Ok(entry & LUT_SYM_MASK);
+            }
+            // Long code (> PRIMARY_BITS) -- fall through to the slow path.
+        }
+
         let (peeked, have) = reader.peek_up_to(max, input);
 
         // For each candidate length, see if the top `length` bits of `peeked`
         // (which is right-aligned to width `max`) fall inside the canonical
         // range. Because peek_up_to zeros out missing low bits, a length
         // that exceeds `have` would let us *accidentally* match a code whose
-        // last bits we don't actually possess — guard with `length <= have`.
+        // last bits we don't actually possess -- guard with `length <= have`.
         for length in 1..=max {
             let count = self.counts[length as usize] as u32;
             if count == 0 {

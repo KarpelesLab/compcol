@@ -23,6 +23,19 @@ use super::bits::BitReader;
 
 const MAX_CODE_LEN: u8 = 15;
 
+/// Primary-LUT width for the fast-path symbol lookup. Codes of length
+/// ≤ `PRIMARY_BITS` resolve in O(1); longer codes fall back to the
+/// per-length walk.
+const PRIMARY_BITS: u32 = 9;
+const PRIMARY_SIZE: usize = 1 << PRIMARY_BITS;
+
+/// Packed (symbol, length) entry in the primary LUT. The low 11 bits hold
+/// the symbol (rar3 main alphabet is 299 symbols, well under 2^11) and the
+/// top 5 bits hold the code length. A length of 0 marks "long code -- take
+/// the slow path".
+const LUT_LEN_SHIFT: u32 = 11;
+const LUT_SYM_MASK: u16 = (1 << LUT_LEN_SHIFT) - 1;
+
 /// Canonical Huffman decoder over an alphabet of up to `cap` symbols.
 #[derive(Debug, Clone)]
 pub struct Huffman {
@@ -31,6 +44,10 @@ pub struct Huffman {
     first_code: [u32; (MAX_CODE_LEN as usize) + 1],
     first_idx: [u16; (MAX_CODE_LEN as usize) + 1],
     max_length: u8,
+    /// Primary lookup table: indexed by the next `PRIMARY_BITS` MSB-first
+    /// stream bits. Each slot holds a packed `(symbol, length)` for codes
+    /// of length ≤ `PRIMARY_BITS`, or `0` to signal the slow path.
+    lut: alloc::boxed::Box<[u16; PRIMARY_SIZE]>,
 }
 
 impl Huffman {
@@ -63,6 +80,7 @@ impl Huffman {
                 first_code: [0u32; (MAX_CODE_LEN as usize) + 1],
                 first_idx: [0u16; (MAX_CODE_LEN as usize) + 1],
                 max_length: 0,
+                lut: alloc::boxed::Box::new([0u16; PRIMARY_SIZE]),
             });
         }
 
@@ -97,12 +115,37 @@ impl Huffman {
             }
         }
 
+        // Build the primary LUT. RAR3 consumes MSB-first, so the top
+        // `PRIMARY_BITS` bits of the accumulator give the index directly.
+        // A code value `c` of length `L ≤ PRIMARY_BITS` occupies the
+        // index range `[c << (PRIMARY_BITS-L), (c+1) << (PRIMARY_BITS-L))`.
+        let mut lut = alloc::boxed::Box::new([0u16; PRIMARY_SIZE]);
+        let mut next_code = first_code;
+        for (sym, &len) in lengths.iter().enumerate() {
+            if len == 0 {
+                continue;
+            }
+            let code = next_code[len as usize];
+            next_code[len as usize] += 1;
+            if (len as u32) > PRIMARY_BITS {
+                continue;
+            }
+            let shift = PRIMARY_BITS - len as u32;
+            let start = (code << shift) as usize;
+            let end = start + (1usize << shift);
+            let entry = (sym as u16) | ((len as u16) << LUT_LEN_SHIFT);
+            for slot in lut.iter_mut().take(end).skip(start) {
+                *slot = entry;
+            }
+        }
+
         Ok(Self {
             counts,
             symbols,
             first_code,
             first_idx,
             max_length,
+            lut,
         })
     }
 
@@ -112,8 +155,21 @@ impl Huffman {
             return Err(Error::InvalidHuffmanTree);
         }
         let max = self.max_length as u32;
+
+        // Fast path: when we can peek PRIMARY_BITS bits, a single LUT
+        // lookup resolves any code of length ≤ PRIMARY_BITS.
+        if let Ok(idx) = reader.peek(PRIMARY_BITS) {
+            let entry = self.lut[idx as usize];
+            let len = (entry >> LUT_LEN_SHIFT) as u32;
+            if len > 0 {
+                reader.drop_bits(len)?;
+                return Ok(entry & LUT_SYM_MASK);
+            }
+            // Long code (> PRIMARY_BITS) -- fall through to the slow path.
+        }
+
         // Peek `max` bits; if not enough, peek the remaining smaller widths
-        // one at a time. For RAR3 trees this is unlikely to matter — most
+        // one at a time. For RAR3 trees this is unlikely to matter -- most
         // codes fit in the buffer easily.
         let lookahead = self.peek_padded(reader, max)?;
         for length in 1..=max {

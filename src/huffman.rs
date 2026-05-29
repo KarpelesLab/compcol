@@ -19,6 +19,20 @@
 use crate::bits::BitReader;
 use crate::error::Error;
 
+/// Primary-LUT width for the fast-path symbol lookup. Codes of length
+/// ≤ `PRIMARY_BITS` resolve in O(1); longer codes fall back to the
+/// per-bit walk. 9 matches zlib's `inflate_fast` and covers the vast
+/// majority of literals in practice.
+const PRIMARY_BITS: u32 = 9;
+const PRIMARY_SIZE: usize = 1 << PRIMARY_BITS;
+
+/// Packed (symbol, length) entry in the primary LUT. The low 12 bits hold
+/// the symbol (deflate symbols fit in 9 bits, so 12 is plenty) and the
+/// top 4 bits hold the code length. A length of 0 marks "long code —
+/// take the slow path".
+const LUT_LEN_SHIFT: u32 = 12;
+const LUT_SYM_MASK: u16 = (1 << LUT_LEN_SHIFT) - 1;
+
 /// Try to decode one symbol from `reader`.
 ///
 /// Returns `Ok(Some(symbol))` on success, `Ok(None)` if the reader doesn't
@@ -37,6 +51,10 @@ pub struct CanonicalDecoder<const N: usize> {
     first_idx: [u16; 16],
     /// Longest code length actually present; 0 if no symbols.
     max_length: u8,
+    /// Primary lookup table: indexed by the next `PRIMARY_BITS` LSB-first
+    /// stream bits. Each slot holds a packed `(symbol, length)` for codes
+    /// of length ≤ `PRIMARY_BITS`, or `0` to signal the slow path.
+    lut: [u16; PRIMARY_SIZE],
 }
 
 impl<const N: usize> CanonicalDecoder<N> {
@@ -93,12 +111,47 @@ impl<const N: usize> CanonicalDecoder<N> {
             }
         }
 
+        // Build the primary LUT. For each symbol whose code length is
+        // ≤ PRIMARY_BITS, compute its LSB-first stream representation
+        // (= bit-reverse of the canonical MSB-first code value) and
+        // populate every entry whose low `len` bits match.
+        let mut lut = [0u16; PRIMARY_SIZE];
+        if max_length > 0 {
+            // Same recurrence as `canonical_codes_from_lengths`: the
+            // first code at length `l` is `(first_at_l-1 + count[l-1]) << 1`.
+            let mut next_code = [0u32; 16];
+            let mut acc: u32 = 0;
+            for l in 1..=15usize {
+                acc = (acc + counts[l - 1] as u32) << 1;
+                next_code[l] = acc;
+            }
+            for (sym, &len) in code_lengths.iter().enumerate() {
+                if len == 0 {
+                    continue;
+                }
+                let code = next_code[len as usize];
+                next_code[len as usize] += 1;
+                if (len as u32) > PRIMARY_BITS {
+                    continue;
+                }
+                let reversed = reverse_bits_lo(code, len as u32);
+                let entry = (sym as u16) | ((len as u16) << LUT_LEN_SHIFT);
+                let stride = 1usize << len;
+                let mut slot = reversed as usize;
+                while slot < PRIMARY_SIZE {
+                    lut[slot] = entry;
+                    slot += stride;
+                }
+            }
+        }
+
         Ok(Self {
             counts,
             symbols,
             first_code,
             first_idx,
             max_length,
+            lut,
         })
     }
 
@@ -111,8 +164,24 @@ impl<const N: usize> CanonicalDecoder<N> {
 
         let available = reader.bits_available();
         let max = self.max_length as u32;
-        let mut code: u32 = 0;
 
+        // Fast path: if we have ≥ PRIMARY_BITS bits buffered, one peek +
+        // one table lookup resolves any code of length ≤ PRIMARY_BITS.
+        if available >= PRIMARY_BITS {
+            let idx = reader.peek(PRIMARY_BITS) as usize;
+            let entry = self.lut[idx];
+            let len = (entry >> LUT_LEN_SHIFT) as u32;
+            if len > 0 {
+                reader.drop_bits(len);
+                return Ok(Some(entry & LUT_SYM_MASK));
+            }
+            // Long code (>PRIMARY_BITS) — fall through to the slow path.
+        }
+
+        // Slow path: walk lengths one bit at a time. Used for codes
+        // longer than PRIMARY_BITS and during the tail of a stream where
+        // fewer than PRIMARY_BITS bits are buffered.
+        let mut code: u32 = 0;
         for length in 1..=max {
             if length > available {
                 // Not enough bits in the accumulator yet. Reader untouched.
@@ -137,6 +206,19 @@ impl<const N: usize> CanonicalDecoder<N> {
         }
         Err(Error::InvalidHuffmanTree)
     }
+}
+
+/// Reverse the lowest `n` bits of `v`. Used at table-build time so the
+/// LUT can be indexed directly by the next `n` LSB-first stream bits.
+const fn reverse_bits_lo(mut v: u32, n: u32) -> u32 {
+    let mut out = 0u32;
+    let mut i = 0;
+    while i < n {
+        out = (out << 1) | (v & 1);
+        v >>= 1;
+        i += 1;
+    }
+    out
 }
 
 // ─── encoder side: length-limited Huffman + canonical code generation ───
