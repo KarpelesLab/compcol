@@ -266,41 +266,99 @@ const fn reverse_bits_lo(mut v: u32, n: u32) -> u32 {
 /// exposes single-bit and multi-bit reads.
 ///
 /// All bit ordering is LSB-first within bytes (same as deflate).
+///
+/// Internally holds a 64-bit accumulator filled from `data` on demand so
+/// the hot path (`read_bit`, `read_bits` for small `n`) services reads
+/// out of registers instead of touching `data` every bit. The logical
+/// bit position exposed via [`BitSource::position`] is
+/// `load_pos - nbits`, i.e. consumed bits up to but not including the
+/// next bit the caller will see.
 #[derive(Debug)]
 pub(crate) struct BitSource<'a> {
     data: &'a [u8],
-    /// Absolute bit offset into `data`. Reading past `data.len() * 8`
-    /// yields `Error::UnexpectedEnd`.
-    pos: usize,
+    /// Absolute bit offset into `data` of the next bit not yet pulled
+    /// into `acc`. Always satisfies `load_pos <= data.len() * 8`.
+    load_pos: usize,
+    /// Up to 64 bits, LSB-first, holding the next `nbits` bits the
+    /// caller will consume.
+    acc: u64,
+    /// Number of valid bits currently in `acc`.
+    nbits: u32,
 }
 
 impl<'a> BitSource<'a> {
     /// Construct from an existing slice and a starting bit position.
     pub(crate) fn at(data: &'a [u8], pos: usize) -> Self {
-        Self { data, pos }
+        Self {
+            data,
+            load_pos: pos,
+            acc: 0,
+            nbits: 0,
+        }
     }
 
     pub(crate) fn position(&self) -> usize {
-        self.pos
+        self.load_pos - self.nbits as usize
     }
 
     pub(crate) fn set_position(&mut self, p: usize) {
-        self.pos = p;
+        self.load_pos = p;
+        self.acc = 0;
+        self.nbits = 0;
     }
 
-    /// Remaining bits available.
+    /// Remaining bits available (still in `data` plus held in `acc`).
+    #[allow(dead_code)]
     pub(crate) fn remaining(&self) -> usize {
-        self.data.len() * 8 - self.pos
+        (self.data.len() * 8 - self.load_pos) + self.nbits as usize
+    }
+
+    /// Pull more bits from `data` into `acc` until at least 57 bits are
+    /// buffered or input is exhausted. Bytes are read LSB-first.
+    fn refill(&mut self) {
+        // Byte-aligned fast path: a single u64::from_le_bytes covers the
+        // common case where the caller is mid-stream and the input slice
+        // has 8 spare bytes ahead.
+        if (self.load_pos & 7) == 0 && self.nbits <= 56 {
+            let byte_pos = self.load_pos >> 3;
+            if byte_pos + 8 <= self.data.len() {
+                let bytes: [u8; 8] = self.data[byte_pos..byte_pos + 8]
+                    .try_into()
+                    .expect("8-byte slice");
+                let chunk = u64::from_le_bytes(bytes);
+                self.acc |= chunk << self.nbits;
+                let added = 64 - self.nbits;
+                self.load_pos += added as usize;
+                self.nbits = 64;
+                return;
+            }
+        }
+        // Slow path: byte-by-byte (handles unaligned start and tail).
+        while self.nbits <= 56 {
+            let byte_pos = self.load_pos >> 3;
+            if byte_pos >= self.data.len() {
+                break;
+            }
+            let bit_off = (self.load_pos & 7) as u32;
+            let take = 8 - bit_off;
+            let chunk = (self.data[byte_pos] as u64) >> bit_off;
+            self.acc |= chunk << self.nbits;
+            self.nbits += take;
+            self.load_pos += take as usize;
+        }
     }
 
     pub(crate) fn read_bit(&mut self) -> Result<u32, Error> {
-        if self.pos >= self.data.len() * 8 {
-            return Err(Error::UnexpectedEnd);
+        if self.nbits == 0 {
+            self.refill();
+            if self.nbits == 0 {
+                return Err(Error::UnexpectedEnd);
+            }
         }
-        let byte = self.data[self.pos >> 3];
-        let bit = (byte >> (self.pos & 7)) & 1;
-        self.pos += 1;
-        Ok(bit as u32)
+        let bit = (self.acc & 1) as u32;
+        self.acc >>= 1;
+        self.nbits -= 1;
+        Ok(bit)
     }
 
     /// Peek `n` bits (0 < n ≤ 32) without advancing. Caller must
@@ -334,33 +392,32 @@ impl<'a> BitSource<'a> {
         if n == 0 {
             return Ok(0);
         }
-        if self.remaining() < n as usize {
-            return Err(Error::UnexpectedEnd);
+        if self.nbits < n {
+            self.refill();
+            if self.nbits < n {
+                return Err(Error::UnexpectedEnd);
+            }
         }
-        let mut acc: u32 = 0;
-        let mut got: u32 = 0;
-        while got < n {
-            let byte_pos = self.pos >> 3;
-            let bit_off = (self.pos & 7) as u32;
-            let take = (8 - bit_off).min(n - got);
-            let mask: u32 = if take == 32 {
-                u32::MAX
-            } else {
-                (1u32 << take) - 1
-            };
-            let chunk = ((self.data[byte_pos] as u32) >> bit_off) & mask;
-            acc |= chunk << got;
-            got += take;
-            self.pos += take as usize;
-        }
-        Ok(acc)
+        let v = (self.acc & ((1u64 << n) - 1)) as u32;
+        self.acc >>= n;
+        self.nbits -= n;
+        Ok(v)
     }
 
     /// Align the bit position up to the next byte boundary.
     pub(crate) fn align_to_byte(&mut self) {
-        let r = self.pos & 7;
+        let r = (self.position() & 7) as u32;
         if r != 0 {
-            self.pos += 8 - r;
+            let drop = 8 - r;
+            if drop <= self.nbits {
+                self.acc >>= drop;
+                self.nbits -= drop;
+            } else {
+                let extra = drop - self.nbits;
+                self.acc = 0;
+                self.nbits = 0;
+                self.load_pos += extra as usize;
+            }
         }
     }
 }
@@ -402,5 +459,70 @@ mod tests {
         // Byte 0 bits 4..7 = 1011 (LSB-first), Byte 1 bits 0..3 = 0001
         // Combined LSB-first: 1011 then 0001 -> 0001_1011 = 0x1B
         assert_eq!(src.read_bits(8).unwrap(), 0x1B);
+    }
+
+    #[test]
+    fn fast_path_byte_aligned_refill() {
+        // 9 bytes so the byte-aligned 8-byte fast path fires on the first
+        // refill, then the slow path handles the final byte.
+        let data: [u8; 9] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0xFF];
+        let mut src = BitSource::at(&data, 0);
+        // Read a u64-sized field worth of bits in pieces.
+        for &expected in &[0x01u32, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0xFF] {
+            assert_eq!(src.read_bits(8).unwrap(), expected);
+        }
+        assert_eq!(src.position(), 9 * 8);
+    }
+
+    #[test]
+    fn unaligned_start_refill() {
+        // Resume mid-byte: the slow path must service partial-byte heads.
+        let data: [u8; 5] = [0xAB, 0xCD, 0xEF, 0x12, 0x34];
+        let mut src = BitSource::at(&data, 3);
+        // Position 3 means we skip the low 3 bits of 0xAB; remaining bits
+        // of byte 0 are the high 5: 0xAB >> 3 = 0b10101 = 21.
+        assert_eq!(src.read_bits(5).unwrap(), 0xAB >> 3);
+        // Now byte-aligned at byte 1.
+        assert_eq!(src.read_bits(8).unwrap(), 0xCD);
+        assert_eq!(src.position(), 16);
+    }
+
+    #[test]
+    fn unexpected_end_short_input() {
+        let data = [0x55u8];
+        let mut src = BitSource::at(&data, 0);
+        // 5 bits available out of 8; asking for 16 must fail without
+        // mutating the visible position.
+        let before = src.position();
+        assert!(src.read_bits(16).is_err());
+        // Implementation may have buffered the byte into acc; position()
+        // should still report the un-consumed bit offset.
+        assert_eq!(src.position(), before);
+        // The bits still readable byte-by-byte.
+        assert_eq!(src.read_bits(8).unwrap(), 0x55);
+        assert!(src.read_bit().is_err());
+    }
+
+    #[test]
+    fn set_position_rolls_back_accumulator() {
+        let data = [0xFFu8, 0x00, 0xAA, 0x55];
+        let mut src = BitSource::at(&data, 0);
+        let saved = src.position();
+        assert_eq!(src.read_bits(12).unwrap(), 0x0FF);
+        src.set_position(saved);
+        // After rollback, re-reading must produce the same bits.
+        assert_eq!(src.read_bits(8).unwrap(), 0xFF);
+        assert_eq!(src.read_bits(8).unwrap(), 0x00);
+    }
+
+    #[test]
+    fn align_to_byte_drops_partial() {
+        let data = [0b1111_0000u8, 0b1010_1010];
+        let mut src = BitSource::at(&data, 0);
+        // Read 3 bits, then align to byte boundary, then read next byte.
+        assert_eq!(src.read_bits(3).unwrap(), 0b000);
+        src.align_to_byte();
+        assert_eq!(src.position(), 8);
+        assert_eq!(src.read_bits(8).unwrap(), 0b1010_1010);
     }
 }
