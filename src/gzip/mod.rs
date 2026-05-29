@@ -29,7 +29,7 @@
 use crate::checksum::Crc32;
 use crate::deflate;
 use crate::error::Error;
-use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
+use crate::traits::{Algorithm, Flush, RawDecoder, RawEncoder, RawProgress};
 
 const MAGIC_ID1: u8 = 0x1F;
 const MAGIC_ID2: u8 = 0x8B;
@@ -745,5 +745,40 @@ impl RawEncoder for Encoder {
         self.trailer = [0u8; 8];
         self.trailer_idx = 0;
         self.phase = EncPhase::Header;
+    }
+
+    fn raw_flush(&mut self, output: &mut [u8], mode: Flush) -> Result<RawProgress, Error> {
+        let mut written = 0usize;
+
+        // Drain the 10-byte gzip header first if it hasn't been written
+        // yet, so a "flush before any encode" still produces a valid
+        // gzip prefix in front of the deflate sync marker.
+        if matches!(self.phase, EncPhase::Header) {
+            if !self.drain_header(output, &mut written) {
+                return Ok(RawProgress {
+                    consumed: 0,
+                    written,
+                    done: false,
+                });
+            }
+            self.phase = EncPhase::Deflate;
+        }
+
+        if !matches!(self.phase, EncPhase::Deflate) {
+            // Trailer / Done — flushing after finish() is meaningless.
+            return Err(Error::Corrupt);
+        }
+
+        let p = self.inner.raw_flush(&mut output[written..], mode)?;
+        written += p.written;
+        Ok(RawProgress {
+            consumed: 0,
+            written,
+            // Forward the deflate-layer flush-complete signal so the
+            // bridge maps it to `Status::InputEmpty`. `done` here is the
+            // flush-call-complete semantic, not stream-end — the gzip
+            // CRC/ISIZE trailer is not emitted by flush.
+            done: p.done,
+        })
     }
 }

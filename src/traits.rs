@@ -38,6 +38,42 @@ pub enum Status {
     StreamEnd,
 }
 
+/// How aggressively [`Encoder::flush`] should drain pending encoder state.
+///
+/// Mirrors zlib's `Z_SYNC_FLUSH` / `Z_FULL_FLUSH` semantics. Both modes
+/// byte-align the encoded bitstream and emit any in-band marker the format
+/// requires so a peer can decode everything the encoder has produced so
+/// far — **without** ending the stream. The encoder remains usable for
+/// further `encode` / `flush` / `finish` calls.
+///
+/// Use case: per-packet sync boundaries in long-lived compressed transports
+/// like SSH ("zlib" compression, RFC 4253 §6.2), HTTP/2 dynamic table
+/// updates, RPC pipes, append-only log streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flush {
+    /// Conventional sync flush: byte-align the bitstream and emit any
+    /// marker the format requires so the peer can decode everything
+    /// emitted so far, **without** ending the stream and **without**
+    /// resetting the encoder's history. Subsequent input continues to
+    /// back-reference data emitted before the flush.
+    ///
+    /// For DEFLATE this corresponds to `Z_SYNC_FLUSH`: the encoder
+    /// closes the current block (BFINAL=0), then emits an empty stored
+    /// block whose four trailer bytes `00 00 ff ff` act as the inline
+    /// sync marker.
+    Sync,
+    /// Like [`Flush::Sync`], but additionally resets the encoder's
+    /// history so the next chunk can be decoded independently of
+    /// anything emitted before the flush. Mirrors DEFLATE's
+    /// `Z_FULL_FLUSH`.
+    ///
+    /// More expensive than `Sync` in terms of ratio (subsequent data
+    /// can no longer back-reference the pre-flush window) but useful
+    /// when the peer might join the stream mid-transmission or when
+    /// the application needs a random-access point.
+    Full,
+}
+
 // ─── implementation traits (private internals) ───────────────────────────
 
 /// Outcome of one internal codec step. The `done` flag is only meaningful
@@ -58,6 +94,23 @@ pub trait RawEncoder {
     fn raw_encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error>;
     fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error>;
     fn raw_reset(&mut self);
+
+    /// Default no-op: formats with no in-band sync marker (rle, raw lz4,
+    /// snappy, …) inherit this and report "nothing to flush".
+    ///
+    /// `RawProgress.done` is repurposed here to mean "the flush call is
+    /// complete — every byte the encoder owed for this flush has been
+    /// forwarded to the caller". The blanket bridge ([`Encoder::flush`])
+    /// maps `done` to [`Status::InputEmpty`] (the encoded stream is
+    /// **not** ended; subsequent encode/flush/finish calls are valid).
+    fn raw_flush(&mut self, output: &mut [u8], mode: Flush) -> Result<RawProgress, Error> {
+        let _ = (output, mode);
+        Ok(RawProgress {
+            consumed: 0,
+            written: 0,
+            done: true,
+        })
+    }
 }
 
 /// Implementation trait for decompressors. End-users go through [`Decoder`].
@@ -148,6 +201,53 @@ pub trait Encoder {
     /// Calling `reset` is also the documented way to recover from an
     /// [`Err`] return.
     fn reset(&mut self);
+
+    /// Drain pending encoder state to `output` at a `mode`-defined sync
+    /// boundary, keeping the encoder usable for further `encode` / `flush`
+    /// / `finish` calls.
+    ///
+    /// Unlike [`finish`](Encoder::finish), `flush` **never** ends the
+    /// stream — the returned [`Status`] is always either
+    /// [`Status::InputEmpty`] (everything pending was written to `output`)
+    /// or [`Status::OutputFull`] (the encoder still has bytes buffered;
+    /// drain `output` and call `flush` again with the same `mode` until
+    /// `InputEmpty` is returned). It never returns [`Status::StreamEnd`].
+    ///
+    /// ## Behaviour by format
+    ///
+    /// Algorithms with no defined in-band sync marker (rle, raw lz4
+    /// blocks, snappy, lzw, …) use the default implementation, which
+    /// is a no-op returning `(Progress::default(), Status::InputEmpty)`.
+    ///
+    /// Algorithms whose format does have a sync marker (deflate, zlib,
+    /// gzip, …) override this to emit the marker:
+    /// - [`Flush::Sync`] byte-aligns the bitstream and emits whatever
+    ///   trailing bytes the format reserves so the peer can decode
+    ///   everything emitted so far. History is preserved.
+    /// - [`Flush::Full`] does the same and additionally resets the
+    ///   encoder's history so the next chunk decodes independently.
+    ///
+    /// ## Loop pattern
+    ///
+    /// ```no_run
+    /// # use compcol::{Encoder, Flush, Status};
+    /// # fn use_it<E: Encoder>(mut enc: E, out: &mut Vec<u8>) -> Result<(), compcol::Error> {
+    /// let mut buf = vec![0u8; 64 * 1024];
+    /// loop {
+    ///     let (p, status) = enc.flush(&mut buf, Flush::Sync)?;
+    ///     out.extend_from_slice(&buf[..p.written]);
+    ///     match status {
+    ///         Status::InputEmpty => break,         // nothing more buffered
+    ///         Status::OutputFull => continue,      // drain buf, call again
+    ///         Status::StreamEnd => unreachable!(), // flush never ends the stream
+    ///     }
+    /// }
+    /// # Ok(()) }
+    /// ```
+    fn flush(&mut self, output: &mut [u8], mode: Flush) -> Result<(Progress, Status), Error> {
+        let _ = (output, mode);
+        Ok((Progress::default(), Status::InputEmpty))
+    }
 }
 
 /// A streaming decompressor.
@@ -230,6 +330,32 @@ impl<T: RawEncoder> Encoder for T {
 
     fn reset(&mut self) {
         self.raw_reset()
+    }
+
+    fn flush(&mut self, output: &mut [u8], mode: Flush) -> Result<(Progress, Status), Error> {
+        let p = self.raw_flush(output, mode)?;
+        // Bridge `RawProgress.done` semantics for `raw_flush`: the raw
+        // impl sets `done = true` exactly when the sync marker has been
+        // fully forwarded to the caller (the flush *call* is complete —
+        // calling `flush` again with no new input would emit a fresh
+        // marker). The public `flush` method maps that to
+        // `Status::InputEmpty` and **never** returns `Status::StreamEnd`
+        // since the encoded stream is still alive after a flush.
+        //
+        // When `done == false` the encoder still has marker bytes
+        // buffered; the caller must drain `output` and call again.
+        let status = if p.done {
+            Status::InputEmpty
+        } else {
+            Status::OutputFull
+        };
+        Ok((
+            Progress {
+                consumed: 0,
+                written: p.written,
+            },
+            status,
+        ))
     }
 }
 
@@ -319,6 +445,9 @@ impl Encoder for alloc::boxed::Box<dyn Encoder + '_> {
     }
     fn reset(&mut self) {
         (**self).reset()
+    }
+    fn flush(&mut self, output: &mut [u8], mode: Flush) -> Result<(Progress, Status), Error> {
+        (**self).flush(output, mode)
     }
 }
 

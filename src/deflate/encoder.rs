@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use crate::bits::{BitWriter, reverse_bits};
 use crate::error::Error;
 use crate::huffman::{canonical_codes_from_lengths, length_limited_huffman};
-use crate::traits::{RawEncoder, RawProgress};
+use crate::traits::{Flush, RawEncoder, RawProgress};
 
 use super::lz77::MatchFinder;
 use super::tables::{
@@ -404,6 +404,11 @@ pub struct Encoder {
     state: EncState,
     /// True once we've emitted a BFINAL=1 block; finish() will not produce more.
     final_emitted: bool,
+    /// True while `raw_flush` is mid-emission of a sync marker — distinguishes
+    /// "out_buffer holds the marker from a prior partial flush" (drain only)
+    /// from "out_buffer is empty at entry" (emit marker, then drain).
+    /// Cleared once the marker has been fully forwarded to the caller.
+    mid_flush: bool,
     /// Match-finder tuning derived from [`EncoderConfig::level`]. Persisted
     /// across `reset` since configuration is meant to survive resets.
     params: LevelParams,
@@ -456,6 +461,7 @@ impl Encoder {
             out_pos: 0,
             state: EncState::Accepting,
             final_emitted: false,
+            mid_flush: false,
             params: LevelParams::from_level(config.level),
             lit_freq: [0u32; 286],
             dist_freq: [0u32; 30],
@@ -843,6 +849,30 @@ impl Encoder {
         }
     }
 
+    /// Emit a `Z_SYNC_FLUSH` marker into `out_buffer`: a non-final empty
+    /// stored block. Per RFC 1951 §3.2.4 the block header is BFINAL=0
+    /// (1 bit) + BTYPE=00 (2 bits), then the byte-alignment pad, then the
+    /// 4 bytes `00 00 ff ff` (LEN=0, NLEN=0xFFFF) and no payload. After
+    /// the marker the bitstream is byte-aligned, so the peer can decode
+    /// everything written so far. The encoder's history (window +
+    /// match-finder chains) is left intact so subsequent encode calls
+    /// can back-reference earlier data.
+    fn emit_sync_marker(&mut self) {
+        let bw = &mut self.bit_writer;
+        let out = &mut self.out_buffer;
+        // BFINAL = 0
+        bw.write(0, 1, out);
+        // BTYPE = 00 (stored)
+        bw.write(0, 2, out);
+        // Pad to byte boundary so the LEN/NLEN bytes are aligned.
+        bw.align(out);
+        // LEN = 0, NLEN = 0xFFFF, no payload.
+        out.push(0x00);
+        out.push(0x00);
+        out.push(0xFF);
+        out.push(0xFF);
+    }
+
     /// Encode the accumulated block as a stored (uncompressed) block.
     fn emit_stored_block(&mut self, bfinal: bool) {
         let bw = &mut self.bit_writer;
@@ -1153,5 +1183,74 @@ impl RawEncoder for Encoder {
         self.out_pos = 0;
         self.state = EncState::Accepting;
         self.final_emitted = false;
+        self.mid_flush = false;
+    }
+
+    fn raw_flush(&mut self, output: &mut [u8], mode: Flush) -> Result<RawProgress, Error> {
+        if matches!(self.state, EncState::Done) || self.final_emitted {
+            return Err(Error::Corrupt);
+        }
+
+        let mut written = 0usize;
+
+        loop {
+            // Drain whatever's already in out_buffer (either prior encode
+            // output or our own pending marker bytes from a prior partial
+            // flush call).
+            if matches!(self.state, EncState::Emitting) {
+                if self.drain(output, &mut written) {
+                    // Buffer fully forwarded.
+                    self.out_buffer.clear();
+                    self.out_pos = 0;
+                    self.state = EncState::Accepting;
+                    if self.mid_flush {
+                        // The marker we'd emitted in a previous call to
+                        // raw_flush has now been fully delivered. This
+                        // flush call is complete — signal with done=true
+                        // so the bridge reports `Status::InputEmpty`
+                        // regardless of output-buffer fullness.
+                        self.mid_flush = false;
+                        return Ok(RawProgress {
+                            consumed: 0,
+                            written,
+                            done: true,
+                        });
+                    }
+                    // Otherwise: we just finished draining prior encode
+                    // output. Fall through to emit our marker.
+                } else {
+                    // Output buffer is full and there's still pending data.
+                    return Ok(RawProgress {
+                        consumed: 0,
+                        written,
+                        done: false,
+                    });
+                }
+            }
+
+            // State is Accepting and we have NOT yet emitted the marker
+            // for this flush call. Encode any pending lookahead into a
+            // non-final block, then emit the empty stored-block sync
+            // marker into out_buffer.
+            debug_assert!(!self.mid_flush);
+            let remaining = self.window.len() - self.cursor;
+            if remaining > 0 {
+                // Compress everything we have. Use a non-final block so
+                // the stream can continue.
+                let end_rel = self.window.len();
+                self.compress_and_emit_block(end_rel, false);
+            }
+            self.emit_sync_marker();
+            if matches!(mode, Flush::Full) {
+                // Reset the LZ77 hash chains so subsequent matches cannot
+                // reach back across the flush boundary. The window bytes
+                // themselves stay — they're just no longer reachable via
+                // any chain entry. This mirrors Z_FULL_FLUSH semantics.
+                self.match_finder.reset();
+            }
+            self.mid_flush = true;
+            self.state = EncState::Emitting;
+            // Loop and drain the marker.
+        }
     }
 }
