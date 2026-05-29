@@ -646,3 +646,159 @@ mod factory {
         assert_eq!(&decoded[..], input);
     }
 }
+
+// ─── Preset dictionary + cross-block window (#22) ─────────────────────────
+
+use compcol::deflate::DecoderConfig;
+
+/// Drain a decoder over a single input slice. The decoder must reach
+/// StreamEnd within this slice (these tests give it a complete stream).
+fn drain_full(mut dec: Decoder, encoded: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    let mut consumed = 0;
+    loop {
+        let (p, status) = dec.decode(&encoded[consumed..], &mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        consumed += p.consumed;
+        if matches!(status, Status::StreamEnd) {
+            return Ok(out);
+        }
+        if matches!(status, Status::InputEmpty) {
+            break;
+        }
+    }
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        if matches!(status, Status::StreamEnd) {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Real cross-block back-reference fixture: a 16-byte raw deflate stream
+/// produced by `python3 -c "zlib.compressobj(wbits=-15, zdict=DICT)..."`
+/// whose payload is "the quick brown fox is quicker than the lazy dog!"
+/// using DICT = "the quick brown fox jumps over the lazy dog. ".
+///
+/// The compressed stream contains back-references at distances larger
+/// than the bytes it has itself emitted so far — they reach into the
+/// preset dictionary. Without the dictionary the decoder MUST error
+/// with `Corrupt` (libmspack does, Python's zlib does, and ours has to
+/// as well or we'd silently corrupt MSZIP output). With the dictionary
+/// supplied via [`DecoderConfig`] the stream decodes cleanly.
+#[test]
+fn deflate_decoder_preset_dictionary_decodes_cross_block_backref() {
+    let dictionary: Vec<u8> = b"the quick brown fox jumps over the lazy dog. ".to_vec();
+    let expected: &[u8] = b"the quick brown fox is quicker than the lazy dog!";
+    let encoded = hex("2bc1a238b3182204569c9887a2431100");
+
+    // Without dictionary: decoding must error (distance too far back).
+    let no_dict = Decoder::new();
+    let err = drain_full(no_dict, &encoded).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Corrupt | Error::UnexpectedEnd | Error::InvalidDistance
+        ),
+        "expected Corrupt/UnexpectedEnd/InvalidDistance without dictionary, got {err:?}"
+    );
+
+    // With dictionary: decoding succeeds and yields the original payload.
+    let with_dict = Decoder::with_config(DecoderConfig {
+        dictionary: dictionary.clone(),
+    });
+    let out = drain_full(with_dict, &encoded).unwrap();
+    assert_eq!(out, expected);
+
+    // Same fixture via Algorithm::decoder_with — confirms the wiring up
+    // through the public type-associated config type is sound.
+    let from_algo: Decoder = Deflate::decoder_with(DecoderConfig { dictionary });
+    let out = drain_full(from_algo, &encoded).unwrap();
+    assert_eq!(out, expected);
+}
+
+/// `reset_keep_window` re-arms the decoder for a fresh deflate stream
+/// while keeping the sliding window contents. Concretely: decode any
+/// stream that fills the window, then `reset_keep_window`, then decode
+/// the cross-block-backref fixture above. The second decode succeeds
+/// because the dictionary text happens to be in the window already.
+///
+/// To make the test deterministic we explicitly preload the window via
+/// `with_config(dictionary=DICT)` for the first round (decoding an empty
+/// stream is the cheapest way to get the window primed without exercising
+/// the encoder), then `reset_keep_window`, then decode the fixture.
+#[test]
+fn deflate_decoder_reset_keep_window_preserves_history_for_mszip() {
+    let dictionary: Vec<u8> = b"the quick brown fox jumps over the lazy dog. ".to_vec();
+    let expected: &[u8] = b"the quick brown fox is quicker than the lazy dog!";
+    let encoded = hex("2bc1a238b3182204569c9887a2431100");
+
+    // Round 1: build a decoder primed with the dictionary, and "decode"
+    // a single-block empty deflate stream (BFINAL=1 BTYPE=01 EOB).
+    // That advances the decoder to Done while leaving the window full
+    // of the dictionary text.
+    let mut dec = Decoder::with_config(DecoderConfig {
+        dictionary: dictionary.clone(),
+    });
+    // Empty fixed-Huffman block: BFINAL=1, BTYPE=01, then EOB (code 256
+    // = 7-bit 0b0000000). Packed LSB-first: 0b00000011 = 0x03, 0x00.
+    let empty_block = [0x03u8, 0x00];
+    let mut buf = vec![0u8; 64];
+    let (_, status) = dec.decode(&empty_block, &mut buf).unwrap();
+    assert!(matches!(status, Status::StreamEnd | Status::InputEmpty));
+    let (_, _) = dec.finish(&mut buf).unwrap();
+
+    // Round 2: reset bit reader + state, KEEP the dictionary in the
+    // window, and decode the cross-block fixture.
+    dec.reset_keep_window();
+    let out = drain_full(dec, &encoded).unwrap();
+    assert_eq!(out, expected);
+}
+
+/// `reset` (the trait method) wipes the window; the same cross-block
+/// fixture must NOT decode after a full reset even if the decoder was
+/// primed with the right dictionary beforehand. Documents the contract
+/// difference between `reset` and `reset_keep_window`.
+#[test]
+fn deflate_decoder_full_reset_drops_dictionary() {
+    let dictionary: Vec<u8> = b"the quick brown fox jumps over the lazy dog. ".to_vec();
+    let encoded = hex("2bc1a238b3182204569c9887a2431100");
+
+    let mut dec = Decoder::with_config(DecoderConfig {
+        dictionary: dictionary.clone(),
+    });
+    let empty_block = [0x03u8, 0x00];
+    let mut buf = vec![0u8; 64];
+    let (_, _) = dec.decode(&empty_block, &mut buf).unwrap();
+    let (_, _) = dec.finish(&mut buf).unwrap();
+
+    // Full reset wipes the window. Subsequent decode of the fixture must
+    // fail because the back-refs go nowhere.
+    <Decoder as compcol::Decoder>::reset(&mut dec);
+    let err = drain_full(dec, &encoded).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Corrupt | Error::UnexpectedEnd | Error::InvalidDistance
+    ));
+}
+
+/// A preset dictionary longer than 32 KiB is silently truncated to its
+/// last 32 KiB. The truncated bytes weren't reachable by any deflate
+/// back-reference anyway (distances cap at 32768), but the API contract
+/// is to accept the slice and not error.
+#[test]
+fn deflate_decoder_preset_dictionary_long_is_truncated() {
+    let huge = vec![0xAAu8; 48 * 1024]; // 48 KiB of one byte
+    let dec = Decoder::with_config(DecoderConfig {
+        dictionary: huge.clone(),
+    });
+    // Decode an empty block — just smoke-test that construction worked.
+    let empty_block = [0x03u8, 0x00];
+    let mut buf = vec![0u8; 64];
+    let mut dec = dec;
+    let (_, status) = dec.decode(&empty_block, &mut buf).unwrap();
+    assert!(matches!(status, Status::StreamEnd | Status::InputEmpty));
+}
