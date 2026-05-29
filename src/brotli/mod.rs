@@ -1786,19 +1786,53 @@ impl Decoder {
         if distance as usize > self.total_out {
             return Err(Error::InvalidDistance);
         }
+        if len == 0 {
+            return Ok(());
+        }
         let out_base = self.total_out - self.out.len();
-        for _ in 0..len {
-            let g = (self.total_out as u64) - (distance as u64);
-            if g < out_base as u64 {
-                // Distance reaches further back than the retained
-                // window. With our `compact_out` retaining
-                // `window_size` bytes this should not happen for valid
-                // streams (Brotli back-references are capped at
-                // `window_size - 16`).
-                return Err(Error::InvalidDistance);
+        let g0 = (self.total_out as u64) - (distance as u64);
+        if g0 < out_base as u64 {
+            // Distance reaches further back than the retained window.
+            // With our `compact_out` retaining `window_size` bytes this
+            // should not happen for valid streams (Brotli back-references
+            // are capped at `window_size - 16`).
+            return Err(Error::InvalidDistance);
+        }
+        let src_start = (g0 - out_base as u64) as usize;
+        let n = len as usize;
+        if (distance as usize) >= n {
+            // Non-overlapping: collapses to memcpy.
+            self.out.extend_from_within(src_start..src_start + n);
+            // Update last-two-bytes context from the tail of the copy.
+            let end = self.out.len();
+            if n >= 2 {
+                self.p2 = self.out[end - 2];
+                self.p1 = self.out[end - 1];
+            } else {
+                // n == 1
+                self.p2 = self.p1;
+                self.p1 = self.out[end - 1];
             }
-            let byte = self.out[(g - out_base as u64) as usize];
-            self.emit_literal(byte);
+            self.total_out += n;
+        } else if distance == 1 {
+            // Byte-splat.
+            let b = self.out[src_start];
+            self.out.resize(self.out.len() + n, b);
+            if n >= 2 {
+                self.p2 = b;
+                self.p1 = b;
+            } else {
+                self.p2 = self.p1;
+                self.p1 = b;
+            }
+            self.total_out += n;
+        } else {
+            // Self-overlap (distance < len): replicate byte-by-byte.
+            for _ in 0..len {
+                let g = (self.total_out as u64) - (distance as u64);
+                let byte = self.out[(g - out_base as u64) as usize];
+                self.emit_literal(byte);
+            }
         }
         Ok(())
     }
