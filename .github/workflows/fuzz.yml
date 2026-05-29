@@ -30,6 +30,7 @@ jobs:
           - decoder_lzma
           - decoder_xz
           - decoder_lz4
+          - decoder_bzip2
     steps:
       - uses: actions/checkout@v6
       - name: Install nightly toolchain
