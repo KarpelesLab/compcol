@@ -228,8 +228,13 @@ impl Decoder {
                 return false;
             }
             let n = po.remaining.min(output.len() - *written);
-            for k in 0..n {
-                output[*written + k] = self.window[(po.start + k) & self.window_mask];
+            // Bulk-copy split at the wrap boundary.
+            let first = (self.window_size - po.start).min(n);
+            output[*written..*written + first]
+                .copy_from_slice(&self.window[po.start..po.start + first]);
+            if first < n {
+                let rem = n - first;
+                output[*written + first..*written + n].copy_from_slice(&self.window[..rem]);
             }
             *written += n;
             let new_rem = po.remaining - n;
@@ -449,6 +454,23 @@ impl Decoder {
         while remaining > 0 {
             let dest = self.window_posn & self.window_mask;
             let src = (self.window_posn.wrapping_sub(match_offset)) & self.window_mask;
+            // Fast path: try to copy a non-overlapping, non-wrapping run.
+            let dst_room = self.window_size - dest;
+            let src_room = self.window_size - src;
+            let max_chunk = remaining.min(dst_room).min(src_room);
+            if max_chunk > 1 && match_offset >= max_chunk {
+                self.window.copy_within(src..src + max_chunk, dest);
+                self.window_posn += max_chunk;
+                remaining -= max_chunk;
+                emit_count += max_chunk;
+                let next = self.window_posn & self.window_mask;
+                if next == 0 && remaining > 0 {
+                    self.enqueue_output(emit_start, emit_count);
+                    emit_start = 0;
+                    emit_count = 0;
+                }
+                continue;
+            }
             self.window[dest] = self.window[src];
             self.window_posn += 1;
             remaining -= 1;
