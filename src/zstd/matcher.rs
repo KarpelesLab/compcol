@@ -160,10 +160,7 @@ impl MatchFinder {
                 continue;
             }
 
-            let mut len = 0;
-            while len < max_len && buffer[cur_pos + len] == buffer[pos + len] {
-                len += 1;
-            }
+            let len = match_extend(buffer, cur_pos, pos, max_len);
             if len >= MIN_MATCH && len > best_len {
                 best_len = len;
                 best_dist = dist;
@@ -202,12 +199,38 @@ impl MatchFinder {
             return 0;
         }
         let src = pos - distance;
-        let mut len = 0;
-        while len < max_len && buffer[src + len] == buffer[pos + len] {
-            len += 1;
-        }
+        let len = match_extend(buffer, src, pos, max_len);
         if len >= MIN_MATCH { len } else { 0 }
     }
+}
+
+/// Extend a match forward up to `max_len` bytes, comparing `buffer[a..]`
+/// against `buffer[b..]`. Loads u64 chunks and uses XOR + trailing_zeros
+/// to locate the first differing byte, falling back to a byte loop for
+/// the tail. Mirrors the deflate lz77 implementation.
+fn match_extend(buffer: &[u8], a: usize, b: usize, max_len: usize) -> usize {
+    let mut len = 0usize;
+    while len + 8 <= max_len {
+        let av: [u8; 8] = buffer[a + len..a + len + 8].try_into().unwrap();
+        let bv: [u8; 8] = buffer[b + len..b + len + 8].try_into().unwrap();
+        let av = u64::from_ne_bytes(av);
+        let bv = u64::from_ne_bytes(bv);
+        let diff = av ^ bv;
+        if diff == 0 {
+            len += 8;
+        } else {
+            #[cfg(target_endian = "little")]
+            let add = (diff.trailing_zeros() / 8) as usize;
+            #[cfg(target_endian = "big")]
+            let add = (diff.leading_zeros() / 8) as usize;
+            len += add;
+            return len;
+        }
+    }
+    while len < max_len && buffer[a + len] == buffer[b + len] {
+        len += 1;
+    }
+    len
 }
 
 #[cfg(test)]

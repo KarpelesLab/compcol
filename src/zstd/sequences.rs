@@ -429,10 +429,19 @@ pub fn execute_sequences(
             return Err(Error::Corrupt);
         }
         let start = history.len() - offset;
-        // Byte-by-byte copy so RLE-style overlapping copies work (LZ77 trick).
-        for i in 0..ml {
-            let b = history[start + i];
-            history.push(b);
+        if offset >= ml {
+            // Non-overlapping: collapses to memcpy.
+            history.extend_from_within(start..start + ml);
+        } else if offset == 1 {
+            // Byte-splat.
+            let b = history[start];
+            history.resize(history.len() + ml, b);
+        } else {
+            // Self-overlapping (RLE-style): replicate byte-by-byte.
+            for i in 0..ml {
+                let b = history[start + i];
+                history.push(b);
+            }
         }
     }
     // Trailing literals: leftover bytes copied verbatim.
