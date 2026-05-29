@@ -21,10 +21,15 @@ use alloc::boxed::Box;
 /// Minimum match length the matcher will report (RFC 8478 §3.1.1.3.2 implies
 /// a hard minimum of 3 via the match-length base table).
 pub const MIN_MATCH: usize = 3;
-/// Maximum match length we cap each match at. Zstd supports up to 65535+3,
-/// but in our single-pass encoder the FSE table for match-length codes does
-/// not need to address values that large; capping keeps the code obvious.
-pub const MAX_MATCH: usize = 4096;
+/// Maximum match length we cap each match at. Zstd's match-length FSE base
+/// table tops out at code 52 (base 65539 + 15 extra bits), so any match of
+/// length ≥ 65539 can still be represented as a single sequence — we cap at
+/// 65535 because that's the largest match where the ML code fits in 16 bits
+/// of base+extra in our encoder and decoder. Allowing matches this long
+/// matters for highly repetitive inputs (e.g. Lorem with phrase-level
+/// periodicity at distance ~445 bytes): each long match amortises the
+/// per-sequence FSE-table cost across thousands more output bytes.
+pub const MAX_MATCH: usize = 65535;
 /// Hash table size (must be a power of two).
 const HASH_BITS: u32 = 15;
 const HASH_SIZE: usize = 1 << HASH_BITS;
@@ -178,6 +183,30 @@ impl MatchFinder {
         } else {
             None
         }
+    }
+
+    /// Probe a specific repeat-offset distance at `pos`: extend the match as
+    /// far as it goes (capped by [`MAX_MATCH`]). Returns the match length, or
+    /// 0 if it doesn't reach [`MIN_MATCH`].
+    ///
+    /// Used to look for "free" repeat-offset matches before the hash-chain
+    /// walk. Repeat offsets cost 1 bit of FSE output (codes 1..=3) versus the
+    /// `floor(log2(distance + 3))` bits a fresh offset spends, so even short
+    /// repeat-offset matches frequently beat the alternatives.
+    pub fn check_repeat_offset(&self, buffer: &[u8], pos: usize, distance: usize) -> usize {
+        if distance == 0 || distance > pos {
+            return 0;
+        }
+        let max_len = MAX_MATCH.min(buffer.len() - pos);
+        if max_len < MIN_MATCH {
+            return 0;
+        }
+        let src = pos - distance;
+        let mut len = 0;
+        while len < max_len && buffer[src + len] == buffer[pos + len] {
+            len += 1;
+        }
+        if len >= MIN_MATCH { len } else { 0 }
     }
 }
 

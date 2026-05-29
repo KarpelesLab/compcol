@@ -24,6 +24,7 @@ const PREV_MASK: usize = PREV_SIZE - 1;
 
 /// Hash function over three bytes. zlib uses a rotated XOR; we use the same
 /// shape for deterministic, well-distributed output.
+#[inline(always)]
 fn hash3(b0: u8, b1: u8, b2: u8) -> u32 {
     ((b0 as u32) << 10) ^ ((b1 as u32) << 5) ^ (b2 as u32)
 }
@@ -79,6 +80,7 @@ impl MatchFinder {
     ///
     /// Returns `Some((length, distance))` with `length ≥ MIN_MATCH` if a
     /// match was found within the 32 KiB deflate window, else `None`.
+    #[inline]
     pub fn find_match(
         &self,
         window: &[u8],
@@ -88,6 +90,27 @@ impl MatchFinder {
         max_chain: usize,
         nice_match: usize,
     ) -> Option<(u16, u16)> {
+        // Hot loop. The structure mirrors zlib's `longest_match`. Key
+        // micro-optimisations (all branch- and load-count reductions; no
+        // unsafe used):
+        //
+        //   • The chain walk's `cur >= abs_pos` filter is removed by
+        //     observing that when we splice the current position into the
+        //     hash chain *before* calling `find_match`, the head of the
+        //     chain we follow is by construction strictly less than
+        //     `abs_pos` — but the encoder does insert at `pos` first, so
+        //     we use `self.head[idx]` (which is the just-inserted self)'s
+        //     prev to start. Keeping the explicit filter for safety since
+        //     callers can also call without inserting first.
+        //   • The "tail byte fast reject" compares `window[cur_rel+best_len]`
+        //     vs `window[rel+best_len]` (one byte) before extending — and
+        //     we also reject when `best_len > 0` and the byte at
+        //     `best_len-1` doesn't match by comparing a u16 pair.
+        //   • The extension loop reads 4 bytes at a time via slice-to-array
+        //     (LLVM lowers the array load to one unaligned 32-bit load) and
+        //     uses XOR + trailing-zero count to find the first differing
+        //     byte. This skips the per-byte loop body's branch entirely.
+
         if rel + MIN_MATCH > window.len() {
             return None;
         }
@@ -107,6 +130,12 @@ impl MatchFinder {
         // If we already have a "good" match, quarter the chain budget.
         let mut chain_left = if have_good { max_chain / 4 } else { max_chain };
 
+        // Snapshot the two bytes at `rel + best_len - 1 .. rel + best_len + 1`
+        // for the fast tail reject. We refresh these whenever `best_len`
+        // changes. Initially `best_len == 0` so the tail reject doesn't apply.
+        // We use `[u8; 2]` so the comparison is a single u16 load.
+        let mut tail_pair: [u8; 2] = [0, 0];
+
         while cur != NIL && chain_left > 0 {
             let cur_abs = cur as usize;
             // Stale entries: ignore positions ≥ our own.
@@ -121,20 +150,64 @@ impl MatchFinder {
             }
             let cur_rel = rel - dist; // safe: dist ≤ rel because the candidate is in-window
 
-            // Cheap rejection: if we already have a match of length `best_len`,
-            // a candidate can only improve it if its byte at position
-            // `best_len` matches. Apply when both buffers have a byte there.
-            if best_len > 0
-                && best_len < max_len
-                && window[cur_rel + best_len] != window[rel + best_len]
-            {
-                cur = self.prev[cur_abs & PREV_MASK];
-                chain_left -= 1;
-                continue;
+            // Fast tail reject. If we have a current best of length `best_len`,
+            // the candidate can only improve it if both the byte at
+            // `best_len-1` (which equalled the rel byte for the previous best)
+            // and at `best_len` (which is the new byte we need to match)
+            // line up. The pair compare is one u16 load on each side.
+            if best_len >= MIN_MATCH && best_len < max_len {
+                // Need bytes at cur_rel + best_len - 1 and cur_rel + best_len.
+                // Both are in bounds because:
+                //   • cur_rel + best_len - 1 < cur_rel + max_len ≤ window.len()
+                //   • cur_rel + best_len < cur_rel + max_len ≤ window.len()
+                // and the prior cheap-reject below ensures cur_rel + best_len < window.len()
+                // because we previously matched up to best_len bytes from this
+                // run's best candidate. We still require cur_rel + best_len + 1 ≤ window.len().
+                let cand_pair: [u8; 2] =
+                    [window[cur_rel + best_len - 1], window[cur_rel + best_len]];
+                if cand_pair != tail_pair {
+                    cur = self.prev[cur_abs & PREV_MASK];
+                    chain_left -= 1;
+                    continue;
+                }
             }
 
-            // Extend the match from the start.
-            let mut len = 0;
+            // Extend the match from the start, eight bytes at a time first
+            // (u64 load + XOR + trailing_zeros) for the bulk, then byte-wise
+            // for the tail.
+            //
+            // Loop invariant: `len` is the number of bytes confirmed to
+            // match starting at `cur_rel`/`rel`.
+            let mut len = 0usize;
+
+            // 8-byte chunks: read [u8; 8] from both sides as native-endian u64
+            // — LLVM lowers slice-to-array (`<[u8; N]>::try_from`) plus
+            // `u64::from_ne_bytes` to a single unaligned 64-bit load, and the
+            // first-differing-byte search becomes a `xor` + `trailing_zeros`.
+            while len + 8 <= max_len {
+                // SAFETY (no unsafe): the slice indexing is bounds-checked
+                // and LLVM removes the check when it sees the prior
+                // `len + 8 <= max_len` guard. Each side resolves to one
+                // unaligned 8-byte load.
+                let a: [u8; 8] = window[cur_rel + len..cur_rel + len + 8].try_into().unwrap();
+                let b: [u8; 8] = window[rel + len..rel + len + 8].try_into().unwrap();
+                let av = u64::from_ne_bytes(a);
+                let bv = u64::from_ne_bytes(b);
+                let diff = av ^ bv;
+                if diff == 0 {
+                    len += 8;
+                } else {
+                    // First differing byte is at trailing_zeros() / 8 (LE)
+                    // or leading_zeros() / 8 (BE).
+                    #[cfg(target_endian = "little")]
+                    let add = (diff.trailing_zeros() / 8) as usize;
+                    #[cfg(target_endian = "big")]
+                    let add = (diff.leading_zeros() / 8) as usize;
+                    len += add;
+                    break;
+                }
+            }
+            // Tail: any remaining bytes (0..=7) compared byte by byte.
             while len < max_len && window[cur_rel + len] == window[rel + len] {
                 len += 1;
             }
@@ -144,6 +217,15 @@ impl MatchFinder {
                 best_dist = dist;
                 if best_len >= nice_match {
                     break;
+                }
+                // Refresh the tail pair for the new best_len. We only refresh
+                // when best_len ≥ MIN_MATCH (which is true here) and we need
+                // both rel + best_len - 1 and rel + best_len to be valid
+                // indices into `window`. The first is fine (best_len ≥ 3).
+                // The second is needed only when best_len < max_len, which
+                // is checked at the next loop's reject guard.
+                if best_len < max_len {
+                    tail_pair = [window[rel + best_len - 1], window[rel + best_len]];
                 }
             }
 

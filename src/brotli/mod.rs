@@ -72,6 +72,7 @@ use huffman::{BitSource, HuffmanDecoder};
 
 use encoder_dict::{DictIndex, IdTransform};
 use encoder_huffman::reverse_bits;
+use encoder_lz77::MatchFinder;
 
 /// Zero-sized marker type implementing [`Algorithm`] for Brotli.
 #[derive(Debug, Clone, Copy, Default)]
@@ -270,6 +271,90 @@ pub struct Encoder {
     /// [`EncoderConfig::quality`]. Persisted across `reset` since
     /// configuration is meant to survive resets.
     params: LevelParams,
+    /// Reusable per-meta-block scratch — keeps match-finder boxes,
+    /// frequency tables, and command vectors out of the per-block hot
+    /// path allocator. Lazily initialised so empty-input streams pay no
+    /// allocation cost.
+    scratch: Option<EncScratch>,
+}
+
+/// Per-meta-block scratch buffers carried on the Encoder. Each field is
+/// `clear()`ed (not freed) between meta-blocks so we keep the capacity
+/// across the whole stream.
+struct EncScratch {
+    /// Hash-chain match finder, reused via `MatchFinder::reset` between
+    /// meta-blocks rather than re-allocating its 128 KiB worth of
+    /// Box<[u32; …]> tables.
+    mf: MatchFinder,
+    /// Commands produced by the LZ77 pass — each carries an
+    /// `insert: Vec<u8>`.
+    cmds: Vec<Command>,
+    /// Free list of `Vec<u8>` buffers used as `Command::insert`. Lets us
+    /// reuse the (often large) allocations across meta-blocks instead of
+    /// freeing them every iteration.
+    insert_pool: Vec<Vec<u8>>,
+    /// Per-command planning output — all four vecs are aligned with
+    /// `cmds[]` after `plan_commands`. Reused via `clear()`.
+    ic_sym: Vec<u32>,
+    ins_extra: Vec<(u32, u32)>,
+    copy_extra: Vec<(u32, u32)>,
+    dist_enc: Vec<Option<(u32, u32, u32)>>,
+    /// Per-alphabet frequency tables — fixed-size arrays so they live
+    /// inline in the struct rather than as boxed Vecs.
+    lit_freq: [u32; 256],
+    ic_freq: [u32; 704],
+    dist_freq: [u32; 64],
+}
+
+impl core::fmt::Debug for EncScratch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("EncScratch")
+            .field("cmds_cap", &self.cmds.capacity())
+            .finish()
+    }
+}
+
+impl Clone for EncScratch {
+    fn clone(&self) -> Self {
+        // Cloning an encoder is rare — produce a fresh scratch.
+        Self::new()
+    }
+}
+
+impl EncScratch {
+    fn new() -> Self {
+        Self {
+            mf: MatchFinder::new(),
+            cmds: Vec::new(),
+            insert_pool: Vec::new(),
+            ic_sym: Vec::new(),
+            ins_extra: Vec::new(),
+            copy_extra: Vec::new(),
+            dist_enc: Vec::new(),
+            lit_freq: [0u32; 256],
+            ic_freq: [0u32; 704],
+            dist_freq: [0u32; 64],
+        }
+    }
+
+    /// Reset everything for a new meta-block. Capacity is retained.
+    fn prepare(&mut self) {
+        self.mf.reset();
+        // Move existing Command::insert buffers into the pool before
+        // clearing `cmds`, so we keep their capacity across blocks.
+        while let Some(c) = self.cmds.pop() {
+            let mut v = c.insert;
+            v.clear();
+            self.insert_pool.push(v);
+        }
+        self.ic_sym.clear();
+        self.ins_extra.clear();
+        self.copy_extra.clear();
+        self.dist_enc.clear();
+        self.lit_freq.fill(0);
+        self.ic_freq.fill(0);
+        self.dist_freq.fill(0);
+    }
 }
 
 impl Encoder {
@@ -294,6 +379,7 @@ impl Encoder {
             dict_index: None,
             id_transforms: None,
             params: LevelParams::from_quality(config.quality),
+            scratch: None,
         }
     }
 
@@ -348,20 +434,30 @@ impl Encoder {
         if self.params.use_dict {
             self.ensure_dict_index();
         }
-        let payload: Vec<u8> = self.pending.drain(..mlen).collect();
+        if self.scratch.is_none() {
+            self.scratch = Some(EncScratch::new());
+        }
         let dict_index = self.dict_index.clone();
         let id_transforms = self.id_transforms.clone();
+        let scratch = self.scratch.as_mut().expect("scratch initialised above");
+        scratch.prepare();
+        // We treat `pending[..mlen]` as the payload in place — no need
+        // to allocate a separate Vec and drain. The drain happens after
+        // we've finished encoding so the borrow doesn't conflict.
+        let pending_view = &self.pending[..mlen];
         encode_meta_block(
             &mut self.bw,
             &mut self.out,
-            &payload,
+            pending_view,
             is_last,
             &mut self.ring,
             self.prev_total_out,
             dict_index.as_deref(),
             id_transforms.as_deref().map(|v| v.as_slice()),
             self.params,
+            scratch,
         );
+        self.pending.drain(..mlen);
         self.prev_total_out += mlen as u64;
     }
 
@@ -482,36 +578,14 @@ impl RawEncoder for Encoder {
         self.seen_any_input = false;
         self.ring = DistRing::new();
         self.prev_total_out = 0;
-        // Keep `dict_index`, `id_transforms`, and `params` — they're
-        // immutable tables / configuration we'd rebuild identically.
+        // Keep `dict_index`, `id_transforms`, `params`, and `scratch` —
+        // they're immutable tables / configuration / capacity we'd
+        // rebuild identically. `scratch` is `prepare()`d before the next
+        // meta-block so any stale state from the previous run is wiped.
     }
 }
 
 // ─── encoder helpers (compressed meta-block emission) ───────────────────
-
-/// Per-position output of the LZ77 pass: a literal byte, a back-
-/// reference match, or a static-dictionary reference.
-#[derive(Clone, Copy)]
-enum LzAtom {
-    Literal(u8),
-    Match {
-        len: u32,
-        dist: u32,
-    },
-    Dict {
-        /// Dictionary word length (4..=24); goes into the IC `copy_len`
-        /// field. This is the value the decoder will see; the actual
-        /// number of input bytes consumed is `emit_len` and may differ.
-        word_len: u8,
-        /// In-bucket word index.
-        word_idx: u32,
-        /// Transform id, in 0..121.
-        transform_id: u8,
-        /// Input bytes consumed by this dictionary reference (= prefix
-        /// length + word length + suffix length for identity transforms).
-        emit_len: u32,
-    },
-}
 
 /// Count distinct literal bytes in `payload` (capped at 32 — we only
 /// need a rough proxy for "literal entropy is high enough to make
@@ -532,8 +606,11 @@ fn distinct_bytes_low(payload: &[u8]) -> usize {
     n
 }
 
-/// LZ77 pass over the payload. Produces a sequence of literals,
-/// in-window matches, and static-dictionary references in input order.
+/// LZ77 pass over the payload. Writes commands directly into
+/// `scratch.cmds`, fusing what used to be `lz77_pass` (per-position
+/// atoms) and `commands_from_atoms` (atom → command) into a single
+/// walk. Each command pairs an insert-run of literals with the next
+/// copy event.
 ///
 /// At each position we consider both a real LZ77 match (via the
 /// hash-chain finder) and a static-dictionary reference (via
@@ -544,17 +621,15 @@ fn distinct_bytes_low(payload: &[u8]) -> usize {
 ///
 /// When `dict_index` / `id_transforms` are `None` (low quality tiers),
 /// the static-dictionary path is skipped entirely.
-fn lz77_pass(
+fn lz77_to_commands(
     payload: &[u8],
     dict_index: Option<&encoder_dict::DictIndex>,
     id_transforms: Option<&[encoder_dict::IdTransform]>,
     prev_total_out: u64,
     finder_params: encoder_lz77::FinderParams,
-) -> Vec<LzAtom> {
-    use encoder_lz77::{MAX_MATCH, MIN_MATCH, MatchFinder};
-    let mut mf = MatchFinder::new();
-    let mut out: Vec<LzAtom> = Vec::with_capacity(payload.len());
-    let mut pos = 0usize;
+    scratch: &mut EncScratch,
+) {
+    use encoder_lz77::{MAX_MATCH, MIN_MATCH};
     // Disable dict-ref matching for inputs with very low literal
     // entropy (≤ 4 distinct bytes). On such inputs the literal
     // Huffman tree collapses to NSYM=1/2 (≤ 1 bit per literal) and
@@ -564,96 +639,155 @@ fn lz77_pass(
     // (low quality tier).
     let use_dict =
         dict_index.is_some() && id_transforms.is_some() && distinct_bytes_low(payload) >= 5;
+
+    // Pre-reserve enough capacity for a worst-case command-count
+    // estimate (one per ~8 input bytes is generous for compressible
+    // text; for random input the upper bound is bytes/MIN_MATCH ≈
+    // bytes/4). Keeping `cmds` from re-allocating during the hot loop
+    // is a measurable win.
+    let estimate = (payload.len() / 4).max(16);
+    if scratch.cmds.capacity() < estimate {
+        scratch.cmds.reserve(estimate - scratch.cmds.capacity());
+    }
+
+    // Split-borrow the scratch up-front so the hot inner loop talks to
+    // raw fields rather than going through method calls on
+    // `&mut EncScratch`.
+    let EncScratch {
+        mf,
+        cmds,
+        insert_pool,
+        ..
+    } = scratch;
+
+    // Pending literal-run accumulator for the next command. Reuses an
+    // existing `Vec<u8>` from the insert-buffer free list to keep the
+    // allocator out of the hot path. Pre-reserve a chunk so the first
+    // few pushes don't trigger a tiny initial allocation.
+    let mut pending: Vec<u8> = insert_pool.pop().unwrap_or_default();
+    if pending.capacity() < 64 {
+        pending.reserve(64 - pending.capacity());
+    }
+    let payload_len = payload.len();
+    let mut pos = 0usize;
+
     // We mirror the decoder's `total_out`: it's `prev_total_out` plus
     // the number of input bytes encoded so far in this meta-block. For
     // dictionary references this drives `max_dist` so the chosen
     // distance survives the magnitude comparison against `max_dist`.
-    while pos < payload.len() {
+    while pos < payload_len {
         mf.insert(payload, pos);
 
         let mut best_len: usize = 0;
-        let mut best_atom: Option<LzAtom> = None;
+        // 0 = none, 1 = match, 2 = dict
+        let mut best_kind: u8 = 0;
+        let mut best_match_dist: u32 = 0;
+        let mut best_dict_word_len: u8 = 0;
+        let mut best_dict_word_idx: u32 = 0;
+        let mut best_dict_tr_id: u8 = 0;
+        let mut best_dict_emit_len: u32 = 0;
 
         // 1) In-window LZ77 match.
-        if pos + MIN_MATCH <= payload.len()
+        if pos + MIN_MATCH <= payload_len
             && let Some((len, dist)) = mf.find_match(payload, pos, finder_params)
         {
-            let len = len.min(MAX_MATCH).min(payload.len() - pos);
+            let len = len.min(MAX_MATCH).min(payload_len - pos);
             if len >= MIN_MATCH {
                 best_len = len;
-                best_atom = Some(LzAtom::Match {
-                    len: len as u32,
-                    dist: dist as u32,
-                });
+                best_kind = 1;
+                best_match_dist = dist as u32;
             }
         }
 
-        // 2) Static-dictionary reference. Dictionary distances live in
-        //    the upper end of the 64-symbol alphabet (typically dcode
-        //    20..63 with 4..24 extra bits each), so a dict ref's full
-        //    cost is meaningfully higher than an in-window match's.
-        //
-        //    Heuristic: only consider dict refs when emitted length is
-        //    long enough to amortise the distance-code cost (≥ 5 bytes
-        //    with no LZ77 alternative, or ≥ best_len + 3 when LZ77
-        //    found something). The `use_dict` flag further skips
-        //    extremely low-entropy inputs (e.g. all-zeros) where any
-        //    literal is already nearly free.
-        let dict_min_emit = if best_len >= 4 {
-            (best_len + 3) as u32
-        } else {
-            6u32
-        };
-        if use_dict
-            && let Some(dm) = encoder_dict::find_dict_match(
+        // 2) Static-dictionary reference. Heuristic: only consider dict
+        //    refs when emitted length is long enough to amortise the
+        //    distance-code cost (≥ 6 bytes with no LZ77 alternative,
+        //    ≥ best_len + 3 when LZ77 found something).
+        if use_dict {
+            let dict_min_emit = if best_len >= 4 {
+                (best_len + 3) as u32
+            } else {
+                6u32
+            };
+            if let Some(dm) = encoder_dict::find_dict_match(
                 dict_index.unwrap(),
                 id_transforms.unwrap(),
                 payload,
                 pos,
                 dict_min_emit,
-            )
-        {
-            // Make sure the encoded distance for this dictionary
-            // reference is going to survive the decoder's
-            // `distance <= max_dist` check.
-            let total_out_at_pos: u64 = prev_total_out + pos as u64;
-            let max_dist: u64 = core::cmp::min((1u64 << 16) - 16, total_out_at_pos);
-            // Compute the dictionary distance value we'd emit.
-            // distance = max_dist + 1 + word_idx + (transform_id << nwords_bits)
-            let len = dm.word_len as usize;
-            let nwords_bits = dictionary::SIZE_BITS_BY_LENGTH[len] as u32;
-            let off = (dm.word_idx as u64) | ((dm.transform_id as u64) << nwords_bits);
-            let distance = max_dist + 1 + off;
-            // Must be representable by the 64-symbol distance alphabet
-            // (NPOSTFIX=0, NDIRECT=0): max distance ≈ 67 M.
-            if distance <= u32::MAX as u64 && distance > 0 && (dm.emit_len as usize) > best_len {
-                best_len = dm.emit_len as usize;
-                best_atom = Some(LzAtom::Dict {
-                    word_len: dm.word_len,
-                    word_idx: dm.word_idx,
-                    transform_id: dm.transform_id,
-                    emit_len: dm.emit_len,
-                });
+            ) {
+                let total_out_at_pos: u64 = prev_total_out + pos as u64;
+                let max_dist: u64 = core::cmp::min((1u64 << 16) - 16, total_out_at_pos);
+                let len = dm.word_len as usize;
+                let nwords_bits = dictionary::SIZE_BITS_BY_LENGTH[len] as u32;
+                let off = (dm.word_idx as u64) | ((dm.transform_id as u64) << nwords_bits);
+                let distance = max_dist + 1 + off;
+                if distance <= u32::MAX as u64 && distance > 0 && (dm.emit_len as usize) > best_len
+                {
+                    best_len = dm.emit_len as usize;
+                    best_kind = 2;
+                    best_dict_word_len = dm.word_len;
+                    best_dict_word_idx = dm.word_idx;
+                    best_dict_tr_id = dm.transform_id;
+                    best_dict_emit_len = dm.emit_len;
+                }
             }
         }
 
-        if let Some(atom) = best_atom {
+        if best_kind != 0 {
             // Splice every covered position into the hash chain.
             for j in 1..best_len {
                 let p = pos + j;
-                if p + MIN_MATCH <= payload.len() {
+                if p + MIN_MATCH <= payload_len {
                     mf.insert(payload, p);
                 }
             }
-            out.push(atom);
+            // Flush pending literals + this copy as a single Command.
+            // Swap a fresh empty insert Vec in via the pool to keep
+            // the next iteration's pending accumulator allocation-free.
+            let next_pending = insert_pool.pop().unwrap_or_default();
+            let cmd_kind = if best_kind == 1 {
+                CopyKind::Backref {
+                    distance: best_match_dist,
+                }
+            } else {
+                CopyKind::Dict {
+                    word_idx: best_dict_word_idx,
+                    transform_id: best_dict_tr_id,
+                    emit_len: best_dict_emit_len,
+                }
+            };
+            let copy_len = if best_kind == 1 {
+                best_len as u32
+            } else {
+                best_dict_word_len as u32
+            };
+            cmds.push(Command {
+                insert: core::mem::replace(&mut pending, next_pending),
+                copy_len,
+                kind: cmd_kind,
+            });
             pos += best_len;
             continue;
         }
 
-        out.push(LzAtom::Literal(payload[pos]));
+        // No copy at this position — accumulate as a literal.
+        pending.push(payload[pos]);
         pos += 1;
     }
-    out
+
+    // Tail: either a final no-copy command (when literals remain), or
+    // recycle the buffer if we already pushed a final command.
+    if !pending.is_empty() || cmds.is_empty() {
+        cmds.push(Command {
+            insert: pending,
+            copy_len: 0,
+            kind: CopyKind::None,
+        });
+    } else {
+        pending.clear();
+        insert_pool.push(pending);
+    }
 }
 
 /// What kind of copy the command carries.
@@ -684,47 +818,6 @@ struct Command {
     /// command's copy-length field.
     copy_len: u32,
     kind: CopyKind,
-}
-
-fn commands_from_atoms(atoms: &[LzAtom]) -> Vec<Command> {
-    let mut cmds: Vec<Command> = Vec::new();
-    let mut pending: Vec<u8> = Vec::new();
-    for a in atoms {
-        match *a {
-            LzAtom::Literal(b) => pending.push(b),
-            LzAtom::Match { len, dist } => {
-                cmds.push(Command {
-                    insert: core::mem::take(&mut pending),
-                    copy_len: len,
-                    kind: CopyKind::Backref { distance: dist },
-                });
-            }
-            LzAtom::Dict {
-                word_len,
-                word_idx,
-                transform_id,
-                emit_len,
-            } => {
-                cmds.push(Command {
-                    insert: core::mem::take(&mut pending),
-                    copy_len: word_len as u32,
-                    kind: CopyKind::Dict {
-                        word_idx,
-                        transform_id,
-                        emit_len,
-                    },
-                });
-            }
-        }
-    }
-    if !pending.is_empty() || cmds.is_empty() {
-        cmds.push(Command {
-            insert: pending,
-            copy_len: 0,
-            kind: CopyKind::None,
-        });
-    }
-    cmds
 }
 
 /// Distance ring buffer used by the encoder to match short codes from
@@ -819,26 +912,13 @@ impl DistRing {
     }
 }
 
-/// Pre-computed per-command frequencies used to size the literal, IC,
-/// and distance Huffman trees.
-struct CmdEncoding {
-    /// IC command symbol per command (0..=703).
-    ic_sym: Vec<u32>,
-    /// Insert-length extra bits per command.
-    ins_extra: Vec<(u32, u32)>, // (bits, value)
-    /// Copy-length extra bits per command (0 bits when no copy).
-    copy_extra: Vec<(u32, u32)>,
-    /// Distance encoding per command. `None` means "no distance read"
-    /// (use_last_dist=true or no copy at all). `Some((dcode, nb,
-    /// dextra))` means write distance code `dcode` with `nb` extra
-    /// bits of value `dextra`.
-    dist_enc: Vec<Option<(u32, u32, u32)>>,
-}
-
 /// Plan how to encode each command: choose IC symbol, decide whether
 /// to use a short distance code, etc. Mutates the supplied ring buffer
 /// in-place so the encoder's view tracks the decoder's view across
 /// meta-block boundaries.
+///
+/// Also folds in the per-alphabet frequency tally so we don't walk
+/// every command twice.
 ///
 /// `prev_total_out` is the number of bytes already emitted in prior
 /// meta-blocks of this stream. The encoder uses it together with the
@@ -846,31 +926,51 @@ struct CmdEncoding {
 /// determines the distance value for static-dictionary references and
 /// must agree exactly with what the decoder computes.
 fn plan_commands(
-    cmds: &[Command],
     mlen: u32,
     ring: &mut DistRing,
     prev_total_out: u64,
     window_size: u32,
-) -> CmdEncoding {
+    scratch: &mut EncScratch,
+) {
     use encoder_iac::{copy_to_code, distance_to_normal_code, ic_command_sym, insert_to_code};
 
-    let mut enc = CmdEncoding {
-        ic_sym: Vec::with_capacity(cmds.len()),
-        ins_extra: Vec::with_capacity(cmds.len()),
-        copy_extra: Vec::with_capacity(cmds.len()),
-        dist_enc: Vec::with_capacity(cmds.len()),
-    };
+    let cmds_len = scratch.cmds.len();
+    scratch.ic_sym.reserve(cmds_len);
+    scratch.ins_extra.reserve(cmds_len);
+    scratch.copy_extra.reserve(cmds_len);
+    scratch.dist_enc.reserve(cmds_len);
+
+    // Split the borrow so the inner per-command iteration can read
+    // scratch.cmds while writing the planning vectors and frequency
+    // tables.
+    let EncScratch {
+        cmds,
+        ic_sym,
+        ins_extra,
+        copy_extra,
+        dist_enc,
+        lit_freq,
+        ic_freq,
+        dist_freq,
+        ..
+    } = scratch;
+
     let mut emitted: u32 = 0;
     for (i, c) in cmds.iter().enumerate() {
-        let is_last_cmd = i == cmds.len() - 1;
+        let is_last_cmd = i == cmds_len - 1;
         let insert_len = c.insert.len() as u32;
+        // Fold the literal-frequency tally into the planning loop — saves
+        // a second walk over every Command.
+        for &b in &c.insert {
+            lit_freq[b as usize] += 1;
+        }
         let (ins_code, ins_eb, ins_ev) = insert_to_code(insert_len);
 
         // For commands without a copy (only happens on the last
         // command), we still need to pick a copy code (the decoder
         // reads its extra bits even if the copy is then skipped).
         // Use copy code 0 (copy_len base 2, zero extra bits).
-        let (copy_code, copy_eb, copy_ev, use_last_dist, dist_enc) = match c.kind {
+        let (copy_code, copy_eb, copy_ev, use_last_dist, dist_plan) = match c.kind {
             CopyKind::Backref { distance } => {
                 let (cc, ceb, cev) = copy_to_code(c.copy_len);
                 // Pick distance encoding. The use_last shortcut requires
@@ -950,12 +1050,19 @@ fn plan_commands(
         } else {
             use_last_dist
         };
-        let ic_sym = ic_command_sym(ins_code, copy_code, use_last_for_ic);
+        let sym = ic_command_sym(ins_code, copy_code, use_last_for_ic);
 
-        enc.ic_sym.push(ic_sym);
-        enc.ins_extra.push((ins_eb, ins_ev));
-        enc.copy_extra.push((copy_eb, copy_ev));
-        enc.dist_enc.push(dist_enc);
+        ic_sym.push(sym);
+        ins_extra.push((ins_eb, ins_ev));
+        copy_extra.push((copy_eb, copy_ev));
+        dist_enc.push(dist_plan);
+
+        // Fused IC + dist frequency tally — saves an extra pass over
+        // every command before Huffman tree construction.
+        ic_freq[sym as usize] += 1;
+        if let Some((dcode, _, _)) = dist_plan {
+            dist_freq[dcode as usize] += 1;
+        }
 
         emitted += insert_len;
         match c.kind {
@@ -968,7 +1075,6 @@ fn plan_commands(
         emitted == mlen,
         "command emission ({emitted}) does not match mlen ({mlen})"
     );
-    enc
 }
 
 /// Build the meta-block header bits *up to but not including* the
@@ -1028,28 +1134,31 @@ enum HuffStrategy {
 /// RLE-encoded code lengths would lack the variety needed for a valid
 /// Kraft-balanced cl-cl tree.
 fn pick_huffman_strategy(freqs: &[u32], alphabet_size: usize) -> HuffStrategy {
-    let nonzero: Vec<usize> = freqs
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &f)| if f > 0 { Some(i) } else { None })
-        .collect();
-    match nonzero.len() {
-        0 => HuffStrategy::SingleSymbol(0),
-        1 => HuffStrategy::SingleSymbol(nonzero[0] as u32),
-        2 => {
-            // Canonical NSYM=2: ascending order. The smaller symbol
-            // gets code 0; the larger gets code 1.
-            let a = nonzero[0] as u32;
-            let b = nonzero[1] as u32;
-            HuffStrategy::TwoSymbols {
-                symbols: [a, b],
-                codes: [0, 1],
-            }
+    // Scan until we've seen three nonzero symbols. Anything beyond two
+    // falls into the complex-code branch — no need to record the rest.
+    let mut first: Option<u32> = None;
+    let mut second: Option<u32> = None;
+    for (i, &f) in freqs.iter().enumerate() {
+        if f == 0 {
+            continue;
         }
-        _ => {
+        if first.is_none() {
+            first = Some(i as u32);
+        } else if second.is_none() {
+            second = Some(i as u32);
+        } else {
+            // Third nonzero symbol — complex code wins.
             let lengths = encoder_huffman::build_huffman_lengths(freqs, alphabet_size);
-            HuffStrategy::Complex(lengths)
+            return HuffStrategy::Complex(lengths);
         }
+    }
+    match (first, second) {
+        (None, _) => HuffStrategy::SingleSymbol(0),
+        (Some(a), None) => HuffStrategy::SingleSymbol(a),
+        (Some(a), Some(b)) => HuffStrategy::TwoSymbols {
+            symbols: [a, b],
+            codes: [0, 1],
+        },
     }
 }
 
@@ -1065,41 +1174,29 @@ fn encode_meta_block(
     dict_index: Option<&DictIndex>,
     id_transforms: Option<&[IdTransform]>,
     level: LevelParams,
+    scratch: &mut EncScratch,
 ) {
     let mlen = payload.len() as u32;
     debug_assert!(mlen >= 1 && mlen <= MAX_BLOCK as u32);
     // Window size = 1 << WBITS = 1 << 16 (the encoder always picks WBITS=16).
     const WINDOW_SIZE: u32 = 1 << 16;
 
-    // 1. Run LZ77 over the payload and build the command stream.
-    let atoms = lz77_pass(
+    // 1. Run LZ77 + command construction in a single fused pass.
+    lz77_to_commands(
         payload,
         dict_index,
         id_transforms,
         prev_total_out,
         level.finder,
+        scratch,
     );
-    let cmds = commands_from_atoms(&atoms);
-    let enc = plan_commands(&cmds, mlen, ring, prev_total_out, WINDOW_SIZE);
+    // 2. Plan + tally frequencies in a single pass.
+    plan_commands(mlen, ring, prev_total_out, WINDOW_SIZE, scratch);
 
-    // 2. Tally frequencies.
-    let mut lit_freq = vec![0u32; 256];
-    let mut ic_freq = vec![0u32; 704];
-    let mut dist_freq = vec![0u32; 64];
-    for (i, c) in cmds.iter().enumerate() {
-        for &b in &c.insert {
-            lit_freq[b as usize] += 1;
-        }
-        ic_freq[enc.ic_sym[i] as usize] += 1;
-        if let Some((dcode, _, _)) = enc.dist_enc[i] {
-            dist_freq[dcode as usize] += 1;
-        }
-    }
-
-    // 3. Pick Huffman strategies.
-    let lit_strategy = pick_huffman_strategy(&lit_freq, 256);
-    let ic_strategy = pick_huffman_strategy(&ic_freq, 704);
-    let dist_strategy = pick_huffman_strategy(&dist_freq, 64);
+    // 3. Pick Huffman strategies (operates on the scratch frequency tables).
+    let lit_strategy = pick_huffman_strategy(&scratch.lit_freq, 256);
+    let ic_strategy = pick_huffman_strategy(&scratch.ic_freq, 704);
+    let dist_strategy = pick_huffman_strategy(&scratch.dist_freq, 64);
 
     // 4. Write the meta-block header.
     write_meta_block_header(bw, out, mlen, is_last);
@@ -1110,26 +1207,44 @@ fn encode_meta_block(
     let dist_codes = emit_prefix_code(bw, out, &dist_strategy, 64);
 
     // 6. Emit the command stream.
-    for (i, c) in cmds.iter().enumerate() {
-        // IC command symbol.
-        let ic_sym = enc.ic_sym[i];
-        write_symbol(bw, out, &ic_strategy, &ic_codes, ic_sym);
-        // Insert extra bits.
-        let (ieb, iev) = enc.ins_extra[i];
+    // Specialise on the common all-complex case so the hot inner loop
+    // skips the per-symbol match dispatch in `write_symbol`. For most
+    // inputs (Lorem, mixed text) the literal alphabet is dense (≥ 16
+    // distinct bytes) so this picks up the complex branch.
+    let scratch_view: &EncScratch = scratch;
+    let cmds_len = scratch_view.cmds.len();
+    for i in 0..cmds_len {
+        let sym = scratch_view.ic_sym[i];
+        write_symbol(bw, out, &ic_strategy, &ic_codes, sym);
+        let (ieb, iev) = scratch_view.ins_extra[i];
         if ieb > 0 {
             bw.write(iev, ieb, out);
         }
-        // Copy extra bits (decoder reads these even when copy is skipped).
-        let (ceb, cev) = enc.copy_extra[i];
+        let (ceb, cev) = scratch_view.copy_extra[i];
         if ceb > 0 {
             bw.write(cev, ceb, out);
         }
-        // Insert literals.
-        for &b in &c.insert {
-            write_symbol(bw, out, &lit_strategy, &lit_codes, b as u32);
+        // Inline the literal-emission fast path for the common complex
+        // strategy: a single bounds-check + length lookup + reverse +
+        // write per byte, with no per-byte enum dispatch.
+        let insert = &scratch_view.cmds[i].insert;
+        match &lit_strategy {
+            HuffStrategy::Complex(lengths) => {
+                for &b in insert {
+                    let len = lengths[b as usize] as u32;
+                    debug_assert!(len > 0);
+                    let code = lit_codes[b as usize];
+                    let rev = reverse_bits(code as u32, len);
+                    bw.write(rev, len, out);
+                }
+            }
+            _ => {
+                for &b in insert {
+                    write_symbol(bw, out, &lit_strategy, &lit_codes, b as u32);
+                }
+            }
         }
-        // Distance code + extra bits, if the decoder is going to read them.
-        if let Some((dcode, ndb, dextra)) = enc.dist_enc[i] {
+        if let Some((dcode, ndb, dextra)) = scratch_view.dist_enc[i] {
             write_symbol(bw, out, &dist_strategy, &dist_codes, dcode);
             if ndb > 0 {
                 bw.write(dextra, ndb, out);

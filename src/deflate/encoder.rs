@@ -147,6 +147,60 @@ impl LevelParams {
 
 // ─── helpers for the length/distance -> code mapping ─────────────────────
 
+// ─── precomputed fixed Huffman tables (const) ───────────────────────────
+//
+// The fixed-Huffman code lengths in `FIXED_LIT_LENGTHS` / `FIXED_DIST_LENGTHS`
+// never change, so we can precompute the canonical codes, bit-reverse them
+// once, and stash both alongside the lengths as `u32` arrays. The encoder
+// then writes a fixed-Huffman literal/length with one table lookup instead
+// of `canonical_codes_from_lengths` + `reverse_bits` per symbol.
+
+const FIXED_LIT_REV: [u32; 288] = compute_canonical_reversed::<288>(&FIXED_LIT_LENGTHS);
+const FIXED_DIST_REV: [u32; 32] = compute_canonical_reversed::<32>(&FIXED_DIST_LENGTHS);
+
+/// Compile-time canonical-code generator that also bit-reverses each code so
+/// the encoder can write it LSB-first without a runtime reverse.
+const fn compute_canonical_reversed<const N: usize>(lengths: &[u8; N]) -> [u32; N] {
+    let mut count = [0u32; 16];
+    let mut i = 0;
+    while i < N {
+        let l = lengths[i] as usize;
+        if l > 0 {
+            count[l] += 1;
+        }
+        i += 1;
+    }
+    let mut next_code = [0u32; 16];
+    let mut code: u32 = 0;
+    let mut bits = 1;
+    while bits <= 15 {
+        code = (code + count[bits - 1]) << 1;
+        next_code[bits] = code;
+        bits += 1;
+    }
+    let mut out = [0u32; N];
+    let mut i = 0;
+    while i < N {
+        let len = lengths[i] as u32;
+        if len > 0 {
+            let c = next_code[len as usize];
+            // Reverse the low `len` bits of `c`.
+            let mut v = c;
+            let mut rev: u32 = 0;
+            let mut j = 0;
+            while j < len {
+                rev = (rev << 1) | (v & 1);
+                v >>= 1;
+                j += 1;
+            }
+            out[i] = rev;
+            next_code[len as usize] = c + 1;
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Maps a match length in 3..=258 to its base code (subtract 257 to get
 /// `LENGTH_BASE`/`LENGTH_EXTRA` index). Built at compile time.
 const LENGTH_CODE_OFFSET: [u8; 256] = {
@@ -163,6 +217,24 @@ const LENGTH_CODE_OFFSET: [u8; 256] = {
     t
 };
 
+/// Maps a distance in 1..=512 to its base code. For distances above 512 we
+/// fall through to a short linear scan. Built at compile time. Indexed
+/// `[distance - 1]`.
+const SMALL_DIST_CODE: [u8; 512] = {
+    let mut t = [0u8; 512];
+    let mut d = 1u16;
+    while d <= 512 {
+        let mut c = 0usize;
+        while c < 29 && DIST_BASE[c + 1] <= d {
+            c += 1;
+        }
+        t[(d - 1) as usize] = c as u8;
+        d += 1;
+    }
+    t
+};
+
+#[inline(always)]
 fn length_to_code(length: u16) -> (u16, u16, u8) {
     let l = (length as usize) - MIN_MATCH;
     let c = LENGTH_CODE_OFFSET[l] as usize;
@@ -172,22 +244,24 @@ fn length_to_code(length: u16) -> (u16, u16, u8) {
     (code, extra_value, extra_bits)
 }
 
+#[inline(always)]
 fn distance_to_code(distance: u16) -> (u16, u16, u8) {
-    // 30 candidates; small enough for a linear scan from the top.
-    let mut c = 29usize;
-    loop {
-        if distance >= DIST_BASE[c] {
-            let extra_value = distance - DIST_BASE[c];
-            let extra_bits = DIST_EXTRA[c];
-            return (c as u16, extra_value, extra_bits);
+    // Fast path: distances 1..=512 cover the bulk of real inputs (32 KiB
+    // window, but English text and binary structures tend to back-reference
+    // recent bytes) — one table lookup, no branches.
+    let c = if distance <= 512 {
+        SMALL_DIST_CODE[(distance - 1) as usize] as usize
+    } else {
+        // 30 candidates; small enough for a linear scan from the top.
+        let mut c = 29usize;
+        while c > 0 && distance < DIST_BASE[c] {
+            c -= 1;
         }
-        if c == 0 {
-            break;
-        }
-        c -= 1;
-    }
-    // Distance was 0, which the caller should never pass.
-    (0, 0, 0)
+        c
+    };
+    let extra_value = distance - DIST_BASE[c];
+    let extra_bits = DIST_EXTRA[c];
+    (c as u16, extra_value, extra_bits)
 }
 
 // ─── per-block symbol stream ─────────────────────────────────────────────
@@ -207,8 +281,8 @@ struct ClSymbol {
     extra_bits: u8,   // 0, 2, 3, or 7
 }
 
-fn rle_encode_lengths(lengths: &[u8]) -> Vec<ClSymbol> {
-    let mut out = Vec::new();
+fn rle_encode_lengths_into(lengths: &[u8], out: &mut Vec<ClSymbol>) {
+    out.clear();
     let mut i = 0usize;
     while i < lengths.len() {
         let cur = lengths[i];
@@ -276,7 +350,6 @@ fn rle_encode_lengths(lengths: &[u8]) -> Vec<ClSymbol> {
 
         i += run;
     }
-    out
 }
 
 // ─── cost estimation (in bits) ──────────────────────────────────────────
@@ -334,6 +407,31 @@ pub struct Encoder {
     /// Match-finder tuning derived from [`EncoderConfig::level`]. Persisted
     /// across `reset` since configuration is meant to survive resets.
     params: LevelParams,
+
+    // ─── reusable scratch buffers (avoid per-block allocation) ───
+    /// Literal/length code frequencies for the current block.
+    lit_freq: [u32; 286],
+    /// Distance code frequencies for the current block.
+    dist_freq: [u32; 30],
+    /// Code lengths for literal/length alphabet (dynamic block).
+    lit_lengths: [u8; 286],
+    /// Code lengths for distance alphabet (dynamic block).
+    dist_lengths: [u8; 30],
+    /// Code lengths for the code-length alphabet (dynamic block header).
+    cl_lengths: [u8; 19],
+    /// Code-length-code frequencies (dynamic block header).
+    cl_freq: [u32; 19],
+    /// Reused RLE buffer for the dynamic-Huffman header.
+    rle_buf: Vec<ClSymbol>,
+    /// Reused buffer for `combined = lit_lengths ++ dist_lengths` in the
+    /// dynamic-Huffman header RLE.
+    combined_lengths: Vec<u8>,
+    /// Number of literal/length code lengths (after trimming trailing zeros).
+    hlit_count: usize,
+    /// Number of distance code lengths (after trimming trailing zeros).
+    hdist_count: usize,
+    /// Number of code-length codes emitted in CODE_LENGTH_ORDER.
+    hclen_count: usize,
 }
 
 impl Encoder {
@@ -359,6 +457,17 @@ impl Encoder {
             state: EncState::Accepting,
             final_emitted: false,
             params: LevelParams::from_level(config.level),
+            lit_freq: [0u32; 286],
+            dist_freq: [0u32; 30],
+            lit_lengths: [0u8; 286],
+            dist_lengths: [0u8; 30],
+            cl_lengths: [0u8; 19],
+            cl_freq: [0u32; 19],
+            rle_buf: Vec::new(),
+            combined_lengths: Vec::new(),
+            hlit_count: 0,
+            hdist_count: 0,
+            hclen_count: 0,
         }
     }
 
@@ -593,78 +702,85 @@ impl Encoder {
         self.cursor = pos;
     }
 
-    /// Build code lengths from frequency histograms and return
-    /// `(lit_lengths, dist_lengths, header_bits, payload_bits)` for the
-    /// dynamic-Huffman encoding.
-    fn build_dynamic(
-        &self,
-        lit_freq: &[u32; 286],
-        dist_freq: &[u32; 30],
-    ) -> ([u8; 286], [u8; 30], u64, u64) {
-        let lit_lengths_vec = length_limited_huffman(lit_freq, 15);
-        let dist_lengths_vec = length_limited_huffman(dist_freq, 15);
+    /// Build code lengths and the dynamic-block header into `self.*` from
+    /// frequency histograms. Returns `(header_bits, payload_bits)`. The
+    /// header preparation (RLE + code-length-code Huffman + HLIT/HDIST/HCLEN
+    /// trims) is stashed on `self` so `emit_dynamic_block` can consume it
+    /// without redoing the work.
+    fn build_dynamic(&mut self) -> (u64, u64) {
+        let lit_lengths_vec = length_limited_huffman(&self.lit_freq, 15);
+        let dist_lengths_vec = length_limited_huffman(&self.dist_freq, 15);
 
-        let mut lit_lengths = [0u8; 286];
-        lit_lengths.copy_from_slice(&lit_lengths_vec);
-        let mut dist_lengths = [0u8; 30];
-        dist_lengths.copy_from_slice(&dist_lengths_vec);
+        // Reset and fill the persistent code-length arrays. The vecs from
+        // length_limited_huffman are sized to the input frequency table, so
+        // they're exactly 286 / 30 entries.
+        debug_assert_eq!(lit_lengths_vec.len(), 286);
+        debug_assert_eq!(dist_lengths_vec.len(), 30);
+        self.lit_lengths.copy_from_slice(&lit_lengths_vec);
+        self.dist_lengths.copy_from_slice(&dist_lengths_vec);
 
         // Trim trailing zeros for HLIT/HDIST.
         let mut hlit_count = 286usize;
-        while hlit_count > 257 && lit_lengths[hlit_count - 1] == 0 {
+        while hlit_count > 257 && self.lit_lengths[hlit_count - 1] == 0 {
             hlit_count -= 1;
         }
         let mut hdist_count = 30usize;
-        while hdist_count > 1 && dist_lengths[hdist_count - 1] == 0 {
+        while hdist_count > 1 && self.dist_lengths[hdist_count - 1] == 0 {
             hdist_count -= 1;
         }
+        self.hlit_count = hlit_count;
+        self.hdist_count = hdist_count;
 
         // RLE-encode the combined code-lengths.
-        let mut combined: Vec<u8> = Vec::with_capacity(hlit_count + hdist_count);
-        combined.extend_from_slice(&lit_lengths[..hlit_count]);
-        combined.extend_from_slice(&dist_lengths[..hdist_count]);
-        let rle = rle_encode_lengths(&combined);
+        self.combined_lengths.clear();
+        self.combined_lengths
+            .extend_from_slice(&self.lit_lengths[..hlit_count]);
+        self.combined_lengths
+            .extend_from_slice(&self.dist_lengths[..hdist_count]);
+        rle_encode_lengths_into(&self.combined_lengths, &mut self.rle_buf);
 
         // Code-length-code Huffman (max length 7).
-        let mut cl_freq = [0u32; 19];
-        for s in &rle {
-            cl_freq[s.sym as usize] += 1;
+        self.cl_freq = [0u32; 19];
+        for s in &self.rle_buf {
+            self.cl_freq[s.sym as usize] += 1;
         }
-        let cl_lengths_vec = length_limited_huffman(&cl_freq, 7);
-        let mut cl_lengths = [0u8; 19];
-        cl_lengths.copy_from_slice(&cl_lengths_vec);
+        let cl_lengths_vec = length_limited_huffman(&self.cl_freq, 7);
+        debug_assert_eq!(cl_lengths_vec.len(), 19);
+        self.cl_lengths.copy_from_slice(&cl_lengths_vec);
 
         // HCLEN: trim trailing zeros in CODE_LENGTH_ORDER permutation.
         let mut hclen_count = 19usize;
-        while hclen_count > 4 && cl_lengths[CODE_LENGTH_ORDER[hclen_count - 1]] == 0 {
+        while hclen_count > 4 && self.cl_lengths[CODE_LENGTH_ORDER[hclen_count - 1]] == 0 {
             hclen_count -= 1;
         }
+        self.hclen_count = hclen_count;
 
         // Header bits:
         //   3 (BFINAL+BTYPE) + 5+5+4 (HLIT,HDIST,HCLEN) + 3·hclen_count
         //   + sum_over_rle(cl_lengths[sym] + extra_bits)
         let mut header_bits: u64 = 3 + 5 + 5 + 4 + 3 * hclen_count as u64;
-        for s in &rle {
-            header_bits += cl_lengths[s.sym as usize] as u64 + s.extra_bits as u64;
+        for s in &self.rle_buf {
+            header_bits += self.cl_lengths[s.sym as usize] as u64 + s.extra_bits as u64;
         }
 
         // Payload bits.
-        let payload_bits = payload_cost_bits(&self.block_symbols, &lit_lengths, &dist_lengths);
+        let payload_bits =
+            payload_cost_bits(&self.block_symbols, &self.lit_lengths, &self.dist_lengths);
 
-        (lit_lengths, dist_lengths, header_bits, payload_bits)
+        (header_bits, payload_bits)
     }
 
     /// Compute the bit cost of encoding `block_symbols` with the fixed
     /// Huffman tables. Returns total bits including 3-bit block header.
     fn fixed_cost_bits(&self) -> u64 {
-        let mut fixed_lit = [0u8; 286];
-        // Fixed table is over 288 symbols; we only need 286 because compcol's
-        // length_limited_huffman returns up to 286 — but here we just need
-        // the lengths for symbols 0..286 which is exactly FIXED_LIT_LENGTHS[..286].
-        fixed_lit.copy_from_slice(&FIXED_LIT_LENGTHS[..286]);
-        let mut fixed_dist = [0u8; 30];
-        fixed_dist.copy_from_slice(&FIXED_DIST_LENGTHS[..30]);
-        3 + payload_cost_bits(&self.block_symbols, &fixed_lit, &fixed_dist)
+        // FIXED_LIT_LENGTHS / FIXED_DIST_LENGTHS are 288 / 32 long, but our
+        // payload_cost_bits only indexes [0, 286) / [0, 30) so taking a
+        // sub-slice is a zero-cost no-op.
+        3 + payload_cost_bits(
+            &self.block_symbols,
+            &FIXED_LIT_LENGTHS[..286],
+            &FIXED_DIST_LENGTHS[..30],
+        )
     }
 
     /// Compute the bit cost of encoding the current block as a single
@@ -689,39 +805,29 @@ impl Encoder {
         bw.write(if bfinal { 1 } else { 0 }, 1, out);
         bw.write(1, 2, out); // BTYPE = 01 (fixed Huffman)
 
-        let mut fixed_lit = [0u8; 286];
-        fixed_lit.copy_from_slice(&FIXED_LIT_LENGTHS[..286]);
-        let mut fixed_dist = [0u8; 30];
-        fixed_dist.copy_from_slice(&FIXED_DIST_LENGTHS[..30]);
-        // Build canonical codes for the full fixed tables (288/32) — needed
-        // for symbols 286/287 which can appear in length_to_code? No: length
-        // codes range 257..=285, so we never index those. Distance codes are
-        // 0..=29. We only ever index ≤285 for literals and ≤29 for distances.
-        let lit_codes_full = canonical_codes_from_lengths(&FIXED_LIT_LENGTHS);
-        let dist_codes_full = canonical_codes_from_lengths(&FIXED_DIST_LENGTHS);
+        // Use the precomputed reversed-code tables. These are computed once
+        // at module load and don't depend on the block content.
+        let lit_rev = &FIXED_LIT_REV;
+        let lit_len_tbl = &FIXED_LIT_LENGTHS;
+        let dist_rev = &FIXED_DIST_REV;
+        let dist_len_tbl = &FIXED_DIST_LENGTHS;
 
         for s in &self.block_symbols {
             match s {
                 Symbol::Literal(b) => {
-                    let code = lit_codes_full[*b as usize];
-                    let len = FIXED_LIT_LENGTHS[*b as usize];
-                    let rev = reverse_bits(code as u32, len as u32);
-                    bw.write(rev, len as u32, out);
+                    let bi = *b as usize;
+                    bw.write(lit_rev[bi], lit_len_tbl[bi] as u32, out);
                 }
                 Symbol::Match { length, distance } => {
                     let (lc, lex, leb) = length_to_code(*length);
-                    let code = lit_codes_full[lc as usize];
-                    let len = FIXED_LIT_LENGTHS[lc as usize];
-                    let rev = reverse_bits(code as u32, len as u32);
-                    bw.write(rev, len as u32, out);
+                    let lci = lc as usize;
+                    bw.write(lit_rev[lci], lit_len_tbl[lci] as u32, out);
                     if leb > 0 {
                         bw.write(lex as u32, leb as u32, out);
                     }
                     let (dc, dex, deb) = distance_to_code(*distance);
-                    let code = dist_codes_full[dc as usize];
-                    let len = FIXED_DIST_LENGTHS[dc as usize];
-                    let rev = reverse_bits(code as u32, len as u32);
-                    bw.write(rev, len as u32, out);
+                    let dci = dc as usize;
+                    bw.write(dist_rev[dci], dist_len_tbl[dci] as u32, out);
                     if deb > 0 {
                         bw.write(dex as u32, deb as u32, out);
                     }
@@ -729,10 +835,8 @@ impl Encoder {
             }
         }
         // End-of-block (symbol 256).
-        let code = lit_codes_full[END_OF_BLOCK as usize];
-        let len = FIXED_LIT_LENGTHS[END_OF_BLOCK as usize];
-        let rev = reverse_bits(code as u32, len as u32);
-        bw.write(rev, len as u32, out);
+        let eob = END_OF_BLOCK as usize;
+        bw.write(lit_rev[eob], lit_len_tbl[eob] as u32, out);
 
         if bfinal {
             bw.align(out);
@@ -760,51 +864,49 @@ impl Encoder {
         let _ = bfinal;
     }
 
-    /// Encode the accumulated block as a dynamic-Huffman block using the
-    /// precomputed code lengths.
-    fn emit_dynamic_block(
-        &mut self,
-        bfinal: bool,
-        lit_lengths: &[u8; 286],
-        dist_lengths: &[u8; 30],
-    ) {
-        // ── determine HLIT / HDIST counts (trim trailing zeros) ──
-        let mut hlit_count = 286usize;
-        while hlit_count > 257 && lit_lengths[hlit_count - 1] == 0 {
-            hlit_count -= 1;
-        }
+    /// Encode the accumulated block as a dynamic-Huffman block.
+    ///
+    /// Consumes the dynamic-header preparation stashed on `self` by the
+    /// preceding [`build_dynamic`] call (lit/dist/cl lengths, RLE, HLIT /
+    /// HDIST / HCLEN counts) — they're already in scratch fields, no recompute.
+    fn emit_dynamic_block(&mut self, bfinal: bool) {
+        let hlit_count = self.hlit_count;
+        let hdist_count = self.hdist_count;
+        let hclen_count = self.hclen_count;
         let hlit = (hlit_count - 257) as u8;
-
-        let mut hdist_count = 30usize;
-        while hdist_count > 1 && dist_lengths[hdist_count - 1] == 0 {
-            hdist_count -= 1;
-        }
         let hdist = (hdist_count - 1) as u8;
-
-        // ── RLE-encode the combined code-lengths ──
-        let mut combined: Vec<u8> = Vec::with_capacity(hlit_count + hdist_count);
-        combined.extend_from_slice(&lit_lengths[..hlit_count]);
-        combined.extend_from_slice(&dist_lengths[..hdist_count]);
-        let rle = rle_encode_lengths(&combined);
-
-        // ── build the code-length-code Huffman (max length 7) ──
-        let mut cl_freq = [0u32; 19];
-        for s in &rle {
-            cl_freq[s.sym as usize] += 1;
-        }
-        let cl_lengths_vec = length_limited_huffman(&cl_freq, 7);
-        let mut cl_lengths = [0u8; 19];
-        cl_lengths.copy_from_slice(&cl_lengths_vec);
-
-        let mut hclen_count = 19usize;
-        while hclen_count > 4 && cl_lengths[CODE_LENGTH_ORDER[hclen_count - 1]] == 0 {
-            hclen_count -= 1;
-        }
         let hclen = (hclen_count - 4) as u8;
 
-        let lit_codes = canonical_codes_from_lengths(lit_lengths);
-        let dist_codes = canonical_codes_from_lengths(dist_lengths);
-        let cl_codes = canonical_codes_from_lengths(&cl_lengths);
+        // Pre-reverse the Huffman codes once so the inner emission loop is
+        // a single `bw.write(rev, len, out)` per symbol.
+        let lit_codes = canonical_codes_from_lengths(&self.lit_lengths);
+        let dist_codes = canonical_codes_from_lengths(&self.dist_lengths);
+        let cl_codes = canonical_codes_from_lengths(&self.cl_lengths);
+
+        // Build per-symbol (reversed_code, length) tables for the two main
+        // alphabets. This converts the inner emission loop from three loads
+        // + a reverse_bits to two loads.
+        let mut lit_rev = [0u32; 286];
+        for i in 0..hlit_count {
+            let l = self.lit_lengths[i] as u32;
+            if l > 0 {
+                lit_rev[i] = reverse_bits(lit_codes[i] as u32, l);
+            }
+        }
+        let mut dist_rev = [0u32; 30];
+        for i in 0..hdist_count {
+            let l = self.dist_lengths[i] as u32;
+            if l > 0 {
+                dist_rev[i] = reverse_bits(dist_codes[i] as u32, l);
+            }
+        }
+        let mut cl_rev = [0u32; 19];
+        for i in 0..19 {
+            let l = self.cl_lengths[i] as u32;
+            if l > 0 {
+                cl_rev[i] = reverse_bits(cl_codes[i] as u32, l);
+            }
+        }
 
         let bw = &mut self.bit_writer;
         let out = &mut self.out_buffer;
@@ -816,16 +918,14 @@ impl Encoder {
         bw.write(hdist as u32, 5, out);
         bw.write(hclen as u32, 4, out);
 
-        for i in 0..hclen_count {
-            let len = cl_lengths[CODE_LENGTH_ORDER[i]];
+        for &idx in CODE_LENGTH_ORDER.iter().take(hclen_count) {
+            let len = self.cl_lengths[idx];
             bw.write(len as u32, 3, out);
         }
 
-        for s in &rle {
-            let code = cl_codes[s.sym as usize];
-            let len = cl_lengths[s.sym as usize];
-            let rev = reverse_bits(code as u32, len as u32);
-            bw.write(rev, len as u32, out);
+        for s in &self.rle_buf {
+            let si = s.sym as usize;
+            bw.write(cl_rev[si], self.cl_lengths[si] as u32, out);
             if s.extra_bits > 0 {
                 bw.write(s.extra_value as u32, s.extra_bits as u32, out);
             }
@@ -834,26 +934,24 @@ impl Encoder {
         for s in &self.block_symbols {
             match s {
                 Symbol::Literal(b) => {
-                    let code = lit_codes[*b as usize];
-                    let len = lit_lengths[*b as usize];
-                    debug_assert!(len > 0, "literal {} has zero-length Huffman code", b);
-                    let rev = reverse_bits(code as u32, len as u32);
-                    bw.write(rev, len as u32, out);
+                    let bi = *b as usize;
+                    debug_assert!(
+                        self.lit_lengths[bi] > 0,
+                        "literal {} has zero-length Huffman code",
+                        bi
+                    );
+                    bw.write(lit_rev[bi], self.lit_lengths[bi] as u32, out);
                 }
                 Symbol::Match { length, distance } => {
                     let (lc, lex, leb) = length_to_code(*length);
-                    let code = lit_codes[lc as usize];
-                    let len = lit_lengths[lc as usize];
-                    let rev = reverse_bits(code as u32, len as u32);
-                    bw.write(rev, len as u32, out);
+                    let lci = lc as usize;
+                    bw.write(lit_rev[lci], self.lit_lengths[lci] as u32, out);
                     if leb > 0 {
                         bw.write(lex as u32, leb as u32, out);
                     }
                     let (dc, dex, deb) = distance_to_code(*distance);
-                    let code = dist_codes[dc as usize];
-                    let len = dist_lengths[dc as usize];
-                    let rev = reverse_bits(code as u32, len as u32);
-                    bw.write(rev, len as u32, out);
+                    let dci = dc as usize;
+                    bw.write(dist_rev[dci], self.dist_lengths[dci] as u32, out);
                     if deb > 0 {
                         bw.write(dex as u32, deb as u32, out);
                     }
@@ -862,10 +960,8 @@ impl Encoder {
         }
 
         // End-of-block.
-        let code = lit_codes[END_OF_BLOCK as usize];
-        let len = lit_lengths[END_OF_BLOCK as usize];
-        let rev = reverse_bits(code as u32, len as u32);
-        bw.write(rev, len as u32, out);
+        let eob = END_OF_BLOCK as usize;
+        bw.write(lit_rev[eob], self.lit_lengths[eob] as u32, out);
 
         if bfinal {
             bw.align(out);
@@ -881,25 +977,30 @@ impl Encoder {
 
         self.lz77_pass(end_rel);
 
-        // Tally frequencies.
-        let mut lit_freq = [0u32; 286];
-        let mut dist_freq = [0u32; 30];
+        // Tally frequencies into the persistent scratch arrays.
+        for f in self.lit_freq.iter_mut() {
+            *f = 0;
+        }
+        for f in self.dist_freq.iter_mut() {
+            *f = 0;
+        }
         for s in &self.block_symbols {
             match s {
-                Symbol::Literal(b) => lit_freq[*b as usize] += 1,
+                Symbol::Literal(b) => self.lit_freq[*b as usize] += 1,
                 Symbol::Match { length, distance } => {
                     let (lc, _, _) = length_to_code(*length);
-                    lit_freq[lc as usize] += 1;
+                    self.lit_freq[lc as usize] += 1;
                     let (dc, _, _) = distance_to_code(*distance);
-                    dist_freq[dc as usize] += 1;
+                    self.dist_freq[dc as usize] += 1;
                 }
             }
         }
-        lit_freq[END_OF_BLOCK as usize] += 1;
+        self.lit_freq[END_OF_BLOCK as usize] += 1;
 
-        // Compute dynamic-Huffman cost.
-        let (lit_lengths, dist_lengths, dyn_header_bits, dyn_payload_bits) =
-            self.build_dynamic(&lit_freq, &dist_freq);
+        // Compute dynamic-Huffman cost. This also stashes the header preparation
+        // (RLE, cl_lengths, hlit/hdist/hclen counts) on `self` so the subsequent
+        // emit_dynamic_block call doesn't redo the work.
+        let (dyn_header_bits, dyn_payload_bits) = self.build_dynamic();
         let dynamic_total = dyn_header_bits + dyn_payload_bits;
 
         // Compute fixed-Huffman cost.
@@ -918,7 +1019,7 @@ impl Encoder {
         } else if fixed_total <= dynamic_total {
             self.emit_fixed_block(bfinal);
         } else {
-            self.emit_dynamic_block(bfinal, &lit_lengths, &dist_lengths);
+            self.emit_dynamic_block(bfinal);
         }
 
         self.maybe_slide();
