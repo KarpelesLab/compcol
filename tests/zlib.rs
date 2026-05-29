@@ -550,3 +550,116 @@ mod factory {
         assert_eq!(&decoded[..], input);
     }
 }
+
+// ─── FDICT / preset dictionary (#22) ──────────────────────────────────────
+
+use compcol::zlib::DecoderConfig;
+
+fn drain_full(mut dec: Decoder, encoded: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    let mut consumed = 0;
+    loop {
+        let (p, status) = dec.decode(&encoded[consumed..], &mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        consumed += p.consumed;
+        if matches!(status, Status::StreamEnd) {
+            return Ok(out);
+        }
+        if matches!(status, Status::InputEmpty) {
+            break;
+        }
+    }
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        if matches!(status, Status::StreamEnd) {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Real FDICT-set zlib stream produced by Python's `zlib.compressobj(zdict=DICT)`.
+/// CMF=0x78, FLG=0xF9 (FDICT=1, FCHECK chosen so `(CMF*256 + FLG) % 31 == 0`).
+/// DICTID = Adler-32 of the dictionary, big-endian: `0x81AC1048`.
+const FDICT_DICTIONARY: &[u8] = b"the quick brown fox jumps over the lazy dog. ";
+const FDICT_PAYLOAD: &[u8] = b"the quick brown fox is quicker than the lazy dog!";
+
+/// FDICT=1 stream with a configured matching dictionary decodes cleanly.
+#[test]
+fn zlib_decoder_fdict_decodes_with_matching_dictionary() {
+    let encoded = hex("78f981ac10482bc1a238b3182204569c9887a2431100c4ce11cb");
+
+    let dec = Decoder::with_config(DecoderConfig {
+        dictionary: FDICT_DICTIONARY.to_vec(),
+    });
+    let out = drain_full(dec, &encoded).unwrap();
+    assert_eq!(out, FDICT_PAYLOAD);
+
+    // Same via the type-associated config path.
+    let dec: Decoder = Zlib::decoder_with(DecoderConfig {
+        dictionary: FDICT_DICTIONARY.to_vec(),
+    });
+    let out = drain_full(dec, &encoded).unwrap();
+    assert_eq!(out, FDICT_PAYLOAD);
+}
+
+/// FDICT=1 stream with NO configured dictionary errors as Unsupported.
+/// Preserves the pre-#22 behaviour: streams the decoder was always
+/// unable to handle still surface the same way.
+#[test]
+fn zlib_decoder_fdict_without_dictionary_is_unsupported() {
+    let encoded = hex("78f981ac10482bc1a238b3182204569c9887a2431100c4ce11cb");
+
+    let dec = Decoder::new();
+    let err = drain_full(dec, &encoded).unwrap_err();
+    assert!(matches!(err, Error::Unsupported), "got {err:?}");
+}
+
+/// FDICT=1 stream with the WRONG dictionary errors as ChecksumMismatch
+/// (the on-wire DICTID is the dictionary's Adler-32, so any non-matching
+/// dict surfaces as a checksum failure before we touch the deflate body).
+#[test]
+fn zlib_decoder_fdict_with_wrong_dictionary_errors_checksum_mismatch() {
+    let encoded = hex("78f981ac10482bc1a238b3182204569c9887a2431100c4ce11cb");
+
+    let dec = Decoder::with_config(DecoderConfig {
+        dictionary: b"definitely not the right dictionary".to_vec(),
+    });
+    let err = drain_full(dec, &encoded).unwrap_err();
+    assert!(matches!(err, Error::ChecksumMismatch), "got {err:?}");
+}
+
+/// FDICT=0 streams still decode normally even when a dictionary is
+/// configured — the dictionary is held but only consulted when the
+/// stream's FDICT bit is set.
+#[test]
+fn zlib_decoder_fdict0_ignores_configured_dictionary() {
+    // Build a normal FDICT=0 stream by encoding "hello zlib" with our own
+    // encoder.
+    let plaintext = b"hello zlib, preset dict should be ignored when FDICT is 0";
+    let mut enc = Encoder::new();
+    let mut buf = vec![0u8; 256];
+    let mut encoded = Vec::new();
+    let mut consumed = 0;
+    while consumed < plaintext.len() {
+        let (p, _status) = enc.encode(&plaintext[consumed..], &mut buf).unwrap();
+        encoded.extend_from_slice(&buf[..p.written]);
+        consumed += p.consumed;
+    }
+    loop {
+        let (p, status) = enc.finish(&mut buf).unwrap();
+        encoded.extend_from_slice(&buf[..p.written]);
+        if matches!(status, Status::StreamEnd) {
+            break;
+        }
+    }
+
+    // Decode with a (wrong) dictionary configured — should still succeed.
+    let dec = Decoder::with_config(DecoderConfig {
+        dictionary: b"unrelated bytes".to_vec(),
+    });
+    let out = drain_full(dec, &encoded).unwrap();
+    assert_eq!(&out[..], plaintext);
+}

@@ -17,7 +17,7 @@ pub mod decoder;
 pub mod encoder;
 pub mod lz77;
 
-pub use decoder::Decoder;
+pub use decoder::{Decoder, DecoderConfig};
 pub use encoder::{Encoder, EncoderConfig};
 
 use crate::traits::Algorithm;
@@ -31,12 +31,12 @@ impl Algorithm for Deflate {
     type Encoder = Encoder;
     type Decoder = Decoder;
     type EncoderConfig = EncoderConfig;
-    type DecoderConfig = ();
+    type DecoderConfig = DecoderConfig;
 
     fn encoder_with(c: Self::EncoderConfig) -> Encoder {
         Encoder::with_config(c)
     }
-    fn decoder_with(_: ()) -> Decoder {
-        Decoder::new()
+    fn decoder_with(c: Self::DecoderConfig) -> Decoder {
+        Decoder::with_config(c)
     }
 }

@@ -68,6 +68,25 @@ fn header_bytes(level: u8) -> (u8, u8) {
     (cmf, flg)
 }
 
+/// Configuration for the zlib decoder.
+///
+/// Carries an optional preset dictionary used when the stream's `FDICT`
+/// bit is set (RFC 1950 §2.2). If `FDICT=1` the wire format includes a
+/// 4-byte `DICTID` field — the Adler-32 of the dictionary — that the
+/// decoder verifies against the configured dictionary; mismatch surfaces
+/// as [`Error::ChecksumMismatch`]. Streams with `FDICT=0` ignore
+/// `dictionary` entirely.
+///
+/// An empty dictionary (the default) preserves the older configless
+/// behaviour: `FDICT=0` streams decode normally, `FDICT=1` streams error
+/// out as [`Error::Unsupported`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DecoderConfig {
+    /// Bytes to seed the underlying deflate window with when the stream's
+    /// `FDICT` bit is set. Up to the last 32 KiB are retained.
+    pub dictionary: Vec<u8>,
+}
+
 /// Zero-sized marker type implementing [`Algorithm`] for zlib.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Zlib;
@@ -77,13 +96,13 @@ impl Algorithm for Zlib {
     type Encoder = Encoder;
     type Decoder = Decoder;
     type EncoderConfig = EncoderConfig;
-    type DecoderConfig = ();
+    type DecoderConfig = DecoderConfig;
 
     fn encoder_with(c: Self::EncoderConfig) -> Encoder {
         Encoder::with_config(c)
     }
-    fn decoder_with(_: ()) -> Decoder {
-        Decoder::new()
+    fn decoder_with(c: Self::DecoderConfig) -> Decoder {
+        Decoder::with_config(c)
     }
 }
 
@@ -93,6 +112,8 @@ impl Algorithm for Zlib {
 enum DecPhase {
     /// Reading the 2-byte header.
     Header,
+    /// FDICT=1: reading the 4-byte big-endian DICTID (Adler-32 of dict).
+    DictId,
     /// Streaming the deflate payload.
     Deflate,
     /// Collecting the 4-byte Adler-32 trailer.
@@ -106,6 +127,14 @@ pub struct Decoder {
     adler: Adler32,
     header: [u8; 2],
     header_idx: u8,
+    /// Caller-supplied preset dictionary. Empty when no dictionary was
+    /// configured; populated by [`Decoder::with_config`]. Used to verify
+    /// the on-wire `DICTID` when `FDICT=1` and to seed the underlying
+    /// deflate window before the first block.
+    dictionary: Vec<u8>,
+    /// `DICTID` bytes collected when `FDICT=1`.
+    dictid: [u8; 4],
+    dictid_idx: u8,
     /// First trailer bytes recovered from the deflate decoder's bit-reader
     /// after the deflate stream ended.
     trailer_carryover: Vec<u8>,
@@ -123,6 +152,9 @@ impl Decoder {
             adler: Adler32::new(),
             header: [0u8; 2],
             header_idx: 0,
+            dictionary: Vec::new(),
+            dictid: [0u8; 4],
+            dictid_idx: 0,
             trailer_carryover: Vec::new(),
             trailer_carryover_idx: 0,
             trailer: [0u8; 4],
@@ -132,26 +164,58 @@ impl Decoder {
         }
     }
 
+    /// Build a zlib decoder with the given [`DecoderConfig`]. The
+    /// dictionary is held until the on-wire `FDICT` bit is parsed; if
+    /// `FDICT=1` and its Adler-32 matches the on-wire `DICTID`, the
+    /// underlying deflate window is seeded with it.
+    pub fn with_config(config: DecoderConfig) -> Self {
+        let mut d = Self::new();
+        d.dictionary = config.dictionary;
+        d
+    }
+
     fn poison(&mut self, e: Error) -> Error {
         self.poisoned = true;
         e
     }
 
-    /// Validate the two header bytes we've collected.
-    fn validate_header(&mut self) -> Result<(), Error> {
+    /// Validate the two header bytes we've collected. Returns the next
+    /// phase to enter: [`DecPhase::DictId`] when `FDICT=1`, otherwise
+    /// [`DecPhase::Deflate`].
+    fn validate_header(&mut self) -> Result<DecPhase, Error> {
         let cmf = self.header[0];
         let flg = self.header[1];
         if cmf & 0x0F != 8 {
-            return Err(self.poison(Error::Unsupported));
-        }
-        if flg & 0x20 != 0 {
-            // FDICT set; we don't carry a preset dictionary.
             return Err(self.poison(Error::Unsupported));
         }
         let total = ((cmf as u32) << 8) | (flg as u32);
         if !total.is_multiple_of(31) {
             return Err(self.poison(Error::BadHeader));
         }
+        let fdict = (flg & 0x20) != 0;
+        if fdict {
+            if self.dictionary.is_empty() {
+                // FDICT set but no dictionary was configured. Mirrors the
+                // old behaviour where every FDICT=1 stream errored, just
+                // worded more precisely.
+                return Err(self.poison(Error::Unsupported));
+            }
+            Ok(DecPhase::DictId)
+        } else {
+            Ok(DecPhase::Deflate)
+        }
+    }
+
+    /// Validate the on-wire `DICTID` against the configured dictionary's
+    /// Adler-32 and, on match, seed the underlying deflate window.
+    fn validate_dictid_and_seed(&mut self) -> Result<(), Error> {
+        let on_wire = u32::from_be_bytes(self.dictid);
+        let mut sum = Adler32::new();
+        sum.update(&self.dictionary);
+        if sum.finalize() != on_wire {
+            return Err(self.poison(Error::ChecksumMismatch));
+        }
+        self.inner.load_dictionary(&self.dictionary);
         Ok(())
     }
 
@@ -203,7 +267,23 @@ impl RawDecoder for Decoder {
                         consumed += 1;
                     }
                     if self.header_idx == 2 {
-                        self.validate_header()?;
+                        self.phase = self.validate_header()?;
+                    } else {
+                        return Ok(RawProgress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                }
+                DecPhase::DictId => {
+                    while self.dictid_idx < 4 && consumed < input.len() {
+                        self.dictid[self.dictid_idx as usize] = input[consumed];
+                        self.dictid_idx += 1;
+                        consumed += 1;
+                    }
+                    if self.dictid_idx == 4 {
+                        self.validate_dictid_and_seed()?;
                         self.phase = DecPhase::Deflate;
                     } else {
                         return Ok(RawProgress {
@@ -294,6 +374,7 @@ impl RawDecoder for Decoder {
         self.inner.raw_reset();
         self.adler.reset();
         self.header_idx = 0;
+        self.dictid_idx = 0;
         self.trailer_carryover.clear();
         self.trailer_carryover_idx = 0;
         self.trailer_idx = 0;

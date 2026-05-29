@@ -1,11 +1,31 @@
 //! Streaming RFC 1951 (deflate) decoder.
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 use crate::bits::BitReader;
 use crate::error::Error;
 use crate::huffman::CanonicalDecoder;
 use crate::traits::{RawDecoder, RawProgress};
+
+/// Configuration for the deflate decoder.
+///
+/// Currently carries one field: an optional **preset dictionary** used to
+/// seed the 32 KiB sliding window before decoding starts. This matches
+/// RFC 1951 §3.2.4's "preset dictionary" concept and the zlib container's
+/// `FDICT` mechanism, and is what container formats like CAB MSZIP need
+/// when back-references in one block reach into the previous block's
+/// decompressed output.
+///
+/// If `dictionary` is longer than 32 KiB only the trailing 32 KiB is
+/// retained (the rest is unreachable from any back-reference). An empty
+/// dictionary — the default — is equivalent to the older configless API.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DecoderConfig {
+    /// Bytes to load into the sliding window before decoding. Up to the
+    /// last 32 KiB are retained.
+    pub dictionary: Vec<u8>,
+}
 
 use super::tables::{
     CODE_LENGTH_ORDER, DIST_BASE, DIST_EXTRA, END_OF_BLOCK, FIXED_DIST_LENGTHS, FIXED_LIT_LENGTHS,
@@ -129,6 +149,61 @@ impl Decoder {
             last_block: false,
             poisoned: false,
         }
+    }
+
+    /// Build a decoder with the given [`DecoderConfig`]. The configured
+    /// dictionary (last 32 KiB if longer) is loaded into the sliding
+    /// window before any input is consumed, so the very first block's
+    /// back-references can reach into it as if it were already-decoded
+    /// output.
+    pub fn with_config(config: DecoderConfig) -> Self {
+        let mut d = Self::new();
+        d.load_dictionary(&config.dictionary);
+        d
+    }
+
+    /// Seed the sliding window with `dict`. Used internally by
+    /// [`with_config`] and the zlib container's `FDICT` handling. If
+    /// `dict` is longer than 32 KiB only its trailing 32 KiB is kept
+    /// (anything older is unreachable from a deflate back-reference).
+    /// Replaces any prior window contents.
+    pub(crate) fn load_dictionary(&mut self, dict: &[u8]) {
+        let take = dict.len().min(WINDOW_SIZE);
+        let start = dict.len() - take;
+        let bytes = &dict[start..];
+        // Reset window state, then write the dictionary as if it had been
+        // emitted by a prior decode pass. `window_pos` ends up just past
+        // the last dictionary byte, which is where future emit_byte calls
+        // will continue from — matching the relative-distance semantics
+        // that deflate back-references rely on.
+        self.window_pos = 0;
+        self.window_size = 0;
+        for &b in bytes {
+            self.window[self.window_pos] = b;
+            self.window_pos = (self.window_pos + 1) % WINDOW_SIZE;
+            if self.window_size < WINDOW_SIZE {
+                self.window_size += 1;
+            }
+        }
+    }
+
+    /// Reset the bit reader and block-decode state but **keep** the
+    /// 32 KiB sliding window contents intact.
+    ///
+    /// This is what CAB MSZIP and similar "chained deflate stream"
+    /// containers need: every chunk is a self-contained deflate stream
+    /// whose back-references can still reach into the previous chunk's
+    /// last 32 KiB of decompressed output. Call this between chunks to
+    /// re-arm the decoder for a fresh stream while preserving history.
+    ///
+    /// For the more common "throw everything away" reset, use the
+    /// [`Decoder::reset`](crate::Decoder::reset) method from the
+    /// `Decoder` trait, which clears the window too.
+    pub fn reset_keep_window(&mut self) {
+        self.bit_reader.reset();
+        self.state = DecState::BlockHeader;
+        self.last_block = false;
+        self.poisoned = false;
     }
 
     /// Pull bytes from `input[*consumed..]` into the bit reader, stopping
