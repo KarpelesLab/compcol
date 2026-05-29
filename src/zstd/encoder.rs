@@ -103,104 +103,136 @@ pub(crate) struct LevelParams {
     pub max_chain: usize,
     /// Length at which the match finder stops looking for a longer candidate.
     pub nice_match: usize,
+    /// When true, the parser uses lazy match selection: after finding a
+    /// match at `pos` it also probes `pos+1`, and may emit a literal and
+    /// take the later match if it's meaningfully longer. Mirrors zstd's
+    /// `lazy`/`lazy2` strategies (we do single-step lookahead only).
+    pub lazy_search: bool,
 }
 
 impl LevelParams {
     /// Clamp `level` to `1..=22` and expand to match-finder tuning. The
     /// table broadly tracks zstd's reference presets but doesn't try to
-    /// reproduce them exactly — the strategy here is always hash-chain
-    /// greedy parsing, so the gains saturate well before level 22.
+    /// reproduce them exactly — the strategy here is hash-chain greedy
+    /// parsing at low levels and hash-chain lazy parsing at level ≥ 4.
+    /// Repeat-offset checks fire at every level (they're cheap enough that
+    /// even level 1 can afford them).
     pub(crate) fn from_level(level: u8) -> Self {
         let level = level.clamp(1, 22);
+        // Lazy parsing kicks in at level 4 — matches zstd's reference table
+        // where `lazy` strategies start at level 4.
+        let lazy_search = level >= 4;
         match level {
             1 => Self {
                 max_chain: 4,
                 nice_match: 8,
+                lazy_search,
             },
             2 => Self {
                 max_chain: 8,
                 nice_match: 12,
+                lazy_search,
             },
             3 => Self {
                 max_chain: 16,
                 nice_match: 16,
+                lazy_search,
             },
             4 => Self {
                 max_chain: 24,
                 nice_match: 24,
+                lazy_search,
             },
             5 => Self {
                 max_chain: 32,
                 nice_match: 32,
+                lazy_search,
             },
             6 => Self {
                 max_chain: 48,
                 nice_match: 48,
+                lazy_search,
             },
             7 => Self {
                 max_chain: 64,
                 nice_match: 64,
+                lazy_search,
             },
             8 => Self {
                 max_chain: 96,
                 nice_match: 96,
+                lazy_search,
             },
             9 => Self {
                 max_chain: 128,
                 nice_match: 128,
+                lazy_search,
             },
             10 => Self {
                 max_chain: 192,
                 nice_match: 160,
+                lazy_search,
             },
             11 => Self {
                 max_chain: 256,
                 nice_match: 192,
+                lazy_search,
             },
             12 => Self {
                 max_chain: 384,
                 nice_match: 224,
+                lazy_search,
             },
             13 => Self {
                 max_chain: 512,
                 nice_match: 256,
+                lazy_search,
             },
             14 => Self {
                 max_chain: 768,
                 nice_match: 384,
+                lazy_search,
             },
             15 => Self {
                 max_chain: 1024,
                 nice_match: 512,
+                lazy_search,
             },
             16 => Self {
                 max_chain: 1536,
                 nice_match: 768,
+                lazy_search,
             },
             17 => Self {
                 max_chain: 2048,
                 nice_match: 1024,
+                lazy_search,
             },
             18 => Self {
                 max_chain: 3072,
                 nice_match: 1536,
+                lazy_search,
             },
             19 => Self {
                 max_chain: 4096,
                 nice_match: 2048,
+                lazy_search,
             },
             20 => Self {
                 max_chain: 6144,
                 nice_match: 3072,
+                lazy_search,
             },
             21 => Self {
                 max_chain: 8192,
                 nice_match: 4096,
+                lazy_search,
             },
             // 22 (and clamp-from-above)
             _ => Self {
                 max_chain: 16384,
                 nice_match: super::matcher::MAX_MATCH,
+                lazy_search,
             },
         }
     }
@@ -307,41 +339,105 @@ impl Encoder {
         // Run LZ77 with repeat-offset awareness. We track a per-block ring
         // copy of `prev_offsets` and rewrite each emitted match's offset
         // through `assign_offset` so equal distances collapse to codes 1..=3.
+        //
+        // Two strategies depending on level:
+        //   - level ≤ 3: greedy. Take the best match at the current position.
+        //   - level ≥ 4: lazy. After finding a match at pos, also probe at
+        //     pos+1; if it gives a meaningfully longer match, emit a literal
+        //     and use that one instead.
+        //
+        // Independent of level, we always check the three repeat offsets at
+        // each position first — a repeat-offset match costs 1 bit in the
+        // offset stream vs. ~log2(distance) bits for a fresh offset, so even
+        // short repeats are cheap wins.
         let mut sequences: Vec<Seq> = Vec::new();
         let mut literals: Vec<u8> = Vec::with_capacity(buffer.len());
         let mut lit_start: usize = 0;
         let mut pos: usize = 0;
         let mut block_offsets = self.prev_offsets;
+        let lazy = self.params.lazy_search;
+        let buf_len = buffer.len();
+        let max_chain = self.params.max_chain;
+        let nice_match = self.params.nice_match;
 
-        while pos + MIN_MATCH < buffer.len() {
-            self.matcher.insert(buffer, pos);
-            let m = self.matcher.find_match(
+        // Invariant: positions in [0, next_insert) have already been spliced
+        // into the matcher's hash chain. We advance `next_insert` lazily.
+        let mut next_insert: usize = 0;
+        while pos + MIN_MATCH < buf_len {
+            // Make sure `pos` is in the chain.
+            while next_insert <= pos {
+                self.matcher.insert(buffer, next_insert);
+                next_insert += 1;
+            }
+
+            // Step 1: best-match selection at `pos`.
+            let (m_dist, m_len, m_is_rep1) = best_at(
+                &self.matcher,
                 buffer,
                 pos,
-                buffer.len(),
-                self.params.max_chain,
-                self.params.nice_match,
+                &block_offsets,
+                max_chain,
+                nice_match,
             );
-            if let Some(m) = m {
-                let literal_run = pos - lit_start;
-                let distance = m.distance;
-                let match_len = m.length;
-                let offset_value =
-                    assign_offset(distance as u32, literal_run as u32, &mut block_offsets);
-                literals.extend_from_slice(&buffer[lit_start..pos]);
-                sequences.push(Seq {
-                    literal_length: literal_run as u32,
-                    match_length: match_len as u32,
-                    offset_value,
-                });
-                for skip_pos in (pos + 1)..(pos + match_len) {
-                    self.matcher.insert(buffer, skip_pos);
-                }
-                pos += match_len;
-                lit_start = pos;
-            } else {
+
+            if m_len == 0 {
                 pos += 1;
+                continue;
             }
+
+            // Step 2 (lazy only): probe pos+1 for a meaningfully better match.
+            // "Meaningfully better" = strictly longer by at least 1 byte when
+            // the current isn't already long. We skip the probe when the
+            // current match is already at least `nice_match` — there's no
+            // plausible win at that point.
+            let (best_pos, best_dist, best_len) =
+                if lazy && m_len < nice_match && pos + 1 + MIN_MATCH < buf_len {
+                    // Insert pos+1 into the chain so its hash bucket includes it.
+                    while next_insert <= pos + 1 {
+                        self.matcher.insert(buffer, next_insert);
+                        next_insert += 1;
+                    }
+                    let (n_dist, n_len, _) = best_at(
+                        &self.matcher,
+                        buffer,
+                        pos + 1,
+                        &block_offsets,
+                        max_chain,
+                        nice_match,
+                    );
+                    // Score: prefer longer-match. A repeat-offset hit at pos
+                    // saves bits in the offset stream — bias slightly in its
+                    // favour by requiring the lazy match to beat by ≥2.
+                    let margin = if m_is_rep1 { 2 } else { 1 };
+                    if n_len >= m_len + margin {
+                        (pos + 1, n_dist, n_len)
+                    } else {
+                        (pos, m_dist, m_len)
+                    }
+                } else {
+                    (pos, m_dist, m_len)
+                };
+
+            // Emit the literals run up to `best_pos`, then the chosen match.
+            let literal_run = best_pos - lit_start;
+            let offset_value =
+                assign_offset(best_dist as u32, literal_run as u32, &mut block_offsets);
+            literals.extend_from_slice(&buffer[lit_start..best_pos]);
+            sequences.push(Seq {
+                literal_length: literal_run as u32,
+                match_length: best_len as u32,
+                offset_value,
+            });
+            // Splice the interior positions of the match into the chain so
+            // later positions can match against them. We only insert
+            // positions that aren't already in.
+            let match_end = best_pos + best_len;
+            while next_insert < match_end {
+                self.matcher.insert(buffer, next_insert);
+                next_insert += 1;
+            }
+            pos = match_end;
+            lit_start = pos;
         }
 
         if sequences.is_empty() {
@@ -595,6 +691,62 @@ impl Encoder {
         }
         drained
     }
+}
+
+/// Find the best (distance, length) match at `pos`, mixing repeat-offset
+/// probes with a hash-chain search.
+///
+/// Repeat-offset candidates are checked first: the three slots in
+/// `block_offsets` (per RFC 8478 §3.1.1.5, the most-recent offset is at
+/// index 0). Repeat-offset matches cost only the FSE code 1..=3 in the
+/// offset stream (1 to ~5 bits depending on FSE table) versus the
+/// `floor(log2(distance + 3))` extra bits a fresh offset spends, so we
+/// prefer them over a fresh-offset match of equal length.
+///
+/// The third return value flags whether the chosen match is the most-recent
+/// repeat offset (`offset_value == 1`). That's a useful hint for the lazy
+/// parser: a rep-0 match is so cheap that the lazy probe should require a
+/// larger gain before throwing it away.
+fn best_at(
+    matcher: &MatchFinder,
+    buffer: &[u8],
+    pos: usize,
+    block_offsets: &[u32; 3],
+    max_chain: usize,
+    nice_match: usize,
+) -> (usize, usize, bool) {
+    // Repeat-offset probes. The reference encoder gives these strong
+    // preference because they're nearly free in the offset stream.
+    let mut best_len: usize = 0;
+    let mut best_dist: usize = 0;
+    let mut best_is_rep1: bool = false;
+    for (i, &d) in block_offsets.iter().enumerate() {
+        let len = matcher.check_repeat_offset(buffer, pos, d as usize);
+        // Prefer earlier rep slots on ties (they encode in fewer bits and
+        // don't perturb the ring).
+        if len > best_len {
+            best_len = len;
+            best_dist = d as usize;
+            best_is_rep1 = i == 0;
+            if best_len >= nice_match {
+                return (best_dist, best_len, best_is_rep1);
+            }
+        }
+    }
+
+    // Hash-chain probe. The matcher already returns the longest such match.
+    if let Some(m) = matcher.find_match(buffer, pos, buffer.len(), max_chain, nice_match) {
+        // For a fresh-offset match to beat a repeat match, it has to be
+        // strictly longer — repeat-offset matches save bits in the offset
+        // stream, so equal lengths favour the repeat.
+        if m.length > best_len {
+            best_len = m.length;
+            best_dist = m.distance;
+            best_is_rep1 = best_dist == block_offsets[0] as usize;
+        }
+    }
+
+    (best_dist, best_len, best_is_rep1)
 }
 
 /// Pick the best per-table FSE mode (Predefined or FSE_Compressed) given the
