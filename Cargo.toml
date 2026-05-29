@@ -30,7 +30,7 @@ all = [
     "alloc", "std", "tokio", "factory",
     "rle", "deflate", "zlib", "gzip",
     "lzma", "xz",
-    "zstd", "brotli", "lz4", "snappy", "lzw",
+    "zstd", "brotli", "lz4", "snappy", "lzw", "bzip2",
     "lzo", "lzx", "quantum", "lzfse", "adc",
     "rar1", "rar2", "rar3", "rar5",
 ]
@@ -70,6 +70,10 @@ lz4     = ["alloc"]
 snappy  = ["alloc"]
 # Lempel–Ziv–Welch (Unix compress / GIF).
 lzw     = ["alloc"]
+# bzip2 (block-sorted: RLE-1 → BWT → MTF → RLE-2 → Huffman). Encoder
+# and decoder both implemented; the encoder uses a naive O(n² log n)
+# suffix-array build (rather than SA-IS) for the BWT.
+bzip2   = ["alloc"]
 # LZO (Lempel–Ziv–Oberhumer), LZO1X-1 variant.
 lzo     = ["alloc"]
 # LZX (Microsoft CAB / WIM compression).

@@ -91,6 +91,9 @@ pub mod lzfse;
 #[cfg(feature = "adc")]
 pub mod adc;
 
+#[cfg(feature = "bzip2")]
+pub mod bzip2;
+
 #[cfg(feature = "rar1")]
 pub mod rar1;
 
