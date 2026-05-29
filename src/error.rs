@@ -6,7 +6,12 @@ use core::fmt;
 /// the [`Encoder`](crate::Encoder) / [`Decoder`](crate::Decoder) traits object
 /// safe and lets the [`factory`](crate::factory) module hand back
 /// `Box<dyn Encoder>` cleanly.
+///
+/// Marked `#[non_exhaustive]`: future variants (new error classes added as
+/// algorithms grow more thorough about input validation) won't break
+/// downstream code. Pattern-matching `Error` requires a `_ => …` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// The encoded stream is malformed.
     Corrupt,
