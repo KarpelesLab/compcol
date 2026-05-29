@@ -50,6 +50,10 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         crate::lzo::Lzo::NAME => Some(Box::new(<crate::lzo::Lzo as Algorithm>::encoder())),
         #[cfg(feature = "lzx")]
         crate::lzx::Lzx::NAME => Some(Box::new(<crate::lzx::Lzx as Algorithm>::encoder())),
+        #[cfg(feature = "amiga_lzx")]
+        crate::amiga_lzx::AmigaLzx::NAME => Some(Box::new(
+            <crate::amiga_lzx::AmigaLzx as Algorithm>::encoder(),
+        )),
         #[cfg(feature = "quantum")]
         crate::quantum::Quantum::NAME => {
             Some(Box::new(<crate::quantum::Quantum as Algorithm>::encoder()))
@@ -171,6 +175,10 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         crate::lzo::Lzo::NAME => Some(Box::new(<crate::lzo::Lzo as Algorithm>::decoder())),
         #[cfg(feature = "lzx")]
         crate::lzx::Lzx::NAME => Some(Box::new(<crate::lzx::Lzx as Algorithm>::decoder())),
+        #[cfg(feature = "amiga_lzx")]
+        crate::amiga_lzx::AmigaLzx::NAME => Some(Box::new(
+            <crate::amiga_lzx::AmigaLzx as Algorithm>::decoder(),
+        )),
         #[cfg(feature = "quantum")]
         crate::quantum::Quantum::NAME => {
             Some(Box::new(<crate::quantum::Quantum as Algorithm>::decoder()))
@@ -323,6 +331,8 @@ pub const fn names() -> &'static [&'static str] {
         crate::lzo::Lzo::NAME,
         #[cfg(feature = "lzx")]
         crate::lzx::Lzx::NAME,
+        #[cfg(feature = "amiga_lzx")]
+        crate::amiga_lzx::AmigaLzx::NAME,
         #[cfg(feature = "quantum")]
         crate::quantum::Quantum::NAME,
         #[cfg(feature = "lzfse")]

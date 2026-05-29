@@ -31,7 +31,7 @@ all = [
     "rle", "deflate", "zlib", "gzip",
     "lzma", "xz",
     "zstd", "brotli", "lz4", "snappy", "lzw", "bzip2",
-    "lzo", "lzx", "quantum", "lzfse", "adc",
+    "lzo", "lzx", "amiga_lzx", "quantum", "lzfse", "adc",
     "rar1", "rar2", "rar3", "rar5",
 ]
 # Enables `alloc`-backed conveniences (e.g. the `factory` module, the
@@ -78,6 +78,10 @@ bzip2   = ["alloc"]
 lzo     = ["alloc"]
 # LZX (Microsoft CAB / WIM compression).
 lzx     = ["alloc"]
+# Amiga LZX (the original 1995 Forbes LZX as used in Amiga `.lzx` archives).
+# Block-level identical to MS-CAB LZX (which is what `lzx` provides) but with
+# a fixed 64 KiB window and no 32 KiB chunking or x86 E8-filter framing.
+amiga_lzx = ["alloc"]
 # Quantum (Stac, old CAB format). Decoder-only target.
 quantum = ["alloc"]
 # LZFSE (Apple's LZ77 + Finite State Entropy). Decoder-only target — the

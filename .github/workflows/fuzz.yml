@@ -32,6 +32,7 @@ jobs:
           - decoder_lz4
           - decoder_lz4_frame
           - decoder_bzip2
+          - decoder_amiga_lzx
     steps:
       - uses: actions/checkout@v6
       - name: Install nightly toolchain
