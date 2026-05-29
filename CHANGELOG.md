@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4](https://github.com/KarpelesLab/compcol/compare/v0.4.3...v0.4.4) - 2026-05-29
+
+### Other
+
+- *(brotli-u64-bitreader)* brotli: u64 accumulator + refill in BitSource ([#37](https://github.com/KarpelesLab/compcol/pull/37))
+- compute block cost from frequency histograms ([#36](https://github.com/KarpelesLab/compcol/pull/36))
+- u64 accumulator in RevBitReader to eliminate per-bit byte loop ([#35](https://github.com/KarpelesLab/compcol/pull/35))
+- byte-indexed table for forward CRC-32/MPEG-2 update ([#34](https://github.com/KarpelesLab/compcol/pull/34))
+- reuse decoder LzmaCore across full-reset chunks ([#33](https://github.com/KarpelesLab/compcol/pull/33))
+- *(pow2-mask)* Power-of-two window mask in 3 algorithms (amiga_lzx, rar3, rar5) ([#32](https://github.com/KarpelesLab/compcol/pull/32))
+- *(bulk-match-copy)* Bulk match copy via extend_from_within / copy_within across 14 algorithms ([#31](https://github.com/KarpelesLab/compcol/pull/31))
+- *(huffman-lut)* Huffman primary LUT for O(1) symbol decode across 7 algorithms ([#30](https://github.com/KarpelesLab/compcol/pull/30))
+- lock the .lzma "alone" encoder header contract against #14 regression ([#29](https://github.com/KarpelesLab/compcol/pull/29))
+- probe inner at the exact-budget boundary so trailer steps complete (closes #26) ([#27](https://github.com/KarpelesLab/compcol/pull/27))
+
 ## [0.4.3](https://github.com/KarpelesLab/compcol/compare/v0.4.2...v0.4.3) - 2026-05-29
 
 ### Other
