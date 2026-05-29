@@ -376,7 +376,23 @@ impl RawDecoder for Decoder {
                             done: false,
                         });
                     }
+                    // Reject implausible block sizes before allocating.
+                    // The encoder caps blocks at `compress_bound(BLOCK_SIZE)`
+                    // (~64 KiB worst case). Any declared length above
+                    // that is either malformed input or a malicious
+                    // payload trying to coax us into a gigabyte-scale
+                    // alloc. Cap with a small headroom (× 2) so legitimate
+                    // streams from foreign encoders aren't rejected.
+                    let max_block = block::compress_bound(BLOCK_SIZE)
+                        .saturating_add(4)
+                        .saturating_mul(2);
+                    if self.expected_len > max_block {
+                        self.poisoned = true;
+                        return Err(Error::Corrupt);
+                    }
                     self.compressed.clear();
+                    // `reserve` only after the bound check, so a hostile
+                    // 0xFFFFFFFF can't trigger an OOM.
                     self.compressed.reserve(self.expected_len);
                     self.phase = DecPhase::BlockData;
                 }

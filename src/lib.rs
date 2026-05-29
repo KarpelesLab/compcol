@@ -21,11 +21,16 @@ mod traits;
 pub use error::Error;
 pub use traits::{Algorithm, Decoder, Encoder, Progress, Status};
 
+pub mod limit;
+
 #[cfg(feature = "alloc")]
 pub mod vec;
 
 #[cfg(feature = "std")]
 pub mod io;
+
+#[cfg(feature = "tokio")]
+pub mod tokio_io;
 
 // Shared internals used by the deflate-family codecs. Kept private; the
 // surface that downstream crates see is the per-algorithm modules below.

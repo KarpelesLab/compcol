@@ -20,7 +20,11 @@
 //! - Encoder always emits a minimal 10-byte header (FLG = 0); the XFL byte
 //!   is filled in from [`EncoderConfig::level`] per RFC 1952 §2.3.1.
 //! - Concatenated gzip members are not supported — decoder stops at the
-//!   first member's trailer.
+//!   first member's trailer. Multi-member streams (RFC 1952 §2.2,
+//!   produced by `gzip --concatenate`, `tar zcf` on partial files,
+//!   `logrotate`, etc.) are now decoded — the decoder restarts at the
+//!   header phase whenever it sees another `1F 8B` magic after a
+//!   trailer.
 
 use crate::checksum::Crc32;
 use crate::deflate;
@@ -101,7 +105,13 @@ enum DecPhase {
     Deflate,
     /// Collecting the 8-byte trailer (CRC-32 + ISIZE, little-endian).
     Trailer,
-    /// Trailer validated; nothing more to consume.
+    /// Previous member's trailer validated. RFC 1952 §2.2 allows
+    /// concatenated members; the next input byte decides whether
+    /// we restart at `FixedHeader` for another member or settle into
+    /// `Done`. With no input available we stay here so `raw_finish`
+    /// can declare success cleanly.
+    BetweenMembers,
+    /// All members consumed; nothing more to do.
     Done,
 }
 
@@ -199,7 +209,8 @@ fn phase_rank(p: DecPhase) -> u8 {
         DecPhase::HeaderCrc => 5,
         DecPhase::Deflate => 6,
         DecPhase::Trailer => 7,
-        DecPhase::Done => 8,
+        DecPhase::BetweenMembers => 8,
+        DecPhase::Done => 9,
     }
 }
 
@@ -396,9 +407,62 @@ impl RawDecoder for Decoder {
                     if expected_isize != self.isize_count {
                         return Err(self.poison(Error::TrailerMismatch));
                     }
+                    // RFC 1952 §2.2: multiple members can be concatenated.
+                    // Park in BetweenMembers; whether the next byte starts
+                    // another member or signals end-of-stream is decided
+                    // on the next iteration / call.
+                    self.phase = DecPhase::BetweenMembers;
+                }
+                DecPhase::BetweenMembers => {
+                    if consumed >= input.len() {
+                        // No more bytes to inspect. Caller may either
+                        // hand us another member's bytes in a follow-up
+                        // call or call raw_finish to settle Done.
+                        return Ok(RawProgress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                    let next = input[consumed];
+                    if next == 0x1F {
+                        // Another member follows. Reset per-member state
+                        // (keep `inner` deflate decoder reusable via reset)
+                        // and re-enter the header. The 0x1F byte itself
+                        // stays in `input` to be consumed by the header
+                        // phase below. We `continue` instead of falling
+                        // through so the outer no-progress check at the
+                        // bottom of the loop doesn't immediately return:
+                        // the transition is real even though no byte was
+                        // consumed yet.
+                        self.inner.raw_reset();
+                        self.crc.reset();
+                        self.isize_count = 0;
+                        self.header_idx = 0;
+                        self.flg = 0;
+                        self.aux_idx = 0;
+                        self.aux_xlen = 0;
+                        self.aux_remaining = 0;
+                        self.trailer_carryover.clear();
+                        self.trailer_carryover_idx = 0;
+                        self.trailer_idx = 0;
+                        self.phase = DecPhase::FixedHeader;
+                        continue;
+                    }
+                    // Anything other than the gzip magic means the
+                    // stream ended. Fall through to Done, which will
+                    // silently swallow the trailing bytes — gzip(1)
+                    // does the same (the input could be a concatenated
+                    // gzip+something-else file, and decoders are
+                    // expected to be permissive).
                     self.phase = DecPhase::Done;
                 }
                 DecPhase::Done => {
+                    // Swallow any trailing bytes the caller still has
+                    // in `input` so the bridge reports Status::InputEmpty
+                    // rather than spinning on Status::OutputFull. The
+                    // payload is finished; nothing here is meaningful.
+                    consumed = input.len();
                     return Ok(RawProgress {
                         consumed,
                         written,
@@ -423,7 +487,10 @@ impl RawDecoder for Decoder {
         }
         let empty: [u8; 0] = [];
         let p = self.raw_decode(&empty, output)?;
-        if matches!(self.phase, DecPhase::Done) {
+        if matches!(self.phase, DecPhase::Done | DecPhase::BetweenMembers) {
+            // BetweenMembers with no more input == stream ended cleanly.
+            // Promote to Done so subsequent calls are idempotent.
+            self.phase = DecPhase::Done;
             Ok(RawProgress {
                 consumed: 0,
                 written: p.written,

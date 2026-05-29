@@ -34,6 +34,12 @@ pub enum Error {
     /// The stream uses an option or compression method this build does not
     /// implement (e.g. zlib `CM != 8`, zlib `FDICT = 1`, gzip reserved flags).
     Unsupported,
+    /// A [`LimitedDecoder`](crate::limit::LimitedDecoder) wrapper aborted
+    /// because the decompressed output would have exceeded the configured
+    /// `max_output_bytes` budget. Defends against decompression bombs
+    /// (small compressed input expanding to gigabytes); see
+    /// [`crate::limit`] for the wrapper.
+    OutputLimitExceeded,
 }
 
 impl fmt::Display for Error {
@@ -49,6 +55,9 @@ impl fmt::Display for Error {
             Error::ChecksumMismatch => f.write_str("checksum mismatch"),
             Error::TrailerMismatch => f.write_str("decoded length doesn't match trailer"),
             Error::Unsupported => f.write_str("unsupported compression option"),
+            Error::OutputLimitExceeded => {
+                f.write_str("decompressed output would exceed the configured limit")
+            }
         }
     }
 }

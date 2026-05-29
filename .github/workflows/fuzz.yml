@@ -1,0 +1,60 @@
+# Smoke fuzz: each decoder fuzz target gets a brief libfuzzer run on every
+# PR. 30 seconds × 9 targets ≈ 5 min wall-clock. Not a coverage campaign —
+# the goal is "do recent changes regress an obvious crash?". For deep
+# campaigns, run locally or wire OSS-Fuzz.
+
+name: Fuzz smoke
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'fuzz/**'
+      - '.github/workflows/fuzz.yml'
+  workflow_dispatch: {}
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - decoder_dispatch
+          - decoder_gzip
+          - decoder_zlib
+          - decoder_deflate
+          - decoder_zstd
+          - decoder_brotli
+          - decoder_lzma
+          - decoder_xz
+          - decoder_lz4
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        # Intentionally NOT --locked: cargo-fuzz 0.13's Cargo.lock pins
+        # rustix 0.36.5, which uses #[cfg_attr(rustc_attrs, ...)] and
+        # fails to compile on current stable. Letting cargo resolve
+        # picks a newer rustix that builds.
+        run: cargo install cargo-fuzz
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: fuzz-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('fuzz/Cargo.toml') }}
+      - name: Run ${{ matrix.target }} for 30s
+        working-directory: fuzz
+        # rss_limit_mb caps the fuzzer's total resident memory. The
+        # earlier 512 MiB cap caught real OOM bugs (lz4/lzo/snappy's
+        # unbounded length-prefix reserves) but also tripped on brotli's
+        # glibc-arena growth across ~500k iterations — not a real
+        # finding, just allocator fragmentation. 2 GiB is well within
+        # the runner's ~7 GiB while staying small enough that a decoder
+        # genuinely allocating gigabytes per iteration is still flagged.
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=30 -rss_limit_mb=2048 -malloc_limit_mb=2048

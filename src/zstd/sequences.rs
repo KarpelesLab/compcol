@@ -78,32 +78,40 @@ pub fn decode_sequences(data: &[u8], state: &mut SequencesState) -> Result<Vec<S
 
     let mut cur = hdr_after_count + 1;
 
+    // Each `resolve_table` advances `cur` based on the table mode and
+    // any embedded length prefixes inside `data`. A maliciously-crafted
+    // header can advance `cur` past `data.len()` between calls; use
+    // checked slicing to reject rather than panic.
+    fn slice_at(data: &[u8], cur: usize) -> Result<&[u8], Error> {
+        data.get(cur..).ok_or(Error::Corrupt)
+    }
+
     // Resolve each table.
     let ll_table = resolve_table(
         ll_mode,
-        &data[cur..],
+        slice_at(data, cur)?,
         &mut cur,
         &mut state.ll_table,
         TableKind::LiteralLength,
     )?;
     let of_table = resolve_table(
         of_mode,
-        &data[cur..],
+        slice_at(data, cur)?,
         &mut cur,
         &mut state.of_table,
         TableKind::Offset,
     )?;
     let ml_table = resolve_table(
         ml_mode,
-        &data[cur..],
+        slice_at(data, cur)?,
         &mut cur,
         &mut state.ml_table,
         TableKind::MatchLength,
     )?;
 
     // What's left is the FSE bit stream (reverse). Its last byte holds the
-    // start marker.
-    let bitstream = &data[cur..];
+    // start marker. Bounds-check the slice for the same reason as above.
+    let bitstream = data.get(cur..).ok_or(Error::Corrupt)?;
     if bitstream.is_empty() {
         return Err(Error::Corrupt);
     }
@@ -134,6 +142,15 @@ pub fn decode_sequences(data: &[u8], state: &mut SequencesState) -> Result<Vec<S
         // when consuming from the reverse stream. Actually per RFC the order
         // is: 1) Offset_Value extra bits, 2) Match_Length extra bits,
         // 3) Literal_Length extra bits.
+        //
+        // `of_sym` comes from an FSE-decoded table whose contents are
+        // taken from the input — malformed input can yield a symbol
+        // ≥ 32, which would overflow the `1u32 << of_sym` shift below.
+        // The zstd spec caps offset codes at 31; reject anything past
+        // that as corrupt.
+        if of_sym >= 32 {
+            return Err(Error::Corrupt);
+        }
         let offset_value = if of_sym > 0 {
             (1u32 << of_sym) + br.read(of_sym as u32)? as u32
         } else {

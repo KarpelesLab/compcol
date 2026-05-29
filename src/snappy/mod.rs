@@ -426,6 +426,16 @@ fn decompress_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
 
     let (uncompressed_len, vi_len) = read_varint_u32(input)?;
     let uncompressed_len = uncompressed_len as usize;
+    // The varint sits in `input` (max u32 = 4 GiB). A truly hostile
+    // header can ask us to reserve gigabytes before we've read a single
+    // byte of payload. Cap at a sane multiple of the compressed input
+    // size — snappy's max ratio is somewhere around 60×, so 256× is
+    // safely above anything legitimate without letting malicious
+    // headers deplete the heap.
+    let max_plausible = input.len().saturating_mul(256).max(64 * 1024);
+    if uncompressed_len > max_plausible {
+        return Err(Error::Corrupt);
+    }
     out.reserve(uncompressed_len);
 
     let mut ip = vi_len;

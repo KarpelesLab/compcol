@@ -353,3 +353,69 @@ fn output_decompresses_with_system_gunzip() {
     assert!(out.status.success());
     assert_eq!(out.stdout, input);
 }
+
+// ─── --level / -l flag ──────────────────────────────────────────────────
+
+#[test]
+fn level_flag_round_trips_through_compression() {
+    // Pick a reasonably-compressible payload (highly compressible data
+    // collapses to the same few bytes at every level on small inputs).
+    let payload: Vec<u8> = (0..16usize * 1024)
+        .map(|i| (i.wrapping_mul(2654435761) >> 8) as u8)
+        .collect();
+    let (out, _err, code) = run_with_stdin(&["-t", "gzip", "-l", "9", "-c"], &payload);
+    assert_eq!(code, 0);
+    assert!(!out.is_empty());
+    // And the resulting bytes decompress back.
+    let (back, _err, code) = run_with_stdin(&["-t", "gzip", "-d", "-c"], &out);
+    assert_eq!(code, 0);
+    assert_eq!(back, payload);
+}
+
+#[test]
+fn level_equals_form_is_accepted() {
+    let (out, _err, code) = run_with_stdin(&["-t", "zstd", "--level=19", "-c"], b"hello\n");
+    assert_eq!(code, 0);
+    // zstd magic.
+    assert_eq!(&out[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+}
+
+#[test]
+fn short_l_attached_value() {
+    let (out, _err, code) = run_with_stdin(&["-t", "gzip", "-l5", "-c"], b"hi\n");
+    assert_eq!(code, 0);
+    // gzip magic.
+    assert_eq!(&out[..2], &[0x1F, 0x8B]);
+}
+
+#[test]
+fn level_with_non_integer_is_usage_error() {
+    let (_out, err, code) = run_with_stdin(&["-t", "gzip", "-l", "abc", "-c"], b"data");
+    assert_eq!(code, 2);
+    assert!(
+        String::from_utf8_lossy(&err).contains("--level"),
+        "stderr was {}",
+        String::from_utf8_lossy(&err)
+    );
+}
+
+#[test]
+fn level_with_decompress_is_usage_error() {
+    let (_out, err, code) = run_with_stdin(&["-t", "gzip", "-d", "-l", "5", "-c"], b"data");
+    assert_eq!(code, 2);
+    assert!(
+        String::from_utf8_lossy(&err).contains("--level"),
+        "stderr was {}",
+        String::from_utf8_lossy(&err)
+    );
+}
+
+#[test]
+fn level_ignored_on_algorithms_without_a_level_knob() {
+    // rle has no level. --level is a no-op rather than an error.
+    let (out, _err, code) = run_with_stdin(&["-t", "rle", "-l", "5", "-c"], b"aaaa");
+    assert_eq!(code, 0);
+    let (back, _err, code) = run_with_stdin(&["-t", "rle", "-d", "-c"], &out);
+    assert_eq!(code, 0);
+    assert_eq!(back, b"aaaa");
+}
