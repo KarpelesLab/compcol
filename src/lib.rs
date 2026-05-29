@@ -21,6 +21,8 @@ mod traits;
 pub use error::Error;
 pub use traits::{Algorithm, Decoder, Encoder, Progress, Status};
 
+pub mod limit;
+
 #[cfg(feature = "alloc")]
 pub mod vec;
 
