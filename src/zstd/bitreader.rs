@@ -21,12 +21,24 @@ use crate::error::Error;
 ///
 /// Used by the FSE decoder, the Huffman decoder, and any zstd component that
 /// reads from a stream terminated by a high-bit "1" marker.
+///
+/// Internally maintains a 64-bit accumulator top-aligned with the next bit to
+/// deliver in the MSB. Bytes are pulled from the payload tail toward byte 0
+/// and shifted into the accumulator's low end, so each refill brings in up to
+/// 8 bits with two arithmetic ops instead of touching memory per bit.
 pub struct RevBitReader<'a> {
     data: &'a [u8],
     /// Total number of payload bits available (after the start marker).
     available: usize,
-    /// Number of bits already consumed.
+    /// Number of bits already consumed (semantic; drives `remaining`).
     consumed: usize,
+    /// Top-aligned bit accumulator: next bit to read is `acc >> 63`.
+    acc: u64,
+    /// Number of valid bits at the top of `acc`. Always in 0..=64.
+    bits_in_acc: u32,
+    /// Number of source bytes still available for refill. The next byte to
+    /// pull is `data[bytes_left - 1]`.
+    bytes_left: usize,
 }
 
 impl<'a> RevBitReader<'a> {
@@ -47,10 +59,24 @@ impl<'a> RevBitReader<'a> {
         // `leading_zeros` on a u8 returns count of leading zero bits.
         let marker_pos = 7 - last.leading_zeros() as usize;
         let available = (data.len() - 1) * 8 + marker_pos;
+
+        // Seed the accumulator with the partial last byte's payload bits
+        // (everything below the marker), MSB-first at the top of `acc`.
+        let mut acc: u64 = 0;
+        let mut bits_in_acc: u32 = 0;
+        if marker_pos > 0 {
+            let payload = (last as u64) & ((1u64 << marker_pos) - 1);
+            acc = payload << (64 - marker_pos as u32);
+            bits_in_acc = marker_pos as u32;
+        }
+
         Ok(Self {
             data,
             available,
             consumed: 0,
+            acc,
+            bits_in_acc,
+            bytes_left: data.len() - 1,
         })
     }
 
@@ -68,9 +94,43 @@ impl<'a> RevBitReader<'a> {
     /// Give back `n` previously-read bits. Required by the Huffman decoder
     /// which peeks `max_bits` and then keeps only the actual code length.
     pub fn unread(&mut self, n: u32) {
-        let n = n as usize;
-        debug_assert!(self.consumed >= n);
-        self.consumed -= n;
+        let n_usize = n as usize;
+        debug_assert!(self.consumed >= n_usize);
+        self.consumed -= n_usize;
+        // Rewind the accumulator. Because the source is read backward and
+        // there is no cheap way to recover prior bits already shifted off,
+        // we rebuild `acc`/`bits_in_acc`/`bytes_left` from the new cursor.
+        self.reseed_from_consumed();
+    }
+
+    /// Rebuild the internal accumulator from `consumed`. Called from `unread`,
+    /// which is rare (one call per Huffman symbol at most).
+    fn reseed_from_consumed(&mut self) {
+        // Position of the next bit to deliver in global bit numbering.
+        let next_bit = self.available - 1 - self.consumed;
+        let next_byte = next_bit / 8;
+        let bit_in_byte = (next_bit % 8) as u32; // 0..=7, 7=MSB
+        // The high byte contributes `bit_in_byte + 1` bits at the top of acc.
+        let high_byte_val = self.data[next_byte] as u64;
+        let take = bit_in_byte + 1;
+        let payload = high_byte_val & ((1u64 << take) - 1);
+        self.acc = payload << (64 - take);
+        self.bits_in_acc = take;
+        // The next byte to refill is the one just below.
+        self.bytes_left = next_byte;
+    }
+
+    /// Refill `acc` from the byte stream until at least 57 bits are buffered
+    /// (or the source is exhausted). Each iteration loads one byte's worth of
+    /// payload bits into the low end of the valid window.
+    #[inline]
+    fn refill(&mut self) {
+        while self.bits_in_acc <= 56 && self.bytes_left > 0 {
+            let byte = self.data[self.bytes_left - 1] as u64;
+            self.acc |= byte << (56 - self.bits_in_acc);
+            self.bits_in_acc += 8;
+            self.bytes_left -= 1;
+        }
     }
 
     /// Read `n` bits (0..=64) MSB-first from the current backward cursor.
@@ -86,46 +146,41 @@ impl<'a> RevBitReader<'a> {
         if self.consumed + n as usize > self.available {
             return Err(Error::Corrupt);
         }
-        // Bit numbering: bit index 0 = LSB of byte 0.
-        // The bit just below the start marker is `available - 1`.
-        // After reading `consumed` bits we're looking at bit
-        // `(available - 1) - consumed` next.
-        //
-        // We need `n` consecutive bits ending at `(available - 1) - consumed`
-        // (high) and starting at `(available - 1) - consumed - n + 1` (low),
-        // returned as MSB-first.
-        let high_bit = self.available - 1 - self.consumed;
-        let low_bit = high_bit + 1 - n as usize;
 
-        // Read byte by byte. Touching at most 9 bytes for n=64.
-        let mut acc: u64 = 0;
-        let mut bits_read: u32 = 0;
-        // Walk from the high byte down.
-        let mut cur_bit = high_bit;
-        while bits_read < n {
-            let byte_idx = cur_bit / 8;
-            let bit_in_byte = cur_bit % 8; // 0..=7, where 7 is MSB
-            // Number of bits we can pull from this byte's low side.
-            let take_from_this_byte = core::cmp::min(bit_in_byte as u32 + 1, n - bits_read);
-            // The bits we want are positions
-            //   (bit_in_byte) downto (bit_in_byte - take_from_this_byte + 1)
-            // i.e. the top `take_from_this_byte` bits of a `bit_in_byte+1`-wide
-            // window into this byte's low side.
-            let byte = self.data[byte_idx] as u64;
-            let shift_down = bit_in_byte as u32 + 1 - take_from_this_byte;
-            let mask = (1u64 << take_from_this_byte) - 1;
-            let chunk = (byte >> shift_down) & mask;
-            acc = (acc << take_from_this_byte) | chunk;
-            bits_read += take_from_this_byte;
-            if bits_read == n {
-                break;
+        if n <= 56 {
+            // Fast path: one refill suffices.
+            if self.bits_in_acc < n {
+                self.refill();
             }
-            cur_bit = (byte_idx * 8) - 1; // step down into the previous byte
+            let result = self.acc >> (64 - n);
+            self.acc <<= n;
+            self.bits_in_acc -= n;
+            self.consumed += n as usize;
+            Ok(result)
+        } else {
+            // Wide-read path (n in 57..=64): take the top 56 bits in one
+            // shot, then the remaining n-56 bits with a second refill. This
+            // matches the byte-by-byte version's semantics without needing
+            // a u128 accumulator.
+            let high_n = 56u32;
+            let low_n = n - 56;
+            // Top chunk.
+            if self.bits_in_acc < high_n {
+                self.refill();
+            }
+            let high = self.acc >> (64 - high_n);
+            self.acc <<= high_n;
+            self.bits_in_acc -= high_n;
+            // Low chunk.
+            if self.bits_in_acc < low_n {
+                self.refill();
+            }
+            let low = self.acc >> (64 - low_n);
+            self.acc <<= low_n;
+            self.bits_in_acc -= low_n;
+            self.consumed += n as usize;
+            Ok((high << low_n) | low)
         }
-        // Guard the unused-variable lint for low_bit; we computed it for clarity.
-        let _ = low_bit;
-        self.consumed += n as usize;
-        Ok(acc)
     }
 }
 
@@ -194,5 +249,49 @@ mod tests {
         // Remaining 4 bits = low nibble of byte 0 = 0xF
         let v = r.read(4).unwrap();
         assert_eq!(v, 0xF);
+    }
+
+    #[test]
+    fn wide_read_64_bits() {
+        // Nine bytes: low eight are payload, last byte is a bare marker (0x01).
+        // available = 8*8 + 0 = 64.
+        // MSB-first 64-bit read = the eight payload bytes interpreted big-endian.
+        let data = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01];
+        let mut r = RevBitReader::new(&data).unwrap();
+        assert_eq!(r.remaining(), 64);
+        let v = r.read(64).unwrap();
+        // Order: byte 7 = 0xEF (MSB), byte 6 = 0xCD, ..., byte 0 = 0x01 (LSB).
+        assert_eq!(v, 0xEFCD_AB89_6745_2301);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn wide_read_60_bits_then_4() {
+        let data = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01];
+        let mut r = RevBitReader::new(&data).unwrap();
+        // Top 60 bits then bottom 4.
+        let high = r.read(60).unwrap();
+        let low = r.read(4).unwrap();
+        let combined = (high << 4) | low;
+        assert_eq!(combined, 0xEFCD_AB89_6745_2301);
+    }
+
+    #[test]
+    fn unread_round_trip() {
+        // Eight bytes plus a marker. Read 12 bits, unread 4, then read 4 — the
+        // unread 4 should reappear as the next 4 bits.
+        let data = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01];
+        let mut r = RevBitReader::new(&data).unwrap();
+        let first12 = r.read(12).unwrap();
+        // The first 12 MSB-first bits are the top 12 of the 64-bit value
+        // 0xEFCD_AB89_6745_2301, i.e. 0xEFC.
+        assert_eq!(first12, 0xEFC);
+        r.unread(4);
+        // Now the next 4 bits should be the lower nibble of the just-read 12.
+        let nibble = r.read(4).unwrap();
+        assert_eq!(nibble, 0xC);
+        // Continue reading the next 8.
+        let next8 = r.read(8).unwrap();
+        assert_eq!(next8, 0xDA);
     }
 }
