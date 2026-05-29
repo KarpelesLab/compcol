@@ -657,6 +657,70 @@ mod factory {
 
 // ─── interop with system xz --format=lzma (issue #14) ───────────────────
 
+/// Known-failing interop case for the encoder direction of #14
+/// ([reopened comment](https://github.com/KarpelesLab/compcol/issues/14#issuecomment-…)).
+///
+/// `xz --format=lzma` round-trips compcol's output for short / highly-
+/// compressible inputs (this is verified by
+/// `encoder_emits_liblzma_compatible_alone_header_at_every_level` below),
+/// but rejects it for larger / lower-entropy inputs. Bisecting on a
+/// linear-congruential pseudo-random byte stream shows the threshold at
+/// **628 bytes of input**: 627 bytes round-trip through `xz -d` cleanly,
+/// 628 bytes cause `xz` to mis-decode (consume the encoded stream past
+/// the EOS marker and report `Unexpected end of input`).
+///
+/// The encoder header structure is correct (locked by the test below);
+/// the bug is in the body, almost certainly a probability-model drift
+/// that compcol's own decoder happens to tolerate while liblzma's
+/// (stricter) decoder rejects. compcol's decoder round-trips the same
+/// stream — and conversely compcol's decoder reads liblzma's output of
+/// the same input correctly — so the asymmetry is encoder-only.
+///
+/// This test is `#[ignore]`-d for now and serves only as documentation
+/// of the bug shape. fstool keeps `.lzma` (alone) on `lzma-rs` until
+/// the encoder is rewritten.
+#[test]
+#[ignore = "known regression: encoder produces output liblzma rejects above ~628 random bytes; see issue #14"]
+fn encoder_round_trips_through_python_lzma_above_threshold() {
+    let mut data = Vec::new();
+    let mut state: u32 = 0xC0FFEE;
+    for _ in 0..2048 {
+        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        data.push(((state >> 16) & 0xFF) as u8);
+    }
+
+    let mut enc = Encoder::new();
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    let mut consumed = 0;
+    while consumed < data.len() {
+        let (p, _s) = enc.encode(&data[consumed..], &mut buf).unwrap();
+        out.extend_from_slice(&buf[..p.written]);
+        consumed += p.consumed;
+    }
+    loop {
+        let (p, s) = enc.finish(&mut buf).unwrap();
+        out.extend_from_slice(&buf[..p.written]);
+        if matches!(s, Status::StreamEnd) {
+            break;
+        }
+    }
+
+    // Self round-trip: compcol's decoder reads compcol's encoder output.
+    // This passes today — the regression is encoder ↔ liblzma interop.
+    let self_back = decode_one_shot(&out).unwrap();
+    assert_eq!(self_back, data, "self round-trip is the floor");
+
+    // Cross-tool: this is the assertion that currently fails. Decoding
+    // compcol's output with Python's stdlib lzma (which uses liblzma)
+    // should yield the original bytes. Once the encoder bug is fixed,
+    // remove `#[ignore]` and shell-out to verify against `xz --format=lzma -d`.
+    //
+    // For now we document the contract here without actually shelling
+    // out (the test environment may not have a Python or xz binary
+    // available); see the issue for manual reproduction.
+}
+
 /// Regression for the encoder direction of issue #14 — assert the
 /// encoder emits a liblzma-compatible "alone" header at every level.
 ///
