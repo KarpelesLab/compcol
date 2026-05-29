@@ -1,6 +1,6 @@
 [package]
 name          = "compcol"
-version       = "0.3.1"
+version       = "0.4.0"
 edition       = "2024"
 # Edition 2024 stabilised in Rust 1.85. Code uses `let chains` (Rust 1.88)
 # inside the brotli encoder and the io adapters, so 1.88 is the real floor.
