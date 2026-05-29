@@ -425,6 +425,54 @@ impl Decoder {
         let idx = (self.window_pos + WINDOW_SIZE - d) % WINDOW_SIZE;
         self.window[idx]
     }
+
+    /// Bulk-emit `n` literal bytes from `src` into output and the sliding
+    /// window. Caller guarantees `n` bytes of output room and `n` bytes
+    /// of input. Splits the window write at the wrap boundary.
+    fn emit_literal_bulk(&mut self, src: &[u8], output: &mut [u8], written: &mut usize) {
+        let n = src.len();
+        output[*written..*written + n].copy_from_slice(src);
+        *written += n;
+        // Window write: may need to split at wrap.
+        let first = (WINDOW_SIZE - self.window_pos).min(n);
+        self.window[self.window_pos..self.window_pos + first].copy_from_slice(&src[..first]);
+        if first < n {
+            let rem = n - first;
+            self.window[..rem].copy_from_slice(&src[first..]);
+        }
+        self.window_pos = (self.window_pos + n) % WINDOW_SIZE;
+        self.emitted += n as u64;
+    }
+
+    /// Bulk-copy `n` bytes from `distance` back. Caller must have
+    /// verified `n <= distance` (non-overlapping) and `n` bytes of output
+    /// room. Splits the read AND write at the wrap boundary.
+    fn copy_match_bulk(&mut self, distance: u32, n: usize, output: &mut [u8], written: &mut usize) {
+        let d = distance as usize;
+        let src_idx = (self.window_pos + WINDOW_SIZE - d) % WINDOW_SIZE;
+        // Source may wrap at WINDOW_SIZE.
+        let src_first = (WINDOW_SIZE - src_idx).min(n);
+        // Write into output (which is linear).
+        output[*written..*written + src_first]
+            .copy_from_slice(&self.window[src_idx..src_idx + src_first]);
+        if src_first < n {
+            let rem = n - src_first;
+            output[*written + src_first..*written + n].copy_from_slice(&self.window[..rem]);
+        }
+        // Now copy those bytes back into the window at window_pos (may wrap).
+        let dst_first = (WINDOW_SIZE - self.window_pos).min(n);
+        // Read from the contiguous output we just wrote.
+        let out_slice = &output[*written..*written + n];
+        self.window[self.window_pos..self.window_pos + dst_first]
+            .copy_from_slice(&out_slice[..dst_first]);
+        if dst_first < n {
+            let rem = n - dst_first;
+            self.window[..rem].copy_from_slice(&out_slice[dst_first..]);
+        }
+        self.window_pos = (self.window_pos + n) % WINDOW_SIZE;
+        *written += n;
+        self.emitted += n as u64;
+    }
 }
 
 impl Default for Decoder {
@@ -449,6 +497,13 @@ impl RawDecoder for Decoder {
             } = self.phase
             {
                 let mut rem = remaining;
+                let out_room = output.len() - written;
+                let chunk = (rem as usize).min(out_room);
+                if chunk > 0 && (distance as usize) >= chunk {
+                    // Non-overlapping: bulk-copy.
+                    self.copy_match_bulk(distance, chunk, output, &mut written);
+                    rem -= chunk as u16;
+                }
                 while rem > 0 {
                     if written == output.len() {
                         self.phase = DecPhase::Copying {
@@ -472,27 +527,22 @@ impl RawDecoder for Decoder {
             // Literal run also wants output room (and input).
             if let DecPhase::Literal { remaining } = self.phase {
                 let mut rem = remaining;
-                while rem > 0 {
-                    if consumed == input.len() {
-                        self.phase = DecPhase::Literal { remaining: rem };
-                        return Ok(RawProgress {
-                            consumed,
-                            written,
-                            done: false,
-                        });
-                    }
-                    if written == output.len() {
-                        self.phase = DecPhase::Literal { remaining: rem };
-                        return Ok(RawProgress {
-                            consumed,
-                            written,
-                            done: false,
-                        });
-                    }
-                    let b = input[consumed];
-                    consumed += 1;
-                    self.emit_byte(b, output, &mut written);
-                    rem -= 1;
+                let in_room = input.len() - consumed;
+                let out_room = output.len() - written;
+                let chunk = (rem as usize).min(in_room).min(out_room);
+                if chunk > 0 {
+                    let src = &input[consumed..consumed + chunk];
+                    self.emit_literal_bulk(src, output, &mut written);
+                    consumed += chunk;
+                    rem -= chunk as u16;
+                }
+                if rem > 0 {
+                    self.phase = DecPhase::Literal { remaining: rem };
+                    return Ok(RawProgress {
+                        consumed,
+                        written,
+                        done: false,
+                    });
                 }
                 self.phase = DecPhase::Tag;
                 continue;
@@ -579,6 +629,12 @@ impl RawDecoder for Decoder {
         } = self.phase
         {
             let mut rem = remaining;
+            let out_room = output.len() - written;
+            let chunk = (rem as usize).min(out_room);
+            if chunk > 0 && (distance as usize) >= chunk {
+                self.copy_match_bulk(distance, chunk, output, &mut written);
+                rem -= chunk as u16;
+            }
             while rem > 0 {
                 if written == output.len() {
                     self.phase = DecPhase::Copying {
