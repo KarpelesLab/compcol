@@ -212,22 +212,25 @@ impl RangeDecoder {
     }
 
     /// Decode `count` direct (uniform) bits in a tight loop and return their
-    /// accumulated value, **LSB-first** — the bit decoded on iteration `i`
-    /// occupies bit position `i` of the result. This matches the LSB-first
-    /// emission convention of `src/lzma/encoder.rs::encode_direct_bits`.
+    /// accumulated value, **MSB-first** — the bit decoded on iteration 0
+    /// becomes the highest bit of the result; the bit decoded last is bit 0.
+    /// This matches liblzma's wire convention (LzmaDec.c uses
+    /// `distance = (distance << 1) + ...`, LzmaEnc.c emits via a top-bit
+    /// shift loop), so the same compressed stream that liblzma's `xz -d`
+    /// decodes is the one this function reconstructs the same value from.
     ///
     /// This is the hot path for slot >= 14 (random / incompressible data):
     /// `count` can be up to 26. By inlining normalisation into the loop we
     /// avoid the per-bit function-call overhead and let the optimiser keep
     /// `range`/`code`/`pos` in registers across iterations.
     #[inline(always)]
-    fn decode_direct_bits_lsb(&mut self, count: u32, buf: &[u8]) -> Result<u32, Error> {
+    fn decode_direct_bits_msb(&mut self, count: u32, buf: &[u8]) -> Result<u32, Error> {
         let mut range = self.range;
         let mut code = self.code;
         let mut pos = self.pos;
         let buf_len = buf.len();
         let mut result: u32 = 0;
-        for i in 0..count {
+        for _ in 0..count {
             // Normalise inline.
             if range < RC_TOP_VALUE {
                 if pos >= buf_len {
@@ -250,7 +253,8 @@ impl RangeDecoder {
             code = (code & mask) | (t & !mask);
             // bit = !mask & 1
             let bit = (!mask) & 1;
-            result |= bit << i;
+            // MSB-first: shift accumulator left, place new bit at position 0.
+            result = (result << 1) | bit;
         }
         self.range = range;
         self.code = code;
@@ -613,10 +617,10 @@ impl LzmaCore {
             // uniform (no probability model), and only the low 4 align bits
             // use a tiny probability tree. On random/incompressible data
             // this branch is taken on every match — batch the direct bits
-            // through `decode_direct_bits_lsb` (one tight loop, normalise
+            // through `decode_direct_bits_msb` (one tight loop, normalise
             // inline) and then run a specialised 4-bit align decode.
             let direct_count = num_direct_bits - ALIGN_BITS;
-            let direct = self.range.decode_direct_bits_lsb(direct_count, buf)?;
+            let direct = self.range.decode_direct_bits_msb(direct_count, buf)?;
             dist |= direct << ALIGN_BITS;
             let v = dist_align_reverse_decode(&mut self.range, &mut self.dist_align, buf)?;
             dist |= v;

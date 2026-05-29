@@ -278,17 +278,19 @@ impl RangeEncoder {
         self.normalize();
     }
 
-    /// Encode `value` as `bits` direct bits.
+    /// Encode `value` as `bits` direct (uniform) bits, **MSB-first**.
     ///
-    /// Direction matters. The range coder transmits the FIRST bit at the
-    /// HIGHEST position on the wire; the decoder reads in matching order.
-    /// The decoder's loop is `for i in 0..direct_count: direct |= bit << i`,
-    /// so the i-th bit it reads becomes bit position `i` of its result. For
-    /// our emission to produce a matching `direct`, the i-th bit we emit
-    /// must equal `(value >> i) & 1` — i.e. LSB-first emission, with the
-    /// MSB of `value` being the LAST bit encoded.
+    /// liblzma's reference encoder (LzmaEnc.c) emits direct bits via a
+    /// top-bit shift loop, so the bit at position `bits-1` of `value`
+    /// goes onto the wire first. To stay interoperable with liblzma's
+    /// `xz -d` / Python's stdlib `lzma` decoder, we mirror that order
+    /// here: bit `(value >> (bits-1)) & 1` is encoded first, bit 0 last.
+    /// The matching decoder is `RangeDecoder::decode_direct_bits_msb` in
+    /// `src/lzma/mod.rs`.
     fn encode_direct_bits(&mut self, value: u32, bits: u32) {
-        for i in 0..bits {
+        let mut i = bits;
+        while i > 0 {
+            i -= 1;
             self.encode_direct_bit((value >> i) & 1);
         }
     }
