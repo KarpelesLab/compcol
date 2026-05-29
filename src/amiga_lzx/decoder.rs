@@ -822,7 +822,8 @@ fn step_huff(ctx: &mut RunCtx) -> Result<bool, Error> {
                         return Err(Error::Corrupt);
                     }
                     debug_assert_eq!(ctx.window.len(), WINDOW_SIZE);
-                    let src = (ctx.window_pos + WINDOW_SIZE - distance as usize) & (WINDOW_SIZE - 1);
+                    let src =
+                        (ctx.window_pos + WINDOW_SIZE - distance as usize) & (WINDOW_SIZE - 1);
                     let b = ctx.window[src];
                     emit_window(ctx, b);
                     copied += 1;
