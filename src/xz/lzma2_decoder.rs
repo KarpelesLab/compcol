@@ -124,6 +124,7 @@ impl RangeDecoder {
         Ok(())
     }
 
+    #[inline(always)]
     fn normalize(&mut self, buf: &[u8]) -> Result<(), Error> {
         if self.range < RC_TOP_VALUE {
             if self.pos >= buf.len() {
@@ -136,6 +137,7 @@ impl RangeDecoder {
         Ok(())
     }
 
+    #[inline(always)]
     fn decode_bit(&mut self, prob: &mut u16, buf: &[u8]) -> Result<u32, Error> {
         self.normalize(buf)?;
         let p = *prob as u32;
@@ -152,19 +154,54 @@ impl RangeDecoder {
         }
     }
 
-    fn decode_direct_bit(&mut self, buf: &[u8]) -> Result<u32, Error> {
-        self.normalize(buf)?;
-        self.range >>= 1;
-        let t = self.code.wrapping_sub(self.range);
-        let mask = (t as i32 >> 31) as u32;
-        self.code = self.code.wrapping_sub(self.range & !mask);
-        let bit = if mask == 0 { 1 } else { 0 };
-        Ok(bit)
+    /// Decode `count` direct (uniform) bits in a tight loop and return their
+    /// accumulated value, **MSB-first** — the first decoded bit becomes the
+    /// highest position of the result. This matches the MSB-first emission
+    /// convention of `src/xz/lzma2_encoder.rs::encode_direct_bits` and the
+    /// per-bit accumulation `direct = (direct << 1) | bit` used previously
+    /// in this file's `decode_distance`.
+    ///
+    /// This is the hot path for slot >= 14 on random / incompressible data.
+    /// Inlining normalisation into the loop avoids per-bit function-call
+    /// overhead and lets the optimiser keep `range`/`code`/`pos` in
+    /// registers across iterations.
+    #[inline(always)]
+    fn decode_direct_bits_msb(&mut self, count: u32, buf: &[u8]) -> Result<u32, Error> {
+        let mut range = self.range;
+        let mut code = self.code;
+        let mut pos = self.pos;
+        let buf_len = buf.len();
+        let mut result: u32 = 0;
+        for _ in 0..count {
+            if range < RC_TOP_VALUE {
+                if pos >= buf_len {
+                    self.range = range;
+                    self.code = code;
+                    self.pos = pos;
+                    return Err(Error::UnexpectedEnd);
+                }
+                range <<= 8;
+                code = (code << 8) | buf[pos] as u32;
+                pos += 1;
+            }
+            range >>= 1;
+            let t = code.wrapping_sub(range);
+            let mask = (t as i32 >> 31) as u32; // all-ones when code < range
+            // bit = 1 if code >= range (mask == 0); subtract `range` from code in that case.
+            code = (code & mask) | (t & !mask);
+            let bit = (!mask) & 1;
+            result = (result << 1) | bit;
+        }
+        self.range = range;
+        self.code = code;
+        self.pos = pos;
+        Ok(result)
     }
 }
 
 // ─── bit-tree helpers ─────────────────────────────────────────────────────
 
+#[inline]
 fn bittree_decode(
     rd: &mut RangeDecoder,
     probs: &mut [u16],
@@ -179,19 +216,28 @@ fn bittree_decode(
     Ok(idx - (1 << bits))
 }
 
-fn bittree_reverse_decode(
+/// Specialised 4-bit reverse bit-tree for the dist-align table; the index
+/// array is fixed-size so the optimiser can elide bounds checks.
+#[inline(always)]
+fn dist_align_reverse_decode(
     rd: &mut RangeDecoder,
-    probs: &mut [u16],
-    bits: u32,
+    probs: &mut [u16; ALIGN_SIZE],
     buf: &[u8],
 ) -> Result<u32, Error> {
-    let mut idx: u32 = 1;
+    let mut idx: usize = 1;
     let mut result: u32 = 0;
-    for i in 0..bits {
-        let bit = rd.decode_bit(&mut probs[idx as usize], buf)?;
-        idx = (idx << 1) | bit;
-        result |= bit << i;
-    }
+    let bit = rd.decode_bit(&mut probs[idx], buf)?;
+    idx = (idx << 1) | bit as usize;
+    result |= bit;
+    let bit = rd.decode_bit(&mut probs[idx], buf)?;
+    idx = (idx << 1) | bit as usize;
+    result |= bit << 1;
+    let bit = rd.decode_bit(&mut probs[idx], buf)?;
+    idx = (idx << 1) | bit as usize;
+    result |= bit << 2;
+    let bit = rd.decode_bit(&mut probs[idx], buf)?;
+    let _ = idx;
+    result |= bit << 3;
     Ok(result)
 }
 
@@ -541,26 +587,18 @@ impl LzmaCore {
             }
             dist = (idx as u32) - m;
         } else {
-            // Direct (uniform) bits, decoded MSB-first. The encoder writes
-            // them with `value >> i` for i from high to low; the decoder
-            // accumulates left-shifted so the first-decoded bit lands in
-            // the highest position. (`src/lzma/mod.rs` uses an equivalent
-            // formulation that happens to put the first bit in the LSB —
-            // both work as long as the bitstream and dist composition are
-            // consistent.)
+            // Direct (uniform) bits, decoded MSB-first, then a 4-bit align
+            // bittree. The MSB-first ordering matches the corresponding
+            // encoder in `src/xz/lzma2_encoder.rs` (which differs from the
+            // LSB-first ordering used by `src/lzma/`).
+            //
+            // Hot path on random / incompressible data — batch the direct
+            // bits with inlined normalisation and use the specialised
+            // 4-bit align decode.
             let direct_count = num_direct_bits - ALIGN_BITS;
-            let mut direct: u32 = 0;
-            for _ in 0..direct_count {
-                let bit = self.range.decode_direct_bit(buf)?;
-                direct = (direct << 1) | bit;
-            }
+            let direct = self.range.decode_direct_bits_msb(direct_count, buf)?;
             dist |= direct << ALIGN_BITS;
-            let v = bittree_reverse_decode(
-                &mut self.range,
-                self.dist_align.as_mut_slice(),
-                ALIGN_BITS,
-                buf,
-            )?;
+            let v = dist_align_reverse_decode(&mut self.range, &mut self.dist_align, buf)?;
             dist |= v;
         }
         Ok(dist)

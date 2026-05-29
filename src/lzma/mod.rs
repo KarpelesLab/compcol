@@ -69,6 +69,14 @@ impl Algorithm for Lzma {
 /// decoder returns `NeedInput` and waits for the next call.
 const REQUIRED_INPUT_MAX: usize = 20;
 
+/// Threshold at which `drain_output` collapses the consumed prefix of
+/// `Decoder::buf`. Compacting on every packet was the dominant decode
+/// cost on incompressible inputs: each packet drained a few bytes from a
+/// buffer holding the entire compressed stream (memmove of ~N bytes per
+/// packet → O(N^2)). Holding off until the prefix is at least this large
+/// caps total memmove work at O(N · buf_max / threshold).
+const COMPACT_THRESHOLD: usize = 64 * 1024;
+
 const STATES: usize = 12;
 const LIT_STATES: usize = 7;
 const POS_STATES_MAX: usize = 1 << 4;
@@ -172,6 +180,7 @@ impl RangeDecoder {
     /// Try to normalise. Returns `Err(UnexpectedEnd)` if there isn't enough
     /// input — callers above this layer must ensure adequate input has been
     /// buffered (see `REQUIRED_INPUT_MAX`).
+    #[inline(always)]
     fn normalize(&mut self, buf: &[u8]) -> Result<(), Error> {
         if self.range < RC_TOP_VALUE {
             if self.pos >= buf.len() {
@@ -185,6 +194,7 @@ impl RangeDecoder {
     }
 
     /// Decode one bit using the probability slot `prob`.
+    #[inline(always)]
     fn decode_bit(&mut self, prob: &mut u16, buf: &[u8]) -> Result<u32, Error> {
         self.normalize(buf)?;
         let p = *prob as u32;
@@ -201,17 +211,51 @@ impl RangeDecoder {
         }
     }
 
-    /// Decode one "direct" bit (uniform).
-    fn decode_direct_bit(&mut self, buf: &[u8]) -> Result<u32, Error> {
-        self.normalize(buf)?;
-        self.range >>= 1;
-        let t = self.code.wrapping_sub(self.range);
-        // t's sign bit: 1 if code < range, 0 otherwise.
-        let mask = (t as i32 >> 31) as u32; // all-ones if code<range, else 0
-        self.code = self.code.wrapping_sub(self.range & !mask);
-        // bit = 1 if code >= range, 0 if code < range
-        let bit = if mask == 0 { 1 } else { 0 };
-        Ok(bit)
+    /// Decode `count` direct (uniform) bits in a tight loop and return their
+    /// accumulated value, **LSB-first** — the bit decoded on iteration `i`
+    /// occupies bit position `i` of the result. This matches the LSB-first
+    /// emission convention of `src/lzma/encoder.rs::encode_direct_bits`.
+    ///
+    /// This is the hot path for slot >= 14 (random / incompressible data):
+    /// `count` can be up to 26. By inlining normalisation into the loop we
+    /// avoid the per-bit function-call overhead and let the optimiser keep
+    /// `range`/`code`/`pos` in registers across iterations.
+    #[inline(always)]
+    fn decode_direct_bits_lsb(&mut self, count: u32, buf: &[u8]) -> Result<u32, Error> {
+        let mut range = self.range;
+        let mut code = self.code;
+        let mut pos = self.pos;
+        let buf_len = buf.len();
+        let mut result: u32 = 0;
+        for i in 0..count {
+            // Normalise inline.
+            if range < RC_TOP_VALUE {
+                if pos >= buf_len {
+                    self.range = range;
+                    self.code = code;
+                    self.pos = pos;
+                    return Err(Error::UnexpectedEnd);
+                }
+                range <<= 8;
+                code = (code << 8) | buf[pos] as u32;
+                pos += 1;
+            }
+            range >>= 1;
+            // Branch-free: bit = (code >= range) ? 1 : 0. We need to also
+            // subtract `range` from `code` when bit == 1.
+            let t = code.wrapping_sub(range);
+            let mask = (t as i32 >> 31) as u32; // all-ones when code < range
+            // When bit == 1 (mask == 0), keep `t` (i.e. code - range);
+            // when bit == 0 (mask == all-ones), keep original `code`.
+            code = (code & mask) | (t & !mask);
+            // bit = !mask & 1
+            let bit = (!mask) & 1;
+            result |= bit << i;
+        }
+        self.range = range;
+        self.code = code;
+        self.pos = pos;
+        Ok(result)
     }
 }
 
@@ -227,6 +271,7 @@ impl RangeDecoder {
 // approach is correct.
 
 /// `bits` is `log2(probs.len())`. Decodes `bits` bits MSB-first.
+#[inline]
 fn bittree_decode(
     rd: &mut RangeDecoder,
     probs: &mut [u16],
@@ -241,20 +286,33 @@ fn bittree_decode(
     Ok(idx - (1 << bits))
 }
 
-/// Reverse bit-tree decoder: the tree returns the bit-reversed symbol value.
-fn bittree_reverse_decode(
+/// Specialised 4-bit reverse bit-tree for the dist-align table. The hot
+/// inner loop unrolls 4 probability lookups onto a fixed-size array, which
+/// lets the optimiser elide bounds checks and keep `idx` in a register.
+#[inline(always)]
+fn dist_align_reverse_decode(
     rd: &mut RangeDecoder,
-    probs: &mut [u16],
-    bits: u32,
+    probs: &mut [u16; ALIGN_SIZE],
     buf: &[u8],
 ) -> Result<u32, Error> {
-    let mut idx: u32 = 1;
+    let mut idx: usize = 1;
     let mut result: u32 = 0;
-    for i in 0..bits {
-        let bit = rd.decode_bit(&mut probs[idx as usize], buf)?;
-        idx = (idx << 1) | bit;
-        result |= bit << i;
-    }
+    // Iteration 0
+    let bit = rd.decode_bit(&mut probs[idx], buf)?;
+    idx = (idx << 1) | bit as usize;
+    result |= bit;
+    // Iteration 1
+    let bit = rd.decode_bit(&mut probs[idx], buf)?;
+    idx = (idx << 1) | bit as usize;
+    result |= bit << 1;
+    // Iteration 2
+    let bit = rd.decode_bit(&mut probs[idx], buf)?;
+    idx = (idx << 1) | bit as usize;
+    result |= bit << 2;
+    // Iteration 3
+    let bit = rd.decode_bit(&mut probs[idx], buf)?;
+    let _ = idx;
+    result |= bit << 3;
     Ok(result)
 }
 
@@ -514,20 +572,16 @@ impl LzmaCore {
             }
             dist = (idx as u32) - m;
         } else {
-            // Direct bits then align bittree.
+            // Slot >= 14: the high `num_direct_bits - ALIGN_BITS` bits are
+            // uniform (no probability model), and only the low 4 align bits
+            // use a tiny probability tree. On random/incompressible data
+            // this branch is taken on every match — batch the direct bits
+            // through `decode_direct_bits_lsb` (one tight loop, normalise
+            // inline) and then run a specialised 4-bit align decode.
             let direct_count = num_direct_bits - ALIGN_BITS;
-            let mut direct: u32 = 0;
-            for i in 0..direct_count {
-                let bit = self.range.decode_direct_bit(buf)?;
-                direct |= bit << i;
-            }
+            let direct = self.range.decode_direct_bits_lsb(direct_count, buf)?;
             dist |= direct << ALIGN_BITS;
-            let v = bittree_reverse_decode(
-                &mut self.range,
-                self.dist_align.as_mut_slice(),
-                ALIGN_BITS,
-                buf,
-            )?;
+            let v = dist_align_reverse_decode(&mut self.range, &mut self.dist_align, buf)?;
             dist |= v;
         }
         Ok(dist)
@@ -973,9 +1027,16 @@ impl Decoder {
                 return Ok(());
             }
 
-            // Compact buf so range.pos doesn't drift indefinitely.
-            let pos_before = core.range.pos;
-            if pos_before > 0 {
+            // Compact buf so range.pos doesn't drift indefinitely — but
+            // only when the consumed prefix has grown large enough that
+            // the memmove cost is amortised. Compacting on *every* packet
+            // was the dominant cost on incompressible inputs: each packet
+            // would `drain(0..few_bytes)` from a buffer that may hold the
+            // entire compressed stream (~N bytes), producing O(N^2)
+            // behaviour. Defer until we've accumulated a chunk worth
+            // collapsing.
+            if core.range.pos >= COMPACT_THRESHOLD {
+                let pos_before = core.range.pos;
                 self.buf.drain(0..pos_before);
                 core.range.pos = 0;
             }
