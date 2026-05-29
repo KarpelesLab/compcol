@@ -121,3 +121,10 @@ path             = "fuzz_targets/decoder_xpress_huffman.rs"
 test             = false
 doc              = false
 bench            = false
+
+[[bin]]
+name             = "decoder_lznt1"
+path             = "fuzz_targets/decoder_lznt1.rs"
+test             = false
+doc              = false
+bench            = false
