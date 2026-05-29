@@ -589,9 +589,19 @@ fn copy_match(out: &mut Vec<u8>, distance: usize, length: usize) -> Result<(), E
         return Err(Error::InvalidDistance);
     }
     let start = out.len() - distance;
-    for i in 0..length {
-        let b = out[start + i];
-        out.push(b);
+    if distance >= length {
+        // Non-overlapping: collapses to memcpy.
+        out.extend_from_within(start..start + length);
+    } else if distance == 1 {
+        // Byte-splat.
+        let b = out[start];
+        out.resize(out.len() + length, b);
+    } else {
+        // Self-overlap (LZ77 RLE-style): replicate byte-by-byte.
+        for i in 0..length {
+            let b = out[start + i];
+            out.push(b);
+        }
     }
     Ok(())
 }
