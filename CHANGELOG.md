@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/KarpelesLab/compcol/compare/v0.4.0...v0.4.1) - 2026-05-29
+
+### Other
+
+- Optimization pass: 6 algorithms, including 120× lzma decoder fix and SA-IS bzip2 BWT ([#13](https://github.com/KarpelesLab/compcol/pull/13))
+- Fix repository URL in Cargo.toml ([#12](https://github.com/KarpelesLab/compcol/pull/12))
+- Add bzip2 (encoder + decoder) ([#8](https://github.com/KarpelesLab/compcol/pull/8))
+- use RELEASE_PLZ_TOKEN on the release-pr job ([#6](https://github.com/KarpelesLab/compcol/pull/6))
+
 ## [0.4.0](https://github.com/KarpelesLab/compcol/compare/v0.3.1...v0.4.0) - 2026-05-29
 
 ### Other
