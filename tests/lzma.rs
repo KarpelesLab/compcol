@@ -657,6 +657,81 @@ mod factory {
 
 // ─── interop with system xz --format=lzma (issue #14) ───────────────────
 
+/// Regression for the encoder direction of issue #14 — assert the
+/// encoder emits a liblzma-compatible "alone" header at every level.
+///
+/// The contract liblzma's `.lzma` reader enforces:
+/// - byte 0       = properties packed `(pb*5 + lp)*9 + lc` = 0x5D for
+///   the canonical `(lc=3, lp=0, pb=2)` triple.
+/// - bytes 1..=4  = dictionary size, little-endian u32, ≥ 4 KiB.
+/// - bytes 5..=12 = uncompressed size, little-endian u64. liblzma
+///   accepts an exact size, but `xz --format=lzma -c` writes the
+///   sentinel `u64::MAX` ("unknown size, terminate on EOS marker"),
+///   and that's what we want our output to interoperate with. Anything
+///   less than `u64::MAX` makes `xz -d` skip the EOS check and refuse
+///   streams whose body terminates with an EOS marker.
+///
+/// If any of those bytes regress, `xz --format=lzma -dc` rejects our
+/// output as "Compressed data is corrupt". The manual `xz` round-trip
+/// across levels 0..=9 has been verified at PR time; this test locks
+/// the header contract so a future encoder change can't silently
+/// reintroduce the original interop bug.
+#[test]
+fn encoder_emits_liblzma_compatible_alone_header_at_every_level() {
+    use compcol::Algorithm;
+    use compcol::Encoder as _;
+
+    let payload: Vec<u8> = b"the quick brown fox jumps over the lazy dog. ".repeat(100);
+
+    for level in 0..=9u8 {
+        let mut enc = compcol::lzma::Lzma::encoder_with(compcol::lzma::EncoderConfig { level });
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        let mut consumed = 0;
+        while consumed < payload.len() {
+            let (p, _) = enc.encode(&payload[consumed..], &mut buf).unwrap();
+            out.extend_from_slice(&buf[..p.written]);
+            consumed += p.consumed;
+        }
+        loop {
+            let (p, s) = enc.finish(&mut buf).unwrap();
+            out.extend_from_slice(&buf[..p.written]);
+            if matches!(s, Status::StreamEnd) {
+                break;
+            }
+        }
+        assert!(out.len() >= 13, "level {level}: header truncated");
+
+        // Properties byte: (pb=2)*5 + (lp=0) = 10, *9 = 90, + (lc=3) = 93 = 0x5D.
+        assert_eq!(out[0], 0x5D, "level {level}: properties byte not 0x5D");
+
+        // Dictionary size: u32 LE, ≥ 4 KiB.
+        let dict_size = u32::from_le_bytes([out[1], out[2], out[3], out[4]]);
+        assert!(
+            dict_size >= 4 * 1024,
+            "level {level}: dict_size {dict_size} < 4 KiB"
+        );
+
+        // Uncompressed size: u64 LE, expected `u64::MAX` (unknown / EOS-marker
+        // terminated). This is the bit that liblzma's `xz -d` needs in order
+        // to honour the EOS marker we emit at the end of the stream.
+        let unc = u64::from_le_bytes([
+            out[5], out[6], out[7], out[8], out[9], out[10], out[11], out[12],
+        ]);
+        assert_eq!(
+            unc,
+            u64::MAX,
+            "level {level}: uncompressed-size field is {unc:#x}, expected u64::MAX (unknown). \
+             liblzma's `xz -d` interprets any other value as a known-size stream and refuses \
+             the trailing EOS marker — this is the original #14 interop bug."
+        );
+
+        // Round-trips through our own decoder regardless.
+        let back = compcol::vec::decompress_to_vec::<compcol::lzma::Lzma>(&out).unwrap();
+        assert_eq!(back, payload, "level {level}: self round-trip failed");
+    }
+}
+
 #[test]
 fn xz_format_lzma_round_trips_via_vec_helper() {
     // Reporter's exact path: xz --format=lzma → vec::decompress_to_vec.
