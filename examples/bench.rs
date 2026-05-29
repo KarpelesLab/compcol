@@ -156,6 +156,18 @@ fn our_decode(algo: &str, encoded: &[u8]) -> Result<Vec<u8>, String> {
             Status::OutputFull => continue,
         }
     }
+    // Drain any queued decoded bytes the decoder is still holding
+    // before declaring "no more input". Some codecs (notably bzip2)
+    // buffer an entire block of decoded output internally; if the
+    // caller's output buffer was smaller than that block we need to
+    // call back with empty input to pull the rest out.
+    loop {
+        let (p, _status) = dec.decode(&[], &mut buf).map_err(|e| format!("{e}"))?;
+        out.extend_from_slice(&buf[..p.written]);
+        if p.written == 0 {
+            break;
+        }
+    }
     loop {
         let (p, status) = dec.finish(&mut buf).map_err(|e| format!("{e}"))?;
         out.extend_from_slice(&buf[..p.written]);
