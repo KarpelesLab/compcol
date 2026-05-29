@@ -16,11 +16,15 @@
 //!
 //! Encoder behaviour:
 //!  - `n_bits` starts at 9 and grows up to 16 as the dictionary fills.
-//!  - When the dictionary reaches the maximum size (65536 entries), the
-//!    encoder emits a `CLEAR` code and resets back to 9 bits / 257 free codes.
-//!  - No ratio-based reset (the optional "ratio bumped" reset compress(1)
-//!    does is omitted; the resulting `.Z` is still decompressable, just not
-//!    always byte-identical to GNU compress's output).
+//!  - Once the dictionary reaches the maximum size (65536 entries), the
+//!    encoder samples the cumulative compression ratio every `CHECK_GAP`
+//!    input bytes. While the ratio keeps improving the dictionary stays;
+//!    as soon as it drops below the high-water mark seen in the current
+//!    epoch the encoder emits a `CLEAR` code and resets back to 9 bits /
+//!    257 free codes. This matches the `compress(1)` reference behaviour
+//!    and prevents output bloat on incompressible data, where a saturated
+//!    dictionary would otherwise keep emitting 16-bit codes for unmatched
+//!    bytes.
 //!
 //! Decoder behaviour:
 //!  - Reads the 3-byte header, supports `maxbits` 9..=16 and both block-mode
@@ -68,6 +72,12 @@ const FIRST: u32 = 257;
 /// Hash table size (power of two, > 2 × `1 << MAX_BITS`).
 const HASH_SIZE: usize = 1 << 17;
 const HASH_MASK: u32 = (HASH_SIZE as u32) - 1;
+/// Stride (in input bytes) between ratio-degradation checks. Matches the
+/// `compress(1)` `CHECK_GAP` constant. After the dictionary is full, we
+/// re-evaluate the cumulative compression ratio every `CHECK_GAP` input
+/// bytes and emit a `CLEAR` if it falls below the high-water mark seen so
+/// far in the current dictionary epoch.
+const CHECK_GAP: u64 = 10_000;
 
 #[inline]
 fn hash(prefix: u32, byte: u8) -> u32 {
@@ -149,6 +159,21 @@ pub struct Encoder {
     pending: ByteQueue,
     /// Set once `finish` has finished draining.
     completed: bool,
+    /// Total input bytes consumed since the last dictionary reset (or stream
+    /// start). Used by the ratio-degradation check.
+    bytes_in: u64,
+    /// Total bits of code output since the last dictionary reset. We use bits
+    /// (not bytes) so the ratio is accurate even mid-byte.
+    bits_out: u64,
+    /// Next value of `bytes_in` at which to re-evaluate the ratio. Set to
+    /// `u64::MAX` until the dictionary fills, then advanced in `CHECK_GAP`
+    /// strides.
+    next_check: u64,
+    /// High-water cumulative ratio (`bytes_in * 256 / bits_out`) seen since
+    /// the current dictionary was last reset. When the current cumulative
+    /// ratio falls below this value, we emit a CLEAR — matching the
+    /// `compress(1)` reference algorithm.
+    best_ratio: u64,
 }
 
 impl Encoder {
@@ -166,6 +191,10 @@ impl Encoder {
             header_remaining: 3,
             pending: ByteQueue::new(),
             completed: false,
+            bytes_in: 0,
+            bits_out: 0,
+            next_check: u64::MAX,
+            best_ratio: 0,
         }
     }
 
@@ -178,6 +207,12 @@ impl Encoder {
         }
         self.next_code = FIRST;
         self.nbits = INIT_BITS;
+        // Reset the ratio-tracking state too. The next check is disarmed
+        // until the dictionary fills again.
+        self.bytes_in = 0;
+        self.bits_out = 0;
+        self.next_check = u64::MAX;
+        self.best_ratio = 0;
     }
 
     /// Push `code` (width = `self.nbits`) onto the bit stream and drain
@@ -192,6 +227,7 @@ impl Encoder {
             self.bit_count -= 8;
         }
         self.codes_in_group = (self.codes_in_group + 1) & 7;
+        self.bits_out = self.bits_out.saturating_add(n as u64);
     }
 
     /// Pad with zero codes at the current width until the current 8-code
@@ -241,10 +277,9 @@ impl Encoder {
         }
     }
 
-    /// After bumping `next_code`, check whether we need to widen `nbits` or
-    /// emit a `CLEAR` to reset the dictionary. Performs alignment in either
-    /// case.
-    fn maybe_widen_or_clear(&mut self) {
+    /// After bumping `next_code`, check whether we need to widen `nbits`.
+    /// Performs alignment when widening.
+    fn maybe_widen(&mut self) {
         if self.nbits < MAX_BITS {
             // Bump when next_code can no longer be encoded at the current
             // width. compress(1) uses extcode = (1<<nbits) + 1 while
@@ -254,8 +289,44 @@ impl Encoder {
                 self.pad_to_group_boundary();
                 self.nbits += 1;
             }
-        } else if self.next_code >= (1u32 << MAX_BITS) {
-            // Dictionary full at max width: emit CLEAR and reset.
+        } else if self.next_code >= (1u32 << MAX_BITS) && self.next_check == u64::MAX {
+            // Dictionary just filled at max width: arm the ratio-degradation
+            // check. We don't clear immediately — compressible data may keep
+            // matching against the saturated dictionary. We only clear when
+            // the cumulative ratio falls below the best seen so far.
+            self.next_check = self.bytes_in.saturating_add(CHECK_GAP);
+        }
+    }
+
+    /// Evaluate the cumulative compression ratio since the last dictionary
+    /// reset. If it is worse than the best seen so far, emit a `CLEAR` code,
+    /// pad to the group boundary, and reset. Otherwise update the
+    /// high-water mark and schedule the next check.
+    ///
+    /// Called only when the dictionary is full (`next_check` armed) and
+    /// `bytes_in >= next_check`. Mirrors `compress(1)`'s `cl_block` logic.
+    fn check_ratio(&mut self) {
+        // ratio = bytes_in * 256 / bits_out, fixed-point. We use bits in
+        // the denominator (not bytes) so the comparison stays precise even
+        // when the bit accumulator straddles a byte. `checked_div` returns
+        // `None` only if `bits_out == 0`, which would mean no codes have
+        // been emitted at all — treat that pathological case as "infinitely
+        // compressible" so we don't spuriously CLEAR.
+        let ratio = (self.bytes_in << 8)
+            .checked_div(self.bits_out)
+            .unwrap_or(u64::MAX);
+
+        if ratio >= self.best_ratio {
+            // Cumulative ratio is still at its high-water mark or better:
+            // keep the dictionary and arm the next check.
+            self.best_ratio = ratio;
+            self.next_check = self.bytes_in.saturating_add(CHECK_GAP);
+        } else {
+            // Cumulative ratio dropped below the high-water mark: the
+            // dictionary is no longer paying for itself. Emit CLEAR + align,
+            // reset the dictionary. `reset_dict` re-arms `next_check` to
+            // `u64::MAX` so we wait until the new dictionary fills again
+            // before re-checking.
             self.emit_code(CLEAR);
             self.pad_to_group_boundary();
             self.reset_dict();
@@ -298,6 +369,7 @@ impl RawEncoder for Encoder {
                 // First byte of the stream: prefix is just the literal.
                 self.w_code = b as u32;
                 consumed += 1;
+                self.bytes_in = self.bytes_in.saturating_add(1);
                 continue;
             }
 
@@ -306,6 +378,7 @@ impl RawEncoder for Encoder {
                     // Extend prefix.
                     self.w_code = existing;
                     consumed += 1;
+                    self.bytes_in = self.bytes_in.saturating_add(1);
                 }
                 Err(slot) => {
                     // Emit prefix, add new entry, reset prefix to b.
@@ -315,9 +388,21 @@ impl RawEncoder for Encoder {
                         self.insert(slot, prefix, b, self.next_code);
                         self.next_code += 1;
                     }
-                    self.maybe_widen_or_clear();
+                    self.maybe_widen();
                     self.w_code = b as u32;
                     consumed += 1;
+                    self.bytes_in = self.bytes_in.saturating_add(1);
+
+                    // Ratio-degradation check: this only fires once the
+                    // dictionary is full (`next_check` is armed by
+                    // `maybe_widen`). We do it here, in the miss branch,
+                    // because at this point we just emitted the previous
+                    // prefix and `w_code` holds a single literal byte —
+                    // safe to discard along with the old dictionary if
+                    // `check_ratio` decides to issue a CLEAR.
+                    if self.bytes_in >= self.next_check {
+                        self.check_ratio();
+                    }
                 }
             }
 
@@ -399,6 +484,10 @@ impl RawEncoder for Encoder {
         self.header_remaining = 3;
         self.pending.clear();
         self.completed = false;
+        self.bytes_in = 0;
+        self.bits_out = 0;
+        self.next_check = u64::MAX;
+        self.best_ratio = 0;
     }
 }
 
