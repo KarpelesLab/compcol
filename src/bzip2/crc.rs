@@ -18,17 +18,35 @@
 //!
 //! Reference: the bzip2 source ships a 256-entry `BZ2_crc32Table` that is
 //! the standard CRC-32/MPEG-2 forward table — identical to what we build
-//! here at runtime via the bit-by-bit definition.
+//! here at compile time.
 
 /// Polynomial used by both gzip and bzip2 (the IEEE 802.3 polynomial,
 /// also called the "Ethernet" polynomial). The two codecs disagree only
 /// on bit ordering and the final XOR step.
 const POLY: u32 = 0x04C1_1DB7;
 
-// 256-entry table for forward (non-reflected) CRC-32 would be one
-// option but for our use the bit-by-bit per-byte loop is already very
-// fast (~32 ops per byte) and keeps the code shorter. No static state
-// is needed.
+/// Forward (non-reflected) CRC-32 table, built at compile time from the
+/// bit-by-bit definition. 1 KiB of `.rodata`; consumes one byte per
+/// update step instead of eight bit iterations.
+const TABLE: [u32; 256] = {
+    let mut t = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = (i as u32) << 24;
+        let mut k = 0;
+        while k < 8 {
+            c = if c & 0x8000_0000 != 0 {
+                (c << 1) ^ POLY
+            } else {
+                c << 1
+            };
+            k += 1;
+        }
+        t[i] = c;
+        i += 1;
+    }
+    t
+};
 
 /// Rolling CRC-32/MPEG-2 state.
 #[derive(Clone, Copy)]
@@ -46,16 +64,9 @@ impl Crc32 {
     pub(crate) fn update(&mut self, bytes: &[u8]) {
         let mut s = self.state;
         for &b in bytes {
-            // XOR the byte into the **high** byte of the register
-            // (non-reflected), then process 8 bits MSB-first.
-            s ^= (b as u32) << 24;
-            for _ in 0..8 {
-                let msb_set = s & 0x8000_0000 != 0;
-                s <<= 1;
-                if msb_set {
-                    s ^= POLY;
-                }
-            }
+            // Non-reflected (MSB-first) byte-at-a-time update.
+            let idx = ((s >> 24) ^ b as u32) & 0xFF;
+            s = (s << 8) ^ TABLE[idx as usize];
         }
         self.state = s;
     }
