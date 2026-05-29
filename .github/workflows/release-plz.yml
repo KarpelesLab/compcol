@@ -76,4 +76,14 @@ jobs:
         with:
           command: release-pr
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Use a fine-grained PAT (RELEASE_PLZ_TOKEN) instead of the
+          # default GITHUB_TOKEN so the release PR release-plz opens
+          # triggers downstream workflows (CI, fuzz). GitHub suppresses
+          # workflow triggers on events created by GITHUB_TOKEN to
+          # prevent recursion — that left every release PR sitting
+          # with zero check runs, and branch protection's required
+          # status checks then held the merge.
+          # The PAT needs `contents: write` + `pull_requests: write`
+          # on this repo and renews on the GitHub fine-grained-PAT
+          # cadence (max 1 year).
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
