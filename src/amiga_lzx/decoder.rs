@@ -420,9 +420,9 @@ fn drain_stage(ctx: &mut RunCtx, output: &mut [u8], written: &mut usize) {
 
 /// Push a single byte into both the LZ sliding window and the staging buffer.
 fn emit_window(ctx: &mut RunCtx, b: u8) {
-    let win_size = ctx.window.len();
+    debug_assert_eq!(ctx.window.len(), WINDOW_SIZE);
     ctx.window[ctx.window_pos] = b;
-    ctx.window_pos = (ctx.window_pos + 1) % win_size;
+    ctx.window_pos = (ctx.window_pos + 1) & (WINDOW_SIZE - 1);
     ctx.stage.push(b);
 }
 
@@ -821,8 +821,9 @@ fn step_huff(ctx: &mut RunCtx) -> Result<bool, Error> {
                     if remaining == 0 {
                         return Err(Error::Corrupt);
                     }
-                    let win_size = ctx.window.len();
-                    let src = (ctx.window_pos + win_size - distance as usize) % win_size;
+                    debug_assert_eq!(ctx.window.len(), WINDOW_SIZE);
+                    let src =
+                        (ctx.window_pos + WINDOW_SIZE - distance as usize) & (WINDOW_SIZE - 1);
                     let b = ctx.window[src];
                     emit_window(ctx, b);
                     copied += 1;

@@ -83,7 +83,10 @@ pub struct Decoder {
     unpack_total: u64,
     unpack_so_far: u64,
     window_size: usize,
-    /// LZ77 sliding window. Indexed modulo `window_size`.
+    /// Cached `window_size - 1`. `window_size` is always a power of two
+    /// so wrap-around is a single AND.
+    window_mask: usize,
+    /// LZ77 sliding window. Indexed via `window_mask`.
     window: Vec<u8>,
     window_pos: usize,
     /// 4-deep distance LRU. Entry 0 is the most recent.
@@ -150,6 +153,7 @@ impl Decoder {
         let ws = window_size
             .clamp(MIN_WINDOW_SIZE, MAX_WINDOW_SIZE)
             .next_power_of_two();
+        debug_assert!(ws.is_power_of_two());
         Self {
             state: State::BlockHeader,
             poisoned: false,
@@ -157,6 +161,7 @@ impl Decoder {
             unpack_total: unpack,
             unpack_so_far: 0,
             window_size: ws,
+            window_mask: ws - 1,
             window: vec![0u8; ws],
             window_pos: 0,
             dist_cache: [0; 4],
@@ -483,7 +488,7 @@ impl Decoder {
 
     fn emit_literal(&mut self, b: u8) {
         self.window[self.window_pos] = b;
-        self.window_pos = (self.window_pos + 1) % self.window_size;
+        self.window_pos = (self.window_pos + 1) & self.window_mask;
         self.out_queue.push_back(b);
     }
 
@@ -495,11 +500,12 @@ impl Decoder {
             return Err(Error::Corrupt);
         }
         let ws = self.window_size;
+        let wmask = self.window_mask;
         for _ in 0..length {
-            let src = (self.window_pos + ws - dist as usize) % ws;
+            let src = (self.window_pos + ws - dist as usize) & wmask;
             let b = self.window[src];
             self.window[self.window_pos] = b;
-            self.window_pos = (self.window_pos + 1) % ws;
+            self.window_pos = (self.window_pos + 1) & wmask;
             self.out_queue.push_back(b);
             if self.unpack_so_far + self.out_queue.len() as u64 >= self.unpack_total {
                 break;

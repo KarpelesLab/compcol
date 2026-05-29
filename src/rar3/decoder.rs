@@ -255,6 +255,10 @@ fn run_decode(
         num_low_offset_repeats: 0,
         out: Vec::new(),
         window: vec![0u8; DICT_DEFAULT_SIZE],
+        wmask: {
+            debug_assert!(DICT_DEFAULT_SIZE.is_power_of_two());
+            DICT_DEFAULT_SIZE - 1
+        },
         window_pos: 0,
         unpack_size,
     });
@@ -290,8 +294,11 @@ struct RunCtx {
     out: Vec<u8>,
     /// Sliding window — kept in sync with `out` for back-reference lookups.
     /// We use a plain Vec sized to DICT_DEFAULT_SIZE so wrap-around at the
-    /// end is cheap; reads use modular indexing.
+    /// end is cheap; reads use bitwise masking.
     window: Vec<u8>,
+    /// Cached `window.len() - 1`. The window length is always a power of two
+    /// so wrap-around is a single AND.
+    wmask: usize,
     window_pos: usize,
     unpack_size: u64,
 }
@@ -299,9 +306,8 @@ struct RunCtx {
 impl RunCtx {
     fn emit_literal(&mut self, b: u8) {
         self.out.push(b);
-        let wlen = self.window.len();
         self.window[self.window_pos] = b;
-        self.window_pos = (self.window_pos + 1) % wlen;
+        self.window_pos = (self.window_pos + 1) & self.wmask;
     }
 
     fn emit_match(&mut self, offset: u32, length: u32) -> Result<(), Error> {
@@ -310,16 +316,17 @@ impl RunCtx {
         }
         // Copy `length` bytes from `offset` behind the window head.
         let wlen = self.window.len();
+        let wmask = self.wmask;
         let off = offset as usize;
         if off > wlen {
             return Err(Error::InvalidDistance);
         }
         for _ in 0..length {
-            let src = (self.window_pos + wlen - off) % wlen;
+            let src = (self.window_pos + wlen - off) & wmask;
             let b = self.window[src];
             self.out.push(b);
             self.window[self.window_pos] = b;
-            self.window_pos = (self.window_pos + 1) % wlen;
+            self.window_pos = (self.window_pos + 1) & wmask;
             if (self.out.len() as u64) >= self.unpack_size {
                 break;
             }
@@ -670,6 +677,7 @@ mod tests {
             num_low_offset_repeats: 0,
             out: vec![],
             window: vec![0u8; 16],
+            wmask: 15,
             window_pos: 0,
             unpack_size: 0,
         };
