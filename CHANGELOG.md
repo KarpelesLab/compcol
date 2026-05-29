@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/KarpelesLab/compcol/compare/v0.3.1...v0.4.0) - 2026-05-29
+
+### Other
+
+- Mark Error enum #[non_exhaustive] ([#5](https://github.com/KarpelesLab/compcol/pull/5))
+- Polish + extend: Box trait impls, CLI levels, multi-member gzip, bomb defense, fuzz harness, async tokio adapters ([#4](https://github.com/KarpelesLab/compcol/pull/4))
+- fix doc warnings, narrow-feature clippy, and cli BrokenPipe race
+- Revert "CHANGELOG: document compcol::vec + compcol::io helpers under Unreleased"
+- document compcol::vec + compcol::io helpers under Unreleased
+- Add compcol::vec (one-shot helpers) and compcol::io (std::io adapters)
+
 ## [0.3.1](https://github.com/KarpelesLab/compcol/compare/v0.3.0...v0.3.1) - 2026-05-28
 
 ### Other
