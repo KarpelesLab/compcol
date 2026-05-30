@@ -316,11 +316,10 @@ impl Decoder {
             return None;
         }
         let mut acc: u64 = 0;
-        let mut got = 0u32;
         let byte_idx = self.bit_pos / 8;
         let off = (self.bit_pos % 8) as u32;
-        // Pull up to 8 bytes (64 bits) starting at byte_idx, shifted
-        // down by `off`.
+        // Pull enough bytes to cover the `n`-bit field; up to 5 bytes
+        // suffices for any `n <= 32`.
         let take = (n + off).div_ceil(8);
         for i in 0..take {
             let b = self.in_buf[byte_idx + i as usize];
@@ -330,8 +329,6 @@ impl Decoder {
         if n < 32 {
             acc &= (1u64 << n) - 1;
         }
-        got += n;
-        let _ = got;
         Some(acc as u32)
     }
 
