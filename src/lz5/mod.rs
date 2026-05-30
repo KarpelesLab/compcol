@@ -675,12 +675,17 @@ impl RawDecoder for Decoder {
                     }
                     // Block fully gathered — decompress.
                     self.decoded.clear();
-                    if let Err(e) =
-                        block::decode_compressed_block(&self.block_buf, &mut self.decoded)
-                    {
+                    if let Err(e) = block::decode_compressed_block(
+                        &self.block_buf,
+                        &mut self.decoded,
+                        self.max_block_raw,
+                    ) {
                         self.poisoned = true;
                         return Err(e);
                     }
+                    // Redundant given the per-append cap inside
+                    // decode_compressed_block, but kept as a cheap
+                    // defense-in-depth backstop.
                     if self.decoded.len() > self.max_block_raw {
                         self.poisoned = true;
                         return Err(Error::Corrupt);
