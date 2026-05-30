@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.7](https://github.com/KarpelesLab/compcol/compare/v0.4.6...v0.4.7) - 2026-05-30
+
+### Other
+
+- Security fixes 2026 05 30 ([#58](https://github.com/KarpelesLab/compcol/pull/58))
+- Add LZ5 / Lizard codec ([#56](https://github.com/KarpelesLab/compcol/pull/56))
+- Add lzham (LZH0 framing parser; payload Unsupported) ([#55](https://github.com/KarpelesLab/compcol/pull/55))
+- Add LZSS codec (Storer-Szymanski / Okumura variant) ([#54](https://github.com/KarpelesLab/compcol/pull/54))
+- Add LZS codec (Lempel-Ziv-Stac, RFC 1974) ([#53](https://github.com/KarpelesLab/compcol/pull/53))
+- Add ZIP method 6 (Implode) decoder ([#52](https://github.com/KarpelesLab/compcol/pull/52))
+- Add PKZip Reduce (methods 2-5, decoder-only) ([#51](https://github.com/KarpelesLab/compcol/pull/51))
+- Add ZIP method 1 (Shrink) decoder ([#50](https://github.com/KarpelesLab/compcol/pull/50))
+- Add PackBits codec (Apple TN1023 RLE, encoder + decoder) ([#49](https://github.com/KarpelesLab/compcol/pull/49))
+
 ## [0.4.6](https://github.com/KarpelesLab/compcol/compare/v0.4.5...v0.4.6) - 2026-05-30
 
 ### Other
