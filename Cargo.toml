@@ -39,6 +39,7 @@ all = [
     "packbits",
     "zip_implode",
     "lzs",
+    "lzham",
     "rar1", "rar2", "rar3", "rar5",
     "zip_shrink",
     "zip_reduce",
@@ -138,6 +139,12 @@ zip_implode = ["alloc"]
 # IPComp, and Cisco hardware compression cards. Bit-packed (MSB-first)
 # with a 2 KiB window. Encoder and decoder both implemented.
 lzs     = ["alloc"]
+# LZHAM (Rich Geldreich's LZMA-class codec, MIT-licensed). This build
+# ships the `LZH0` container header parser only — the inner arithmetic-
+# coded bitstream is not documented outside the reference C++ source
+# and is permanently `Error::Unsupported` in this build. The encoder
+# is also permanently `Error::Unsupported`.
+lzham   = ["alloc"]
 # RAR decoders (rar1, rar2, rar3, rar5). Decoder-only — RARLAB's unRAR
 # license explicitly forbids re-creating the compression algorithm, so
 # the encoders permanently return `Error::Unsupported`.
