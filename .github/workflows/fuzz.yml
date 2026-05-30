@@ -37,6 +37,7 @@ jobs:
           - decoder_ppmd
           - decoder_xpress_huffman
           - decoder_lznt1
+          - decoder_xpress
     steps:
       - uses: actions/checkout@v6
       - name: Install nightly toolchain

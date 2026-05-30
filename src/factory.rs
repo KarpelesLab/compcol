@@ -76,6 +76,10 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         crate::xpress_huffman::XpressHuffman::NAME => Some(Box::new(
             <crate::xpress_huffman::XpressHuffman as Algorithm>::encoder(),
         )),
+        #[cfg(feature = "xpress")]
+        crate::xpress::Xpress::NAME => {
+            Some(Box::new(<crate::xpress::Xpress as Algorithm>::encoder()))
+        }
         #[cfg(feature = "rar1")]
         crate::rar1::Rar1::NAME => Some(Box::new(<crate::rar1::Rar1 as Algorithm>::encoder())),
         #[cfg(feature = "rar2")]
@@ -219,6 +223,10 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         crate::xpress_huffman::XpressHuffman::NAME => Some(Box::new(
             <crate::xpress_huffman::XpressHuffman as Algorithm>::decoder(),
         )),
+        #[cfg(feature = "xpress")]
+        crate::xpress::Xpress::NAME => {
+            Some(Box::new(<crate::xpress::Xpress as Algorithm>::decoder()))
+        }
         #[cfg(feature = "rar1")]
         crate::rar1::Rar1::NAME => Some(Box::new(<crate::rar1::Rar1 as Algorithm>::decoder())),
         #[cfg(feature = "rar2")]
@@ -306,6 +314,9 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     if str_eq(name, "xpress-huffman") && cfg!(feature = "xpress_huffman") {
         return Some("xph");
     }
+    if str_eq(name, "xpress") && cfg!(feature = "xpress") {
+        return Some("xpress");
+    }
     // All RAR versions share the .rar extension; the version is in-band in
     // the file header. The CLI's in-place mode will write to <input>.rar
     // and strip .rar on decode for any rar* algorithm.
@@ -391,6 +402,8 @@ pub const fn names() -> &'static [&'static str] {
         crate::bzip2::Bzip2::NAME,
         #[cfg(feature = "xpress_huffman")]
         crate::xpress_huffman::XpressHuffman::NAME,
+        #[cfg(feature = "xpress")]
+        crate::xpress::Xpress::NAME,
         #[cfg(feature = "rar1")]
         crate::rar1::Rar1::NAME,
         #[cfg(feature = "rar2")]
