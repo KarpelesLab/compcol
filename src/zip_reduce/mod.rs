@@ -269,12 +269,21 @@ pub struct Decoder {
     fsets: Vec<FollowerSet>,
 
     // -- LZ77 body progress --------------------------------------------
-    /// Output buffer being filled. Reduce can self-reference, so we
-    /// need the full produced stream available for back references.
+    /// Sliding output window. Reduce can self-reference, but the maximum
+    /// back-reference distance is bounded (`max_dist`, ≤ ~64 KiB), so we
+    /// keep only a suffix of the produced stream here and drop the
+    /// already-emitted, no-longer-referenceable prefix. `window_base` is
+    /// the absolute index of `out[0]` in the full output stream; the total
+    /// number of bytes produced so far is `window_base + out.len()`.
+    /// Retaining the whole stream (up to the attacker-controlled 4-byte
+    /// `uncomp_len`, ~4 GiB) would be a decompression-bomb / OOM vector.
     out: Vec<u8>,
-    /// Cursor: next byte to emit from `out` to the caller. We retain
-    /// already-emitted bytes in `out` because back references may reach
-    /// arbitrarily far back into the stream.
+    /// Absolute index (in the full output stream) of `out[0]` — i.e. the
+    /// number of leading bytes already dropped from the sliding window.
+    window_base: usize,
+    /// Cursor: absolute index in the full output stream of the next byte
+    /// to emit to the caller. Always `>= window_base` (we never drop a
+    /// byte before it has been emitted).
     emit_cursor: usize,
     /// Last decoded byte ("prev_byte" in the spec). Initialised to 0.
     prev_byte: u8,
@@ -301,6 +310,7 @@ impl Decoder {
             next_fset: 255,
             fsets: Vec::new(),
             out: Vec::new(),
+            window_base: 0,
             emit_cursor: 0,
             prev_byte: 0,
             pending: None,
@@ -331,10 +341,15 @@ impl Decoder {
         // Bit reader hasn't started yet so this is a no-op aside from
         // resetting the rebase accounting.
         self.bits = BitReader::new();
-        // Allocate output buffer up front when feasible (caps oversize
-        // to avoid a 4 GiB up-front alloc for adversarial headers).
-        let cap = (ucl as usize).min(64 * 1024 * 1024);
+        // Pre-size the sliding window. `out` is now a bounded window (we
+        // drop the consumed prefix in `slide_window`), so we never need
+        // more than the window's worth of capacity regardless of how large
+        // the attacker-controlled `uncomp_len` claims to be. Cap the
+        // reservation at 1 MiB — comfortably above the largest window
+        // (max_dist ≈ 64 KiB plus the buffer-ahead margin) for any factor.
+        let cap = (ucl as usize).min(1024 * 1024);
         self.out = Vec::with_capacity(cap);
+        self.window_base = 0;
         // Build follower-sets vector lazily filled by `read_follower_sets`.
         self.fsets = vec![FollowerSet::empty(); 256];
         self.next_fset = 255;
@@ -432,17 +447,25 @@ impl Decoder {
 
     /// Drive the LZ77 body until output produces `uncomp_len` bytes,
     /// the bit reader needs more input, or the output buffer is full.
-    /// Bytes are appended to `self.out` here; the caller's slice is
-    /// filled via [`flush_emit`] which advances `emit_cursor`.
+    /// Bytes are appended to the sliding window `self.out` here; the
+    /// caller's slice is filled via [`flush_emit`] which advances
+    /// `emit_cursor`, and [`slide_window`] drops the consumed prefix.
     ///
-    /// We bound how many bytes we'll buffer ahead of the caller's
-    /// emit cursor — without that bound, a one-byte caller output slice
-    /// against a 60 MB stream would still buffer the full 60 MB in
-    /// `self.out` before yielding. The window has to stay at least as
-    /// large as the worst-case back-reference distance for the active
-    /// factor (`max_dist`); we use a generous 4 × max_dist so a single
-    /// `decode_body` call still makes meaningful progress without
-    /// stalling on every match boundary.
+    /// Two independent bounds keep memory flat regardless of the
+    /// attacker-controlled `uncomp_len`:
+    ///
+    /// 1. **Buffer-ahead bound** — we stop decoding once we've produced
+    ///    more than `4 × max_dist` bytes past the caller's emit cursor and
+    ///    the caller's slice is full, so a one-byte output slice against a
+    ///    multi-megabyte stream does not race ahead.
+    /// 2. **Sliding window** — [`slide_window`] drops the already-emitted
+    ///    prefix that no future back-reference can reach (distances are
+    ///    bounded by `max_dist`), so `self.out` never grows to the full
+    ///    decompressed length. Without this the decoder retained the
+    ///    entire stream (up to ~4 GiB) — a decompression-bomb / OOM vector.
+    ///
+    /// The window stays at least `max_dist` bytes deep (we keep
+    /// `4 × max_dist` for margin) so every legal back-reference resolves.
     fn decode_body(&mut self, output: &mut [u8], written: &mut usize) -> Result<(), Error> {
         // Compute how much we're willing to buffer past the emit cursor.
         let max_dist = ((1usize << self.factor) - 1) * 256 + 255 + 1;
@@ -452,19 +475,20 @@ impl Decoder {
         if let Some(mut pm) = self.pending.take() {
             while pm.remaining > 0 {
                 self.flush_emit(output, written);
-                if self.out.len() - self.emit_cursor >= buffer_ahead && *written >= output.len() {
+                self.slide_window(max_dist);
+                if self.produced() - self.emit_cursor >= buffer_ahead && *written >= output.len() {
                     self.pending = Some(pm);
                     return Ok(());
                 }
-                let pos = self.out.len();
+                let pos = self.produced();
                 let b = if pm.dist > pos {
                     0u8
                 } else {
-                    self.out[pos - pm.dist]
+                    self.out[(pos - pm.dist) - self.window_base]
                 };
                 self.out.push(b);
                 pm.remaining -= 1;
-                if (self.out.len() as u32) >= self.uncomp_len && pm.remaining > 0 {
+                if (self.produced() as u32) >= self.uncomp_len && pm.remaining > 0 {
                     return Err(Error::Corrupt);
                 }
             }
@@ -473,11 +497,12 @@ impl Decoder {
         let v_len_bits: u32 = (8 - self.factor) as u32;
         let len_mask: u32 = (1u32 << v_len_bits) - 1;
 
-        while (self.out.len() as u32) < self.uncomp_len {
-            // Periodically drain to the caller and stop early if we've
-            // buffered too far ahead.
+        while (self.produced() as u32) < self.uncomp_len {
+            // Periodically drain to the caller, drop the consumed prefix of
+            // the window, and stop early if we've buffered too far ahead.
             self.flush_emit(output, written);
-            if self.out.len() - self.emit_cursor >= buffer_ahead && *written >= output.len() {
+            self.slide_window(max_dist);
+            if self.produced() - self.emit_cursor >= buffer_ahead && *written >= output.len() {
                 return Ok(());
             }
 
@@ -545,7 +570,7 @@ impl Decoder {
             let dist_hi = (v as usize) >> v_len_bits;
             let dist = dist_hi * 256 + w as usize + 1;
 
-            let remaining_out = (self.uncomp_len as usize) - self.out.len();
+            let remaining_out = (self.uncomp_len as usize) - self.produced();
             if len > remaining_out {
                 return Err(Error::Corrupt);
             }
@@ -556,16 +581,21 @@ impl Decoder {
             // last byte read from the *bitstream* (which is W here),
             // not the last byte emitted by the match. Keeping prev =
             // W is what real PKZIP-1.x streams expect.
+            //
+            // `len` is small (≤ ~385 bytes: the inline length field plus
+            // one optional extension byte), far below `buffer_ahead`, so
+            // materialising it inline only overshoots the window bound by a
+            // bounded amount that the next iteration's `slide_window` reaps.
             let mut pm = PendingMatch {
                 dist,
                 remaining: len,
             };
             while pm.remaining > 0 {
-                let pos = self.out.len();
+                let pos = self.produced();
                 let b = if pm.dist > pos {
                     0u8
                 } else {
-                    self.out[pos - pm.dist]
+                    self.out[(pos - pm.dist) - self.window_base]
                 };
                 self.out.push(b);
                 pm.remaining -= 1;
@@ -574,12 +604,40 @@ impl Decoder {
         Ok(())
     }
 
+    /// Total number of output bytes produced so far across the whole
+    /// stream, including bytes already dropped from the sliding window.
+    fn produced(&self) -> usize {
+        self.window_base + self.out.len()
+    }
+
+    /// Drop the consumed, no-longer-referenceable prefix of the sliding
+    /// output window. We retain every byte that (a) has not yet been
+    /// emitted to the caller (index `>= emit_cursor`) or (b) lies within
+    /// `keep` bytes of the current end so a future back-reference (bounded
+    /// by `max_dist`) can still resolve. This is what keeps `out` bounded
+    /// instead of growing to the attacker-controlled `uncomp_len`.
+    fn slide_window(&mut self, max_dist: usize) {
+        // Retain at least `max_dist` bytes of history for back references,
+        // plus a generous margin so we are not draining one byte at a time.
+        let keep = max_dist.saturating_mul(4).max(max_dist + 1);
+        let end = self.produced();
+        // Highest absolute index we are allowed to drop *up to* (exclusive):
+        // never past the emit cursor, never within `keep` of the end.
+        let drop_limit = self.emit_cursor.min(end.saturating_sub(keep));
+        if drop_limit <= self.window_base {
+            return;
+        }
+        let drop = drop_limit - self.window_base;
+        self.out.drain(0..drop);
+        self.window_base += drop;
+    }
+
     /// Forward bytes that have been appended to `out` past `emit_cursor`
     /// to the caller's slice. Returns when either output fills or all
     /// produced bytes have been forwarded.
     fn flush_emit(&mut self, output: &mut [u8], written: &mut usize) {
-        while self.emit_cursor < self.out.len() && *written < output.len() {
-            output[*written] = self.out[self.emit_cursor];
+        while self.emit_cursor < self.produced() && *written < output.len() {
+            output[*written] = self.out[self.emit_cursor - self.window_base];
             *written += 1;
             self.emit_cursor += 1;
         }
@@ -657,7 +715,7 @@ impl RawDecoder for Decoder {
 
         // Edge case: zero-length stream. The follower-set header is
         // still present and parsed; we go straight to Done.
-        if (self.out.len() as u32) >= self.uncomp_len && matches!(self.phase, Phase::Body) {
+        if (self.produced() as u32) >= self.uncomp_len && matches!(self.phase, Phase::Body) {
             self.phase = Phase::Done;
         }
 
@@ -671,7 +729,7 @@ impl RawDecoder for Decoder {
             }
             // Forward any leftover internal-buffer bytes to the caller.
             self.flush_emit(output, &mut written);
-            if (self.out.len() as u32) >= self.uncomp_len && self.emit_cursor == self.out.len() {
+            if (self.produced() as u32) >= self.uncomp_len && self.emit_cursor == self.produced() {
                 self.phase = Phase::Done;
             }
         }
@@ -699,7 +757,7 @@ impl RawDecoder for Decoder {
                 }
             }
             self.flush_emit(output, &mut written);
-            if (self.out.len() as u32) >= self.uncomp_len && self.emit_cursor == self.out.len() {
+            if (self.produced() as u32) >= self.uncomp_len && self.emit_cursor == self.produced() {
                 self.phase = Phase::Done;
             }
         }
@@ -710,7 +768,7 @@ impl RawDecoder for Decoder {
             // Distinguish "still emitting" from "stalled on input".
             // If the caller's buffer isn't full *and* we wrote nothing
             // *and* we're not already done, the stream is truncated.
-            if self.emit_cursor == self.out.len() && !matches!(self.phase, Phase::Done) {
+            if self.emit_cursor == self.produced() && !matches!(self.phase, Phase::Done) {
                 self.phase = Phase::Poison;
                 return Err(Error::UnexpectedEnd);
             }
@@ -731,6 +789,7 @@ impl RawDecoder for Decoder {
         self.next_fset = 255;
         self.fsets.clear();
         self.out.clear();
+        self.window_base = 0;
         self.emit_cursor = 0;
         self.prev_byte = 0;
         self.pending = None;
@@ -766,5 +825,71 @@ mod tests {
         assert_eq!(br.read_bits(&buf, 4).unwrap(), 0xB);
         assert_eq!(br.read_bits(&buf, 4).unwrap(), 0x0);
         assert_eq!(br.read_bits(&buf, 4).unwrap(), 0xF);
+    }
+
+    // The Reduce fixtures (raw payloads wrapped in this crate's 5-byte
+    // container header) live alongside the integration tests. Pull them in
+    // here so the unit tests can assert internal sliding-window invariants
+    // that the public API does not expose. Only `ABC_REPEATED_R4` is used;
+    // the rest are exercised by the integration suite, so silence
+    // dead-code warnings for the unused fixture constants.
+    #[allow(dead_code)]
+    mod fixtures {
+        include!("../../tests/zip_reduce_fixtures.in");
+        // Re-export the one fixture the unit test needs as `pub`, since the
+        // included declarations are private `const` items.
+        pub(super) const ABC_REPEATED_R4_PUB: &[u8] = ABC_REPEATED_R4;
+    }
+
+    /// H6 regression: decoding a large, highly compressible stream must
+    /// NOT retain the whole decompressed output in `self.out`. Before the
+    /// sliding-window fix, `out` grew to the full attacker-controlled
+    /// `uncomp_len` (here 66000 bytes; for adversarial headers up to
+    /// ~4 GiB). Drain through a tiny output buffer and assert the live
+    /// window stays bounded by the back-reference window plus margin,
+    /// independent of total output length.
+    #[test]
+    fn sliding_window_bounds_retained_output() {
+        let mut dec = Decoder::new();
+        let mut buf = [0u8; 7];
+        let mut total = 0usize;
+        // The worst-case window we permit: keep (4*max_dist) + buffer_ahead
+        // (4*max_dist) + one max match (~385) + one full input chunk's
+        // worth of slack. max_dist for factor 4 is 0xFFF + 1 = 4096.
+        let max_dist = ((1usize << 4) - 1) * 256 + 255 + 1;
+        let window_cap = max_dist * 8 + 4096;
+
+        let mut consumed = 0usize;
+        loop {
+            let (p, status) = {
+                use crate::traits::RawDecoder;
+                let r = dec
+                    .raw_decode(&fixtures::ABC_REPEATED_R4_PUB[consumed..], &mut buf)
+                    .unwrap();
+                let s = r.done;
+                (r, s)
+            };
+            consumed += p.consumed;
+            total += p.written;
+            // The invariant under test: live window never balloons to the
+            // full output size.
+            assert!(
+                dec.out.len() <= window_cap,
+                "retained window {} exceeded bound {} (OOM regression)",
+                dec.out.len(),
+                window_cap
+            );
+            if status {
+                break;
+            }
+            if p.consumed == 0 && p.written == 0 {
+                // No forward progress with input still pending → feed more
+                // by looping (consumed slice shrinks) or finish.
+                if consumed >= fixtures::ABC_REPEATED_R4_PUB.len() {
+                    break;
+                }
+            }
+        }
+        assert_eq!(total, 66000, "decoded length mismatch");
     }
 }
