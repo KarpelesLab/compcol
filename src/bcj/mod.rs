@@ -16,7 +16,7 @@
 //!
 //! ## Streaming
 //!
-//! The public [`Encoder`]/[`Decoder`] are driven through the crate's
+//! The public [`crate::Encoder`]/[`crate::Decoder`] are driven through the crate's
 //! 1-byte-in/1-byte-out streaming loop. To process one instruction that
 //! may straddle a chunk boundary, the engine keeps a small bounded buffer
 //! (`MAX_INSN` bytes) of input it has accepted but cannot yet fully

@@ -46,14 +46,14 @@
 //! Internally the module provides the generic primitives any LZ+Huffman
 //! decoder of this shape requires, each independently unit-tested:
 //!
-//! - [`bits::BitReader`] — MSB-first streaming bit reader (the convention
+//! - `BitReader` — MSB-first streaming bit reader (the convention
 //!   the StuffIt readers use), with a 32-bit accumulator fed one byte at a
 //!   time so it works under arbitrary input chunking.
-//! - [`huffman::Huffman`] — canonical, **Kraft-validated** Huffman decoder
+//! - `Huffman` — canonical, **Kraft-validated** Huffman decoder
 //!   parameterised by alphabet size. Rejects over-full (Kraft-overflowing)
 //!   and over-long code-length tables with [`Error::InvalidHuffmanTree`];
 //!   never panics on crafted input.
-//! - [`window::Window`] — bounds-checked LZSS sliding-window output buffer
+//! - `Window` — bounds-checked LZSS sliding-window output buffer
 //!   with literal / overlapping-match emission and a streaming drain
 //!   cursor. Rejects distance 0, distance past the window, and
 //!   back-references that point before the start of produced output with
