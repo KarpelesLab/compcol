@@ -27,11 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   distance (1..=256), encoder + decoder.
 - **ARC Crunch** (`arc_crunch`, method 8, 12-bit dynamic LZW) and **ARC
   Squeeze** (`arc_squeeze`, method 4, RLE + static Huffman), encoder + decoder.
-- **StuffIt method 13** (`sit13`): tested building blocks (bit reader,
-  Kraft-validated Huffman, bounds-checked LZSS window) behind a decoder that
-  returns `Unsupported` — the format is proprietary and the only public
-  reference is LGPL-licensed, so a conformant payload decoder could be neither
-  cleanly derived nor validated (mirrors `rar1`/`lzham`).
+- **StuffIt method 13 decoder** (`sit13`, "LZ+Huffman"): LZSS (64 KiB window,
+  LSB-first) + two per-stream 321-symbol Huffman codes switched per token,
+  obtained via the fixed meta-code or one of five predefined code-length sets;
+  explicit end-of-stream symbol. Decode-only. Clean-room from a facts-only
+  spec, with the fixed interop tables supplied as a separately-licensed
+  adjunct. Validated bit-exactly against real classic `SIT!` archives —
+  28 method-13 forks pass the stored per-fork CRC-16, covering all five
+  control modes. (Upgrades the earlier building-blocks-only `Unsupported`
+  stub.)
 
   Note: `lha` and `arc_*` are clean-room from public specs and validated by
   their own encoder↔decoder round-trip, not against reference-tool output.
