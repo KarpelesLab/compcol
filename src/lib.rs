@@ -128,6 +128,8 @@ pub mod xpress_huffman;
 
 #[cfg(feature = "lzah")]
 pub mod lzah;
+#[cfg(feature = "arsenic")]
+pub mod arsenic;
 #[cfg(feature = "lzham")]
 pub mod lzham;
 #[cfg(feature = "sit13")]
