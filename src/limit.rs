@@ -122,7 +122,14 @@ impl<D: Decoder> Decoder for LimitedDecoder<D> {
                 status,
             ));
         }
-        let cap = core::cmp::min(remaining as usize, output.len());
+        // Clamp the output slice to the remaining budget without
+        // truncating the u64 first. Casting `remaining as usize` on a
+        // 32-bit target loses the high word, so a budget that is an exact
+        // multiple of 2^32 would yield cap == 0 — handing the inner
+        // decoder an empty slice and spinning callers forever. Comparing
+        // in u64 and casting the (already <= output.len()) result back is
+        // lossless because output.len() always fits in usize.
+        let cap = remaining.min(output.len() as u64) as usize;
         let (p, status) = self.inner.decode(input, &mut output[..cap])?;
         self.written = self.written.saturating_add(p.written as u64);
         Ok((p, status))
@@ -146,7 +153,9 @@ impl<D: Decoder> Decoder for LimitedDecoder<D> {
                 status,
             ));
         }
-        let cap = core::cmp::min(remaining as usize, output.len());
+        // See decode(): clamp in u64 to avoid a 32-bit truncation that
+        // could collapse the cap to 0 and stall callers.
+        let cap = remaining.min(output.len() as u64) as usize;
         let (p, status) = self.inner.finish(&mut output[..cap])?;
         self.written = self.written.saturating_add(p.written as u64);
         Ok((p, status))
