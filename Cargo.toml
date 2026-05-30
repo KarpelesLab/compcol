@@ -36,6 +36,7 @@ all = [
     "xpress_huffman",
     "lznt1",
     "xpress",
+    "packbits",
     "rar1", "rar2", "rar3", "rar5",
 ]
 # Enables `alloc`-backed conveniences (e.g. the `factory` module, the
@@ -114,6 +115,10 @@ lznt1   = ["alloc"]
 # Microsoft Xpress (Plain LZ77 variant from MS-XCA). Byte-aligned
 # LZ77 with no entropy coding; encoder and decoder both implemented.
 xpress  = ["alloc"]
+# Apple PackBits — tag-byte RLE used in TIFF, PSD, BMP, and macOS
+# metadata. Source-byte oriented; no header/trailer. Encoder and
+# decoder both implemented.
+packbits = ["alloc"]
 # RAR decoders (rar1, rar2, rar3, rar5). Decoder-only — RARLAB's unRAR
 # license explicitly forbids re-creating the compression algorithm, so
 # the encoders permanently return `Error::Unsupported`.
