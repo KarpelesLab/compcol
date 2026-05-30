@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.6](https://github.com/KarpelesLab/compcol/compare/v0.4.5...v0.4.6) - 2026-05-30
+
+### Other
+
+- Add Microsoft Xpress (Plain LZ77) codec ([#45](https://github.com/KarpelesLab/compcol/pull/45))
+- Add lznt1 (encoder + decoder) ([#44](https://github.com/KarpelesLab/compcol/pull/44))
+- Add xpress_huffman (encoder + decoder) ([#43](https://github.com/KarpelesLab/compcol/pull/43))
+- Add ppmd (PPMd / PPMII variant H, decoder-only) ([#42](https://github.com/KarpelesLab/compcol/pull/42))
+- Add deflate64 (encoder + decoder) ([#41](https://github.com/KarpelesLab/compcol/pull/41))
+
 ## [0.4.5](https://github.com/KarpelesLab/compcol/compare/v0.4.4...v0.4.5) - 2026-05-29
 
 ### Other
