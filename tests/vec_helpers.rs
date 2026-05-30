@@ -7,6 +7,10 @@
 
 #![cfg(feature = "alloc")]
 
+// Only used by feature-gated submodules below; a minimal feature set that
+// enables `alloc` (e.g. just `bcj` or `delta`) compiles none of them, so the
+// helper is legitimately unused in those builds.
+#[allow(dead_code)]
 fn payload(n: usize) -> Vec<u8> {
     // Mixed corpus: short alphabet noise + repeated phrase. Compresses
     // well enough to exercise the codec; large enough (~96 KiB) to

@@ -153,3 +153,9 @@ pub mod lha;
 
 #[cfg(feature = "factory")]
 pub mod factory;
+
+#[cfg(feature = "bcj")]
+pub mod bcj;
+
+#[cfg(feature = "delta")]
+pub mod delta;

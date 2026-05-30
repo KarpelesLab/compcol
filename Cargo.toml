@@ -45,6 +45,7 @@ all = [
     "zip_shrink",
     "zip_reduce",
     "lha",
+    "bcj", "delta",
 ]
 # Enables `alloc`-backed conveniences (e.g. the `factory` module, the
 # `compcol::vec` one-shot helpers). Pulled in automatically by features
@@ -176,6 +177,14 @@ zip_reduce = ["alloc"]
 # LHA container header). Decoder for all five plus a static-Huffman
 # lh5/lh6/lh7 encoder (clean-room, round-trip validated).
 lha     = ["alloc"]
+# BCJ branch-converter filters (x86/ARM/ARMT/ARM64/PPC/SPARC/IA-64/RISC-V),
+# from the public-domain LZMA SDK lineage. Reversible filters, not
+# compressors: forward rewrites relative branch operands to absolute form,
+# inverse restores them. Encoder + decoder both implemented.
+bcj     = ["alloc"]
+# Delta filter — byte-wise delta with a configurable distance (1..=256).
+# Reversible filter (xz/LZMA SDK lineage). Encoder + decoder both implemented.
+delta   = ["alloc"]
 # `compcol::tokio_io` — async mirrors of compcol::io for the tokio
 # runtime. Pulls the tokio dependency for its AsyncRead/AsyncWrite
 # trait definitions; the rest of the crate stays dep-free.

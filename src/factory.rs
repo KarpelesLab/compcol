@@ -122,6 +122,32 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         crate::lha::Lh6::NAME => Some(Box::new(<crate::lha::Lh6 as Algorithm>::encoder())),
         #[cfg(feature = "lha")]
         crate::lha::Lh7::NAME => Some(Box::new(<crate::lha::Lh7 as Algorithm>::encoder())),
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjX86::NAME => Some(Box::new(<crate::bcj::BcjX86 as Algorithm>::encoder())),
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjArm::NAME => Some(Box::new(<crate::bcj::BcjArm as Algorithm>::encoder())),
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjArmThumb::NAME => {
+            Some(Box::new(<crate::bcj::BcjArmThumb as Algorithm>::encoder()))
+        }
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjArm64::NAME => {
+            Some(Box::new(<crate::bcj::BcjArm64 as Algorithm>::encoder()))
+        }
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjPpc::NAME => Some(Box::new(<crate::bcj::BcjPpc as Algorithm>::encoder())),
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjSparc::NAME => {
+            Some(Box::new(<crate::bcj::BcjSparc as Algorithm>::encoder()))
+        }
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjIa64::NAME => Some(Box::new(<crate::bcj::BcjIa64 as Algorithm>::encoder())),
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjRiscV::NAME => {
+            Some(Box::new(<crate::bcj::BcjRiscV as Algorithm>::encoder()))
+        }
+        #[cfg(feature = "delta")]
+        crate::delta::Delta::NAME => Some(Box::new(<crate::delta::Delta as Algorithm>::encoder())),
         _ => None,
     }
 }
@@ -303,6 +329,32 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         crate::lha::Lh6::NAME => Some(Box::new(<crate::lha::Lh6 as Algorithm>::decoder())),
         #[cfg(feature = "lha")]
         crate::lha::Lh7::NAME => Some(Box::new(<crate::lha::Lh7 as Algorithm>::decoder())),
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjX86::NAME => Some(Box::new(<crate::bcj::BcjX86 as Algorithm>::decoder())),
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjArm::NAME => Some(Box::new(<crate::bcj::BcjArm as Algorithm>::decoder())),
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjArmThumb::NAME => {
+            Some(Box::new(<crate::bcj::BcjArmThumb as Algorithm>::decoder()))
+        }
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjArm64::NAME => {
+            Some(Box::new(<crate::bcj::BcjArm64 as Algorithm>::decoder()))
+        }
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjPpc::NAME => Some(Box::new(<crate::bcj::BcjPpc as Algorithm>::decoder())),
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjSparc::NAME => {
+            Some(Box::new(<crate::bcj::BcjSparc as Algorithm>::decoder()))
+        }
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjIa64::NAME => Some(Box::new(<crate::bcj::BcjIa64 as Algorithm>::decoder())),
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjRiscV::NAME => {
+            Some(Box::new(<crate::bcj::BcjRiscV as Algorithm>::decoder()))
+        }
+        #[cfg(feature = "delta")]
+        crate::delta::Delta::NAME => Some(Box::new(<crate::delta::Delta as Algorithm>::decoder())),
         _ => None,
     }
 }
@@ -442,6 +494,36 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     if str_eq(name, "lh7") && cfg!(feature = "lha") {
         return Some("lzh");
     }
+    // BCJ branch filters and the delta filter are pre-processors, not
+    // standalone container formats; they have no conventional extension, so
+    // the filter name doubles as the suffix the CLI appends.
+    if str_eq(name, "bcj-x86") && cfg!(feature = "bcj") {
+        return Some("bcj-x86");
+    }
+    if str_eq(name, "bcj-arm") && cfg!(feature = "bcj") {
+        return Some("bcj-arm");
+    }
+    if str_eq(name, "bcj-armt") && cfg!(feature = "bcj") {
+        return Some("bcj-armt");
+    }
+    if str_eq(name, "bcj-arm64") && cfg!(feature = "bcj") {
+        return Some("bcj-arm64");
+    }
+    if str_eq(name, "bcj-ppc") && cfg!(feature = "bcj") {
+        return Some("bcj-ppc");
+    }
+    if str_eq(name, "bcj-sparc") && cfg!(feature = "bcj") {
+        return Some("bcj-sparc");
+    }
+    if str_eq(name, "bcj-ia64") && cfg!(feature = "bcj") {
+        return Some("bcj-ia64");
+    }
+    if str_eq(name, "bcj-riscv") && cfg!(feature = "bcj") {
+        return Some("bcj-riscv");
+    }
+    if str_eq(name, "delta") && cfg!(feature = "delta") {
+        return Some("delta");
+    }
     None
 }
 
@@ -548,5 +630,23 @@ pub const fn names() -> &'static [&'static str] {
         crate::lha::Lh6::NAME,
         #[cfg(feature = "lha")]
         crate::lha::Lh7::NAME,
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjX86::NAME,
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjArm::NAME,
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjArmThumb::NAME,
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjArm64::NAME,
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjPpc::NAME,
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjSparc::NAME,
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjIa64::NAME,
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjRiscV::NAME,
+        #[cfg(feature = "delta")]
+        crate::delta::Delta::NAME,
     ]
 }
