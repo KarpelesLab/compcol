@@ -170,3 +170,10 @@ path             = "fuzz_targets/decoder_lzs.rs"
 test             = false
 doc              = false
 bench            = false
+
+[[bin]]
+name             = "decoder_lzss"
+path             = "fuzz_targets/decoder_lzss.rs"
+test             = false
+doc              = false
+bench            = false
