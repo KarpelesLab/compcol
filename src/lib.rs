@@ -130,5 +130,8 @@ pub mod rar3;
 #[cfg(feature = "rar5")]
 pub mod rar5;
 
+#[cfg(feature = "zip_shrink")]
+pub mod zip_shrink;
+
 #[cfg(feature = "factory")]
 pub mod factory;
