@@ -16,6 +16,8 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
     match name {
         #[cfg(feature = "rle")]
         crate::rle::Rle::NAME => Some(Box::new(<crate::rle::Rle as Algorithm>::encoder())),
+        #[cfg(feature = "rle90")]
+        crate::rle90::Rle90::NAME => Some(Box::new(<crate::rle90::Rle90 as Algorithm>::encoder())),
         #[cfg(feature = "deflate")]
         crate::deflate::Deflate::NAME => {
             Some(Box::new(<crate::deflate::Deflate as Algorithm>::encoder()))
@@ -239,6 +241,8 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
     match name {
         #[cfg(feature = "rle")]
         crate::rle::Rle::NAME => Some(Box::new(<crate::rle::Rle as Algorithm>::decoder())),
+        #[cfg(feature = "rle90")]
+        crate::rle90::Rle90::NAME => Some(Box::new(<crate::rle90::Rle90 as Algorithm>::decoder())),
         #[cfg(feature = "deflate")]
         crate::deflate::Deflate::NAME => {
             Some(Box::new(<crate::deflate::Deflate as Algorithm>::decoder()))
@@ -402,6 +406,9 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     // allows; can't use enum dispatch through trait objects in const context.
     if str_eq(name, "rle") && cfg!(feature = "rle") {
         return Some("rle");
+    }
+    if str_eq(name, "rle90") && cfg!(feature = "rle90") {
+        return Some("rle90");
     }
     if str_eq(name, "deflate") && cfg!(feature = "deflate") {
         return Some("deflate");
@@ -597,6 +604,8 @@ pub const fn names() -> &'static [&'static str] {
     &[
         #[cfg(feature = "rle")]
         crate::rle::Rle::NAME,
+        #[cfg(feature = "rle90")]
+        crate::rle90::Rle90::NAME,
         #[cfg(feature = "deflate")]
         crate::deflate::Deflate::NAME,
         #[cfg(feature = "deflate64")]

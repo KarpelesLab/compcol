@@ -28,7 +28,7 @@ default = ["alloc", "rle", "deflate", "zlib", "gzip", "factory"]
 # Cargo.toml entries (`features = ["all"]`) instead of a 20-item list.
 all = [
     "alloc", "std", "tokio", "factory",
-    "rle", "deflate", "deflate64", "zlib", "gzip",
+    "rle", "rle90", "deflate", "deflate64", "zlib", "gzip",
     "lzma", "xz",
     "zstd", "brotli", "lz4", "snappy", "lzw", "lzss", "bzip2",
     "zstd", "brotli", "lz4", "lz5", "snappy", "lzw", "bzip2",
@@ -63,6 +63,8 @@ std     = ["alloc"]
 factory = ["alloc"]
 # Run-length encoding.
 rle     = []
+# RLE90 — the 0x90/DLE run-length variant (ARC method 3, StuffIt method 1).
+rle90   = ["alloc"]
 # RFC 1951 raw deflate. Requires `alloc` for the 32 KiB sliding window and
 # the per-block symbol/bit buffers.
 deflate = ["alloc"]

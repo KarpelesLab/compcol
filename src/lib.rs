@@ -46,6 +46,9 @@ mod huffman;
 #[cfg(feature = "rle")]
 pub mod rle;
 
+#[cfg(feature = "rle90")]
+pub mod rle90;
+
 #[cfg(feature = "deflate")]
 pub mod deflate;
 
