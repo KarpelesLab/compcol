@@ -49,7 +49,7 @@ all = [
     "zip_reduce",
     "lha",
     "bcj", "delta",
-    "arc_crunch", "arc_squeeze",
+    "arc_crunch", "arc_squeeze", "arc_squash",
 ]
 # Enables `alloc`-backed conveniences (e.g. the `factory` module, the
 # `compcol::vec` one-shot helpers). Pulled in automatically by features
@@ -222,6 +222,10 @@ arc_crunch = ["alloc"]
 # stream header. Encoder and decoder both implemented and validated by
 # round-trip.
 arc_squeeze = ["alloc"]
+# ARC "Squashed" (ARC method 9 / PKARC-PKPAK): fixed 13-bit LZW with a
+# block-mode CLEAR code and no header byte (no RLE pre-pass). Encoder and
+# decoder both implemented and validated by round-trip.
+arc_squash = ["alloc"]
 # `compcol::tokio_io` — async mirrors of compcol::io for the tokio
 # runtime. Pulls the tokio dependency for its AsyncRead/AsyncWrite
 # trait definitions; the rest of the crate stays dep-free.

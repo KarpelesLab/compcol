@@ -166,6 +166,10 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         crate::arc_squeeze::ArcSqueeze::NAME => Some(Box::new(
             <crate::arc_squeeze::ArcSqueeze as Algorithm>::encoder(),
         )),
+        #[cfg(feature = "arc_squash")]
+        crate::arc_squash::ArcSquash::NAME => Some(Box::new(
+            <crate::arc_squash::ArcSquash as Algorithm>::encoder(),
+        )),
         _ => None,
     }
 }
@@ -391,6 +395,10 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         crate::arc_squeeze::ArcSqueeze::NAME => Some(Box::new(
             <crate::arc_squeeze::ArcSqueeze as Algorithm>::decoder(),
         )),
+        #[cfg(feature = "arc_squash")]
+        crate::arc_squash::ArcSquash::NAME => Some(Box::new(
+            <crate::arc_squash::ArcSquash as Algorithm>::decoder(),
+        )),
         _ => None,
     }
 }
@@ -578,6 +586,9 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     if str_eq(name, "squeeze") && cfg!(feature = "arc_squeeze") {
         return Some("sqz");
     }
+    if str_eq(name, "squashed") && cfg!(feature = "arc_squash") {
+        return Some("arc");
+    }
     None
 }
 
@@ -714,5 +725,7 @@ pub const fn names() -> &'static [&'static str] {
         crate::arc_crunch::ArcCrunch::NAME,
         #[cfg(feature = "arc_squeeze")]
         crate::arc_squeeze::ArcSqueeze::NAME,
+        #[cfg(feature = "arc_squash")]
+        crate::arc_squash::ArcSquash::NAME,
     ]
 }

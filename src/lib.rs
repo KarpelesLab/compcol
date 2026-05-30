@@ -159,6 +159,8 @@ pub mod zip_shrink;
 
 #[cfg(feature = "arc_crunch")]
 pub mod arc_crunch;
+#[cfg(feature = "arc_squash")]
+pub mod arc_squash;
 #[cfg(feature = "arc_squeeze")]
 pub mod arc_squeeze;
 #[cfg(feature = "lha")]
