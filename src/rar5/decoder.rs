@@ -757,6 +757,14 @@ fn adjust_length(length: u32, dist: u32) -> u32 {
 /// Decode a distance given the distance slot. For slots with extra bits
 /// >= 4, the lower 4 bits come from the low-distance Huffman table `ldc`.
 fn decode_distance(bits: &mut BitBuf, dist_slot: u16, ldc: &Huffman) -> Result<u32, Error> {
+    // `dist_slot` is decoded from the DC Huffman table, which has exactly
+    // HUFF_DC (64) symbols, so it is in 0..=63. Guard against an
+    // out-of-contract value: with slots > 63, `dbits` would exceed 30 and
+    // the shifts below could overflow. This keeps the function within the
+    // RAR5 distance-slot range.
+    if dist_slot as usize >= HUFF_DC {
+        return Err(Error::Corrupt);
+    }
     let mut dist: u32;
     let dbits: u32;
     if dist_slot < 4 {
@@ -768,9 +776,21 @@ fn decode_distance(bits: &mut BitBuf, dist_slot: u16, ldc: &Huffman) -> Result<u
     }
     if dbits > 0 {
         if dbits >= 4 {
+            // `high_extra = dbits - 4` can be as large as 26 for slot 63,
+            // which exceeds BitBuf::read's documented 1..=16-bit limit (it
+            // debug-asserts n <= 16). Read it in <=16-bit chunks so debug
+            // builds don't panic and the value is assembled MSB-first
+            // exactly as a single wide read would have produced it.
             let high_extra = dbits - 4;
             if high_extra > 0 {
-                let high = bits.read(high_extra)?;
+                let mut high: u32 = 0;
+                let mut remaining = high_extra;
+                while remaining > 0 {
+                    let chunk = remaining.min(16);
+                    let part = bits.read(chunk)?;
+                    high = (high << chunk) | part;
+                    remaining -= chunk;
+                }
                 dist += high << 4;
             }
             let low = ldc.decode(bits)? as u32;
