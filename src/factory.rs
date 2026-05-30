@@ -98,6 +98,8 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         crate::lzham::Lzham::NAME => Some(Box::new(<crate::lzham::Lzham as Algorithm>::encoder())),
         #[cfg(feature = "sit13")]
         crate::sit13::Sit13::NAME => Some(Box::new(<crate::sit13::Sit13 as Algorithm>::encoder())),
+        #[cfg(feature = "lzah")]
+        crate::lzah::Lzah::NAME => Some(Box::new(<crate::lzah::Lzah as Algorithm>::encoder())),
         #[cfg(feature = "rar1")]
         crate::rar1::Rar1::NAME => Some(Box::new(<crate::rar1::Rar1 as Algorithm>::encoder())),
         #[cfg(feature = "rar2")]
@@ -315,6 +317,8 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         crate::lzham::Lzham::NAME => Some(Box::new(<crate::lzham::Lzham as Algorithm>::decoder())),
         #[cfg(feature = "sit13")]
         crate::sit13::Sit13::NAME => Some(Box::new(<crate::sit13::Sit13 as Algorithm>::decoder())),
+        #[cfg(feature = "lzah")]
+        crate::lzah::Lzah::NAME => Some(Box::new(<crate::lzah::Lzah as Algorithm>::decoder())),
         #[cfg(feature = "rar1")]
         crate::rar1::Rar1::NAME => Some(Box::new(<crate::rar1::Rar1 as Algorithm>::decoder())),
         #[cfg(feature = "rar2")]
@@ -478,6 +482,9 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     if str_eq(name, "sit13") && cfg!(feature = "sit13") {
         return Some("sit13");
     }
+    if str_eq(name, "lzah") && cfg!(feature = "lzah") {
+        return Some("lzah");
+    }
     // All RAR versions share the .rar extension; the version is in-band in
     // the file header. The CLI's in-place mode will write to <input>.rar
     // and strip .rar on decode for any rar* algorithm.
@@ -639,6 +646,8 @@ pub const fn names() -> &'static [&'static str] {
         crate::lzham::Lzham::NAME,
         #[cfg(feature = "sit13")]
         crate::sit13::Sit13::NAME,
+        #[cfg(feature = "lzah")]
+        crate::lzah::Lzah::NAME,
         #[cfg(feature = "rar1")]
         crate::rar1::Rar1::NAME,
         #[cfg(feature = "rar2")]

@@ -42,6 +42,7 @@ all = [
     "lzs",
     "lzham",
     "sit13",
+    "lzah",
     "rar1", "rar2", "rar3", "rar5",
     "zip_shrink",
     "zip_reduce",
@@ -166,6 +167,14 @@ lzham   = ["alloc"]
 # decoder could be neither derived nor validated. The encoder is also
 # permanently `Error::Unsupported`.
 sit13   = ["alloc"]
+# StuffIt classic compression method 5 ("LZAH"): LZSS over a pre-seeded
+# 4 KiB sliding window with a single adaptive (sibling-property) Huffman
+# tree for literal/length tokens and a static canonical prefix code for the
+# high offset bits, MSB-first. Decode-only target — the encoder permanently
+# returns `Error::Unsupported` (no StuffIt encoder exists). The uncompressed
+# length is out of band (the archive entry header), supplied via
+# `DecoderConfig::with_len`.
+lzah    = ["alloc"]
 # RAR decoders (rar1, rar2, rar3, rar5). Decoder-only — RARLAB's unRAR
 # license explicitly forbids re-creating the compression algorithm, so
 # the encoders permanently return `Error::Unsupported`.
