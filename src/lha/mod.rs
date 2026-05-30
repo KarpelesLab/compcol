@@ -18,14 +18,20 @@
 //! only in dictionary size and the number of position-code bits. `lh1`
 //! uses the adaptive-Huffman tree-update scheme (see [`lzhuf`]).
 //!
-//! ## Framing
+//! ## Framing — none
 //!
-//! The raw payloads carry no length, so — like [`lzss`](crate::lzss) and
-//! [`xpress_huffman`](crate::xpress_huffman) — every stream here is
-//! prefixed with a **4-byte little-endian uncompressed length**. The
-//! decoder stops once that many bytes have been produced, which makes the
-//! stream self-delimiting and bounds decompressed size for
-//! decompression-bomb safety.
+//! These codecs read and write the **raw** method payload, exactly as stored
+//! in a `.lzh`/`.lha` archive: no length prefix, no added framing. How the
+//! decoder knows where the stream ends depends on the method (see
+//! [`DecoderConfig`]):
+//!
+//! - `lh4`/`lh5`/`lh6`/`lh7` are block-structured and self-terminate — decode
+//!   the input and call `finish()`, like any other codec here.
+//! - `lh1` is a continuous, size-terminated stream with no in-band end, so its
+//!   decoder needs the uncompressed length out of band via
+//!   [`DecoderConfig::with_len`] (the size a container reader already has).
+//!   `with_len` is accepted by every method and bounds decompressed size for
+//!   decompression-bomb safety.
 //!
 //! ## Licensing
 //!
@@ -80,6 +86,43 @@ impl Method {
     }
 }
 
+// ─── decoder configuration ───────────────────────────────────────────────
+
+/// Optional out-of-band uncompressed length for the decoder.
+///
+/// The decoder consumes the **raw** `-lh*-` method payload (exactly the bytes
+/// stored in a `.lzh`/`.lha` archive — no length prefix, no extra framing):
+///
+/// - **Default (`expected_len: None`)** — stream-terminated. Decode the input
+///   and call `finish()` at the end, like any other codec in this crate. This
+///   works for the block-structured methods (`lh4`/`lh5`/`lh6`/`lh7`), which
+///   self-terminate at the final block boundary. It does **not** work for
+///   `lh1` (see below).
+/// - **`with_len(n)`** — when the original size is known out of band (e.g.
+///   from the LHA container header), the decoder stops at exactly `n` bytes
+///   and never touches trailing padding. Required for `lh1`, and valid for
+///   every method.
+///
+/// `lh1` (LZHUF) is a continuous, size-terminated code stream with no in-band
+/// end marker, so decoding it **requires** `with_len`; a default (`None`)
+/// `lh1` decoder returns [`Error::Unsupported`] on non-empty input rather than
+/// emit trailing garbage from padding bits.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DecoderConfig {
+    /// Uncompressed size from the container header, if known out of band.
+    pub expected_len: Option<usize>,
+}
+
+impl DecoderConfig {
+    /// Config for decoding a raw `-lh*-` payload whose uncompressed size is
+    /// known out of band (the common container-reader case).
+    pub fn with_len(expected_len: usize) -> Self {
+        Self {
+            expected_len: Some(expected_len),
+        }
+    }
+}
+
 // ─── marker types ────────────────────────────────────────────────────────
 
 macro_rules! define_method {
@@ -93,12 +136,12 @@ macro_rules! define_method {
             type Encoder = Encoder;
             type Decoder = Decoder;
             type EncoderConfig = ();
-            type DecoderConfig = ();
+            type DecoderConfig = DecoderConfig;
             fn encoder_with(_: ()) -> Encoder {
                 Encoder::new(Method::$variant)
             }
-            fn decoder_with(_: ()) -> Decoder {
-                Decoder::new(Method::$variant)
+            fn decoder_with(config: DecoderConfig) -> Decoder {
+                Decoder::with_config(Method::$variant, config)
             }
         }
     };
@@ -164,8 +207,6 @@ impl Encoder {
     }
 
     fn finalize(&mut self) {
-        let n = self.input.len() as u32;
-        self.output.extend_from_slice(&n.to_le_bytes());
         let payload = if self.method.is_static() {
             let params = Params::for_method(self.method.name());
             static_huff::encode_payload(&self.input, params)
@@ -223,6 +264,9 @@ impl RawEncoder for Encoder {
 #[derive(Debug)]
 pub struct Decoder {
     method: Method,
+    /// Uncompressed size supplied out of band; `None` selects the legacy
+    /// 4-byte-length-prefix framing (see [`DecoderConfig`]).
+    expected_len: Option<usize>,
     input: Vec<u8>,
     /// Decoded output buffer, produced lazily once enough input is
     /// available (or at `raw_finish`).
@@ -232,9 +276,10 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    fn new(method: Method) -> Self {
+    fn with_config(method: Method, config: DecoderConfig) -> Self {
         Self {
             method,
+            expected_len: config.expected_len,
             input: Vec::new(),
             output: Vec::new(),
             out_cursor: 0,
@@ -242,24 +287,31 @@ impl Decoder {
         }
     }
 
-    /// Decode the buffered input into `self.output`. Idempotent.
+    /// Decode the buffered raw `-lh*-` payload into `self.output`. Idempotent.
     fn decode_all(&mut self) -> Result<(), Error> {
         if self.decoded {
             return Ok(());
         }
-        if self.input.len() < 4 {
-            return Err(Error::UnexpectedEnd);
-        }
-        let mut len_bytes = [0u8; 4];
-        len_bytes.copy_from_slice(&self.input[..4]);
-        let expected = u32::from_le_bytes(len_bytes) as usize;
-        let payload = &self.input[4..];
+        let payload = &self.input[..];
 
         self.output = if self.method.is_static() {
+            // lh4/5/6/7 are block-structured: each block declares its code
+            // count, so the decoder self-terminates when the bitstream ends
+            // at a block boundary. `expected_len`, when supplied, just stops
+            // it earlier (and avoids touching trailing padding).
             let params = Params::for_method(self.method.name());
-            static_huff::decode_payload(payload, expected, params)?
+            static_huff::decode_payload(payload, self.expected_len, params)?
         } else {
-            lzhuf::decode_payload(payload, expected)?
+            // lh1 (LZHUF) is a continuous, size-terminated code stream with no
+            // in-band end marker — the uncompressed length must be supplied
+            // out of band via `DecoderConfig::with_len`. Without it we cannot
+            // know where the data ends (the trailing bits are padding), so we
+            // refuse rather than emit garbage.
+            match self.expected_len {
+                Some(n) => lzhuf::decode_payload(payload, n)?,
+                None if payload.is_empty() => Vec::new(),
+                None => return Err(Error::Unsupported),
+            }
         };
         self.decoded = true;
         Ok(())

@@ -200,12 +200,18 @@ mod brotli {
     }
 }
 
-// ─── lha (lh5 / lh1 via the one-shot vec helpers) ───────────────────────
+// ─── lha (lh5 via the one-shot vec helpers) ─────────────────────────────
+//
+// Only the block-structured static methods (e.g. lh5) work through the
+// generic one-shot helpers, which use the default decoder config (no length)
+// and rely on `finish()` to terminate. `lh1` is size-terminated and needs
+// `DecoderConfig::with_len`, which the generic helpers can't supply — so it
+// is exercised in `tests/lha.rs` instead.
 
 #[cfg(feature = "lha")]
 mod lha {
     use super::*;
-    use compcol::lha::{Lh1, Lh5};
+    use compcol::lha::Lh5;
     use compcol::vec::{compress_to_vec, decompress_to_vec};
 
     #[test]
@@ -213,14 +219,6 @@ mod lha {
         let input = payload(64 * 1024 + 7);
         let c = compress_to_vec::<Lh5>(&input).unwrap();
         let d = decompress_to_vec::<Lh5>(&c).unwrap();
-        assert_eq!(d, input);
-    }
-
-    #[test]
-    fn round_trip_lh1() {
-        let input = payload(20 * 1024 + 3);
-        let c = compress_to_vec::<Lh1>(&input).unwrap();
-        let d = decompress_to_vec::<Lh1>(&c).unwrap();
         assert_eq!(d, input);
     }
 }

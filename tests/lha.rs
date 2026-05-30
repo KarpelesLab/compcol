@@ -1,7 +1,7 @@
 #![cfg(feature = "lha")]
 //! Streaming round-trip + error-path tests for the LHA/LZH methods.
 
-use compcol::lha::{Lh1, Lh4, Lh5, Lh6, Lh7};
+use compcol::lha::{DecoderConfig, Lh1, Lh4, Lh5, Lh6, Lh7};
 use compcol::{Algorithm, Decoder, Encoder, Error, Status};
 
 /// Encode `data` with `enc`, feeding `in_chunk` bytes at a time and
@@ -81,23 +81,41 @@ fn decode_chunked<D: Decoder>(
     out
 }
 
-fn roundtrip_method<A: Algorithm>(data: &[u8]) {
+/// Round-trip `data` through the raw (un-prefixed) payload.
+///
+/// `with_len = false` exercises the streaming `finish()` path (no length —
+/// the block-structured static methods self-terminate). `with_len = true`
+/// supplies the uncompressed size out of band via `DecoderConfig::with_len`
+/// (required by `lh1`, valid for all).
+fn roundtrip_mode<A: Algorithm<DecoderConfig = DecoderConfig>>(data: &[u8], with_len: bool) {
     // A few chunk-size combinations to exercise resumability.
     for &(ic, oc) in &[(1 << 20, 1 << 20), (1, 1), (7, 3), (64, 16)] {
         let enc = A::encoder();
         let encoded = encode_chunked(enc, data, ic, oc);
-        let dec = A::decoder();
+        let dec = if with_len {
+            A::decoder_with(DecoderConfig::with_len(data.len()))
+        } else {
+            A::decoder()
+        };
         let decoded = decode_chunked(dec, &encoded, ic, oc);
         assert_eq!(
             decoded,
             data,
-            "round-trip mismatch for {} (in={}, out={}, len={})",
+            "round-trip mismatch for {} (with_len={}, in={}, out={}, len={})",
             A::NAME,
+            with_len,
             ic,
             oc,
             data.len()
         );
     }
+}
+
+/// Static methods (lh4/5/6/7) must round-trip both via `finish()` and with an
+/// explicit length.
+fn roundtrip_static<A: Algorithm<DecoderConfig = DecoderConfig>>(data: &[u8]) {
+    roundtrip_mode::<A>(data, false);
+    roundtrip_mode::<A>(data, true);
 }
 
 fn sample_inputs() -> Vec<Vec<u8>> {
@@ -136,35 +154,35 @@ fn sample_inputs() -> Vec<Vec<u8>> {
 #[test]
 fn roundtrip_lh5() {
     for data in sample_inputs() {
-        roundtrip_method::<Lh5>(&data);
+        roundtrip_static::<Lh5>(&data);
     }
 }
 
 #[test]
 fn roundtrip_lh4() {
     for data in sample_inputs() {
-        roundtrip_method::<Lh4>(&data);
+        roundtrip_static::<Lh4>(&data);
     }
 }
 
 #[test]
 fn roundtrip_lh6() {
     for data in sample_inputs() {
-        roundtrip_method::<Lh6>(&data);
+        roundtrip_static::<Lh6>(&data);
     }
 }
 
 #[test]
 fn roundtrip_lh7() {
     for data in sample_inputs() {
-        roundtrip_method::<Lh7>(&data);
+        roundtrip_static::<Lh7>(&data);
     }
 }
 
 #[test]
 fn roundtrip_lh1() {
     for data in sample_inputs() {
-        roundtrip_method::<Lh1>(&data);
+        roundtrip_mode::<Lh1>(&data, true);
     }
 }
 
@@ -178,7 +196,7 @@ fn large_window_match_lh7() {
     // Append a copy of the first 5000 bytes so it back-references far.
     let head: Vec<u8> = data[..5000].to_vec();
     data.extend_from_slice(&head);
-    roundtrip_method::<Lh7>(&data);
+    roundtrip_static::<Lh7>(&data);
 }
 
 // ─── error paths: crafted/truncated input must never panic ───────────────
@@ -190,7 +208,7 @@ fn truncated_payload_errors_cleanly() {
     let data = b"the quick brown fox jumps over the lazy dog, repeatedly!".repeat(20);
     let enc = Lh5::encoder();
     let encoded = encode_chunked(enc, &data, 1 << 16, 1 << 16);
-    // Keep the 4-byte length header + a few payload bytes only.
+    // Keep only the first few bytes of the raw payload.
     let truncated = &encoded[..(encoded.len().min(8))];
     let mut dec = Lh5::decoder();
     let mut buf = vec![0u8; 4096];
@@ -211,9 +229,12 @@ fn truncated_payload_errors_cleanly() {
 }
 
 #[test]
-fn header_only_then_garbage_errors() {
-    // 4-byte length header claiming 1000 bytes, followed by random junk.
-    let mut stream = 1000u32.to_le_bytes().to_vec();
+fn garbage_payload_errors_cleanly() {
+    // Random junk fed as a raw payload must never panic — the decoder either
+    // errors or terminates with bounded output. `lh1` (no length) refuses
+    // outright with `Unsupported`; the static methods decode-until-EOF and
+    // either error on the malformed bitstream or stop.
+    let mut stream = Vec::new();
     let mut rng = 0xdead_beefu32;
     for _ in 0..200 {
         rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
@@ -227,11 +248,11 @@ fn header_only_then_garbage_errors() {
     for mut dec in decoders {
         let mut buf = vec![0u8; 8192];
         let _ = dec.decode(&stream, &mut buf);
-        // Must not panic; produce no more than the claimed length.
+        // Must not panic; output is bounded well under any bomb threshold.
         let mut produced = 0usize;
         while let Ok((p, status)) = dec.finish(&mut buf) {
             produced += p.written;
-            assert!(produced <= 1000);
+            assert!(produced <= 4 * 1024 * 1024);
             if matches!(status, Status::StreamEnd) || p.written == 0 {
                 break;
             }
