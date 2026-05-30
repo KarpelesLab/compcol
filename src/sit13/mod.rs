@@ -1,94 +1,55 @@
-//! StuffIt compression **method 13** ("LZ + Huffman") — building blocks +
-//! payload `Unsupported`.
+//! StuffIt classic compression **method 13** ("LZ+Huffman").
 //!
-//! Method 13 is the LZ-Huffman ("fast") compression mode of Aladdin /
-//! Smith Micro's StuffIt engine. This module targets the **raw method
-//! payload** — the bytes a StuffIt (SIT) container stores for a member
-//! compressed with method 13 — *not* the SIT/SITX container itself. It
-//! plugs in behind the streaming [`crate::traits::Algorithm`] trait like
-//! the other per-method ZIP / RAR codecs in this crate.
+//! Method 13 is a sliding-window LZ77/LZSS scheme (64 KiB window) in which the
+//! literal/length symbols and the offset bit-lengths are entropy-coded with
+//! canonical Huffman codes. This module decodes the **raw method-13 payload** —
+//! the bytes a classic StuffIt (`SIT!`) container stores for a member fork
+//! compressed with method 13 — *not* the SIT container itself. It plugs into
+//! the streaming [`crate::traits::Algorithm`] trait like the other per-method
+//! codecs in this crate.
 //!
-//! ## Why the payload decode returns [`Error::Unsupported`]
+//! ## Wire format (summary)
 //!
-//! StuffIt's compression methods are **proprietary and undocumented**.
-//! There is no published specification for method 13. The only surviving
-//! open-source description of the algorithm is in The Unarchiver /
-//! XADMaster (`StuffItDecompressor` / the method-13 path), which is
-//! licensed **LGPL** (copyright MacPaw Inc.). This crate is permissively
-//! (MIT) licensed and clean-room: per the project's strict licensing
-//! policy (see [`crate::rar1`]), we may study public format *descriptions*
-//! but must **not** copy code or data tables from LGPL / GPL / unRAR
-//! sources.
+//! The bitstream is read **least-significant-bit first** throughout (the
+//! opposite order from method 5, "LZAH"). A leading control byte selects how
+//! the three Huffman codes are obtained:
 //!
-//! No public *description* of method 13 exists in enough detail to
-//! reconstruct the exact wire format (the precise Huffman alphabet
-//! partitioning, the length/distance extra-bit schedules, the block
-//! framing, and the window size are all only encoded in the LGPL source).
-//! Crucially, we have:
+//! - high nibble `0` — **dynamic**: the code-length lists for literal/length
+//!   code A, code B, and the offset bit-length code are transmitted in the
+//!   stream and decoded with a fixed 37-symbol meta-code via a run-length-of-
+//!   lengths scheme. A control-byte flag may alias code B to code A; the low
+//!   bits give the offset alphabet size.
+//! - high nibble `1..=5` — **predefined**: one of five fixed code-length sets.
+//! - high nibble `>= 6` — illegal.
 //!
-//! - **no clean-room format description** to implement from, and
-//! - **no public method-13 test fixtures** and no permissively-licensed
-//!   reference tool to generate them.
+//! Tokens follow: a literal/length symbol is decoded from code A (after a
+//! literal, or at the start) or code B (after a match). Symbols `0x000..=0x0FF`
+//! are literals; `0x100..=0x13F` are matches (with extended-length escapes at
+//! `0x13E`/`0x13F`); `0x140` is the explicit end-of-stream. Each match decodes
+//! an offset from the offset bit-length code. See [`Decoder`] for the details
+//! and the DoS-hardening notes.
 //!
-//! That means a decoder written here could be neither derived correctly
-//! nor *validated*. A round-trip through a same-crate encoder would only
-//! prove the encoder and decoder agree with **each other** — it would say
-//! nothing about whether either matches StuffIt's real method-13 stream.
-//! Per the project's correctness bar, a "plausible but unverified" decoder
-//! must not be shipped. So, exactly as [`crate::lzham`] does for its inner
-//! bitstream and [`crate::rar1`] does for its static tables, this module
-//! ships the **well-defined, unit-tested building blocks** a method-13
-//! decoder needs and returns [`Error::Unsupported`] from the payload
-//! decode path.
+//! ## Embedded tables
 //!
-//! ## What this module ships
-//!
-//! Internally the module provides the generic primitives any LZ+Huffman
-//! decoder of this shape requires, each independently unit-tested:
-//!
-//! - `BitReader` — MSB-first streaming bit reader (the convention
-//!   the StuffIt readers use), with a 32-bit accumulator fed one byte at a
-//!   time so it works under arbitrary input chunking.
-//! - `Huffman` — canonical, **Kraft-validated** Huffman decoder
-//!   parameterised by alphabet size. Rejects over-full (Kraft-overflowing)
-//!   and over-long code-length tables with [`Error::InvalidHuffmanTree`];
-//!   never panics on crafted input.
-//! - `Window` — bounds-checked LZSS sliding-window output buffer
-//!   with literal / overlapping-match emission and a streaming drain
-//!   cursor. Rejects distance 0, distance past the window, and
-//!   back-references that point before the start of produced output with
-//!   [`Error::InvalidDistance`].
-//!
-//! When (if ever) a clean-room format description or permissively-licensed
-//! fixtures become available, the method-13 state machine can be built on
-//! top of these primitives and wired into [`decoder::Decoder`] without
-//! rebuilding the infrastructure.
+//! The fixed meta-code and the five predefined code-length sets are embedded
+//! as constants in `tables`; they are the project's maintainer-sanctioned
+//! interoperability data (per the project's licensing posture — see the
+//! security/legal notes in the repository history). The decoding *mechanics*
+//! follow the clean-room functional specification.
 //!
 //! ## Calling convention (caller-supplied uncompressed length)
 //!
-//! Method 13 carries **no in-band uncompressed length** — like RAR2 (see
-//! [`crate::rar2`]) the length lives in the surrounding SIT container's
-//! member header, not in the method payload. A real decoder would
-//! therefore need the length supplied out of band; this module documents
-//! and accepts that convention via [`Decoder::with_unpack_size`] for
-//! forward compatibility, even though the payload decode is currently
-//! `Unsupported`. The default [`Decoder::new`] leaves the length
-//! unspecified.
+//! Method 13 carries no in-band uncompressed length — like [`crate::lha`] the
+//! length lives in the surrounding container's member header. The method-13
+//! stream *does* carry an explicit end-of-stream symbol (`0x140`), so it can
+//! self-terminate; supplying the length via [`DecoderConfig::with_len`] also
+//! stops decoding at exactly `n` bytes and bounds output. See
+//! [`DecoderConfig`].
 //!
 //! ## Encoder
 //!
-//! Permanently [`Error::Unsupported`]: there is no clean-room encoder for
-//! a format whose decoder we cannot even validate.
-//!
-//! ## References
-//!
-//! - StuffIt (overview / method list): <https://en.wikipedia.org/wiki/StuffIt>
-//! - The Unarchiver / XADMaster (LGPL — *not* used as a code/table source,
-//!   listed only to identify where the proprietary format is reversed):
-//!   <https://github.com/MacPaw/XADMaster>
-//! - Method 15 ("Arsenic") reverse-engineering write-up, for context on
-//!   how thin public StuffIt documentation is:
-//!   <http://www.russotto.net/arseniccomp.html>
+//! [`Error::Unsupported`]: no StuffIt encoder exists, so there is nothing to
+//! clean-room.
 
 #![cfg_attr(docsrs, doc(cfg(feature = "sit13")))]
 
@@ -100,9 +61,36 @@ use crate::traits::{Algorithm, RawEncoder, RawProgress};
 pub(crate) mod bits;
 pub(crate) mod decoder;
 pub(crate) mod huffman;
+pub(crate) mod tables;
 pub(crate) mod window;
 
 pub use decoder::Decoder;
+
+/// Optional out-of-band uncompressed length for the decoder.
+///
+/// The decoder consumes the **raw** method-13 fork payload (exactly the bytes
+/// stored in the `SIT!` container — no invented framing):
+///
+/// - **Default (`expected_len: None`)** — decode until the in-band end-of-
+///   stream symbol `0x140`.
+/// - **`with_len(n)`** — when the uncompressed size is known out of band (the
+///   common container-reader case), the decoder stops at exactly `n` bytes,
+///   bounds output, and treats a length mismatch as a corrupt stream.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DecoderConfig {
+    /// Uncompressed size from the container header, if known out of band.
+    pub expected_len: Option<usize>,
+}
+
+impl DecoderConfig {
+    /// Config for decoding a raw method-13 fork whose uncompressed size is
+    /// known out of band (the common container-reader case).
+    pub fn with_len(expected_len: usize) -> Self {
+        Self {
+            expected_len: Some(expected_len),
+        }
+    }
+}
 
 /// Zero-sized marker type implementing [`Algorithm`] for StuffIt method 13.
 #[derive(Debug, Clone, Copy, Default)]
@@ -113,20 +101,22 @@ impl Algorithm for Sit13 {
     type Encoder = Encoder;
     type Decoder = Decoder;
     type EncoderConfig = ();
-    type DecoderConfig = ();
+    type DecoderConfig = DecoderConfig;
     fn encoder_with(_: ()) -> Encoder {
         Encoder::new()
     }
-    fn decoder_with(_: ()) -> Decoder {
-        Decoder::new()
+    fn decoder_with(config: DecoderConfig) -> Decoder {
+        match config.expected_len {
+            Some(n) => Decoder::with_len(n),
+            None => Decoder::new(),
+        }
     }
 }
 
 // ─── encoder ─────────────────────────────────────────────────────────────
 
-/// Encoder stub. StuffIt method 13 encoding is out of scope for this build
-/// (the format is undocumented and the decoder is unvalidatable); every
-/// method here returns [`Error::Unsupported`].
+/// Encoder stub. There is no StuffIt encoder to clean-room, so every method
+/// here returns [`Error::Unsupported`].
 #[derive(Debug, Default)]
 pub struct Encoder;
 

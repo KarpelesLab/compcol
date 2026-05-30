@@ -1,176 +1,225 @@
-//! Canonical, Kraft-validated Huffman decoder.
+//! LSB-first prefix-code decoder for StuffIt method 13.
 //!
-//! StuffIt method 13 partitions its symbol stream into Huffman-coded
-//! literal / length / distance alphabets (the classic LZ+Huffman shape).
-//! The exact alphabet sizes and code-length transmission are part of the
-//! undocumented format, but the *decoding* machinery is the ordinary
-//! canonical Huffman scheme used by DEFLATE, LZX, RAR, etc. — "shortest
-//! code is all-zeros", codes assigned shortest-to-longest in ascending
-//! symbol order.
+//! Method 13 uses four prefix codes: a fixed, hand-tuned (non-canonical)
+//! meta-code given as explicit (code value, length) pairs, plus three
+//! per-stream canonical codes (literal/length code A, code B, and the offset
+//! bit-length code) reconstructed from per-symbol bit-length lists. All four
+//! are decoded the same way: bits are consumed **least-significant-bit first**
+//! and walked down a binary trie until a leaf (symbol) is reached.
 //!
-//! This decoder is parameterised by alphabet size (`N`) so the same type
-//! covers whatever alphabets the eventual state machine needs. It is built
-//! from a slice of per-symbol code lengths (0 = unused) and **validates
-//! the Kraft inequality**: over-full tables (which would otherwise let a
-//! crafted stream index past the symbol array) are rejected up front with
-//! [`Error::InvalidHuffmanTree`]. No `unsafe`; no panic reachable from any
-//! input.
-//!
-//! Shares its shape with [`crate::rar1::huffman`] and
-//! [`crate::lzx::huffman`].
+//! Using a trie makes the decoder agnostic to whether a code is canonical: it
+//! handles the tuned meta-code and the canonical codes uniformly, and it is
+//! prefix-correct by construction. Construction validates that the codes form
+//! a proper prefix set (no code is a prefix of another, no two codes collide);
+//! a malformed length list (over- or under-subscribed, or exceeding the 32-bit
+//! length cap) is rejected with [`Error::InvalidHuffmanTree`]. No `unsafe`; no
+//! panic reachable from any input.
 
-// Building block; the consumer is a future method-13 state machine.
-#![allow(dead_code)]
+extern crate alloc;
+
+use alloc::vec;
+use alloc::vec::Vec;
 
 use crate::error::Error;
 
 use super::bits::BitReader;
 
-/// Maximum supported Huffman code length, in bits. Generous upper bound:
-/// canonical LZ+Huffman alphabets of this era cap well under 16, and any
-/// length above this is rejected as an invalid tree.
-pub const MAX_CODE_LENGTH: u32 = 16;
+/// Maximum supported prefix-code length, in bits (per the format spec).
+pub(crate) const MAX_CODE_LENGTH: u32 = 32;
 
-/// Fixed-capacity canonical-Huffman decoder over an alphabet of size `N`.
-///
-/// Code lengths are passed in as a slice (index = symbol, value = length
-/// in bits, 0 = unused). The slice may be at most `N` long. Non-zero
-/// lengths must satisfy the Kraft inequality.
-#[derive(Debug, Clone)]
-pub struct Huffman<const N: usize> {
-    /// `counts[l]` = number of symbols whose canonical code has length `l`.
-    counts: [u16; MAX_CODE_LENGTH as usize + 1],
-    /// First numeric code value used at each length.
-    first_code: [u32; MAX_CODE_LENGTH as usize + 1],
-    /// Index into `symbols` where length-`l` codes start.
-    first_idx: [u16; MAX_CODE_LENGTH as usize + 1],
-    /// Symbols in canonical order.
-    symbols: [u16; N],
-    /// Longest code length actually present (0 = empty tree).
-    max_length: u8,
+/// A trie node. `children[bit]` is the next node index, or `NONE` if absent.
+/// A `symbol` of `Some` marks a leaf.
+const NONE: u32 = u32::MAX;
+
+/// LSB-first prefix-code decoder backed by a binary trie.
+pub(crate) struct Huffman {
+    /// Flattened trie: two child links per node (`[2*i]` = bit 0, `[2*i+1]`
+    /// = bit 1). `NONE` = no child.
+    links: Vec<u32>,
+    /// Per-node leaf symbol (`u32::MAX` = internal node).
+    leaf: Vec<u32>,
 }
 
-impl<const N: usize> Huffman<N> {
-    /// Build a decoder from a slice of code lengths.
+impl Huffman {
+    /// Build a decoder from a canonical bit-length list (index = symbol,
+    /// value = code length in bits, 0 = symbol absent).
     ///
-    /// Returns `Err(InvalidHuffmanTree)` if any length exceeds
-    /// [`MAX_CODE_LENGTH`], if the slice is longer than `N`, or if the
-    /// lengths over-fill the code space (Kraft inequality violated). An
-    /// all-zero (empty) table is accepted and yields an empty tree whose
-    /// [`decode`](Huffman::decode) always errors.
-    pub fn from_lengths(code_lengths: &[u8]) -> Result<Self, Error> {
-        // Reject rather than panic: a crafted header could declare more
-        // symbols than the alphabet holds.
-        if code_lengths.len() > N {
-            return Err(Error::InvalidHuffmanTree);
-        }
-
-        let mut counts = [0u16; MAX_CODE_LENGTH as usize + 1];
-        let mut max_length: u8 = 0;
-        for &len in code_lengths {
-            if len as u32 > MAX_CODE_LENGTH {
+    /// The canonical assignment is the "shortest code is all-zero bits"
+    /// variant with the standard increment, codes assigned in ascending
+    /// symbol order among equal lengths; each code is then emitted/read
+    /// least-significant-bit first (the MSB-canonical value is reversed to
+    /// its bit length). Returns [`Error::InvalidHuffmanTree`] if a length
+    /// exceeds [`MAX_CODE_LENGTH`] or the lengths do not form a valid prefix
+    /// code.
+    pub(crate) fn from_lengths(lengths: &[u8]) -> Result<Self, Error> {
+        let mut counts = [0u32; MAX_CODE_LENGTH as usize + 1];
+        let mut max_len = 0u32;
+        for &l in lengths {
+            let l = l as u32;
+            if l > MAX_CODE_LENGTH {
                 return Err(Error::InvalidHuffmanTree);
             }
-            if len > 0 {
-                counts[len as usize] += 1;
-                if len > max_length {
-                    max_length = len;
+            if l > 0 {
+                counts[l as usize] += 1;
+                if l > max_len {
+                    max_len = l;
                 }
             }
         }
-
-        // Empty tree allowed.
-        if max_length == 0 {
-            return Ok(Self {
-                counts,
-                first_code: [0u32; MAX_CODE_LENGTH as usize + 1],
-                first_idx: [0u16; MAX_CODE_LENGTH as usize + 1],
-                symbols: [0u16; N],
-                max_length: 0,
-            });
+        if max_len == 0 {
+            // Empty code: valid to construct, but any decode fails.
+            return Ok(Self::empty());
         }
 
-        // Kraft inequality: Σ counts[l] · 2^(MAX-l) ≤ 2^MAX.
-        let mut kraft: u32 = 0;
-        for l in 1..=MAX_CODE_LENGTH {
-            kraft += (counts[l as usize] as u32) << (MAX_CODE_LENGTH - l);
+        // Kraft equality check: a usable prefix code must be exactly full.
+        // (Under-full would leave undecodable bit patterns; over-full is
+        // impossible to assign.) Accumulate in u64 to avoid overflow.
+        let mut kraft: u64 = 0;
+        for l in 1..=max_len {
+            kraft += (counts[l as usize] as u64) << (max_len - l);
         }
-        if kraft > (1 << MAX_CODE_LENGTH) {
+        let full: u64 = 1u64 << max_len;
+        if kraft > full {
+            return Err(Error::InvalidHuffmanTree);
+        }
+        // A single symbol of length 0 already returned `empty()` above; here
+        // we additionally require exact fullness so under-subscribed tables
+        // (which would admit bit patterns matching no symbol) are rejected.
+        if kraft != full {
             return Err(Error::InvalidHuffmanTree);
         }
 
-        let mut first_code = [0u32; MAX_CODE_LENGTH as usize + 1];
-        let mut first_idx = [0u16; MAX_CODE_LENGTH as usize + 1];
+        // Standard canonical first-code-per-length (MSB space).
+        let mut next_code = [0u32; MAX_CODE_LENGTH as usize + 1];
         let mut code: u32 = 0;
-        let mut idx: u16 = 0;
-        for l in 1..=MAX_CODE_LENGTH as usize {
-            code <<= 1;
-            first_code[l] = code;
-            first_idx[l] = idx;
-            code += counts[l] as u32;
-            idx += counts[l];
+        for l in 1..=max_len {
+            next_code[l as usize] = code;
+            code = (code + counts[l as usize]) << 1;
         }
 
-        let mut symbols = [0u16; N];
-        let mut next = first_idx;
-        for (sym, &len) in code_lengths.iter().enumerate() {
-            if len > 0 {
-                symbols[next[len as usize] as usize] = sym as u16;
-                next[len as usize] += 1;
+        let mut builder = TrieBuilder::new();
+        for (sym, &l8) in lengths.iter().enumerate() {
+            let l = l8 as u32;
+            if l == 0 {
+                continue;
             }
+            let msb_code = next_code[l as usize];
+            next_code[l as usize] += 1;
+            // Read LSB-first ⇒ stream value is the bit-reverse of the MSB
+            // canonical code, taken to `l` bits.
+            let lsb_code = reverse_bits(msb_code, l);
+            builder.insert(lsb_code, l, sym as u32)?;
         }
-
-        Ok(Self {
-            counts,
-            first_code,
-            first_idx,
-            symbols,
-            max_length,
-        })
+        Ok(builder.finish())
     }
 
-    pub const fn is_empty(&self) -> bool {
-        self.max_length == 0
-    }
-
-    pub const fn max_length(&self) -> u8 {
-        self.max_length
-    }
-
-    /// Attempt to decode one symbol.
-    ///
-    /// Returns:
-    /// - `Ok(Some(sym))` on success (the reader has advanced past the code).
-    /// - `Ok(None)` if `reader` doesn't yet have enough bits for the
-    ///   worst-case length. The reader is untouched; feed more bytes and
-    ///   retry.
-    /// - `Err(InvalidHuffmanTree)` if the table is empty or the buffered
-    ///   bits match no valid code.
-    pub fn decode(&self, reader: &mut BitReader) -> Result<Option<u16>, Error> {
-        if self.max_length == 0 {
+    /// Build a decoder from explicit (LSB-first code value, length) pairs,
+    /// used for the fixed non-canonical meta-code.
+    pub(crate) fn from_codes(values: &[u32], lengths: &[u8]) -> Result<Self, Error> {
+        if values.len() != lengths.len() {
             return Err(Error::InvalidHuffmanTree);
         }
-        let max = self.max_length as u32;
-        if reader.bits_available() < max {
-            return Ok(None);
-        }
-
-        let lookahead = reader.peek(max);
-        for length in 1..=max {
-            let code = lookahead >> (max - length);
-            let count = self.counts[length as usize] as u32;
-            if count > 0 {
-                let first = self.first_code[length as usize];
-                if code >= first && code < first + count {
-                    let sym_idx = self.first_idx[length as usize] as u32 + (code - first);
-                    reader.drop_bits(length);
-                    // `sym_idx` is in-range by construction (Kraft-validated,
-                    // counts sum to the number of assigned symbols ≤ N).
-                    return Ok(Some(self.symbols[sym_idx as usize]));
-                }
+        let mut builder = TrieBuilder::new();
+        for (sym, (&v, &l8)) in values.iter().zip(lengths.iter()).enumerate() {
+            let l = l8 as u32;
+            if l == 0 {
+                continue;
             }
+            if l > MAX_CODE_LENGTH {
+                return Err(Error::InvalidHuffmanTree);
+            }
+            builder.insert(v, l, sym as u32)?;
         }
-        Err(Error::InvalidHuffmanTree)
+        Ok(builder.finish())
+    }
+
+    fn empty() -> Self {
+        Self {
+            // One root node, no children, not a leaf.
+            links: vec![NONE, NONE],
+            leaf: vec![NONE],
+        }
+    }
+
+    /// Decode one symbol, consuming bits LSB-first. Returns
+    /// [`Error::InvalidHuffmanTree`] if the bits walk off the trie (no such
+    /// code) and [`Error::UnexpectedEnd`] if input runs out mid-code.
+    pub(crate) fn decode(&self, reader: &mut BitReader<'_>) -> Result<u32, Error> {
+        let mut node: u32 = 0;
+        loop {
+            if self.leaf[node as usize] != NONE {
+                return Ok(self.leaf[node as usize]);
+            }
+            let bit = reader.read_bit()?;
+            let next = self.links[(node as usize) * 2 + bit as usize];
+            if next == NONE {
+                return Err(Error::InvalidHuffmanTree);
+            }
+            node = next;
+        }
+    }
+}
+
+/// Reverse the low `n` bits of `v` (LSB ↔ MSB within an `n`-bit field).
+fn reverse_bits(v: u32, n: u32) -> u32 {
+    let mut out = 0u32;
+    for i in 0..n {
+        out |= ((v >> i) & 1) << (n - 1 - i);
+    }
+    out
+}
+
+/// Incremental trie builder shared by both constructors.
+struct TrieBuilder {
+    links: Vec<u32>,
+    leaf: Vec<u32>,
+}
+
+impl TrieBuilder {
+    fn new() -> Self {
+        Self {
+            links: vec![NONE, NONE],
+            leaf: vec![NONE],
+        }
+    }
+
+    /// Insert one codeword: `code`'s bits read LSB-first over `len` bits map
+    /// to `sym`. Rejects prefix conflicts and collisions.
+    fn insert(&mut self, code: u32, len: u32, sym: u32) -> Result<(), Error> {
+        let mut node: u32 = 0;
+        for i in 0..len {
+            // If we're already at a leaf, an earlier (shorter) code is a
+            // prefix of this one — not a valid prefix code.
+            if self.leaf[node as usize] != NONE {
+                return Err(Error::InvalidHuffmanTree);
+            }
+            let bit = ((code >> i) & 1) as usize;
+            let slot = (node as usize) * 2 + bit;
+            if self.links[slot] == NONE {
+                let new_idx = self.leaf.len() as u32;
+                self.links.push(NONE);
+                self.links.push(NONE);
+                self.leaf.push(NONE);
+                self.links[slot] = new_idx;
+            }
+            node = self.links[slot];
+        }
+        // Landing node must be fresh (no symbol, no children).
+        if self.leaf[node as usize] != NONE
+            || self.links[(node as usize) * 2] != NONE
+            || self.links[(node as usize) * 2 + 1] != NONE
+        {
+            return Err(Error::InvalidHuffmanTree);
+        }
+        self.leaf[node as usize] = sym;
+        Ok(())
+    }
+
+    fn finish(self) -> Huffman {
+        Huffman {
+            links: self.links,
+            leaf: self.leaf,
+        }
     }
 }
 
@@ -179,94 +228,82 @@ mod tests {
     use super::*;
 
     #[test]
-    fn canonical_msb_decode() {
-        // lengths [2,1,3,3] → 0:"10" 1:"0" 2:"110" 3:"111"
-        let dec = Huffman::<4>::from_lengths(&[2, 1, 3, 3]).unwrap();
-        assert!(!dec.is_empty());
-        assert_eq!(dec.max_length(), 3);
-        // stream "0 10 111" → 0b0101_1100 = 0x5C
-        let mut r = BitReader::new();
-        r.feed_byte(0x5C);
-        assert_eq!(dec.decode(&mut r).unwrap(), Some(1));
-        assert_eq!(dec.decode(&mut r).unwrap(), Some(0));
-        assert_eq!(r.bits_available(), 5);
-        assert_eq!(dec.decode(&mut r).unwrap(), Some(3));
-        assert_eq!(r.bits_available(), 2);
-        assert_eq!(dec.decode(&mut r).unwrap(), None);
+    fn reverse_bits_works() {
+        assert_eq!(reverse_bits(0b001, 3), 0b100);
+        assert_eq!(reverse_bits(0b10, 2), 0b01);
+        assert_eq!(reverse_bits(0, 5), 0);
     }
 
     #[test]
-    fn underflow_returns_none_untouched() {
-        let dec = Huffman::<3>::from_lengths(&[2, 2, 1]).unwrap();
-        let mut r = BitReader::new();
-        r.feed_byte(0b1000_0000);
-        r.drop_bits(7);
-        assert_eq!(r.bits_available(), 1);
-        assert_eq!(dec.decode(&mut r).unwrap(), None);
-        assert_eq!(r.bits_available(), 1, "reader must be untouched");
+    fn canonical_lsb_roundtrip() {
+        // lengths [1,2,2]: canonical MSB codes 0:"0", 1:"10", 2:"11".
+        // LSB-first stream values: 0→0(1b), 1→01=1(2b), 2→11=3(2b).
+        let h = Huffman::from_lengths(&[1, 2, 2]).unwrap();
+        // bit sequence to feed: symbol0 (bit 0), symbol1 (bits 1,0), symbol2 (bits 1,1)
+        // Pack LSB-first into bytes: bits in order: 0 | 1,0 | 1,1
+        // positions: b0=0,b1=1,b2=0,b3=1,b4=1 → byte = 0b0001_1010 = 0x1A
+        let data = [0x1Au8];
+        let mut r = BitReader::new(&data);
+        assert_eq!(h.decode(&mut r).unwrap(), 0);
+        assert_eq!(h.decode(&mut r).unwrap(), 1);
+        assert_eq!(h.decode(&mut r).unwrap(), 2);
     }
 
     #[test]
-    fn empty_tree_errors_on_decode() {
-        let dec = Huffman::<4>::from_lengths(&[0, 0, 0, 0]).unwrap();
-        assert!(dec.is_empty());
-        let mut r = BitReader::new();
-        r.feed_byte(0xFF);
-        assert!(matches!(dec.decode(&mut r), Err(Error::InvalidHuffmanTree)));
+    fn metacode_builds_and_decodes() {
+        let h = Huffman::from_codes(
+            &super::super::tables::META_CODE_VALUES,
+            &super::super::tables::META_CODE_LENGTHS,
+        )
+        .unwrap();
+        // Symbol 32 has code value 1, length 2 (LSB-first 0b01 → bits 1,0).
+        let data = [0b0000_0001u8];
+        let mut r = BitReader::new(&data);
+        assert_eq!(h.decode(&mut r).unwrap(), 32);
     }
 
     #[test]
-    fn rejects_length_above_cap() {
+    fn rejects_oversubscribed() {
+        // three length-1 codes cannot coexist.
         assert!(matches!(
-            Huffman::<2>::from_lengths(&[17, 1]),
+            Huffman::from_lengths(&[1, 1, 1]),
             Err(Error::InvalidHuffmanTree)
         ));
     }
 
     #[test]
-    fn rejects_kraft_overflow() {
-        // Two length-1 codes saturate; a third length-2 over-fills.
+    fn rejects_undersubscribed() {
+        // a single length-2 code leaves the space under-full.
         assert!(matches!(
-            Huffman::<3>::from_lengths(&[1, 1, 2]),
+            Huffman::from_lengths(&[2]),
             Err(Error::InvalidHuffmanTree)
         ));
     }
 
     #[test]
-    fn rejects_too_many_symbols() {
-        // 5 lengths for an alphabet of 4.
+    fn rejects_length_over_cap() {
+        let mut lens = [0u8; 2];
+        lens[0] = 33;
         assert!(matches!(
-            Huffman::<4>::from_lengths(&[1, 2, 3, 4, 4]),
+            Huffman::from_lengths(&lens),
             Err(Error::InvalidHuffmanTree)
         ));
     }
 
     #[test]
-    fn accepts_kraft_underflow_but_rejects_unassigned_pattern() {
-        let dec = Huffman::<2>::from_lengths(&[1, 0]).unwrap();
-        let mut r = BitReader::new();
-        r.feed_byte(0xFF); // top bit 1 — no assigned length-1 "1" code
-        assert!(matches!(dec.decode(&mut r), Err(Error::InvalidHuffmanTree)));
-        let mut r2 = BitReader::new();
-        r2.feed_byte(0x00);
-        assert_eq!(dec.decode(&mut r2).unwrap(), Some(0));
+    fn empty_decode_errors() {
+        let h = Huffman::from_lengths(&[0, 0, 0]).unwrap();
+        let data = [0xFFu8];
+        let mut r = BitReader::new(&data);
+        assert!(matches!(h.decode(&mut r), Err(Error::InvalidHuffmanTree)));
     }
 
     #[test]
-    fn larger_alphabet_canonical() {
-        // 4×len3 + 8×len4 → Kraft = 4·2 + 8·1 = 16 (full). OK.
-        let lens: [u8; 12] = [3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4];
-        let dec = Huffman::<12>::from_lengths(&lens).unwrap();
-        assert_eq!(dec.max_length(), 4);
-        // 000 1011 1111 001 1001 → 0x17 0xE6 0x40
-        let mut r = BitReader::new();
-        r.feed_byte(0x17);
-        r.feed_byte(0xE6);
-        r.feed_byte(0x40);
-        assert_eq!(dec.decode(&mut r).unwrap(), Some(0));
-        assert_eq!(dec.decode(&mut r).unwrap(), Some(7));
-        assert_eq!(dec.decode(&mut r).unwrap(), Some(11));
-        assert_eq!(dec.decode(&mut r).unwrap(), Some(1));
-        assert_eq!(dec.decode(&mut r).unwrap(), Some(5));
+    fn all_predefined_sets_build() {
+        for s in 0..5 {
+            Huffman::from_lengths(super::super::tables::PREDEFINED_FIRST[s]).unwrap();
+            Huffman::from_lengths(super::super::tables::PREDEFINED_SECOND[s]).unwrap();
+            Huffman::from_lengths(super::super::tables::PREDEFINED_OFFSET[s]).unwrap();
+        }
     }
 }
