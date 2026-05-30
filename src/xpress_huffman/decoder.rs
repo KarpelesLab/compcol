@@ -21,6 +21,12 @@ use crate::traits::{RawDecoder, RawProgress};
 use super::huffman::{DecodeTable, NUM_SYMBOLS, build_decode_table, unpack_lengths};
 
 const BLOCK_OUTPUT_BYTES: usize = 65536;
+/// Maximum back-reference distance. XPRESS-Huffman distances are bounded
+/// by `dist_low + (1 << dist_hi)` with `dist_hi <= 15`, so the largest
+/// representable distance is `2^16 = 65536`. We retain at least this many
+/// of the most-recently emitted bytes so any legal match can be resolved
+/// even after the streaming output buffer (`decoded`) has been drained.
+const MAX_DISTANCE: usize = 65536;
 /// Length-table byte count per block.
 const TABLE_BYTES: usize = 256;
 /// Each block reserves at least the table plus the initial 4 bytes for the
@@ -46,6 +52,14 @@ pub struct Decoder {
 
     decoded: Vec<u8>,
     decoded_idx: usize,
+
+    /// Sliding window of the most-recently emitted output bytes, used as
+    /// the source for back-reference match copies. Unlike `decoded` (which
+    /// is cleared by `drain_decoded_into` once handed to the caller), this
+    /// buffer is retained across drains so cross-block / cross-drain
+    /// back-references resolve correctly. Trimmed to the last
+    /// `MAX_DISTANCE` bytes so it never grows without bound.
+    out_history: Vec<u8>,
 
     phase: Phase,
     poisoned: bool,
@@ -73,6 +87,7 @@ impl Decoder {
             in_pos: 0,
             decoded: Vec::new(),
             decoded_idx: 0,
+            out_history: Vec::new(),
             phase: Phase::Header,
             poisoned: false,
             total_output: 0,
@@ -102,6 +117,20 @@ impl Decoder {
             self.decoded_idx = 0;
         }
         n
+    }
+
+    /// Emit a single produced byte: append it to the caller-facing
+    /// `decoded` queue, append it to the retained back-reference history
+    /// (`out_history`, trimmed to the last `MAX_DISTANCE` bytes), and bump
+    /// the whole-stream emitted counter.
+    fn emit_byte(&mut self, b: u8) {
+        self.decoded.push(b);
+        self.out_history.push(b);
+        if self.out_history.len() > MAX_DISTANCE {
+            let drop = self.out_history.len() - MAX_DISTANCE;
+            self.out_history.drain(0..drop);
+        }
+        self.output_emitted += 1;
     }
 
     /// Try to start (or restart) a block by parsing the 256-byte length
@@ -216,8 +245,7 @@ impl Decoder {
                     // Garbage symbol past expected end — ignore.
                     continue;
                 }
-                self.decoded.push(symbol as u8);
-                self.output_emitted += 1;
+                self.emit_byte(symbol as u8);
                 continue;
             }
 
@@ -271,17 +299,23 @@ impl Decoder {
                 v
             };
             let match_offset = dist_low + (1u32 << dist_hi);
-            if (match_offset as u64) > self.output_emitted {
+            // Validate against the retained history we can actually copy
+            // from. `out_history` holds the last `MAX_DISTANCE` emitted
+            // bytes (or fewer near the start of the stream), so this both
+            // rejects distances that reach before the start of the stream
+            // and prevents an underflow when `decoded` has been drained.
+            if (match_offset as usize) > self.out_history.len() {
                 return Err(self.poison(Error::InvalidDistance));
             }
 
             // Byte-by-byte copy: match length may exceed match offset
-            // (run-length expansion), so we cannot do bulk memcpy.
+            // (run-length expansion), so we cannot do bulk memcpy. Source
+            // bytes are read from the retained history (which is appended
+            // to as we emit), allowing the copy to extend itself.
             for _ in 0..match_length {
-                let src = self.decoded.len() - match_offset as usize;
-                let b = self.decoded[src];
-                self.decoded.push(b);
-                self.output_emitted += 1;
+                let src = self.out_history.len() - match_offset as usize;
+                let b = self.out_history[src];
+                self.emit_byte(b);
                 if self.output_emitted >= self.block_end_emitted {
                     break;
                 }
@@ -366,6 +400,13 @@ impl RawDecoder for Decoder {
                     let snap_phase = self.phase;
                     let snap_table = self.table.clone();
                     let snap_lengths = self.lengths;
+                    // The retained history is mutated in place (appended to
+                    // and trimmed), so unlike `decoded` it cannot be undone
+                    // with a `truncate`. Snapshot it so an `UnexpectedEnd`
+                    // rollback restores it exactly. It is bounded by
+                    // `MAX_DISTANCE`, and this clone happens at most once per
+                    // `raw_decode` call, not per symbol.
+                    let snap_out_history = self.out_history.clone();
                     match self.decode_loop() {
                         Ok(()) => {}
                         Err(Error::UnexpectedEnd) => {
@@ -380,6 +421,7 @@ impl RawDecoder for Decoder {
                             self.phase = snap_phase;
                             self.table = snap_table;
                             self.lengths = snap_lengths;
+                            self.out_history = snap_out_history;
                             break;
                         }
                         Err(e) => return Err(self.poison(e)),
@@ -463,6 +505,7 @@ impl RawDecoder for Decoder {
         self.in_pos = 0;
         self.decoded.clear();
         self.decoded_idx = 0;
+        self.out_history.clear();
         self.phase = Phase::Header;
         self.poisoned = false;
         self.total_output = 0;

@@ -39,7 +39,14 @@ pub struct Lz4ModeDecoder;
 /// frame's 4-byte block-size word and the start of the next block).
 /// `out` is appended to — the caller is expected to clear it first if
 /// they want only this block's bytes.
-pub fn decode_compressed_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+///
+/// `cap` is the per-frame ceiling on this block's decoded size. Output
+/// is checked against it *before* every append (literal run, match copy,
+/// in-block-uncompressed payload, trailing literals) so a malformed
+/// stream cannot balloon `out` to gigabytes before the size is rejected.
+/// A valid block always stays `<= cap`. On overflow we return
+/// `Error::Corrupt`, matching the caller's post-hoc size check.
+pub fn decode_compressed_block(input: &[u8], out: &mut Vec<u8>, cap: usize) -> Result<(), Error> {
     if input.is_empty() {
         return Err(Error::UnexpectedEnd);
     }
@@ -76,6 +83,9 @@ pub fn decode_compressed_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Er
         if ip + length > input.len() {
             return Err(Error::UnexpectedEnd);
         }
+        if out.len() + length > cap {
+            return Err(Error::Corrupt);
+        }
         out.extend_from_slice(&input[ip..ip + length]);
         return Ok(());
     }
@@ -111,7 +121,7 @@ pub fn decode_compressed_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Er
         return Err(Error::Corrupt);
     }
 
-    decode_lz4_sequences(flags, literals, out)
+    decode_lz4_sequences(flags, literals, out, cap)
 }
 
 /// Read one raw (non-Huffman) sub-stream: 3-byte LE length + bytes.
@@ -144,7 +154,12 @@ fn read_u24_le(s: &[u8]) -> usize {
 /// match-length extension bytes. All bytes that the token's literal-run
 /// and match-length nibbles refer to are pulled from `literals` via a
 /// single cursor that advances through it monotonically.
-fn decode_lz4_sequences(flags: &[u8], literals: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+fn decode_lz4_sequences(
+    flags: &[u8],
+    literals: &[u8],
+    out: &mut Vec<u8>,
+    cap: usize,
+) -> Result<(), Error> {
     let mut lp = 0usize; // literals-stream cursor
 
     for &token in flags {
@@ -163,6 +178,9 @@ fn decode_lz4_sequences(flags: &[u8], literals: &[u8], out: &mut Vec<u8>) -> Res
         if lit_len > 0 {
             if lp + lit_len > literals.len() {
                 return Err(Error::UnexpectedEnd);
+            }
+            if out.len() + lit_len > cap {
+                return Err(Error::Corrupt);
             }
             out.extend_from_slice(&literals[lp..lp + lit_len]);
             lp += lit_len;
@@ -188,12 +206,16 @@ fn decode_lz4_sequences(flags: &[u8], literals: &[u8], out: &mut Vec<u8>) -> Res
                 .ok_or(Error::Corrupt)?;
         }
         let match_len = match_excess.checked_add(MINMATCH).ok_or(Error::Corrupt)?;
-        copy_match(out, offset, match_len)?;
+        copy_match(out, offset, match_len, cap)?;
     }
 
     // Trailing literals: everything left in the literals stream is
     // copied verbatim after the last token.
     if lp < literals.len() {
+        let tail = literals.len() - lp;
+        if out.len() + tail > cap {
+            return Err(Error::Corrupt);
+        }
         out.extend_from_slice(&literals[lp..]);
     }
     Ok(())
@@ -234,10 +256,14 @@ fn read_length_ext(literals: &[u8], lp: &mut usize) -> Result<usize, Error> {
 
 /// Copy `match_len` bytes from `out[start..]` to the end of `out`,
 /// where `start = out.len() - offset`. Handles LZ77 self-overlap
-/// (offset < match_len) byte-by-byte.
-fn copy_match(out: &mut Vec<u8>, offset: usize, match_len: usize) -> Result<(), Error> {
+/// (offset < match_len) byte-by-byte. Rejects (`Error::Corrupt`) any
+/// match that would grow `out` past `cap` before copying a single byte.
+fn copy_match(out: &mut Vec<u8>, offset: usize, match_len: usize, cap: usize) -> Result<(), Error> {
     if offset > out.len() {
         return Err(Error::InvalidDistance);
+    }
+    if out.len() + match_len > cap {
+        return Err(Error::Corrupt);
     }
     let start = out.len() - offset;
     if offset >= match_len {
@@ -280,7 +306,7 @@ mod tests {
         block.extend_from_slice(b"hi");
 
         let mut out = Vec::new();
-        decode_compressed_block(&block, &mut out).unwrap();
+        decode_compressed_block(&block, &mut out, usize::MAX).unwrap();
         assert_eq!(out, b"hi");
     }
 
@@ -296,7 +322,7 @@ mod tests {
         block.extend_from_slice(b"hello");
 
         let mut out = Vec::new();
-        decode_compressed_block(&block, &mut out).unwrap();
+        decode_compressed_block(&block, &mut out, usize::MAX).unwrap();
         assert_eq!(out, b"hello");
     }
 
@@ -305,7 +331,7 @@ mod tests {
         let block = alloc::vec![20u8, 0u8]; // clevel 20 → LIZv1
         let mut out = Vec::new();
         assert_eq!(
-            decode_compressed_block(&block, &mut out),
+            decode_compressed_block(&block, &mut out, usize::MAX),
             Err(Error::Unsupported)
         );
     }
@@ -315,7 +341,7 @@ mod tests {
         let block = alloc::vec![10u8, FLAG_LITERALS]; // Huffman literals stream
         let mut out = Vec::new();
         assert_eq!(
-            decode_compressed_block(&block, &mut out),
+            decode_compressed_block(&block, &mut out, usize::MAX),
             Err(Error::Unsupported)
         );
     }
@@ -325,7 +351,7 @@ mod tests {
         let block = alloc::vec![9u8, 0u8];
         let mut out = Vec::new();
         assert_eq!(
-            decode_compressed_block(&block, &mut out),
+            decode_compressed_block(&block, &mut out, usize::MAX),
             Err(Error::Corrupt)
         );
     }

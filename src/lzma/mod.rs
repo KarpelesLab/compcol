@@ -863,6 +863,13 @@ impl RawDecoder for Decoder {
             let remainder = (props as u32) / 9;
             let lp = remainder % 5;
             let pb = remainder / 5;
+            // Enforce the real LZMA constraint lc + lp <= 4 (matching the
+            // LZMA2 path in Lzma2Props::parse). Without this bound a 13-byte
+            // header with lc=8,lp=4 would size the literal table at
+            // 0x300 << 12 ≈ 6.3 MB, an over-allocation from tiny input.
+            if lc + lp > 4 {
+                return Err(Error::BadHeader);
+            }
             let dict_size =
                 u32::from_le_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]);
             let uncompressed_size = u64::from_le_bytes([
