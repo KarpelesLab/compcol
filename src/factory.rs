@@ -70,6 +70,10 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         crate::ppmd::Ppmd::NAME => Some(Box::new(<crate::ppmd::Ppmd as Algorithm>::encoder())),
         #[cfg(feature = "bzip2")]
         crate::bzip2::Bzip2::NAME => Some(Box::new(<crate::bzip2::Bzip2 as Algorithm>::encoder())),
+        #[cfg(feature = "xpress_huffman")]
+        crate::xpress_huffman::XpressHuffman::NAME => Some(Box::new(
+            <crate::xpress_huffman::XpressHuffman as Algorithm>::encoder(),
+        )),
         #[cfg(feature = "rar1")]
         crate::rar1::Rar1::NAME => Some(Box::new(<crate::rar1::Rar1 as Algorithm>::encoder())),
         #[cfg(feature = "rar2")]
@@ -207,6 +211,10 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         crate::ppmd::Ppmd::NAME => Some(Box::new(<crate::ppmd::Ppmd as Algorithm>::decoder())),
         #[cfg(feature = "bzip2")]
         crate::bzip2::Bzip2::NAME => Some(Box::new(<crate::bzip2::Bzip2 as Algorithm>::decoder())),
+        #[cfg(feature = "xpress_huffman")]
+        crate::xpress_huffman::XpressHuffman::NAME => Some(Box::new(
+            <crate::xpress_huffman::XpressHuffman as Algorithm>::decoder(),
+        )),
         #[cfg(feature = "rar1")]
         crate::rar1::Rar1::NAME => Some(Box::new(<crate::rar1::Rar1 as Algorithm>::decoder())),
         #[cfg(feature = "rar2")]
@@ -287,6 +295,9 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     }
     if str_eq(name, "bzip2") && cfg!(feature = "bzip2") {
         return Some("bz2");
+    }
+    if str_eq(name, "xpress-huffman") && cfg!(feature = "xpress_huffman") {
+        return Some("xph");
     }
     // All RAR versions share the .rar extension; the version is in-band in
     // the file header. The CLI's in-place mode will write to <input>.rar
@@ -369,6 +380,8 @@ pub const fn names() -> &'static [&'static str] {
         crate::ppmd::Ppmd::NAME,
         #[cfg(feature = "bzip2")]
         crate::bzip2::Bzip2::NAME,
+        #[cfg(feature = "xpress_huffman")]
+        crate::xpress_huffman::XpressHuffman::NAME,
         #[cfg(feature = "rar1")]
         crate::rar1::Rar1::NAME,
         #[cfg(feature = "rar2")]

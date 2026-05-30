@@ -108,6 +108,9 @@ pub mod ppmd;
 #[cfg(feature = "bzip2")]
 pub mod bzip2;
 
+#[cfg(feature = "xpress_huffman")]
+pub mod xpress_huffman;
+
 #[cfg(feature = "rar1")]
 pub mod rar1;
 

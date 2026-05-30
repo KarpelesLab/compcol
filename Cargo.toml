@@ -33,6 +33,7 @@ all = [
     "zstd", "brotli", "lz4", "snappy", "lzw", "bzip2",
     "lzo", "lzx", "amiga_lzx", "quantum", "lzfse", "adc",
     "ppmd",
+    "xpress_huffman",
     "rar1", "rar2", "rar3", "rar5",
 ]
 # Enables `alloc`-backed conveniences (e.g. the `factory` module, the
@@ -101,6 +102,10 @@ adc     = ["alloc"]
 # `Error::Unsupported` (the PPM model with information-inheritance updates
 # is out of scope for this build).
 ppmd    = ["alloc"]
+# XPress Huffman ([MS-XCA] §2.1): LZ77 + canonical Huffman used by WIM
+# resources and NTFS CompactOS file compression. Encoder and decoder
+# both implemented.
+xpress_huffman = ["alloc"]
 # RAR decoders (rar1, rar2, rar3, rar5). Decoder-only — RARLAB's unRAR
 # license explicitly forbids re-creating the compression algorithm, so
 # the encoders permanently return `Error::Unsupported`.
