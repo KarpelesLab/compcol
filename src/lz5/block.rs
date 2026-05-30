@@ -258,12 +258,7 @@ fn read_length_ext(literals: &[u8], lp: &mut usize) -> Result<usize, Error> {
 /// where `start = out.len() - offset`. Handles LZ77 self-overlap
 /// (offset < match_len) byte-by-byte. Rejects (`Error::Corrupt`) any
 /// match that would grow `out` past `cap` before copying a single byte.
-fn copy_match(
-    out: &mut Vec<u8>,
-    offset: usize,
-    match_len: usize,
-    cap: usize,
-) -> Result<(), Error> {
+fn copy_match(out: &mut Vec<u8>, offset: usize, match_len: usize, cap: usize) -> Result<(), Error> {
     if offset > out.len() {
         return Err(Error::InvalidDistance);
     }
