@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/KarpelesLab/compcol/compare/v0.4.7...v0.5.0) - 2026-05-30
+
+### Other
+
+- bound block decode output with raw_max to prevent OOM (parity with lz4) ([#62](https://github.com/KarpelesLab/compcol/pull/62))
+- add RAR trademark + clean-room licensing note to README ([#61](https://github.com/KarpelesLab/compcol/pull/61))
+- Security hardening: DoS fixes across decoders (panics, OOM, decompression bombs) ([#59](https://github.com/KarpelesLab/compcol/pull/59))
+
 ### Security
 
 Decoder hardening against malicious/untrusted compressed input (DoS):
