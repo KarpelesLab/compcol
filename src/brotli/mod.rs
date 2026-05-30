@@ -2179,22 +2179,37 @@ impl Decoder {
                 if $len == 0 {
                     let g = &$group;
                     let nbl = g.nbltypes;
-                    let type_tree = g.type_tree.as_ref().unwrap();
-                    let count_tree = g.count_tree.as_ref().unwrap();
-                    let code = type_tree.decode(src)?;
-                    let next_type = if code == 0 {
-                        $prev
-                    } else if code == 1 {
-                        ($bt + 1) % nbl
-                    } else {
-                        code - 2
-                    };
-                    if next_type >= nbl {
-                        return Err(Error::Corrupt);
+                    // When NBLTYPES == 1 the type/count trees are absent and
+                    // there is only one block type, so there is never a switch.
+                    // The block-length counter decrements once per command (IC)
+                    // or per literal/distance, and a command can emit zero
+                    // output bytes (e.g. a dictionary reference whose transform
+                    // omits the whole word), so after `first_count` (1<<24) such
+                    // commands the counter can reach 0. Reload it to an
+                    // effectively-infinite value instead of unwrapping the
+                    // `None` trees (which would panic).
+                    match (g.type_tree.as_ref(), g.count_tree.as_ref()) {
+                        (Some(type_tree), Some(count_tree)) => {
+                            let code = type_tree.decode(src)?;
+                            let next_type = if code == 0 {
+                                $prev
+                            } else if code == 1 {
+                                ($bt + 1) % nbl
+                            } else {
+                                code - 2
+                            };
+                            if next_type >= nbl {
+                                return Err(Error::Corrupt);
+                            }
+                            $prev = $bt;
+                            $bt = next_type;
+                            $len = Self::read_block_count(src, count_tree)?;
+                        }
+                        _ => {
+                            // Single block type: never switch, just keep going.
+                            $len = u32::MAX;
+                        }
                     }
-                    $prev = $bt;
-                    $bt = next_type;
-                    $len = Self::read_block_count(src, count_tree)?;
                 }
             };
         }
