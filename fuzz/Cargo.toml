@@ -107,3 +107,10 @@ path             = "fuzz_targets/decoder_amiga_lzx.rs"
 test             = false
 doc              = false
 bench            = false
+
+[[bin]]
+name             = "decoder_ppmd"
+path             = "fuzz_targets/decoder_ppmd.rs"
+test             = false
+doc              = false
+bench            = false
