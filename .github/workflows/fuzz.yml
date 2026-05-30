@@ -25,6 +25,7 @@ jobs:
           - decoder_gzip
           - decoder_zlib
           - decoder_deflate
+          - decoder_deflate64
           - decoder_zstd
           - decoder_brotli
           - decoder_lzma

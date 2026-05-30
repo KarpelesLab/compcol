@@ -373,6 +373,7 @@ fn level_flag_round_trips_through_compression() {
 }
 
 #[test]
+#[cfg(feature = "zstd")]
 fn level_equals_form_is_accepted() {
     let (out, _err, code) = run_with_stdin(&["-t", "zstd", "--level=19", "-c"], b"hello\n");
     assert_eq!(code, 0);
