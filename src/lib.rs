@@ -148,5 +148,8 @@ pub mod zip_reduce;
 #[cfg(feature = "zip_shrink")]
 pub mod zip_shrink;
 
+#[cfg(feature = "lha")]
+pub mod lha;
+
 #[cfg(feature = "factory")]
 pub mod factory;

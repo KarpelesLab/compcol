@@ -195,3 +195,28 @@ mod brotli {
         assert_eq!(d, input);
     }
 }
+
+// ─── lha (lh5 / lh1 via the one-shot vec helpers) ───────────────────────
+
+#[cfg(feature = "lha")]
+mod lha {
+    use super::*;
+    use compcol::lha::{Lh1, Lh5};
+    use compcol::vec::{compress_to_vec, decompress_to_vec};
+
+    #[test]
+    fn round_trip_lh5() {
+        let input = payload(64 * 1024 + 7);
+        let c = compress_to_vec::<Lh5>(&input).unwrap();
+        let d = decompress_to_vec::<Lh5>(&c).unwrap();
+        assert_eq!(d, input);
+    }
+
+    #[test]
+    fn round_trip_lh1() {
+        let input = payload(20 * 1024 + 3);
+        let c = compress_to_vec::<Lh1>(&input).unwrap();
+        let d = decompress_to_vec::<Lh1>(&c).unwrap();
+        assert_eq!(d, input);
+    }
+}

@@ -112,6 +112,16 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         crate::zip_reduce::ZipReduce::NAME => Some(Box::new(
             <crate::zip_reduce::ZipReduce as Algorithm>::encoder(),
         )),
+        #[cfg(feature = "lha")]
+        crate::lha::Lh1::NAME => Some(Box::new(<crate::lha::Lh1 as Algorithm>::encoder())),
+        #[cfg(feature = "lha")]
+        crate::lha::Lh4::NAME => Some(Box::new(<crate::lha::Lh4 as Algorithm>::encoder())),
+        #[cfg(feature = "lha")]
+        crate::lha::Lh5::NAME => Some(Box::new(<crate::lha::Lh5 as Algorithm>::encoder())),
+        #[cfg(feature = "lha")]
+        crate::lha::Lh6::NAME => Some(Box::new(<crate::lha::Lh6 as Algorithm>::encoder())),
+        #[cfg(feature = "lha")]
+        crate::lha::Lh7::NAME => Some(Box::new(<crate::lha::Lh7 as Algorithm>::encoder())),
         _ => None,
     }
 }
@@ -283,6 +293,16 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         crate::zip_reduce::ZipReduce::NAME => Some(Box::new(
             <crate::zip_reduce::ZipReduce as Algorithm>::decoder(),
         )),
+        #[cfg(feature = "lha")]
+        crate::lha::Lh1::NAME => Some(Box::new(<crate::lha::Lh1 as Algorithm>::decoder())),
+        #[cfg(feature = "lha")]
+        crate::lha::Lh4::NAME => Some(Box::new(<crate::lha::Lh4 as Algorithm>::decoder())),
+        #[cfg(feature = "lha")]
+        crate::lha::Lh5::NAME => Some(Box::new(<crate::lha::Lh5 as Algorithm>::decoder())),
+        #[cfg(feature = "lha")]
+        crate::lha::Lh6::NAME => Some(Box::new(<crate::lha::Lh6 as Algorithm>::decoder())),
+        #[cfg(feature = "lha")]
+        crate::lha::Lh7::NAME => Some(Box::new(<crate::lha::Lh7 as Algorithm>::decoder())),
         _ => None,
     }
 }
@@ -404,6 +424,24 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     if str_eq(name, "zip-reduce") && cfg!(feature = "zip_reduce") {
         return Some("reduce");
     }
+    // LHA methods all conventionally live in `.lzh` archives; the method
+    // is in-band in the LHA header. The CLI's in-place mode writes to
+    // `<input>.lzh`.
+    if str_eq(name, "lh1") && cfg!(feature = "lha") {
+        return Some("lzh");
+    }
+    if str_eq(name, "lh4") && cfg!(feature = "lha") {
+        return Some("lzh");
+    }
+    if str_eq(name, "lh5") && cfg!(feature = "lha") {
+        return Some("lzh");
+    }
+    if str_eq(name, "lh6") && cfg!(feature = "lha") {
+        return Some("lzh");
+    }
+    if str_eq(name, "lh7") && cfg!(feature = "lha") {
+        return Some("lzh");
+    }
     None
 }
 
@@ -500,5 +538,15 @@ pub const fn names() -> &'static [&'static str] {
         crate::zip_shrink::ZipShrink::NAME,
         #[cfg(feature = "zip_reduce")]
         crate::zip_reduce::ZipReduce::NAME,
+        #[cfg(feature = "lha")]
+        crate::lha::Lh1::NAME,
+        #[cfg(feature = "lha")]
+        crate::lha::Lh4::NAME,
+        #[cfg(feature = "lha")]
+        crate::lha::Lh5::NAME,
+        #[cfg(feature = "lha")]
+        crate::lha::Lh6::NAME,
+        #[cfg(feature = "lha")]
+        crate::lha::Lh7::NAME,
     ]
 }
