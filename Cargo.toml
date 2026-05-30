@@ -38,6 +38,7 @@ all = [
     "xpress",
     "packbits",
     "rar1", "rar2", "rar3", "rar5",
+    "zip_shrink",
 ]
 # Enables `alloc`-backed conveniences (e.g. the `factory` module, the
 # `compcol::vec` one-shot helpers). Pulled in automatically by features
@@ -126,6 +127,9 @@ rar1    = ["alloc"]
 rar2    = ["alloc"]
 rar3    = ["alloc"]
 rar5    = ["alloc"]
+# ZIP method 1 (Shrink): PKZIP 1.x dynamic LZW with partial-clear marker.
+# Decoder-only — the encoder permanently returns `Error::Unsupported`.
+zip_shrink = ["alloc"]
 # `compcol::tokio_io` — async mirrors of compcol::io for the tokio
 # runtime. Pulls the tokio dependency for its AsyncRead/AsyncWrite
 # trait definitions; the rest of the crate stays dep-free.

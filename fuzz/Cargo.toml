@@ -142,3 +142,10 @@ path             = "fuzz_targets/decoder_packbits.rs"
 test             = false
 doc              = false
 bench            = false
+
+[[bin]]
+name             = "decoder_zip_shrink"
+path             = "fuzz_targets/decoder_zip_shrink.rs"
+test             = false
+doc              = false
+bench            = false
