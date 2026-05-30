@@ -44,6 +44,8 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         crate::lz4::frame::LZ4Frame::NAME => Some(Box::new(
             <crate::lz4::frame::LZ4Frame as Algorithm>::encoder(),
         )),
+        #[cfg(feature = "lz5")]
+        crate::lz5::Lz5::NAME => Some(Box::new(<crate::lz5::Lz5 as Algorithm>::encoder())),
         #[cfg(feature = "snappy")]
         crate::snappy::Snappy::NAME => {
             Some(Box::new(<crate::snappy::Snappy as Algorithm>::encoder()))
@@ -213,6 +215,8 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         crate::lz4::frame::LZ4Frame::NAME => Some(Box::new(
             <crate::lz4::frame::LZ4Frame as Algorithm>::decoder(),
         )),
+        #[cfg(feature = "lz5")]
+        crate::lz5::Lz5::NAME => Some(Box::new(<crate::lz5::Lz5 as Algorithm>::decoder())),
         #[cfg(feature = "snappy")]
         crate::snappy::Snappy::NAME => {
             Some(Box::new(<crate::snappy::Snappy as Algorithm>::decoder()))
@@ -324,6 +328,9 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     }
     if str_eq(name, "lz4-frame") && cfg!(feature = "lz4") {
         return Some("lz4");
+    }
+    if str_eq(name, "lz5") && cfg!(feature = "lz5") {
+        return Some("liz");
     }
     if str_eq(name, "snappy") && cfg!(feature = "snappy") {
         return Some("sz");
@@ -443,6 +450,8 @@ pub const fn names() -> &'static [&'static str] {
         crate::lz4::Lz4::NAME,
         #[cfg(feature = "lz4")]
         crate::lz4::frame::LZ4Frame::NAME,
+        #[cfg(feature = "lz5")]
+        crate::lz5::Lz5::NAME,
         #[cfg(feature = "snappy")]
         crate::snappy::Snappy::NAME,
         #[cfg(feature = "lzw")]

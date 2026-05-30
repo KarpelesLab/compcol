@@ -32,6 +32,7 @@ jobs:
           - decoder_xz
           - decoder_lz4
           - decoder_lz4_frame
+          - decoder_lz5
           - decoder_bzip2
           - decoder_amiga_lzx
           - decoder_ppmd
