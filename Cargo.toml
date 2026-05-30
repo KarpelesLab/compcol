@@ -41,6 +41,7 @@ all = [
     "zip_implode",
     "lzs",
     "lzham",
+    "sit13",
     "rar1", "rar2", "rar3", "rar5",
     "zip_shrink",
     "zip_reduce",
@@ -156,6 +157,15 @@ lzs     = ["alloc"]
 # and is permanently `Error::Unsupported` in this build. The encoder
 # is also permanently `Error::Unsupported`.
 lzham   = ["alloc"]
+# StuffIt compression method 13 ("LZ + Huffman"). This build ships the
+# well-defined, unit-tested building blocks (MSB-first bit reader,
+# Kraft-validated canonical Huffman decoder, bounds-checked LZSS window)
+# but returns `Error::Unsupported` for the payload decode: the format is
+# proprietary/undocumented (only an LGPL reverse-engineering exists, which
+# this MIT crate must not copy) and there are no public fixtures, so a
+# decoder could be neither derived nor validated. The encoder is also
+# permanently `Error::Unsupported`.
+sit13   = ["alloc"]
 # RAR decoders (rar1, rar2, rar3, rar5). Decoder-only — RARLAB's unRAR
 # license explicitly forbids re-creating the compression algorithm, so
 # the encoders permanently return `Error::Unsupported`.

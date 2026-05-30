@@ -128,6 +128,8 @@ pub mod xpress_huffman;
 
 #[cfg(feature = "lzham")]
 pub mod lzham;
+#[cfg(feature = "sit13")]
+pub mod sit13;
 #[cfg(feature = "zip_implode")]
 pub mod zip_implode;
 
