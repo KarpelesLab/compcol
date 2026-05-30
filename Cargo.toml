@@ -37,6 +37,7 @@ all = [
     "lznt1",
     "xpress",
     "packbits",
+    "zip_implode",
     "rar1", "rar2", "rar3", "rar5",
     "zip_shrink",
     "zip_reduce",
@@ -121,6 +122,12 @@ xpress  = ["alloc"]
 # metadata. Source-byte oriented; no header/trailer. Encoder and
 # decoder both implemented.
 packbits = ["alloc"]
+# PKZIP Implode (ZIP method 6, PKZIP 1.x). Decoder-only target — the
+# encoder permanently returns `Error::Unsupported` (Shannon–Fano tree
+# construction from frequencies is intricate and there is no modern
+# need for an encoder). Supports both 4 KiB / 8 KiB dictionaries and
+# both 2-tree / 3-tree modes.
+zip_implode = ["alloc"]
 # RAR decoders (rar1, rar2, rar3, rar5). Decoder-only — RARLAB's unRAR
 # license explicitly forbids re-creating the compression algorithm, so
 # the encoders permanently return `Error::Unsupported`.

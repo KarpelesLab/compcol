@@ -118,6 +118,9 @@ pub mod xpress;
 #[cfg(feature = "xpress_huffman")]
 pub mod xpress_huffman;
 
+#[cfg(feature = "zip_implode")]
+pub mod zip_implode;
+
 #[cfg(feature = "rar1")]
 pub mod rar1;
 
