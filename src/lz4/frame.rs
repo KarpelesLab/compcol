@@ -1023,8 +1023,17 @@ impl RawDecoder for Decoder {
                         // Wire payload is the raw block bytes.
                         self.decoded.extend_from_slice(&self.compressed);
                     } else if self.block_independent {
-                        if let Err(e) = block::decode_block(&self.compressed, &mut self.decoded) {
+                        let raw_max = self.block_max.bytes();
+                        if let Err(e) =
+                            block::decode_block(&self.compressed, &mut self.decoded, raw_max)
+                        {
                             return self.poison(e);
+                        }
+                        // Backstop: the per-append cap above already enforces
+                        // this, but keep an explicit post-decode check for
+                        // parity with the linked-block path and LZ5.
+                        if self.decoded.len() > raw_max {
+                            return self.poison(Error::Corrupt);
                         }
                     } else {
                         // Linked-block decode: the back-reference search

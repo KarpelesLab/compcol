@@ -415,7 +415,15 @@ impl RawDecoder for Decoder {
                     }
                     // Block fully gathered — decompress it.
                     self.decoded.clear();
-                    if let Err(e) = block::decode_block(&self.compressed, &mut self.decoded) {
+                    // A single block decodes from at most `BLOCK_SIZE` bytes
+                    // of raw input on the encode side, but an LZ4 block can
+                    // expand a match-copy ~255×. Cap the decoded output so a
+                    // malicious block can't balloon into a huge allocation;
+                    // 2× `BLOCK_SIZE` gives headroom for foreign encoders.
+                    let raw_max = BLOCK_SIZE.saturating_mul(2);
+                    if let Err(e) =
+                        block::decode_block(&self.compressed, &mut self.decoded, raw_max)
+                    {
                         self.poisoned = true;
                         return Err(e);
                     }
