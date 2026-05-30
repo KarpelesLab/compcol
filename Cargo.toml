@@ -30,7 +30,7 @@ all = [
     "alloc", "std", "tokio", "factory",
     "rle", "deflate", "deflate64", "zlib", "gzip",
     "lzma", "xz",
-    "zstd", "brotli", "lz4", "snappy", "lzw", "bzip2",
+    "zstd", "brotli", "lz4", "snappy", "lzw", "lzss", "bzip2",
     "lzo", "lzx", "amiga_lzx", "quantum", "lzfse", "adc",
     "ppmd",
     "xpress_huffman",
@@ -83,6 +83,11 @@ lz4     = ["alloc"]
 snappy  = ["alloc"]
 # Lempel–Ziv–Welch (Unix compress / GIF).
 lzw     = ["alloc"]
+# LZSS (Storer–Szymanski). Okumura's reference layout: 4 KiB ring buffer
+# initialized to 0x20, 12-bit position + 4-bit length, 8 tokens per flag
+# group. Plus a 4-byte LE uncompressed-length header so streams self-
+# delimit.
+lzss    = ["alloc"]
 # bzip2 (block-sorted: RLE-1 → BWT → MTF → RLE-2 → Huffman). Encoder
 # and decoder both implemented; the encoder uses a naive O(n² log n)
 # suffix-array build (rather than SA-IS) for the BWT.
