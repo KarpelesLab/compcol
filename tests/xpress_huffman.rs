@@ -214,6 +214,33 @@ fn round_trip_multi_block() {
     round_trip(&input);
 }
 
+// ─── cross-drain back-reference regression ─────────────────────────────
+
+/// Regression for the cross-block / cross-drain back-reference underflow
+/// (DoS panic). The decoder's `decoded` buffer is cleared every time it
+/// is fully drained to the caller; back-references that reach across such
+/// a drain boundary must read from the retained history, not the cleared
+/// buffer. Decoding a multi-block, highly back-referential stream through
+/// a 1-byte output buffer forces a drain after essentially every emitted
+/// byte, so any match looking further back than the (cleared) `decoded`
+/// length would previously underflow `decoded.len() - match_offset` and
+/// panic. With the fix it must decode correctly.
+#[test]
+fn cross_drain_back_reference_does_not_panic() {
+    // ~3 full 64 KiB blocks of a repeating phrase: matches routinely
+    // reach back across drain and block boundaries.
+    let phrase = b"the quick brown fox jumps over the lazy dog 0123456789 ";
+    let mut input = Vec::new();
+    while input.len() < 3 * 64 * 1024 + 1234 {
+        input.extend_from_slice(phrase);
+    }
+    let encoded = encode_all(&input);
+
+    // out_chunk == 1 forces a drain (and `decoded.clear()`) on every byte.
+    let decoded = decode_chunked(&encoded, 4096, 1).expect("must not panic/error");
+    assert_eq!(decoded, input, "cross-drain round-trip mismatch");
+}
+
 // ─── streaming chunk sizes ─────────────────────────────────────────────
 
 #[test]
