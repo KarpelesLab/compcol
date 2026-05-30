@@ -73,6 +73,9 @@ pub mod brotli;
 #[cfg(feature = "lz4")]
 pub mod lz4;
 
+#[cfg(feature = "lz5")]
+pub mod lz5;
+
 #[cfg(feature = "snappy")]
 pub mod snappy;
 

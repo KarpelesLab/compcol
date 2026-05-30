@@ -31,6 +31,7 @@ all = [
     "rle", "deflate", "deflate64", "zlib", "gzip",
     "lzma", "xz",
     "zstd", "brotli", "lz4", "snappy", "lzw", "lzss", "bzip2",
+    "zstd", "brotli", "lz4", "lz5", "snappy", "lzw", "bzip2",
     "lzo", "lzx", "amiga_lzx", "quantum", "lzfse", "adc",
     "ppmd",
     "xpress_huffman",
@@ -80,6 +81,13 @@ zstd    = ["alloc"]
 brotli  = ["alloc"]
 # LZ4 block format.
 lz4     = ["alloc"]
+# LZ5 / Lizard frame format (Yann Collet & Przemyslaw Skibinski's modern
+# LZ4 descendant). Decoder handles the LZ4-codeword path with all
+# sub-streams stored raw (compression levels 10..=19 without Huffman);
+# LIZv1 mode and Huffman-coded streams are rejected as `Unsupported`.
+# Encoder emits store-only frames (round-trips through reference CLI but
+# achieves no compression).
+lz5     = ["alloc"]
 # Google Snappy.
 snappy  = ["alloc"]
 # Lempel–Ziv–Welch (Unix compress / GIF).
