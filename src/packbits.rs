@@ -121,7 +121,9 @@ impl Encoder {
         self.literal.clear();
     }
 
-    /// Emit a replicate-run as a `-1..=-127` header + the byte.
+    /// Emit a replicate-run as a `-1..=-127` header + the byte. The
+    /// caller is responsible for flushing any preceding literal first,
+    /// or the run will appear before the literal in the output stream.
     fn flush_run(&mut self) {
         if let Some((byte, count)) = self.run.take() {
             debug_assert!((MIN_RUN..=MAX_RUN).contains(&count));
@@ -145,19 +147,24 @@ impl Encoder {
                 // Either we hit the cap, or `b` breaks the run.
                 if byte == b {
                     // Cap reached — flush and start a fresh run with `b`.
+                    // Order matters: the literal buffer (if any) was
+                    // accumulated *before* this run started, so it must
+                    // hit the wire first.
+                    self.flush_literal();
+                    self.flush_run();
+                    self.run = Some((b, 1));
+                } else if count >= MIN_RUN {
+                    // Real run ending: flush literal-then-run so the
+                    // wire order matches input order.
+                    self.flush_literal();
                     self.flush_run();
                     self.run = Some((b, 1));
                 } else {
-                    if count >= MIN_RUN {
-                        // Real run: flush it.
-                        self.flush_run();
-                    } else {
-                        // Tracked bytes that never reached the run
-                        // threshold get demoted to literals.
-                        self.run = None;
-                        for _ in 0..count {
-                            self.push_literal(byte);
-                        }
+                    // Tracked bytes that never reached the run
+                    // threshold get demoted to literals.
+                    self.run = None;
+                    for _ in 0..count {
+                        self.push_literal(byte);
                     }
                     self.run = Some((b, 1));
                 }
@@ -178,21 +185,26 @@ impl Encoder {
     }
 
     /// Commit any pending state at end-of-stream: short runs collapse
-    /// into the literal buffer, real runs flush, and then any literals
-    /// flush. Idempotent.
+    /// into the literal buffer, real runs flush in literal-then-run
+    /// order. Idempotent.
     fn finalize(&mut self) {
         if let Some((byte, count)) = self.run.take() {
             if count >= MIN_RUN {
-                // Re-arm and flush as a run.
+                // Real run: emit any preceding literal first, then
+                // the run header. (`flush_literal` no-ops on empty.)
+                self.flush_literal();
                 self.run = Some((byte, count));
                 self.flush_run();
             } else {
+                // Short tail: demote to literals and flush together.
                 for _ in 0..count {
                     self.push_literal(byte);
                 }
+                self.flush_literal();
             }
+        } else {
+            self.flush_literal();
         }
-        self.flush_literal();
     }
 }
 
