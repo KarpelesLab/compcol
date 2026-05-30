@@ -2276,7 +2276,13 @@ impl Decoder {
             };
 
             // Compute max-distance: min(window_size - 16, total_out so far).
-            let max_dist = (self.window_size.saturating_sub(16)).min(self.total_out as u32);
+            // `total_out` is a usize accumulated over the whole stream; a plain
+            // `as u32` cast wraps after 4 GiB of output and collapses max_dist,
+            // corrupting decoding. Do the comparison at full usize width and
+            // clamp the (window-bounded) result back to u32 losslessly:
+            // max_dist <= window_size - 16, which always fits in u32.
+            let max_dist =
+                (self.window_size.saturating_sub(16) as usize).min(self.total_out) as u32;
             if distance <= max_dist {
                 // Normal back-reference. Non-short distances are
                 // pushed to the ring here.
