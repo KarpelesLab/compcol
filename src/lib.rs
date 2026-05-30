@@ -148,6 +148,10 @@ pub mod zip_reduce;
 #[cfg(feature = "zip_shrink")]
 pub mod zip_shrink;
 
+#[cfg(feature = "arc_crunch")]
+pub mod arc_crunch;
+#[cfg(feature = "arc_squeeze")]
+pub mod arc_squeeze;
 #[cfg(feature = "lha")]
 pub mod lha;
 

@@ -148,6 +148,14 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         }
         #[cfg(feature = "delta")]
         crate::delta::Delta::NAME => Some(Box::new(<crate::delta::Delta as Algorithm>::encoder())),
+        #[cfg(feature = "arc_crunch")]
+        crate::arc_crunch::ArcCrunch::NAME => Some(Box::new(
+            <crate::arc_crunch::ArcCrunch as Algorithm>::encoder(),
+        )),
+        #[cfg(feature = "arc_squeeze")]
+        crate::arc_squeeze::ArcSqueeze::NAME => Some(Box::new(
+            <crate::arc_squeeze::ArcSqueeze as Algorithm>::encoder(),
+        )),
         _ => None,
     }
 }
@@ -355,6 +363,14 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         }
         #[cfg(feature = "delta")]
         crate::delta::Delta::NAME => Some(Box::new(<crate::delta::Delta as Algorithm>::decoder())),
+        #[cfg(feature = "arc_crunch")]
+        crate::arc_crunch::ArcCrunch::NAME => Some(Box::new(
+            <crate::arc_crunch::ArcCrunch as Algorithm>::decoder(),
+        )),
+        #[cfg(feature = "arc_squeeze")]
+        crate::arc_squeeze::ArcSqueeze::NAME => Some(Box::new(
+            <crate::arc_squeeze::ArcSqueeze as Algorithm>::decoder(),
+        )),
         _ => None,
     }
 }
@@ -524,6 +540,12 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     if str_eq(name, "delta") && cfg!(feature = "delta") {
         return Some("delta");
     }
+    if str_eq(name, "crunch") && cfg!(feature = "arc_crunch") {
+        return Some("arc");
+    }
+    if str_eq(name, "squeeze") && cfg!(feature = "arc_squeeze") {
+        return Some("sqz");
+    }
     None
 }
 
@@ -648,5 +670,9 @@ pub const fn names() -> &'static [&'static str] {
         crate::bcj::BcjRiscV::NAME,
         #[cfg(feature = "delta")]
         crate::delta::Delta::NAME,
+        #[cfg(feature = "arc_crunch")]
+        crate::arc_crunch::ArcCrunch::NAME,
+        #[cfg(feature = "arc_squeeze")]
+        crate::arc_squeeze::ArcSqueeze::NAME,
     ]
 }

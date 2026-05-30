@@ -46,6 +46,7 @@ all = [
     "zip_reduce",
     "lha",
     "bcj", "delta",
+    "arc_crunch", "arc_squeeze",
 ]
 # Enables `alloc`-backed conveniences (e.g. the `factory` module, the
 # `compcol::vec` one-shot helpers). Pulled in automatically by features
@@ -185,6 +186,15 @@ bcj     = ["alloc"]
 # Delta filter — byte-wise delta with a configurable distance (1..=256).
 # Reversible filter (xz/LZMA SDK lineage). Encoder + decoder both implemented.
 delta   = ["alloc"]
+# ARC "Crunch" (ARC method 8): dynamic LZW (a `compress`-style variant) with
+# a one-byte maxbits header and a block-mode CLEAR code. Encoder and decoder
+# both implemented and validated by round-trip.
+arc_crunch = ["alloc"]
+# ARC "Squeeze" (ARC method 4 / CP-M `.SQ`): a `0x90`-flag run-length
+# pre-pass followed by static Huffman coding with the tree serialised in the
+# stream header. Encoder and decoder both implemented and validated by
+# round-trip.
+arc_squeeze = ["alloc"]
 # `compcol::tokio_io` — async mirrors of compcol::io for the tokio
 # runtime. Pulls the tokio dependency for its AsyncRead/AsyncWrite
 # trait definitions; the rest of the crate stays dep-free.
