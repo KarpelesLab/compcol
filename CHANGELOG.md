@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **StuffIt 5 Arsenic codec** (`arsenic`, compression method 15): BWT-based —
+  a carry-less range/arithmetic decoder (9 adaptive models) → selector-driven
+  un-MTF/un-RLE → inverse BWT → optional de-randomization → final RLE →
+  CRC-32. Decode-only, self-terminating (in-band end-of-blocks + CRC trailer).
+  Clean-room from a facts-only spec, with the fixed interop tables (9 model
+  parameters + 256-entry randomization table) supplied as a separately-licensed
+  adjunct. Validated bit-exactly against real StuffIt 5 archives — 46 method-15
+  forks across 5 fixtures verify (in-stream CRC-32 + declared size), and all 11
+  data forks SHA-256 match the reference `unar` output.
+
 - **StuffIt classic LZAH codec** (`lzah`, compression method 5): LZSS sliding
   window (4 KiB, MSB-first) + a single 314-symbol adaptive Huffman tree,
   decode-only. Clean-room from a facts-only functional spec; the raw fork
