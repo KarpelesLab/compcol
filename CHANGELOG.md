@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **LHA / LZH codecs** (`lha`): `-lh1-` (adaptive Huffman) and
+  `-lh4-/-lh5-/-lh6-/-lh7-` (static Huffman) LZSS methods, encoder + decoder.
+  Clean-room from Okumura's public-domain LZHUF / ar002 descriptions.
+- **BCJ branch-converter filters** (`bcj`): reversible x86, ARM, ARM-Thumb,
+  ARM64, PowerPC, SPARC, IA-64, and RISC-V filters (public-domain LZMA SDK
+  lineage), encoder + decoder.
+- **Delta filter** (`delta`): reversible byte-wise delta with a configurable
+  distance (1..=256), encoder + decoder.
+- **ARC Crunch** (`arc_crunch`, method 8, 12-bit dynamic LZW) and **ARC
+  Squeeze** (`arc_squeeze`, method 4, RLE + static Huffman), encoder + decoder.
+- **StuffIt method 13** (`sit13`): tested building blocks (bit reader,
+  Kraft-validated Huffman, bounds-checked LZSS window) behind a decoder that
+  returns `Unsupported` — the format is proprietary and the only public
+  reference is LGPL-licensed, so a conformant payload decoder could be neither
+  cleanly derived nor validated (mirrors `rar1`/`lzham`).
+
+  Note: `lha` and `arc_*` are clean-room from public specs and validated by
+  their own encoder↔decoder round-trip, not against reference-tool output.
+
 ## [0.5.0](https://github.com/KarpelesLab/compcol/compare/v0.4.7...v0.5.0) - 2026-05-30
 
 ### Other
