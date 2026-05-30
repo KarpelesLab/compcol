@@ -102,6 +102,8 @@ pub mod lzfse;
 #[cfg(feature = "adc")]
 pub mod adc;
 
+#[cfg(feature = "lznt1")]
+pub mod lznt1;
 #[cfg(feature = "ppmd")]
 pub mod ppmd;
 
