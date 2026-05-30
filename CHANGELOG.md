@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **StuffIt classic LZAH codec** (`lzah`, compression method 5): LZSS sliding
+  window (4 KiB, MSB-first) + a single 314-symbol adaptive Huffman tree,
+  decode-only. Clean-room from a facts-only functional spec; the raw fork
+  payload is decoded with the uncompressed size supplied out of band via
+  `DecoderConfig::with_len` (StuffIt has no in-band end marker). Validated
+  bit-exactly against real classic `SIT!` archives — 17 method-5 forks across
+  5 fixtures pass the stored per-fork CRC-16.
+
 - **LHA / LZH codecs** (`lha`): `-lh1-` (adaptive Huffman) and
   `-lh4-/-lh5-/-lh6-/-lh7-` (static Huffman) LZSS methods, encoder + decoder.
   Clean-room from Okumura's public-domain LZHUF / ar002 descriptions.
