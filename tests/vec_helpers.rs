@@ -63,7 +63,8 @@ mod gzip {
     use super::*;
     use compcol::gzip::{EncoderConfig, Gzip};
     use compcol::vec::{
-        compress_to_vec, compress_to_vec_with, decompress_to_vec, decompress_to_vec_with,
+        compress_to_vec, compress_to_vec_with, decompress_to_vec, decompress_to_vec_capped,
+        decompress_to_vec_capped_with, decompress_to_vec_with,
     };
 
     #[test]
@@ -102,6 +103,34 @@ mod gzip {
             matches!(err, Error::UnexpectedEnd | Error::TrailerMismatch),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn capped_within_limit_round_trips() {
+        let input = payload(64 * 1024);
+        let c = compress_to_vec::<Gzip>(&input).unwrap();
+        // Cap comfortably above the decoded size: succeeds, matches input.
+        let d = decompress_to_vec_capped::<Gzip>(&c, 1 << 20).unwrap();
+        assert_eq!(d, input);
+    }
+
+    #[test]
+    fn capped_over_limit_errors() {
+        use compcol::Error;
+        let input = payload(64 * 1024);
+        let c = compress_to_vec::<Gzip>(&input).unwrap();
+        // Cap below the decoded size: must abort with OutputLimitExceeded.
+        let err = decompress_to_vec_capped::<Gzip>(&c, 1024).unwrap_err();
+        assert!(matches!(err, Error::OutputLimitExceeded), "got {err:?}");
+    }
+
+    #[test]
+    fn capped_exact_limit_succeeds() {
+        let input = payload(8 * 1024);
+        let c = compress_to_vec::<Gzip>(&input).unwrap();
+        // Exactly the decoded size is allowed.
+        let d = decompress_to_vec_capped_with::<Gzip>(&c, (), input.len() as u64).unwrap();
+        assert_eq!(d, input);
     }
 
     #[test]

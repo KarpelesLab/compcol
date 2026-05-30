@@ -1542,7 +1542,14 @@ impl RawDecoder for Decoder {
                                     self.index_records_total = n;
                                     self.index_records_remaining = n.saturating_mul(2);
                                     self.index_pos = p;
-                                    self.blocks.reserve(n as usize);
+                                    // NOTE: Do NOT pre-reserve based on the raw
+                                    // attacker-controlled NumRecords `n` (up to
+                                    // ~2^63): that would panic with "capacity
+                                    // overflow" or trigger an OOM-aborting
+                                    // allocation before any validation. The
+                                    // `blocks` vec is built from actually-decoded
+                                    // blocks and cross-checked against
+                                    // `index_records_total` below.
                                 }
                                 None => break, // need more bytes
                             }

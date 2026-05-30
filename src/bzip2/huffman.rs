@@ -93,6 +93,25 @@ impl DecodeTable {
             count[l as usize] += 1;
         }
 
+        // Kraft–McMillan validity check. A canonical prefix code is valid
+        // iff, accumulating `left = (left << 1) + count[len]` from len 1
+        // upward, `left` never exceeds the code space `1 << len` (no
+        // over-subscription) and exactly fills it at the end
+        // (`left == 1 << max_len`, no under-subscription). This matches the
+        // discipline in `src/huffman.rs` and rejects malformed tables here
+        // rather than deferring detection to the block CRC.
+        let mut left: i64 = 0;
+        for (i, &c) in count[1..=(max_len as usize)].iter().enumerate() {
+            let len = i + 1;
+            left = (left << 1) + c as i64;
+            if left > (1i64 << len) {
+                return Err(Error::InvalidHuffmanTree);
+            }
+        }
+        if left != (1i64 << max_len) {
+            return Err(Error::InvalidHuffmanTree);
+        }
+
         // Build base/limit tables in the bzip2 / RFC1951 canonical style.
         // base[len]  = first symbol index at length `len` (in the sorted
         //              symbol order)

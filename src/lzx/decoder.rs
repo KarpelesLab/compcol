@@ -69,6 +69,10 @@ struct RunCtx {
     header_read: bool,
     /// True iff the intel-translation post-filter is active for this stream.
     intel_started: bool,
+    /// True once the 32-bit intel filesize field has been read. Tracked
+    /// separately from the value so a legitimate filesize of 0xFFFFFFFF is
+    /// not mistaken for an "unread" sentinel and re-read forever.
+    intel_filesize_read: bool,
     intel_filesize: u32,
     /// Current LRU repeat offsets.
     r0: u32,
@@ -274,6 +278,7 @@ impl RawDecoder for Decoder {
                         output_total: total,
                         header_read: false,
                         intel_started: false,
+                        intel_filesize_read: false,
                         intel_filesize: 0,
                         r0: 1,
                         r1: 1,
@@ -485,16 +490,17 @@ fn step(ctx: &mut RunCtx) -> Result<(), Error> {
             ctx.bit_reader.drop_bits(1);
             if flag != 0 {
                 ctx.intel_started = true;
-                // Sentinel: we've consumed the flag bit but haven't read the
-                // 32-bit filesize yet. The next iteration polls for it.
-                ctx.intel_filesize = u32::MAX;
+                // We've consumed the flag bit but haven't read the 32-bit
+                // filesize yet; the next iteration polls for it. Read-state
+                // is tracked by `intel_filesize_read`, not the value, so a
+                // legitimate filesize of 0xFFFFFFFF is accepted.
             }
             ctx.header_read = true;
             continue;
         }
 
         // Finish a possibly-deferred intel_filesize read.
-        if ctx.intel_started && ctx.intel_filesize == u32::MAX {
+        if ctx.intel_started && !ctx.intel_filesize_read {
             if ctx.bit_reader.bits_available() < 32 {
                 return Ok(());
             }
@@ -503,10 +509,7 @@ fn step(ctx: &mut RunCtx) -> Result<(), Error> {
             let lo = ctx.bit_reader.peek(16);
             ctx.bit_reader.drop_bits(16);
             ctx.intel_filesize = (hi << 16) | lo;
-            // Edge case: real LZX with filesize == 0xFFFFFFFF would collide
-            // with our sentinel. In practice filesizes are bounded by
-            // 2 GiB per LZX spec, so this is fine — but document the
-            // invariant.
+            ctx.intel_filesize_read = true;
             continue;
         }
 

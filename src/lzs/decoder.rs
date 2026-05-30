@@ -173,6 +173,9 @@ impl Decoder {
 
             // 1. Pending literal.
             if let Some(b) = self.pending_literal.take() {
+                if self.produced >= target {
+                    return Err(Error::TrailerMismatch);
+                }
                 if *written == output.len() {
                     self.pending_literal = Some(b);
                     return Ok(());
@@ -185,6 +188,9 @@ impl Decoder {
             // 2. Pending match.
             if let Some(mut pm) = self.pending_match.take() {
                 while pm.remaining > 0 && *written < output.len() {
+                    if self.produced >= target {
+                        return Err(Error::TrailerMismatch);
+                    }
                     if (pm.distance as usize) > self.history.len() {
                         return Err(Error::InvalidDistance);
                     }
@@ -241,6 +247,9 @@ impl Decoder {
                     }
                 };
                 self.bits.compact();
+                if self.produced >= target {
+                    return Err(Error::TrailerMismatch);
+                }
                 if *written == output.len() {
                     self.pending_literal = Some(byte as u8);
                     return Ok(());
@@ -323,6 +332,13 @@ impl Decoder {
                 remaining: length,
             };
             while pm.remaining > 0 && *written < output.len() {
+                // A match must not push `produced` past the declared
+                // `target`: doing so would deliver more bytes than the
+                // framing header promised. Detect it here rather than
+                // deferring to the EOS cross-check.
+                if self.produced >= target {
+                    return Err(Error::TrailerMismatch);
+                }
                 if (pm.distance as usize) > self.history.len() {
                     return Err(Error::InvalidDistance);
                 }

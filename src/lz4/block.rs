@@ -240,7 +240,13 @@ fn emit_last_literals(literals: &[u8], out: &mut Vec<u8>) {
 /// Decode one LZ4 block from `input` into `out`.
 ///
 /// `out` is cleared first; on success it contains the decompressed bytes.
-pub fn decode_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+///
+/// `raw_max` bounds the decoded output: a single LZ4 block can expand a
+/// match-copy by up to ~255×, so without a ceiling a small malicious block
+/// could be coaxed into a multi-gigabyte allocation (decompression bomb).
+/// Any literal or match append that would push `out.len()` past `raw_max`
+/// returns [`Error::Corrupt`].
+pub fn decode_block(input: &[u8], out: &mut Vec<u8>, raw_max: usize) -> Result<(), Error> {
     out.clear();
     if input.is_empty() {
         return Ok(());
@@ -274,6 +280,9 @@ pub fn decode_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
         if lit_len > 0 {
             if ip + lit_len > n {
                 return Err(Error::UnexpectedEnd);
+            }
+            if out.len() + lit_len > raw_max {
+                return Err(Error::Corrupt);
             }
             out.extend_from_slice(&input[ip..ip + lit_len]);
             ip += lit_len;
@@ -311,6 +320,9 @@ pub fn decode_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
             }
         }
         let match_len = MIN_MATCH + match_excess;
+        if out.len() + match_len > raw_max {
+            return Err(Error::Corrupt);
+        }
 
         // Non-overlapping match collapses to memcpy; offset==1 is a byte-splat;
         // otherwise replicate byte-by-byte to handle LZ77 self-overlap.
@@ -337,7 +349,7 @@ mod tests {
         let mut encoded = Vec::new();
         encode_block(data, &mut encoded);
         let mut decoded = Vec::new();
-        decode_block(&encoded, &mut decoded).expect("decode");
+        decode_block(&encoded, &mut decoded, usize::MAX).expect("decode");
         assert_eq!(decoded, data);
     }
 

@@ -241,6 +241,28 @@ fn cross_drain_back_reference_does_not_panic() {
     assert_eq!(decoded, input, "cross-drain round-trip mismatch");
 }
 
+/// Regression for the `decode_loop` output back-pressure bound (H5 OOM).
+/// Feeding the *entire* multi-block compressed stream in a single `decode`
+/// call previously let `decode_loop` decode every buffered block into the
+/// internal `decoded` buffer before a single byte was drained (a tiny input
+/// could balloon to gigabytes resident). Draining through a 1-byte output
+/// buffer means the decoder must bound its backlog and resume across many
+/// calls; the round-trip must still be byte-exact.
+#[test]
+fn whole_stream_one_byte_output_is_bounded_and_correct() {
+    let phrase = b"the quick brown fox jumps over the lazy dog 0123456789 ";
+    let mut input = Vec::new();
+    while input.len() < 4 * 64 * 1024 + 777 {
+        input.extend_from_slice(phrase);
+    }
+    let encoded = encode_all(&input);
+
+    // in_chunk == whole stream: all blocks are buffered before decoding.
+    // out_chunk == 1: forces the back-pressure return path every byte.
+    let decoded = decode_chunked(&encoded, encoded.len(), 1).expect("must decode");
+    assert_eq!(decoded, input, "whole-stream/1-byte round-trip mismatch");
+}
+
 // ─── streaming chunk sizes ─────────────────────────────────────────────
 
 #[test]

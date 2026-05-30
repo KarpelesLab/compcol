@@ -279,12 +279,24 @@ fn decode_fse_weights(payload: &[u8]) -> Result<Vec<u8>, Error> {
 
     let mut weights: Vec<u8> = Vec::new();
 
+    // A Huffman weight array describes at most 255 explicit symbols (the 256th
+    // — symbol 255 — is the implicit "last weight" closing the tree, computed
+    // by the caller). A crafted FSE table whose reachable states all have
+    // `num_bits == 0` (e.g. a single-symbol normalized distribution) consumes
+    // no bits per advance, so the `br.remaining() < nb` checks below never
+    // fire and the loop would push weights forever (hang / OOM). Bound the
+    // accumulated weight count and reject once it would exceed the alphabet.
+    const MAX_WEIGHTS: usize = 255;
+
     // Decode in the canonical interleaved FSE pattern:
     //   emit s1.symbol; advance s1 (read num_bits)
     //   emit s2.symbol; advance s2
     // If the advance would have read past the end of the stream we stop;
     // the *other* state's pending symbol is emitted as the final byte.
     loop {
+        if weights.len() >= MAX_WEIGHTS {
+            return Err(Error::Corrupt);
+        }
         let w1 = s1.symbol(&table) as u8;
         weights.push(w1);
         let nb = table.entries[s1.state as usize].num_bits as usize;
@@ -296,6 +308,9 @@ fn decode_fse_weights(payload: &[u8]) -> Result<Vec<u8>, Error> {
         }
         s1.advance(&table, &mut br)?;
 
+        if weights.len() >= MAX_WEIGHTS {
+            return Err(Error::Corrupt);
+        }
         let w2 = s2.symbol(&table) as u8;
         weights.push(w2);
         let nb = table.entries[s2.state as usize].num_bits as usize;

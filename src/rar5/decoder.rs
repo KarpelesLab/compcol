@@ -405,7 +405,7 @@ impl Decoder {
                     }
                     // Flush the output queue / apply filters that became
                     // ready as a result of finishing the block.
-                    self.flush_ready_through_filters();
+                    self.flush_ready_through_filters()?;
                     return Ok(true);
                 }
                 Ok(made_progress)
@@ -429,7 +429,7 @@ impl Decoder {
             // flush it through filters at every iteration so this only
             // matters when filters are pending.
             if self.out_queue.len() > 1 << 20 {
-                self.flush_ready_through_filters();
+                self.flush_ready_through_filters()?;
             }
             let t = self.tables.as_ref().ok_or(Error::Corrupt)?;
             let num = t.nc.decode(bits)?;
@@ -481,7 +481,7 @@ impl Decoder {
             }
             // Periodically push the head of out_queue through filters.
             if self.out_queue.len() >= 4096 {
-                self.flush_ready_through_filters();
+                self.flush_ready_through_filters()?;
             }
         }
     }
@@ -524,7 +524,7 @@ impl Decoder {
     /// Pull bytes out of `out_queue` into `ready`, applying any filters
     /// whose target range is fully produced. Filters that aren't yet fully
     /// covered stay in `pending_filters`.
-    fn flush_ready_through_filters(&mut self) {
+    fn flush_ready_through_filters(&mut self) -> Result<(), Error> {
         // First, push bytes out of out_queue into ready until we hit a
         // pending filter's start (in absolute coordinates) — those bytes
         // can flow without modification.
@@ -546,7 +546,7 @@ impl Decoder {
                     }
                     self.out_queue_start += drained;
                     self.unpack_so_far += drained;
-                    return;
+                    return Ok(());
                 }
                 Some(s) if s > pos => {
                     // Drain up to `s` from out_queue into ready.
@@ -563,7 +563,7 @@ impl Decoder {
                     self.unpack_so_far += take as u64;
                     if (take as u64) < n as u64 {
                         // out_queue is empty before reaching the filter.
-                        return;
+                        return Ok(());
                     }
                 }
                 Some(_) => {
@@ -574,7 +574,7 @@ impl Decoder {
                     let buf_end = pos + self.out_queue.len() as u64;
                     if end > buf_end {
                         // Not enough bytes yet — wait.
-                        return;
+                        return Ok(());
                     }
                     // We have the whole filter range. Extract it into a
                     // contiguous Vec, apply the filter, then push back to
@@ -584,7 +584,7 @@ impl Decoder {
                         // already emitted. Unsupported in our streaming
                         // model — refuse.
                         // (This shouldn't happen with normal RAR5 streams.)
-                        return;
+                        return Ok(());
                     }
                     let leading = (f.start - pos) as usize;
                     for _ in 0..leading {
@@ -604,18 +604,10 @@ impl Decoder {
                             region.push(b);
                         }
                     }
-                    let ok = super::filters::apply(&f, &mut region);
-                    if ok.is_err() {
-                        // We refuse to silently discard the filter; push the
-                        // raw bytes through so the caller at least sees the
-                        // uncompressed output for the surrounding bytes.
-                        // But a corrupt-filter signal must still propagate
-                        // to the caller via poisoning. We can't propagate
-                        // from here without ? — flag via ready being empty
-                        // is hostile. Instead, push raw bytes then surface
-                        // poison the next time around. For simplicity, push
-                        // raw bytes.
-                    }
+                    // Propagate filter failures instead of silently emitting
+                    // the raw, unfiltered bytes. An unsupported or corrupt
+                    // filter would otherwise yield wrong output with no error.
+                    super::filters::apply(&f, &mut region)?;
                     for &b in &region {
                         self.ready.push_back(b);
                     }
@@ -765,6 +757,14 @@ fn adjust_length(length: u32, dist: u32) -> u32 {
 /// Decode a distance given the distance slot. For slots with extra bits
 /// >= 4, the lower 4 bits come from the low-distance Huffman table `ldc`.
 fn decode_distance(bits: &mut BitBuf, dist_slot: u16, ldc: &Huffman) -> Result<u32, Error> {
+    // `dist_slot` is decoded from the DC Huffman table, which has exactly
+    // HUFF_DC (64) symbols, so it is in 0..=63. Guard against an
+    // out-of-contract value: with slots > 63, `dbits` would exceed 30 and
+    // the shifts below could overflow. This keeps the function within the
+    // RAR5 distance-slot range.
+    if dist_slot as usize >= HUFF_DC {
+        return Err(Error::Corrupt);
+    }
     let mut dist: u32;
     let dbits: u32;
     if dist_slot < 4 {
@@ -776,9 +776,21 @@ fn decode_distance(bits: &mut BitBuf, dist_slot: u16, ldc: &Huffman) -> Result<u
     }
     if dbits > 0 {
         if dbits >= 4 {
+            // `high_extra = dbits - 4` can be as large as 26 for slot 63,
+            // which exceeds BitBuf::read's documented 1..=16-bit limit (it
+            // debug-asserts n <= 16). Read it in <=16-bit chunks so debug
+            // builds don't panic and the value is assembled MSB-first
+            // exactly as a single wide read would have produced it.
             let high_extra = dbits - 4;
             if high_extra > 0 {
-                let high = bits.read(high_extra)?;
+                let mut high: u32 = 0;
+                let mut remaining = high_extra;
+                while remaining > 0 {
+                    let chunk = remaining.min(16);
+                    let part = bits.read(chunk)?;
+                    high = (high << chunk) | part;
+                    remaining -= chunk;
+                }
                 dist += high << 4;
             }
             let low = ldc.decode(bits)? as u32;

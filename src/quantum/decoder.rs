@@ -23,7 +23,7 @@ use crate::traits::{RawDecoder, RawProgress};
 
 /// One Quantum frame is 32 KiB of output. After each frame the bit reader
 /// realigns to a byte boundary and a small trailer is consumed.
-const FRAME_SIZE: u32 = 32_768;
+const FRAME_SIZE: i32 = 32_768;
 
 /// Default window size if the caller did not specify one.
 /// Quantum window_bits ranges from 10 (1 KiB) to 21 (2 MiB); 21 is the max
@@ -94,7 +94,11 @@ pub struct Decoder {
     header_read: bool,
 
     // --- Frame accounting -------------------------------------------------
-    frame_todo: u32,
+    /// Bytes still owed for the current 32 KiB frame. Signed so a match
+    /// that overshoots the frame end drives it to/below zero (frame done)
+    /// rather than wrapping around a `u32`, which would skip the per-frame
+    /// realignment + 0xFF trailer handling and desync the bitstream.
+    frame_todo: i32,
     trailer_state: TrailerState,
 
     // --- Pending mid-packet work -----------------------------------------
@@ -345,7 +349,7 @@ impl Decoder {
             self.window[self.window_posn & self.window_mask] = byte;
             let start = self.window_posn & self.window_mask;
             self.window_posn += 1;
-            self.frame_todo = self.frame_todo.wrapping_sub(1);
+            self.frame_todo -= 1;
             self.enqueue_output(start, 1);
             return Ok(());
         }
@@ -436,7 +440,9 @@ impl Decoder {
             remaining: match_length,
         });
         // frame_todo is decremented up front for matches, matching libmspack.
-        self.frame_todo = self.frame_todo.wrapping_sub(match_length as u32);
+        // A match may overshoot the frame end; because frame_todo is signed
+        // it goes <= 0 (frame done) instead of wrapping around a u32.
+        self.frame_todo -= match_length as i32;
         Ok(())
     }
 
@@ -540,8 +546,11 @@ impl Decoder {
                 }
             }
 
-            // If frame is full, switch to trailer.
-            if self.frame_todo == 0 {
+            // If frame is full, switch to trailer. A match that overshoots
+            // the frame end leaves frame_todo negative, so test "<= 0" to
+            // catch both exact fills and overshoots (libmspack's
+            // `while (frame_todo > 0)` semantics).
+            if self.frame_todo <= 0 {
                 // Realign: discard the remaining bits in the current byte.
                 let leftover = self.bit_reader.bits_left() & 7;
                 self.bit_reader.remove_bits(leftover);

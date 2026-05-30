@@ -416,6 +416,14 @@ fn run(args: &Args, algo: &str) -> Result<(), RunError> {
             // check and the open, and refuses to follow a pre-existing or
             // dangling symlink into an attacker-controlled target. With
             // --force we keep the documented overwrite (truncate) behavior.
+            //
+            // For the --force path, remember whether the target already
+            // existed: if a later codec error triggers cleanup we must NOT
+            // delete a file the user already had (data loss). Only output we
+            // newly created is ours to remove on failure. (The non-force path
+            // uses create_new, so a successful open there always created the
+            // file — it is always safe to clean up.)
+            let preexisting = args.force && p.exists();
             let open_result = if args.force {
                 OpenOptions::new()
                     .write(true)
@@ -438,7 +446,11 @@ fn run(args: &Args, algo: &str) -> Result<(), RunError> {
                     ))
                 }
             })?;
-            (Box::new(BufWriter::new(f)), Some(p.clone()))
+            // Cleanup only files we created. A pre-existing --force target is
+            // left in place (already truncated) rather than deleted out from
+            // under the user.
+            let cleanup = if preexisting { None } else { Some(p.clone()) };
+            (Box::new(BufWriter::new(f)), cleanup)
         }
     };
 

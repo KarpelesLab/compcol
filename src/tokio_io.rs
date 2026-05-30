@@ -36,7 +36,7 @@ use std::io;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::{Decoder, Encoder, Status};
+use crate::{Decoder, Encoder, Error, Status};
 
 const SCRATCH: usize = 64 * 1024;
 
@@ -465,6 +465,15 @@ impl<R: AsyncRead + Unpin, D: Decoder + Unpin> AsyncRead for DecoderReader<R, D>
             buf.advance(p.written);
             if matches!(status, Status::StreamEnd) {
                 me.finished = true;
+            }
+            if p.written == 0 && !me.finished {
+                // Inner is at EOF and finish() produced no output yet did
+                // not reach StreamEnd: the stream is truncated. Returning
+                // Ready(Ok) with nothing filled looks like a clean EOF and
+                // would silently drop the missing tail, so surface it as
+                // an error — mirroring the writer-path stall guard in
+                // poll_shutdown().
+                return Poll::Ready(Err(io::Error::from(Error::UnexpectedEnd)));
             }
             return Poll::Ready(Ok(()));
         }
