@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+Decoder hardening against malicious/untrusted compressed input (DoS):
+
+- zstd: bound the FSE Huffman-weight decode loop (a `num_bits == 0` table
+  could spin forever / OOM); cap `window_size` and literal `Regenerated_Size`
+  at 128 MiB to bound decompression-bomb frames.
+- xz: drop the unbounded `Vec::reserve` driven by the Index `NumRecords`
+  varint (could panic with capacity-overflow or OOM-abort).
+- lz4: bound block-decode output (`decode_block` now takes a `raw_max`
+  ceiling) on both the independent-block frame path and the streaming path,
+  preventing ~255× match-copy decompression bombs.
+- lzfse/LZVN: reject match copies that exceed the block's declared size
+  before materializing them.
+- xpress_huffman: bound `decode_loop` output backlog so a multi-block stream
+  can't accumulate unbounded internal memory before draining.
+- zip_reduce: decode through a bounded sliding output window instead of
+  retaining the entire (header-declared) output in memory.
+- brotli: avoid a panic when a single-block-type length counter is exhausted.
+- bzip2: enforce the Kraft–McMillan check on Huffman tables.
+- quantum: end frames on overshooting matches (signed `frame_todo`).
+- lzx: track the intel-translation filesize read with a flag, not a
+  `0xFFFFFFFF` sentinel that a real filesize could collide with.
+- ppmd: cap the order-0 arena allocation to what is actually used rather than
+  the advertised (attacker-controlled, up to 255 MiB) memory size.
+- rar5: split wide high-distance bit reads to respect the 16-bit reader
+  contract (debug-build panic); propagate filter-apply failures instead of
+  emitting raw bytes.
+- lzs: stop emitting once the declared output length is reached.
+- limit: clamp the budget in `u64` to avoid a 32-bit truncation that could
+  stall the decode loop.
+- io/tokio_io: surface truncated streams as an error instead of a silent EOF.
+- vec: add `decompress_to_vec_capped{,_with}` bounded one-shot helpers;
+  documented that the unbounded variants must not be used on untrusted input.
+- cli: don't delete a pre-existing `--force` output target if the codec
+  errors mid-stream (data loss); the non-`--force` `create_new` symlink/TOCTOU
+  protection is retained.
+
+### Changed
+
+- **Breaking:** `compcol::lz4::block::decode_block` now takes a third
+  `raw_max: usize` argument bounding the decoded output. Pass `usize::MAX`
+  to preserve the previous unbounded behavior for trusted input.
+
 ## [0.4.7](https://github.com/KarpelesLab/compcol/compare/v0.4.6...v0.4.7) - 2026-05-30
 
 ### Other

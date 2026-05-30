@@ -17,7 +17,7 @@ mod lz4_raw {
         assert!(!out.is_empty());
 
         let mut decoded = Vec::new();
-        decode_block(&out, &mut decoded).unwrap();
+        decode_block(&out, &mut decoded, usize::MAX).unwrap();
         assert_eq!(decoded, input);
     }
 
@@ -29,7 +29,7 @@ mod lz4_raw {
         assert!(out.len() < input.len(), "should compress");
 
         let mut decoded = Vec::new();
-        decode_block(&out, &mut decoded).unwrap();
+        decode_block(&out, &mut decoded, usize::MAX).unwrap();
         assert_eq!(decoded, input);
     }
 
