@@ -2,13 +2,14 @@
 
 A collection of compression algorithms in pure Rust.
 
-`compcol` puts every supported algorithm — RLE, deflate, zlib, gzip,
-LZMA, xz, Zstandard, Brotli, LZ4, Snappy, LZW, LZO, LZX, Quantum, plus
-decoders for RAR 1/2/3/5 — behind one uniform streaming trait, with
-each algorithm gated by its own Cargo feature so downstream crates
-only pay for what they pull in. A runtime by-name factory makes
-algorithms selectable from configuration or a CLI flag, and a
-`compcol` binary turns the library into a Unix-style filter.
+`compcol` puts every supported algorithm — RLE, deflate, Deflate64,
+zlib, gzip, LZMA, xz, Zstandard, Brotli, LZ4, Snappy, LZW, LZO, LZX,
+Amiga LZX, Quantum, LZFSE, ADC, bzip2, Microsoft Xpress / Xpress
+Huffman, LZNT1, plus decoders for RAR 1/2/3/5 and PPMd — behind one
+uniform streaming trait, with each algorithm gated by its own Cargo
+feature so downstream crates only pay for what they pull in. A runtime
+by-name factory makes algorithms selectable from configuration or a CLI
+flag, and a `compcol` binary turns the library into a Unix-style filter.
 
 ## Design principles
 
@@ -33,6 +34,7 @@ algorithms selectable from configuration or a CLI flag, and a
 |---|---|---|---|---|---|
 | RLE | `rle` | `.rle` | full | full | — |
 | Deflate (RFC 1951) | `deflate` | `.deflate` | full (lazy LZ77 + dynamic / fixed / stored Huffman; cross-block matching) | full | `python3 -c "import zlib"` |
+| Deflate64 (PKWARE method 9) | `deflate64` | `.deflate64` | full (LZ77 + 64 KiB window + extended length/distance codes) | full | `7z a -tzip -mm=deflate64` |
 | Zlib (RFC 1950) | `zlib` | `.zz` | full | full | `python3 -c "import zlib"` |
 | Gzip (RFC 1952) | `gzip` | `.gz` | full | full | `gzip(1)` |
 | LZ4 block format | `lz4` | `.lz4` | LZ77 hash matcher | full | — |
@@ -44,9 +46,15 @@ algorithms selectable from configuration or a CLI flag, and a
 | Brotli (RFC 7932) | `brotli` | `.br` | LZ77 + length-limited Huffman + 704-symbol IC alphabet + static-dictionary refs | full (with 122 KiB static dictionary) | `brotli(1)` both directions |
 | LZO (LZO1X-1) | `lzo` | `.lzo` | LZ77 hash matcher | full | `python3 -c "import lzo"` |
 | LZX (Microsoft CAB / WIM) | `lzx` | `.lzx` | uncompressed blocks only | full (verbatim + aligned-offset + uncompressed; E8 filter) | — |
+| Amiga LZX (original 1995 Forbes) | `amiga_lzx` | — (`.lzx` claimed by MS LZX) | uncompressed blocks only | full (verbatim + aligned + uncompressed; fixed 64 KiB window, no chunk reset, no E8 filter) | — |
 | Quantum (Stac, old CAB) | `quantum` | `.q` | `Unsupported` (no public encoder exists) | full (libmspack-equivalent) | libmspack regression fixtures |
 | LZFSE (Apple) | `lzfse` | `.lzfse` | `Unsupported` (decoder-only) | `bvx-` raw + `bvxn` (LZVN); `bvx2` returns `Unsupported` | hand-built fixtures (no Apple toolchain bundled) |
 | ADC (Apple DMG) | `adc` | `.adc` | LZSS-style greedy match-finder | full | hand-built fixtures |
+| bzip2 | `bzip2` | `.bz2` | full (RLE-1 + SA-IS BWT + MTF + RLE-2 + dynamic Huffman) | full | `bzip2(1)` both directions |
+| PPMd (Shkarin's PPMII variant H) | `ppmd` | `.ppmd` | `Unsupported` (decoder-only; PPM model is intricate) | full (used in 7z / RAR3+ / ZIP method 98) | `python3 ppmd-cffi` |
+| Microsoft Xpress (plain LZ77) | `xpress` | `.xpress` | full | full (per [MS-XCA] §2.2) | hand-built fixtures |
+| Microsoft Xpress Huffman | `xpress_huffman` | `.xph` | full (LZ77 + canonical Huffman) | full (per [MS-XCA] §2.1; used in WIM / CompactOS NTFS) | hand-built fixtures |
+| LZNT1 (NTFS native compression) | `lznt1` | `.lznt1` | full | full (per [MS-XCA] §2.5; 4 KiB-chunked LZ77, no entropy coding) | hand-built fixtures |
 | RAR 1.x | `rar1` | `.rar` | `Unsupported` (license) | building blocks only (Huffman tables not license-clean) | — |
 | RAR 2.x | `rar2` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + audio predictor | real rar-2.60 fixtures |
 | RAR 3.x | `rar3` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + E8 filter; PPMd & VM filters refused | libarchive RAR3 fixtures |
@@ -68,7 +76,7 @@ text (brotli); the wire format is always conformant.
 ```toml
 # Cargo.toml
 [dependencies]
-compcol = { version = "0.1", features = ["gzip", "factory"] }
+compcol = { version = "0.4", features = ["gzip", "factory"] }
 ```
 
 ### The trait
