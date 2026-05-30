@@ -411,23 +411,33 @@ fn run(args: &Args, algo: &str) -> Result<(), RunError> {
     let (mut writer, output_path): (Box<dyn Write>, Option<PathBuf>) = match &output {
         Output::Stdout => (Box::new(BufWriter::new(stdout.lock())), None),
         Output::File(p) => {
-            if !args.force && p.exists() {
-                return Err(RunError::Usage(format!(
-                    "output exists: {} (use -f to overwrite)",
-                    p.display()
-                )));
-            }
-            let f = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(p)
-                .map_err(|e| {
+            // Without --force, create the output atomically with O_EXCL
+            // (create_new). This eliminates the TOCTOU between an existence
+            // check and the open, and refuses to follow a pre-existing or
+            // dangling symlink into an attacker-controlled target. With
+            // --force we keep the documented overwrite (truncate) behavior.
+            let open_result = if args.force {
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(p)
+            } else {
+                OpenOptions::new().write(true).create_new(true).open(p)
+            };
+            let f = open_result.map_err(|e| {
+                if !args.force && e.kind() == io::ErrorKind::AlreadyExists {
+                    RunError::Usage(format!(
+                        "output exists: {} (use -f to overwrite)",
+                        p.display()
+                    ))
+                } else {
                     RunError::Io(io::Error::new(
                         e.kind(),
                         format!("create {}: {e}", p.display()),
                     ))
-                })?;
+                }
+            })?;
             (Box::new(BufWriter::new(f)), Some(p.clone()))
         }
     };
