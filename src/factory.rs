@@ -88,6 +88,8 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         crate::zip_implode::ZipImplode::NAME => Some(Box::new(
             <crate::zip_implode::ZipImplode as Algorithm>::encoder(),
         )),
+        #[cfg(feature = "lzs")]
+        crate::lzs::Lzs::NAME => Some(Box::new(<crate::lzs::Lzs as Algorithm>::encoder())),
         #[cfg(feature = "rar1")]
         crate::rar1::Rar1::NAME => Some(Box::new(<crate::rar1::Rar1 as Algorithm>::encoder())),
         #[cfg(feature = "rar2")]
@@ -251,6 +253,8 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         crate::zip_implode::ZipImplode::NAME => Some(Box::new(
             <crate::zip_implode::ZipImplode as Algorithm>::decoder(),
         )),
+        #[cfg(feature = "lzs")]
+        crate::lzs::Lzs::NAME => Some(Box::new(<crate::lzs::Lzs as Algorithm>::decoder())),
         #[cfg(feature = "rar1")]
         crate::rar1::Rar1::NAME => Some(Box::new(<crate::rar1::Rar1 as Algorithm>::decoder())),
         #[cfg(feature = "rar2")]
@@ -355,6 +359,9 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     if str_eq(name, "zip-implode") && cfg!(feature = "zip_implode") {
         return Some("implode");
     }
+    if str_eq(name, "lzs") && cfg!(feature = "lzs") {
+        return Some("lzs");
+    }
     // All RAR versions share the .rar extension; the version is in-band in
     // the file header. The CLI's in-place mode will write to <input>.rar
     // and strip .rar on decode for any rar* algorithm.
@@ -452,6 +459,8 @@ pub const fn names() -> &'static [&'static str] {
         crate::packbits::PackBits::NAME,
         #[cfg(feature = "zip_implode")]
         crate::zip_implode::ZipImplode::NAME,
+        #[cfg(feature = "lzs")]
+        crate::lzs::Lzs::NAME,
         #[cfg(feature = "rar1")]
         crate::rar1::Rar1::NAME,
         #[cfg(feature = "rar2")]

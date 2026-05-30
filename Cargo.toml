@@ -38,6 +38,7 @@ all = [
     "xpress",
     "packbits",
     "zip_implode",
+    "lzs",
     "rar1", "rar2", "rar3", "rar5",
     "zip_shrink",
     "zip_reduce",
@@ -128,6 +129,10 @@ packbits = ["alloc"]
 # need for an encoder). Supports both 4 KiB / 8 KiB dictionaries and
 # both 2-tree / 3-tree modes.
 zip_implode = ["alloc"]
+# Stac LZS (RFC 1974) — the LZ77 variant used by PPP Stac LZS, MPPE,
+# IPComp, and Cisco hardware compression cards. Bit-packed (MSB-first)
+# with a 2 KiB window. Encoder and decoder both implemented.
+lzs     = ["alloc"]
 # RAR decoders (rar1, rar2, rar3, rar5). Decoder-only — RARLAB's unRAR
 # license explicitly forbids re-creating the compression algorithm, so
 # the encoders permanently return `Error::Unsupported`.

@@ -163,3 +163,10 @@ path             = "fuzz_targets/decoder_zip_implode.rs"
 test             = false
 doc              = false
 bench            = false
+
+[[bin]]
+name             = "decoder_lzs"
+path             = "fuzz_targets/decoder_lzs.rs"
+test             = false
+doc              = false
+bench            = false
