@@ -29,7 +29,7 @@ default = ["alloc", "rle", "deflate", "zlib", "gzip", "factory"]
 all = [
     "alloc", "std", "tokio", "factory",
     "rle", "rle90", "deflate", "deflate64", "zlib", "gzip",
-    "lzma", "xz",
+    "lzma", "xz", "lzma2",
     "zstd", "brotli", "lz4", "snappy", "lzw", "lzss", "bzip2",
     "zstd", "brotli", "lz4", "lz5", "snappy", "lzw", "bzip2",
     "lzo", "lzx", "amiga_lzx", "quantum", "lzfse", "adc",
@@ -48,7 +48,7 @@ all = [
     "zip_shrink",
     "zip_reduce",
     "lha",
-    "bcj", "delta",
+    "bcj", "bcj2", "delta",
     "arc_crunch", "arc_squeeze", "arc_squash",
 ]
 # Enables `alloc`-backed conveniences (e.g. the `factory` module, the
@@ -82,6 +82,12 @@ lzma    = ["alloc"]
 # xz container (RFC-style stream/block headers + check codes; the inner
 # LZMA2 chunk codec is inlined inside `src/xz/`).
 xz      = ["lzma"]
+# Raw LZMA2 chunk stream (7-Zip coder id 21) — the dict-reset control bytes
+# + LZMA chunks, without the `.xz` container. Decode-only entry point that
+# reuses the same LZMA2 chunk codec the `xz` feature uses. The 7z coder
+# property is a 1-byte dictionary-size code. The encoder is an
+# `Error::Unsupported` stub (produce LZMA2 via the `xz` encoder).
+lzma2   = ["alloc", "lzma"]
 # Zstandard (RFC 8478).
 zstd    = ["alloc"]
 # Brotli (RFC 7932). Carries a 170 KiB built-in static dictionary when fully
@@ -210,6 +216,13 @@ lha     = ["alloc"]
 # compressors: forward rewrites relative branch operands to absolute form,
 # inverse restores them. Encoder + decoder both implemented.
 bcj     = ["alloc"]
+# BCJ2 — the 4-stream x86 branch filter from the public-domain LZMA SDK
+# (7-Zip filter id 0303011B), distinct from the single-stream BCJ above.
+# Decode recombines four input streams (main + call + jump + a range-coded
+# control stream) into the filtered output. Exposes a dedicated function
+# API (`compcol::bcj2::decode`) since the 4-input shape does not fit the
+# single-input `Decoder` trait. Encoder also provided for round-trip tests.
+bcj2    = ["alloc"]
 # Delta filter — byte-wise delta with a configurable distance (1..=256).
 # Reversible filter (xz/LZMA SDK lineage). Encoder + decoder both implemented.
 delta   = ["alloc"]

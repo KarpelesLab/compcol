@@ -53,10 +53,12 @@ use alloc::vec::Vec;
 use crate::error::Error;
 use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
 
-mod lzma2_decoder;
-mod lzma2_encoder;
-use lzma2_decoder::{Lzma2Props, LzmaCore, lzma2_dict_size};
-use lzma2_encoder::{EncoderParams, LZMA2_PROPS_BYTE, encode_lzma_chunk};
+// The LZMA2 chunk codec lives in a crate-internal shared module
+// (`crate::lzma2_internal`) so it can also back the public raw LZMA2
+// decoder exposed under the `lzma2` feature without pulling in this xz
+// container. See `lib.rs`.
+use crate::lzma2_internal::lzma2_decoder::{Lzma2Props, LzmaCore, lzma2_dict_size};
+use crate::lzma2_internal::lzma2_encoder::{EncoderParams, LZMA2_PROPS_BYTE, encode_lzma_chunk};
 
 // ─── constants ─────────────────────────────────────────────────────────────
 

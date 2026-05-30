@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Raw LZMA2 decoder** (`lzma2`): decodes the raw 7-Zip LZMA2 chunk stream
+  (codec id 21) — control-byte-framed chunks, self-terminating — distinct from
+  the `.xz` container. The 1-byte 7z dict-size coder property is passed via
+  `DecoderConfig::with_dict_prop`. Reuses the existing xz LZMA2 engine (the
+  shared codec was relocated to a crate-internal `lzma2_internal` module; `xz`
+  behavior unchanged). Decode-only.
+- **BCJ2 filter** (`bcj2`): the 7-Zip 4-stream x86 branch filter
+  (`0303011B`), encode + decode via a dedicated `compcol::bcj2::{encode,decode}`
+  function API (the 4-input shape doesn't fit the single-stream `Decoder`
+  trait). Public-domain LZMA SDK algorithm; round-trip validated.
 - **RLE90 codec** (`rle90`): the `0x90`/DLE run-length variant shared by ARC
   method 3 ("packed") and classic StuffIt method 1, encoder + decoder.
   Byte-compatible with the `arc_squeeze` internal RLE90 pre-pass.
