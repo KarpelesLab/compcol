@@ -64,8 +64,18 @@ pub mod gzip;
 #[cfg(feature = "lzma")]
 pub mod lzma;
 
+// Shared LZMA2 chunk codec (range coder + LZ window + chunk framing helpers).
+// Lives in `src/xz/lzma2_decoder.rs` / `src/xz/lzma2_encoder.rs` historically;
+// declared here as a crate-internal module so both the `xz` container and the
+// raw `lzma2` decoder can reuse it without depending on each other.
+#[cfg(any(feature = "xz", feature = "lzma2"))]
+pub(crate) mod lzma2_internal;
+
 #[cfg(feature = "xz")]
 pub mod xz;
+
+#[cfg(feature = "lzma2")]
+pub mod lzma2;
 
 #[cfg(feature = "zstd")]
 pub mod zstd;
@@ -171,6 +181,9 @@ pub mod factory;
 
 #[cfg(feature = "bcj")]
 pub mod bcj;
+
+#[cfg(feature = "bcj2")]
+pub mod bcj2;
 
 #[cfg(feature = "delta")]
 pub mod delta;

@@ -488,6 +488,18 @@ impl LzmaCore {
         self.range.init(buf)
     }
 
+    /// Feed already-known literal bytes (e.g. from an LZMA2 *uncompressed*
+    /// chunk) into the LZ window so a later compressed chunk that does not
+    /// reset the dictionary can back-reference them. Does not emit output.
+    ///
+    /// Used by the raw [`crate::lzma2`] decoder; dead under an xz-only build.
+    #[cfg_attr(not(any(feature = "lzma2", test)), allow(dead_code))]
+    pub fn append_literals(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.dict_put(b);
+        }
+    }
+
     fn dict_get(&self, distance: u32) -> u8 {
         let dist1 = distance as usize + 1;
         let pos = if self.dict_pos >= dist1 {
