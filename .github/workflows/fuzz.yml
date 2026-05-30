@@ -40,6 +40,7 @@ jobs:
           - decoder_xpress
           - decoder_packbits
           - decoder_zip_shrink
+          - decoder_zip_reduce
     steps:
       - uses: actions/checkout@v6
       - name: Install nightly toolchain

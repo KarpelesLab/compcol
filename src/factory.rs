@@ -96,6 +96,10 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         crate::zip_shrink::ZipShrink::NAME => Some(Box::new(
             <crate::zip_shrink::ZipShrink as Algorithm>::encoder(),
         )),
+        #[cfg(feature = "zip_reduce")]
+        crate::zip_reduce::ZipReduce::NAME => Some(Box::new(
+            <crate::zip_reduce::ZipReduce as Algorithm>::encoder(),
+        )),
         _ => None,
     }
 }
@@ -251,6 +255,10 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         crate::zip_shrink::ZipShrink::NAME => Some(Box::new(
             <crate::zip_shrink::ZipShrink as Algorithm>::decoder(),
         )),
+        #[cfg(feature = "zip_reduce")]
+        crate::zip_reduce::ZipReduce::NAME => Some(Box::new(
+            <crate::zip_reduce::ZipReduce as Algorithm>::decoder(),
+        )),
         _ => None,
     }
 }
@@ -354,6 +362,9 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     if str_eq(name, "zip-shrink") && cfg!(feature = "zip_shrink") {
         return Some("shrunk");
     }
+    if str_eq(name, "zip-reduce") && cfg!(feature = "zip_reduce") {
+        return Some("reduce");
+    }
     None
 }
 
@@ -438,5 +449,7 @@ pub const fn names() -> &'static [&'static str] {
         crate::rar5::Rar5::NAME,
         #[cfg(feature = "zip_shrink")]
         crate::zip_shrink::ZipShrink::NAME,
+        #[cfg(feature = "zip_reduce")]
+        crate::zip_reduce::ZipReduce::NAME,
     ]
 }
