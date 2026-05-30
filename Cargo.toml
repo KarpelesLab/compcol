@@ -43,6 +43,7 @@ all = [
     "lzham",
     "sit13",
     "lzah",
+    "arsenic",
     "rar1", "rar2", "rar3", "rar5",
     "zip_shrink",
     "zip_reduce",
@@ -175,6 +176,11 @@ sit13   = ["alloc"]
 # length is out of band (the archive entry header), supplied via
 # `DecoderConfig::with_len`.
 lzah    = ["alloc"]
+# StuffIt 5 "Arsenic" (compression method 15). BWT-based: carry-less range
+# decoder → un-MTF/un-RLE → inverse BWT → optional de-randomization → final
+# RLE → CRC-32 check. Decoder-only (self-terminating stream; no out-of-band
+# length needed); the encoder permanently returns `Error::Unsupported`.
+arsenic = ["alloc"]
 # RAR decoders (rar1, rar2, rar3, rar5). Decoder-only — RARLAB's unRAR
 # license explicitly forbids re-creating the compression algorithm, so
 # the encoders permanently return `Error::Unsupported`.

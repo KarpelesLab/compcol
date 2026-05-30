@@ -126,6 +126,8 @@ pub mod xpress;
 #[cfg(feature = "xpress_huffman")]
 pub mod xpress_huffman;
 
+#[cfg(feature = "arsenic")]
+pub mod arsenic;
 #[cfg(feature = "lzah")]
 pub mod lzah;
 #[cfg(feature = "lzham")]

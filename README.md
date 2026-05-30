@@ -62,6 +62,7 @@ flag, and a `compcol` binary turns the library into a Unix-style filter.
 | ARC Squeeze (method 4) | `arc_squeeze` | `.sqz` | full (RLE + static Huffman) | full | own round-trip (no reference fixture) |
 | StuffIt method 5 (LZAH) | `lzah` | `.sit` | `Unsupported` (decode-only) | full (LZSS + 314-symbol adaptive Huffman, 4 KiB window) | **real StuffIt `.sit` fixtures (per-fork CRC-16)** |
 | StuffIt method 13 (LZ+Huffman) | `sit13` | `.sit` | `Unsupported` (decode-only) | full (LZSS + dual 321-symbol Huffman, 64 KiB window, LSB-first) | **real StuffIt `.sit` fixtures (per-fork CRC-16)** |
+| StuffIt 5 Arsenic (method 15) | `arsenic` | `.sit` | `Unsupported` (decode-only) | full (range coder + inverse BWT + MTF/RLE + de-randomization) | **real StuffIt 5 fixtures (in-stream CRC-32 + SHA vs `unar`)** |
 | RAR 1.x | `rar1` | `.rar` | `Unsupported` (license) | building blocks only (Huffman tables not license-clean) | — |
 | RAR 2.x | `rar2` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + audio predictor | real rar-2.60 fixtures |
 | RAR 3.x | `rar3` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + E8 filter; PPMd & VM filters refused | libarchive RAR3 fixtures |
