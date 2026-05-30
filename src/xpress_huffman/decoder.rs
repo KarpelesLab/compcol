@@ -191,10 +191,22 @@ impl Decoder {
     /// `self.decoded`. Stops at end-of-block (transitions to a new block
     /// or to `DrainTail`), at exhausted input (returns `Ok(())`), or on
     /// malformed input.
-    fn decode_loop(&mut self) -> Result<(), Error> {
+    fn decode_loop(&mut self, cap: usize) -> Result<(), Error> {
         loop {
             if self.output_emitted == self.total_output {
                 self.phase = Phase::DrainTail;
+                return Ok(());
+            }
+            // Output back-pressure: `decode_loop` would otherwise keep
+            // decoding across every buffered block (the block-boundary
+            // `continue` below never returns), accumulating the entire
+            // concatenated output of all blocks into `self.decoded` before
+            // `raw_decode` gets a chance to drain it — a tiny-input → GiB
+            // OOM. Once the undrained backlog reaches `cap` (the caller's
+            // remaining output room plus one block of slack), return so
+            // `raw_decode` can drain into `output` and resume on the next
+            // call. State lives on `self`, so resuming is seamless.
+            if self.decoded.len() - self.decoded_idx >= cap {
                 return Ok(());
             }
             if self.output_emitted >= self.block_end_emitted {
@@ -407,7 +419,12 @@ impl RawDecoder for Decoder {
                     // `MAX_DISTANCE`, and this clone happens at most once per
                     // `raw_decode` call, not per symbol.
                     let snap_out_history = self.out_history.clone();
-                    match self.decode_loop() {
+                    // Bound the backlog `decode_loop` may build up to what the
+                    // caller can drain this round, plus one block of slack (a
+                    // single match copy can emit up to a block before the cap
+                    // is re-checked).
+                    let cap = (output.len() - written).saturating_add(BLOCK_OUTPUT_BYTES);
+                    match self.decode_loop(cap) {
                         Ok(()) => {}
                         Err(Error::UnexpectedEnd) => {
                             // Roll back: not a real error, just need more
