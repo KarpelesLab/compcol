@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/KarpelesLab/compcol/compare/v0.5.0...v0.5.1) - 2026-05-30
+
+### Other
+
+- raw LZMA2 decoder + BCJ2 4-stream filter ([#74](https://github.com/KarpelesLab/compcol/pull/74)) ([#79](https://github.com/KarpelesLab/compcol/pull/79))
+- Add RLE90 ([#75](https://github.com/KarpelesLab/compcol/pull/75)) and ARC Squashed / method 9 ([#76](https://github.com/KarpelesLab/compcol/pull/76)) codecs ([#78](https://github.com/KarpelesLab/compcol/pull/78))
+- StuffIt 5 Arsenic (method 15) decoder, validated against real archives ([#73](https://github.com/KarpelesLab/compcol/pull/73))
+- real StuffIt method-13 (LZ+Huffman) decoder, validated against real archives ([#72](https://github.com/KarpelesLab/compcol/pull/72))
+- StuffIt classic method-5 (LZAH) decoder, validated against real archives ([#71](https://github.com/KarpelesLab/compcol/pull/71))
+- decode the raw method payload (no invented length prefix) ([#70](https://github.com/KarpelesLab/compcol/pull/70))
+- *(release-plz)* create the GitHub Release with RELEASE_PLZ_TOKEN ([#63](https://github.com/KarpelesLab/compcol/pull/63))
+- Add LHA, BCJ/Delta filters, ARC Crunch/Squeeze, and StuffIt-13 building blocks ([#68](https://github.com/KarpelesLab/compcol/pull/68))
+
 ### Added
 
 - **Raw LZMA2 decoder** (`lzma2`): decodes the raw 7-Zip LZMA2 chunk stream
