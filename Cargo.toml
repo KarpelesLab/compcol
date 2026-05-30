@@ -32,6 +32,7 @@ all = [
     "lzma", "xz",
     "zstd", "brotli", "lz4", "snappy", "lzw", "bzip2",
     "lzo", "lzx", "amiga_lzx", "quantum", "lzfse", "adc",
+    "ppmd",
     "rar1", "rar2", "rar3", "rar5",
 ]
 # Enables `alloc`-backed conveniences (e.g. the `factory` module, the
@@ -95,6 +96,11 @@ lzfse   = ["alloc"]
 # ADC (Apple Data Compression) — the LZSS-like codec used in Apple DMG
 # disk images and HFS+ compressed resource forks.
 adc     = ["alloc"]
+# PPMd (Dmitry Shkarin's PPMII variant H, used in 7z/RAR/ZIP method 98).
+# Decoder-only target — the encoder permanently returns
+# `Error::Unsupported` (the PPM model with information-inheritance updates
+# is out of scope for this build).
+ppmd    = ["alloc"]
 # RAR decoders (rar1, rar2, rar3, rar5). Decoder-only — RARLAB's unRAR
 # license explicitly forbids re-creating the compression algorithm, so
 # the encoders permanently return `Error::Unsupported`.

@@ -66,6 +66,8 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         crate::lzfse::Lzfse::NAME => Some(Box::new(<crate::lzfse::Lzfse as Algorithm>::encoder())),
         #[cfg(feature = "adc")]
         crate::adc::Adc::NAME => Some(Box::new(<crate::adc::Adc as Algorithm>::encoder())),
+        #[cfg(feature = "ppmd")]
+        crate::ppmd::Ppmd::NAME => Some(Box::new(<crate::ppmd::Ppmd as Algorithm>::encoder())),
         #[cfg(feature = "bzip2")]
         crate::bzip2::Bzip2::NAME => Some(Box::new(<crate::bzip2::Bzip2 as Algorithm>::encoder())),
         #[cfg(feature = "rar1")]
@@ -201,6 +203,8 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         crate::lzfse::Lzfse::NAME => Some(Box::new(<crate::lzfse::Lzfse as Algorithm>::decoder())),
         #[cfg(feature = "adc")]
         crate::adc::Adc::NAME => Some(Box::new(<crate::adc::Adc as Algorithm>::decoder())),
+        #[cfg(feature = "ppmd")]
+        crate::ppmd::Ppmd::NAME => Some(Box::new(<crate::ppmd::Ppmd as Algorithm>::decoder())),
         #[cfg(feature = "bzip2")]
         crate::bzip2::Bzip2::NAME => Some(Box::new(<crate::bzip2::Bzip2 as Algorithm>::decoder())),
         #[cfg(feature = "rar1")]
@@ -277,6 +281,9 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     }
     if str_eq(name, "adc") && cfg!(feature = "adc") {
         return Some("adc");
+    }
+    if str_eq(name, "ppmd") && cfg!(feature = "ppmd") {
+        return Some("ppmd");
     }
     if str_eq(name, "bzip2") && cfg!(feature = "bzip2") {
         return Some("bz2");
@@ -358,6 +365,8 @@ pub const fn names() -> &'static [&'static str] {
         crate::lzfse::Lzfse::NAME,
         #[cfg(feature = "adc")]
         crate::adc::Adc::NAME,
+        #[cfg(feature = "ppmd")]
+        crate::ppmd::Ppmd::NAME,
         #[cfg(feature = "bzip2")]
         crate::bzip2::Bzip2::NAME,
         #[cfg(feature = "rar1")]
