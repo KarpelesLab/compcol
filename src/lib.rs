@@ -79,6 +79,9 @@ pub mod snappy;
 #[cfg(feature = "lzw")]
 pub mod lzw;
 
+#[cfg(feature = "lzss")]
+pub mod lzss;
+
 #[cfg(feature = "lzo")]
 pub mod lzo;
 
