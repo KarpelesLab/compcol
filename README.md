@@ -42,6 +42,7 @@ flag, and a `compcol` binary turns the library into a Unix-style filter.
 | LZW (`compress(1)` `.Z`) | `lzw` | `.lzw` | full | full | `compress(1)` / `uncompress(1)` |
 | LZMA (legacy `.lzma`) | `lzma` | `.lzma` | full | full | `python3 -m lzma` (FORMAT_ALONE) |
 | xz | `xz` | `.xz` | compressed-LZMA2 chunks + uncompressed fallback | full envelope + all reset variants | `xz(1)` both directions |
+| Raw LZMA2 (7z coder 21) | `lzma2` | `.lzma2` | `Unsupported` (decode-only) | full (raw LZMA2 chunk stream; reuses the xz LZMA2 engine) | round-trip vs the xz LZMA2 encoder |
 | Zstandard (RFC 8478) | `zstd` | `.zst` | LZ77 + Huffman literals + FSE_Compressed_Mode sequences + repeat offsets + RLE blocks | full Compressed_Block | `zstd(1)` both directions |
 | Brotli (RFC 7932) | `brotli` | `.br` | LZ77 + length-limited Huffman + 704-symbol IC alphabet + static-dictionary refs | full (with 122 KiB static dictionary) | `brotli(1)` both directions |
 | LZO (LZO1X-1) | `lzo` | `.lzo` | LZ77 hash matcher | full | `python3 -c "import lzo"` |
@@ -57,6 +58,7 @@ flag, and a `compcol` binary turns the library into a Unix-style filter.
 | LZNT1 (NTFS native compression) | `lznt1` | `.lznt1` | full | full (per [MS-XCA] §2.5; 4 KiB-chunked LZ77, no entropy coding) | hand-built fixtures |
 | LHA / LZH (`-lh1-`/`-lh4-`/`-lh5-`/`-lh6-`/`-lh7-`) | `lha` | `.lzh` | full (lh1 adaptive Huffman; lh4/5/6/7 static Huffman) | full (clean-room from Okumura LZHUF / ar002) | own round-trip (no reference fixture) |
 | BCJ branch filters (x86, ARM, ARMT, ARM64, PPC, SPARC, IA-64, RISC-V) | `bcj` | `bcj-<arch>` | full (reversible filter) | full | round-trip identity (public-domain LZMA SDK transform) |
+| BCJ2 (7z 4-stream x86 filter) | `bcj2` | — | `bcj2::encode` (fn API) | `bcj2::decode` (fn API) | round-trip identity (LZMA SDK algorithm) |
 | Delta filter (distance 1..=256) | `delta` | `delta` | full (reversible filter) | full | round-trip identity |
 | ARC Crunch (method 8) | `arc_crunch` | `.arc` | full (12-bit dynamic LZW) | full | own round-trip (no reference fixture) |
 | ARC Squeeze (method 4) | `arc_squeeze` | `.sqz` | full (RLE + static Huffman) | full | own round-trip (no reference fixture) |
