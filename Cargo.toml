@@ -41,9 +41,13 @@ all = [
     "zip_implode",
     "lzs",
     "lzham",
+    "sit13",
     "rar1", "rar2", "rar3", "rar5",
     "zip_shrink",
     "zip_reduce",
+    "lha",
+    "bcj", "delta",
+    "arc_crunch", "arc_squeeze",
 ]
 # Enables `alloc`-backed conveniences (e.g. the `factory` module, the
 # `compcol::vec` one-shot helpers). Pulled in automatically by features
@@ -153,6 +157,15 @@ lzs     = ["alloc"]
 # and is permanently `Error::Unsupported` in this build. The encoder
 # is also permanently `Error::Unsupported`.
 lzham   = ["alloc"]
+# StuffIt compression method 13 ("LZ + Huffman"). This build ships the
+# well-defined, unit-tested building blocks (MSB-first bit reader,
+# Kraft-validated canonical Huffman decoder, bounds-checked LZSS window)
+# but returns `Error::Unsupported` for the payload decode: the format is
+# proprietary/undocumented (only an LGPL reverse-engineering exists, which
+# this MIT crate must not copy) and there are no public fixtures, so a
+# decoder could be neither derived nor validated. The encoder is also
+# permanently `Error::Unsupported`.
+sit13   = ["alloc"]
 # RAR decoders (rar1, rar2, rar3, rar5). Decoder-only — RARLAB's unRAR
 # license explicitly forbids re-creating the compression algorithm, so
 # the encoders permanently return `Error::Unsupported`.
@@ -166,6 +179,32 @@ zip_shrink = ["alloc"]
 # PKZip Reduce (methods 2..5). Decoder-only: the encoder permanently
 # returns `Error::Unsupported`.
 zip_reduce = ["alloc"]
+# LHA / LZH compression methods (-lh1-/-lh4-/-lh5-/-lh6-/-lh7-): LZSS
+# sliding-dictionary back-references with Huffman-coded literal/length
+# and position codes. lh4/lh5/lh6/lh7 share the static-Huffman block
+# structure (Okumura's public-domain ar002 layout) and differ only in
+# dictionary size and number of position bits; lh1 uses the classic
+# adaptive-Huffman LZHUF scheme. These are the raw method payloads (no
+# LHA container header). Decoder for all five plus a static-Huffman
+# lh5/lh6/lh7 encoder (clean-room, round-trip validated).
+lha     = ["alloc"]
+# BCJ branch-converter filters (x86/ARM/ARMT/ARM64/PPC/SPARC/IA-64/RISC-V),
+# from the public-domain LZMA SDK lineage. Reversible filters, not
+# compressors: forward rewrites relative branch operands to absolute form,
+# inverse restores them. Encoder + decoder both implemented.
+bcj     = ["alloc"]
+# Delta filter — byte-wise delta with a configurable distance (1..=256).
+# Reversible filter (xz/LZMA SDK lineage). Encoder + decoder both implemented.
+delta   = ["alloc"]
+# ARC "Crunch" (ARC method 8): dynamic LZW (a `compress`-style variant) with
+# a one-byte maxbits header and a block-mode CLEAR code. Encoder and decoder
+# both implemented and validated by round-trip.
+arc_crunch = ["alloc"]
+# ARC "Squeeze" (ARC method 4 / CP-M `.SQ`): a `0x90`-flag run-length
+# pre-pass followed by static Huffman coding with the tree serialised in the
+# stream header. Encoder and decoder both implemented and validated by
+# round-trip.
+arc_squeeze = ["alloc"]
 # `compcol::tokio_io` — async mirrors of compcol::io for the tokio
 # runtime. Pulls the tokio dependency for its AsyncRead/AsyncWrite
 # trait definitions; the rest of the crate stays dep-free.
