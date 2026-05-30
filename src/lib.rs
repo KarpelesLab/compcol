@@ -110,10 +110,10 @@ pub mod ppmd;
 #[cfg(feature = "bzip2")]
 pub mod bzip2;
 
-#[cfg(feature = "packbits")]
-pub mod packbits;
 #[cfg(feature = "lzs")]
 pub mod lzs;
+#[cfg(feature = "packbits")]
+pub mod packbits;
 
 #[cfg(feature = "xpress")]
 pub mod xpress;

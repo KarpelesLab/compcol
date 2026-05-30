@@ -42,6 +42,7 @@ jobs:
           - decoder_zip_shrink
           - decoder_zip_reduce
           - decoder_zip_implode
+          - decoder_lzs
     steps:
       - uses: actions/checkout@v6
       - name: Install nightly toolchain
