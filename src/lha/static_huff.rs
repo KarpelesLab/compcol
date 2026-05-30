@@ -390,9 +390,21 @@ fn read_offset_code(br: &mut BitReader<'_>, table: &HuffTable) -> Result<usize, 
 ///
 /// Bounds output to `expected` bytes (decompression-bomb safe) and never
 /// panics on crafted input.
-pub fn decode_payload(payload: &[u8], expected: usize, params: Params) -> Result<Vec<u8>, Error> {
-    let mut out: Vec<u8> = Vec::with_capacity(expected.min(1 << 20));
-    if expected == 0 {
+/// Decode an `lh4`/`lh5`/`lh6`/`lh7` payload.
+///
+/// `expected` is the uncompressed length if known out of band:
+/// - `Some(n)`: stop after exactly `n` bytes (never reads trailing padding).
+/// - `None`: stream-terminated — decode whole blocks until the input is
+///   exhausted at a block boundary (the next 16-bit block header can't be
+///   read). Each block is self-counted, so this reproduces the input without
+///   a declared length.
+pub fn decode_payload(
+    payload: &[u8],
+    expected: Option<usize>,
+    params: Params,
+) -> Result<Vec<u8>, Error> {
+    let mut out: Vec<u8> = Vec::with_capacity(expected.unwrap_or(0).min(1 << 20));
+    if expected == Some(0) {
         return Ok(out);
     }
     let ring_size = params.ring_size;
@@ -401,15 +413,26 @@ pub fn decode_payload(payload: &[u8], expected: usize, params: Params) -> Result
 
     let mut br = BitReader::new(payload);
 
-    while out.len() < expected {
+    loop {
+        if let Some(n) = expected
+            && out.len() >= n
+        {
+            break;
+        }
+
         // Start a new block.
         let block_codes = br.get_bits(16) as usize;
         if br.overran() {
-            return Err(Error::UnexpectedEnd);
+            // Ran out of input at a block boundary. With a declared length
+            // that means the stream was truncated; without one it's the clean
+            // end of a stream-terminated payload.
+            return match expected {
+                Some(_) => Err(Error::UnexpectedEnd),
+                None => Ok(out),
+            };
         }
         if block_codes == 0 {
-            // A zero-length block makes no progress; if we still owe
-            // output the stream is malformed.
+            // A zero-length block makes no progress; the stream is malformed.
             return Err(Error::Corrupt);
         }
 
@@ -419,7 +442,12 @@ pub fn decode_payload(payload: &[u8], expected: usize, params: Params) -> Result
         let p_table = read_position_table(&mut br, params.np, params.pbit)?;
 
         let mut remaining = block_codes;
-        while remaining > 0 && out.len() < expected {
+        while remaining > 0 {
+            if let Some(n) = expected
+                && out.len() >= n
+            {
+                break;
+            }
             let code = c_table.decode(&mut br)? as usize;
             if br.overran() {
                 return Err(Error::UnexpectedEnd);
@@ -443,7 +471,9 @@ pub fn decode_payload(payload: &[u8], expected: usize, params: Params) -> Result
                 }
                 let start = (ring_pos + ring_size - offset - 1) % ring_size;
                 for k in 0..count {
-                    if out.len() >= expected {
+                    if let Some(n) = expected
+                        && out.len() >= n
+                    {
                         break;
                     }
                     let b = ring[(start + k) % ring_size];
