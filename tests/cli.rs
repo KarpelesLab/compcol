@@ -292,6 +292,44 @@ fn force_overwrites_existing_output() {
 }
 
 #[test]
+fn force_target_not_deleted_when_codec_errors_midstream() {
+    // Regression for L12: a mid-stream codec error on an existing
+    // --force target must not delete the user's pre-existing file. We
+    // feed corrupt gzip so stream_decode fails after the output was
+    // opened (and truncated). The file must still exist afterwards.
+    let s = Scratch::new("force_no_delete");
+    let bad = s.file("bad.gz");
+    // Valid gzip magic + method/flags + zeroed mtime, then garbage that
+    // is not a valid deflate stream — decode starts then errors.
+    fs::write(
+        &bad,
+        b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xff\xff\xff\xff",
+    )
+    .unwrap();
+
+    let out = s.file("preexisting.out");
+    fs::write(&out, b"precious user data").unwrap();
+
+    let (_o, _err, code) = run(&[
+        "-t",
+        "gzip",
+        "-d",
+        "-f",
+        "-o",
+        out.to_str().unwrap(),
+        bad.to_str().unwrap(),
+    ]);
+    assert_ne!(code, 0, "expected the corrupt input to fail");
+    // The pre-existing target must survive the error (truncated, but
+    // present — not removed). Before the fix it was unconditionally
+    // deleted.
+    assert!(
+        out.exists(),
+        "pre-existing --force target was deleted on codec error"
+    );
+}
+
+#[test]
 fn decompress_requires_matching_extension_in_inplace_mode() {
     let s = Scratch::new("dec_ext");
     let bogus = s.file("data.txt"); // wrong extension for gzip
