@@ -36,7 +36,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use std::io::{self, Read, Write};
 
-use crate::{Decoder, Encoder, Status};
+use crate::{Decoder, Encoder, Error, Status};
 
 /// Per-call scratch buffer size. 64 KiB matches the CLI streaming
 /// loop in `src/bin/compcol.rs` and is comfortably above the
@@ -457,7 +457,15 @@ impl<R: Read, D: Decoder> Read for DecoderReader<R, D> {
             if p.written > 0 {
                 return Ok(p.written);
             }
-            return Ok(0);
+            if self.finished {
+                return Ok(0);
+            }
+            // Inner is at EOF and finish() produced no output yet did not
+            // reach StreamEnd: the stream is truncated. Returning Ok(0)
+            // here would look like a clean EOF and silently drop the
+            // missing tail, so surface it as an error instead — mirroring
+            // the writer-path stall guard in do_finish().
+            return Err(io::Error::from(Error::UnexpectedEnd));
         }
     }
 }
