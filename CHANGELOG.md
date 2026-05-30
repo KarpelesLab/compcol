@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **LHA / LZH codecs** (`lha`): `-lh1-` (adaptive Huffman) and
+  `-lh4-/-lh5-/-lh6-/-lh7-` (static Huffman) LZSS methods, encoder + decoder.
+  Clean-room from Okumura's public-domain LZHUF / ar002 descriptions.
+- **BCJ branch-converter filters** (`bcj`): reversible x86, ARM, ARM-Thumb,
+  ARM64, PowerPC, SPARC, IA-64, and RISC-V filters (public-domain LZMA SDK
+  lineage), encoder + decoder.
+- **Delta filter** (`delta`): reversible byte-wise delta with a configurable
+  distance (1..=256), encoder + decoder.
+- **ARC Crunch** (`arc_crunch`, method 8, 12-bit dynamic LZW) and **ARC
+  Squeeze** (`arc_squeeze`, method 4, RLE + static Huffman), encoder + decoder.
+- **StuffIt method 13** (`sit13`): tested building blocks (bit reader,
+  Kraft-validated Huffman, bounds-checked LZSS window) behind a decoder that
+  returns `Unsupported` — the format is proprietary and the only public
+  reference is LGPL-licensed, so a conformant payload decoder could be neither
+  cleanly derived nor validated (mirrors `rar1`/`lzham`).
+
+  Note: `lha` and `arc_*` are clean-room from public specs and validated by
+  their own encoder↔decoder round-trip, not against reference-tool output.
+
+## [0.5.0](https://github.com/KarpelesLab/compcol/compare/v0.4.7...v0.5.0) - 2026-05-30
+
+### Other
+
+- bound block decode output with raw_max to prevent OOM (parity with lz4) ([#62](https://github.com/KarpelesLab/compcol/pull/62))
+- add RAR trademark + clean-room licensing note to README ([#61](https://github.com/KarpelesLab/compcol/pull/61))
+- Security hardening: DoS fixes across decoders (panics, OOM, decompression bombs) ([#59](https://github.com/KarpelesLab/compcol/pull/59))
+
 ### Security
 
 Decoder hardening against malicious/untrusted compressed input (DoS):
@@ -16,8 +45,8 @@ Decoder hardening against malicious/untrusted compressed input (DoS):
   at 128 MiB to bound decompression-bomb frames.
 - xz: drop the unbounded `Vec::reserve` driven by the Index `NumRecords`
   varint (could panic with capacity-overflow or OOM-abort).
-- lz4: bound block-decode output (`decode_block` now takes a `raw_max`
-  ceiling) on both the independent-block frame path and the streaming path,
+- lz4 / lzo: bound raw block-decode output (`block::decode_block` now takes a
+  `raw_max` ceiling) on the public block API and the streaming paths,
   preventing ~255× match-copy decompression bombs.
 - lzfse/LZVN: reject match copies that exceed the block's declared size
   before materializing them.
@@ -47,9 +76,10 @@ Decoder hardening against malicious/untrusted compressed input (DoS):
 
 ### Changed
 
-- **Breaking:** `compcol::lz4::block::decode_block` now takes a third
-  `raw_max: usize` argument bounding the decoded output. Pass `usize::MAX`
-  to preserve the previous unbounded behavior for trusted input.
+- **Breaking:** `compcol::lz4::block::decode_block` and
+  `compcol::lzo::block::decode_block` now take a third `raw_max: usize`
+  argument bounding the decoded output. Pass `usize::MAX` to preserve the
+  previous unbounded behavior for trusted input.
 
 ## [0.4.7](https://github.com/KarpelesLab/compcol/compare/v0.4.6...v0.4.7) - 2026-05-30
 

@@ -373,7 +373,12 @@ impl RawDecoder for Decoder {
                         });
                     }
                     self.decoded.clear();
-                    if let Err(e) = block::decode_block(&self.compressed, &mut self.decoded) {
+                    // One block decodes to at most ~BLOCK_SIZE raw bytes;
+                    // double it for foreign-encoder headroom (mirrors lz4).
+                    let raw_max = BLOCK_SIZE.saturating_mul(2);
+                    if let Err(e) =
+                        block::decode_block(&self.compressed, &mut self.decoded, raw_max)
+                    {
                         self.poisoned = true;
                         return Err(e);
                     }

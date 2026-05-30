@@ -96,6 +96,8 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         crate::lzs::Lzs::NAME => Some(Box::new(<crate::lzs::Lzs as Algorithm>::encoder())),
         #[cfg(feature = "lzham")]
         crate::lzham::Lzham::NAME => Some(Box::new(<crate::lzham::Lzham as Algorithm>::encoder())),
+        #[cfg(feature = "sit13")]
+        crate::sit13::Sit13::NAME => Some(Box::new(<crate::sit13::Sit13 as Algorithm>::encoder())),
         #[cfg(feature = "rar1")]
         crate::rar1::Rar1::NAME => Some(Box::new(<crate::rar1::Rar1 as Algorithm>::encoder())),
         #[cfg(feature = "rar2")]
@@ -111,6 +113,50 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         #[cfg(feature = "zip_reduce")]
         crate::zip_reduce::ZipReduce::NAME => Some(Box::new(
             <crate::zip_reduce::ZipReduce as Algorithm>::encoder(),
+        )),
+        #[cfg(feature = "lha")]
+        crate::lha::Lh1::NAME => Some(Box::new(<crate::lha::Lh1 as Algorithm>::encoder())),
+        #[cfg(feature = "lha")]
+        crate::lha::Lh4::NAME => Some(Box::new(<crate::lha::Lh4 as Algorithm>::encoder())),
+        #[cfg(feature = "lha")]
+        crate::lha::Lh5::NAME => Some(Box::new(<crate::lha::Lh5 as Algorithm>::encoder())),
+        #[cfg(feature = "lha")]
+        crate::lha::Lh6::NAME => Some(Box::new(<crate::lha::Lh6 as Algorithm>::encoder())),
+        #[cfg(feature = "lha")]
+        crate::lha::Lh7::NAME => Some(Box::new(<crate::lha::Lh7 as Algorithm>::encoder())),
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjX86::NAME => Some(Box::new(<crate::bcj::BcjX86 as Algorithm>::encoder())),
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjArm::NAME => Some(Box::new(<crate::bcj::BcjArm as Algorithm>::encoder())),
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjArmThumb::NAME => {
+            Some(Box::new(<crate::bcj::BcjArmThumb as Algorithm>::encoder()))
+        }
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjArm64::NAME => {
+            Some(Box::new(<crate::bcj::BcjArm64 as Algorithm>::encoder()))
+        }
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjPpc::NAME => Some(Box::new(<crate::bcj::BcjPpc as Algorithm>::encoder())),
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjSparc::NAME => {
+            Some(Box::new(<crate::bcj::BcjSparc as Algorithm>::encoder()))
+        }
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjIa64::NAME => Some(Box::new(<crate::bcj::BcjIa64 as Algorithm>::encoder())),
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjRiscV::NAME => {
+            Some(Box::new(<crate::bcj::BcjRiscV as Algorithm>::encoder()))
+        }
+        #[cfg(feature = "delta")]
+        crate::delta::Delta::NAME => Some(Box::new(<crate::delta::Delta as Algorithm>::encoder())),
+        #[cfg(feature = "arc_crunch")]
+        crate::arc_crunch::ArcCrunch::NAME => Some(Box::new(
+            <crate::arc_crunch::ArcCrunch as Algorithm>::encoder(),
+        )),
+        #[cfg(feature = "arc_squeeze")]
+        crate::arc_squeeze::ArcSqueeze::NAME => Some(Box::new(
+            <crate::arc_squeeze::ArcSqueeze as Algorithm>::encoder(),
         )),
         _ => None,
     }
@@ -267,6 +313,8 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         crate::lzs::Lzs::NAME => Some(Box::new(<crate::lzs::Lzs as Algorithm>::decoder())),
         #[cfg(feature = "lzham")]
         crate::lzham::Lzham::NAME => Some(Box::new(<crate::lzham::Lzham as Algorithm>::decoder())),
+        #[cfg(feature = "sit13")]
+        crate::sit13::Sit13::NAME => Some(Box::new(<crate::sit13::Sit13 as Algorithm>::decoder())),
         #[cfg(feature = "rar1")]
         crate::rar1::Rar1::NAME => Some(Box::new(<crate::rar1::Rar1 as Algorithm>::decoder())),
         #[cfg(feature = "rar2")]
@@ -282,6 +330,50 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         #[cfg(feature = "zip_reduce")]
         crate::zip_reduce::ZipReduce::NAME => Some(Box::new(
             <crate::zip_reduce::ZipReduce as Algorithm>::decoder(),
+        )),
+        #[cfg(feature = "lha")]
+        crate::lha::Lh1::NAME => Some(Box::new(<crate::lha::Lh1 as Algorithm>::decoder())),
+        #[cfg(feature = "lha")]
+        crate::lha::Lh4::NAME => Some(Box::new(<crate::lha::Lh4 as Algorithm>::decoder())),
+        #[cfg(feature = "lha")]
+        crate::lha::Lh5::NAME => Some(Box::new(<crate::lha::Lh5 as Algorithm>::decoder())),
+        #[cfg(feature = "lha")]
+        crate::lha::Lh6::NAME => Some(Box::new(<crate::lha::Lh6 as Algorithm>::decoder())),
+        #[cfg(feature = "lha")]
+        crate::lha::Lh7::NAME => Some(Box::new(<crate::lha::Lh7 as Algorithm>::decoder())),
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjX86::NAME => Some(Box::new(<crate::bcj::BcjX86 as Algorithm>::decoder())),
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjArm::NAME => Some(Box::new(<crate::bcj::BcjArm as Algorithm>::decoder())),
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjArmThumb::NAME => {
+            Some(Box::new(<crate::bcj::BcjArmThumb as Algorithm>::decoder()))
+        }
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjArm64::NAME => {
+            Some(Box::new(<crate::bcj::BcjArm64 as Algorithm>::decoder()))
+        }
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjPpc::NAME => Some(Box::new(<crate::bcj::BcjPpc as Algorithm>::decoder())),
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjSparc::NAME => {
+            Some(Box::new(<crate::bcj::BcjSparc as Algorithm>::decoder()))
+        }
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjIa64::NAME => Some(Box::new(<crate::bcj::BcjIa64 as Algorithm>::decoder())),
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjRiscV::NAME => {
+            Some(Box::new(<crate::bcj::BcjRiscV as Algorithm>::decoder()))
+        }
+        #[cfg(feature = "delta")]
+        crate::delta::Delta::NAME => Some(Box::new(<crate::delta::Delta as Algorithm>::decoder())),
+        #[cfg(feature = "arc_crunch")]
+        crate::arc_crunch::ArcCrunch::NAME => Some(Box::new(
+            <crate::arc_crunch::ArcCrunch as Algorithm>::decoder(),
+        )),
+        #[cfg(feature = "arc_squeeze")]
+        crate::arc_squeeze::ArcSqueeze::NAME => Some(Box::new(
+            <crate::arc_squeeze::ArcSqueeze as Algorithm>::decoder(),
         )),
         _ => None,
     }
@@ -383,6 +475,9 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     if str_eq(name, "lzham") && cfg!(feature = "lzham") {
         return Some("lzham");
     }
+    if str_eq(name, "sit13") && cfg!(feature = "sit13") {
+        return Some("sit13");
+    }
     // All RAR versions share the .rar extension; the version is in-band in
     // the file header. The CLI's in-place mode will write to <input>.rar
     // and strip .rar on decode for any rar* algorithm.
@@ -403,6 +498,60 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     }
     if str_eq(name, "zip-reduce") && cfg!(feature = "zip_reduce") {
         return Some("reduce");
+    }
+    // LHA methods all conventionally live in `.lzh` archives; the method
+    // is in-band in the LHA header. The CLI's in-place mode writes to
+    // `<input>.lzh`.
+    if str_eq(name, "lh1") && cfg!(feature = "lha") {
+        return Some("lzh");
+    }
+    if str_eq(name, "lh4") && cfg!(feature = "lha") {
+        return Some("lzh");
+    }
+    if str_eq(name, "lh5") && cfg!(feature = "lha") {
+        return Some("lzh");
+    }
+    if str_eq(name, "lh6") && cfg!(feature = "lha") {
+        return Some("lzh");
+    }
+    if str_eq(name, "lh7") && cfg!(feature = "lha") {
+        return Some("lzh");
+    }
+    // BCJ branch filters and the delta filter are pre-processors, not
+    // standalone container formats; they have no conventional extension, so
+    // the filter name doubles as the suffix the CLI appends.
+    if str_eq(name, "bcj-x86") && cfg!(feature = "bcj") {
+        return Some("bcj-x86");
+    }
+    if str_eq(name, "bcj-arm") && cfg!(feature = "bcj") {
+        return Some("bcj-arm");
+    }
+    if str_eq(name, "bcj-armt") && cfg!(feature = "bcj") {
+        return Some("bcj-armt");
+    }
+    if str_eq(name, "bcj-arm64") && cfg!(feature = "bcj") {
+        return Some("bcj-arm64");
+    }
+    if str_eq(name, "bcj-ppc") && cfg!(feature = "bcj") {
+        return Some("bcj-ppc");
+    }
+    if str_eq(name, "bcj-sparc") && cfg!(feature = "bcj") {
+        return Some("bcj-sparc");
+    }
+    if str_eq(name, "bcj-ia64") && cfg!(feature = "bcj") {
+        return Some("bcj-ia64");
+    }
+    if str_eq(name, "bcj-riscv") && cfg!(feature = "bcj") {
+        return Some("bcj-riscv");
+    }
+    if str_eq(name, "delta") && cfg!(feature = "delta") {
+        return Some("delta");
+    }
+    if str_eq(name, "crunch") && cfg!(feature = "arc_crunch") {
+        return Some("arc");
+    }
+    if str_eq(name, "squeeze") && cfg!(feature = "arc_squeeze") {
+        return Some("sqz");
     }
     None
 }
@@ -488,6 +637,8 @@ pub const fn names() -> &'static [&'static str] {
         crate::lzs::Lzs::NAME,
         #[cfg(feature = "lzham")]
         crate::lzham::Lzham::NAME,
+        #[cfg(feature = "sit13")]
+        crate::sit13::Sit13::NAME,
         #[cfg(feature = "rar1")]
         crate::rar1::Rar1::NAME,
         #[cfg(feature = "rar2")]
@@ -500,5 +651,37 @@ pub const fn names() -> &'static [&'static str] {
         crate::zip_shrink::ZipShrink::NAME,
         #[cfg(feature = "zip_reduce")]
         crate::zip_reduce::ZipReduce::NAME,
+        #[cfg(feature = "lha")]
+        crate::lha::Lh1::NAME,
+        #[cfg(feature = "lha")]
+        crate::lha::Lh4::NAME,
+        #[cfg(feature = "lha")]
+        crate::lha::Lh5::NAME,
+        #[cfg(feature = "lha")]
+        crate::lha::Lh6::NAME,
+        #[cfg(feature = "lha")]
+        crate::lha::Lh7::NAME,
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjX86::NAME,
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjArm::NAME,
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjArmThumb::NAME,
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjArm64::NAME,
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjPpc::NAME,
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjSparc::NAME,
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjIa64::NAME,
+        #[cfg(feature = "bcj")]
+        crate::bcj::BcjRiscV::NAME,
+        #[cfg(feature = "delta")]
+        crate::delta::Delta::NAME,
+        #[cfg(feature = "arc_crunch")]
+        crate::arc_crunch::ArcCrunch::NAME,
+        #[cfg(feature = "arc_squeeze")]
+        crate::arc_squeeze::ArcSqueeze::NAME,
     ]
 }

@@ -55,6 +55,12 @@ flag, and a `compcol` binary turns the library into a Unix-style filter.
 | Microsoft Xpress (plain LZ77) | `xpress` | `.xpress` | full | full (per [MS-XCA] §2.2) | hand-built fixtures |
 | Microsoft Xpress Huffman | `xpress_huffman` | `.xph` | full (LZ77 + canonical Huffman) | full (per [MS-XCA] §2.1; used in WIM / CompactOS NTFS) | hand-built fixtures |
 | LZNT1 (NTFS native compression) | `lznt1` | `.lznt1` | full | full (per [MS-XCA] §2.5; 4 KiB-chunked LZ77, no entropy coding) | hand-built fixtures |
+| LHA / LZH (`-lh1-`/`-lh4-`/`-lh5-`/`-lh6-`/`-lh7-`) | `lha` | `.lzh` | full (lh1 adaptive Huffman; lh4/5/6/7 static Huffman) | full (clean-room from Okumura LZHUF / ar002) | own round-trip (no reference fixture) |
+| BCJ branch filters (x86, ARM, ARMT, ARM64, PPC, SPARC, IA-64, RISC-V) | `bcj` | `bcj-<arch>` | full (reversible filter) | full | round-trip identity (public-domain LZMA SDK transform) |
+| Delta filter (distance 1..=256) | `delta` | `delta` | full (reversible filter) | full | round-trip identity |
+| ARC Crunch (method 8) | `arc_crunch` | `.arc` | full (12-bit dynamic LZW) | full | own round-trip (no reference fixture) |
+| ARC Squeeze (method 4) | `arc_squeeze` | `.sqz` | full (RLE + static Huffman) | full | own round-trip (no reference fixture) |
+| StuffIt method 13 | `sit13` | `.sit` | `Unsupported` | building blocks only (proprietary; only LGPL reference, not copyable) | — |
 | RAR 1.x | `rar1` | `.rar` | `Unsupported` (license) | building blocks only (Huffman tables not license-clean) | — |
 | RAR 2.x | `rar2` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + audio predictor | real rar-2.60 fixtures |
 | RAR 3.x | `rar3` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + E8 filter; PPMd & VM filters refused | libarchive RAR3 fixtures |
@@ -64,12 +70,29 @@ The RAR encoders are permanently `Unsupported` per RARLAB's unRAR
 license terms (every clean-room RAR reader — libarchive, The
 Unarchiver, 7-Zip — ships decoder-only for the same reason).
 
-Every other algorithm decodes real-world output from its reference
-toolchain and produces output that the same reference toolchain
-accepts. Some encoders (zstd, brotli) lag the reference's compression
-ratio because they skip features like FSE-compressed Huffman weight
-tables (zstd) or encoder-side static-dictionary lookups for non-English
-text (brotli); the wire format is always conformant.
+Most other algorithms decode real-world output from their reference
+toolchain and produce output that the same reference toolchain accepts.
+Some encoders (zstd, brotli) lag the reference's compression ratio
+because they skip features like FSE-compressed Huffman weight tables
+(zstd) or encoder-side static-dictionary lookups for non-English text
+(brotli); the wire format is always conformant.
+
+The exceptions, where no reference toolchain or fixtures were available,
+are noted in the table above:
+
+- **LHA (`lha`)** and **ARC Crunch/Squeeze (`arc_crunch`/`arc_squeeze`)**
+  are clean-room implementations from public format descriptions,
+  validated by their own encoder↔decoder round-trip rather than against
+  reference-tool output. They are expected to be wire-compatible but this
+  has not been cross-checked against the original tools.
+- **BCJ (`bcj`)** and **Delta (`delta`)** are reversible *filters* (from
+  the public-domain LZMA SDK lineage); correctness is the
+  forward∘inverse identity, verified exhaustively.
+- **StuffIt method 13 (`sit13`)** ships only its tested building blocks
+  (bit reader, Kraft-validated Huffman, bounds-checked LZSS window) behind
+  a decoder that returns `Unsupported`: the format is proprietary and the
+  only public reference is LGPL-licensed, so a conformant payload decoder
+  could be neither cleanly derived nor validated.
 
 ## Library usage
 
@@ -432,4 +455,25 @@ is kept in [`BENCH.md`](./BENCH.md).
 
 ## License
 
-MIT. © 2026 Karpeles Lab Inc.
+MIT. © 2026 Karpeles Lab Inc. See [`LICENSE`](./LICENSE). The MIT terms
+cover this crate's own source code; they grant no rights in any
+third-party trademark or compressed-format specification.
+
+### A note on RAR
+
+`RAR`, `WinRAR`, and `unRAR` are trademarks of Alexander Roshal / RARLAB.
+This project is **not** affiliated with or endorsed by RARLAB.
+
+The `rar2` / `rar3` / `rar5` decoders are **clean-room** reimplementations
+written from public format descriptions and other clean-room readers
+(libarchive, The Unarchiver). **No source code or data tables from
+RARLAB's `unRAR` distribution were used.** RARLAB's unRAR license forbids
+using its source to recreate the RAR *compression* algorithm, so every RAR
+**encoder** in this crate is permanently `Unsupported` by design — the same
+decoder-only posture taken by libarchive, The Unarchiver, and 7-Zip.
+
+`rar1` is `Unsupported` even for decoding: a working RAR1 decoder needs
+static Huffman code-length tables that RAR1 does not transmit, and no
+license-clean published form of those tables is available to reproduce
+here (the building blocks ship, but the tables do not). See the module
+docs in `src/rar1/`, `src/rar2/`, `src/rar3/`, and `src/rar5/` for details.

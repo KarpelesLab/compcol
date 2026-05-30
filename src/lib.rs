@@ -128,6 +128,8 @@ pub mod xpress_huffman;
 
 #[cfg(feature = "lzham")]
 pub mod lzham;
+#[cfg(feature = "sit13")]
+pub mod sit13;
 #[cfg(feature = "zip_implode")]
 pub mod zip_implode;
 
@@ -148,5 +150,18 @@ pub mod zip_reduce;
 #[cfg(feature = "zip_shrink")]
 pub mod zip_shrink;
 
+#[cfg(feature = "arc_crunch")]
+pub mod arc_crunch;
+#[cfg(feature = "arc_squeeze")]
+pub mod arc_squeeze;
+#[cfg(feature = "lha")]
+pub mod lha;
+
 #[cfg(feature = "factory")]
 pub mod factory;
+
+#[cfg(feature = "bcj")]
+pub mod bcj;
+
+#[cfg(feature = "delta")]
+pub mod delta;

@@ -7,6 +7,10 @@
 
 #![cfg(feature = "alloc")]
 
+// Only used by feature-gated submodules below; a minimal feature set that
+// enables `alloc` (e.g. just `bcj` or `delta`) compiles none of them, so the
+// helper is legitimately unused in those builds.
+#[allow(dead_code)]
 fn payload(n: usize) -> Vec<u8> {
     // Mixed corpus: short alphabet noise + repeated phrase. Compresses
     // well enough to exercise the codec; large enough (~96 KiB) to
@@ -192,6 +196,31 @@ mod brotli {
         let input = payload(1_000_000);
         let c = compress_to_vec::<Brotli>(&input).unwrap();
         let d = decompress_to_vec::<Brotli>(&c).unwrap();
+        assert_eq!(d, input);
+    }
+}
+
+// ─── lha (lh5 / lh1 via the one-shot vec helpers) ───────────────────────
+
+#[cfg(feature = "lha")]
+mod lha {
+    use super::*;
+    use compcol::lha::{Lh1, Lh5};
+    use compcol::vec::{compress_to_vec, decompress_to_vec};
+
+    #[test]
+    fn round_trip_lh5() {
+        let input = payload(64 * 1024 + 7);
+        let c = compress_to_vec::<Lh5>(&input).unwrap();
+        let d = decompress_to_vec::<Lh5>(&c).unwrap();
+        assert_eq!(d, input);
+    }
+
+    #[test]
+    fn round_trip_lh1() {
+        let input = payload(20 * 1024 + 3);
+        let c = compress_to_vec::<Lh1>(&input).unwrap();
+        let d = decompress_to_vec::<Lh1>(&c).unwrap();
         assert_eq!(d, input);
     }
 }
