@@ -62,7 +62,18 @@ impl Model {
         if !(2..=16).contains(&order) {
             return Err(Error::BadHeader);
         }
-        let size = mem_size_bytes.max(Self::MIN_ARENA);
+        // The header's advertised memory size (`mem_size_bytes`, up to
+        // 255 MiB) describes the arena the *full* PPMII tree would need.
+        // This build only implements the order-0 subset, whose arena never
+        // grows past root (`MIN_ARENA` = 2 KiB) — `arena.rs` has no growth
+        // path and every offset stays within that window. So we cap the
+        // eager `vec![0u8; size]` allocation to the actual working size
+        // rather than honouring the advertised figure, which would let an
+        // 11-byte header force a 255 MiB allocation (L9). The parsed header
+        // value is still validated and retained by the decoder; only the
+        // allocation size is capped here.
+        let _ = mem_size_bytes;
+        let size = Self::MIN_ARENA;
         let _ = order; // captured in the framing header only; the order-0
         // subset doesn't grow the tree past root.
         let mut m = Self {
