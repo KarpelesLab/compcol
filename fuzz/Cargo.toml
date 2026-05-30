@@ -114,3 +114,10 @@ path             = "fuzz_targets/decoder_ppmd.rs"
 test             = false
 doc              = false
 bench            = false
+
+[[bin]]
+name             = "decoder_xpress_huffman"
+path             = "fuzz_targets/decoder_xpress_huffman.rs"
+test             = false
+doc              = false
+bench            = false
