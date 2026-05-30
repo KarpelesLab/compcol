@@ -156,3 +156,10 @@ path             = "fuzz_targets/decoder_zip_reduce.rs"
 test             = false
 doc              = false
 bench            = false
+
+[[bin]]
+name             = "decoder_zip_implode"
+path             = "fuzz_targets/decoder_zip_implode.rs"
+test             = false
+doc              = false
+bench            = false
