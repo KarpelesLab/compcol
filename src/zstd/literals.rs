@@ -21,6 +21,7 @@ use alloc::vec::Vec;
 
 use crate::error::Error;
 use crate::zstd::bitreader::RevBitReader;
+use crate::zstd::decoder::MAX_WINDOW_SIZE;
 use crate::zstd::huffman::{HuffTable, decode_huffman_tree};
 
 /// State carried across blocks: the most recently seen Huffman tree (used by
@@ -83,10 +84,18 @@ fn decode_raw_or_rle(block: &[u8], is_rle: bool, sf: u8) -> Result<LiteralsResul
         _ => unreachable!(),
     };
 
-    // Cap only the capacity HINT (per-block output is bounded to 128 KiB by the
-    // decoder) so a tiny malformed header can't force a multi-MiB reservation
-    // before the backing data is known to exist. The logical size is unchanged:
-    // the RLE resize / raw copy below still produce exactly `regen_size` bytes.
+    // Guard against decompression-bomb literal blocks: the 20-bit RLE
+    // `Regenerated_Size` can request up to ~1 MiB from a few input bytes, and
+    // we materialize it eagerly below. Reject sizes above the conventional
+    // window cap before allocating/resizing.
+    if regen_size as u64 > MAX_WINDOW_SIZE {
+        return Err(Error::Corrupt);
+    }
+
+    // Cap only the capacity HINT so a header in the (128 KiB, 128 MiB] range
+    // can't force a large reservation before the backing data is known to
+    // exist. The logical size is unchanged: the RLE resize / raw copy below
+    // still produce exactly `regen_size` bytes.
     let mut literals = Vec::with_capacity(regen_size.min(128 * 1024));
     if is_rle {
         if block.len() < header_bytes + 1 {
@@ -165,6 +174,13 @@ fn decode_compressed_literals(
         }
         _ => unreachable!(),
     };
+
+    // Same decompression-bomb guard as the Raw/RLE path: reject a
+    // `Regenerated_Size` above the conventional window cap before we allocate
+    // an output buffer sized to it.
+    if regen_size as u64 > MAX_WINDOW_SIZE {
+        return Err(Error::Corrupt);
+    }
 
     if block.len() < header_bytes + comp_size {
         return Err(Error::Corrupt);

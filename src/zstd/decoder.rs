@@ -16,6 +16,13 @@ use crate::zstd::literals::{LiteralsState, decode_literals};
 use crate::zstd::sequences::{SequencesState, decode_sequences, execute_sequences};
 
 const MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Hard cap on the decoder window size (and, by extension, on RLE/compressed
+/// literal `Regenerated_Size` and the running `history` buffer). This is the
+/// zstd-conventional decoder maximum (`ZSTD_WINDOWLOG_LIMIT_DEFAULT` = 27, i.e.
+/// 128 MiB). A frame declaring a window above this is rejected to bound memory
+/// against decompression-bomb inputs (a few input bytes expanding to GiB).
+pub(crate) const MAX_WINDOW_SIZE: u64 = 128 * 1024 * 1024;
 /// Skippable_Frame magic numbers occupy 0x184D2A50..=0x184D2A5F. We do not
 /// decode them; they're rejected as unsupported.
 const SKIPPABLE_MAGIC_HI3: [u8; 3] = [0x4D, 0x2A, 0x18];
@@ -217,7 +224,7 @@ impl Decoder {
         Ok(())
     }
 
-    fn parse_window_descriptor(&mut self) {
+    fn parse_window_descriptor(&mut self) -> Result<(), Error> {
         let wd = self.scratch[0];
         let exponent = ((wd >> 3) & 0x1F) as u32;
         let mantissa = (wd & 0x07) as u32;
@@ -225,6 +232,12 @@ impl Decoder {
         let base = 1u64 << (exponent + 10);
         let add = (base >> 3) * mantissa as u64;
         self.window_size = base + add;
+        // Reject windows above the conventional decoder maximum to bound
+        // memory against decompression-bomb frames.
+        if self.window_size > MAX_WINDOW_SIZE {
+            return Err(self.poison(Error::Unsupported));
+        }
+        Ok(())
     }
 
     fn parse_dictionary_id(&mut self) -> Result<(), Error> {
@@ -240,10 +253,10 @@ impl Decoder {
         Ok(())
     }
 
-    fn parse_fcs(&mut self) {
+    fn parse_fcs(&mut self) -> Result<(), Error> {
         if self.fcs_field_size == 0 {
             self.frame_content_size = None;
-            return;
+            return Ok(());
         }
         let mut v: u64 = 0;
         for i in 0..self.fcs_field_size {
@@ -255,6 +268,16 @@ impl Decoder {
             v += 256;
         }
         self.frame_content_size = Some(v);
+        // Single_Segment frames carry no Window_Descriptor; per RFC 8478
+        // §3.1.1.1.2 the effective Window_Size equals Frame_Content_Size.
+        // Apply the same hard cap so a single-segment bomb is rejected too.
+        if self.single_segment {
+            self.window_size = v;
+            if self.window_size > MAX_WINDOW_SIZE {
+                return Err(self.poison(Error::Unsupported));
+            }
+        }
+        Ok(())
     }
 
     fn parse_block_header(&mut self) -> Result<DecPhase, Error> {
@@ -392,7 +415,7 @@ impl RawDecoder for Decoder {
                             done: false,
                         });
                     }
-                    self.parse_window_descriptor();
+                    self.parse_window_descriptor()?;
                     if self.dict_id_field_size > 0 {
                         self.phase = DecPhase::DictionaryId;
                         self.begin_scratch(self.dict_id_field_size);
@@ -429,7 +452,7 @@ impl RawDecoder for Decoder {
                             done: false,
                         });
                     }
-                    self.parse_fcs();
+                    self.parse_fcs()?;
                     self.phase = DecPhase::BlockHeader;
                     self.begin_scratch(3);
                 }
