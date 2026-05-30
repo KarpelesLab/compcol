@@ -16,8 +16,8 @@ Decoder hardening against malicious/untrusted compressed input (DoS):
   at 128 MiB to bound decompression-bomb frames.
 - xz: drop the unbounded `Vec::reserve` driven by the Index `NumRecords`
   varint (could panic with capacity-overflow or OOM-abort).
-- lz4: bound block-decode output (`decode_block` now takes a `raw_max`
-  ceiling) on both the independent-block frame path and the streaming path,
+- lz4 / lzo: bound raw block-decode output (`block::decode_block` now takes a
+  `raw_max` ceiling) on the public block API and the streaming paths,
   preventing ~255× match-copy decompression bombs.
 - lzfse/LZVN: reject match copies that exceed the block's declared size
   before materializing them.
@@ -47,9 +47,10 @@ Decoder hardening against malicious/untrusted compressed input (DoS):
 
 ### Changed
 
-- **Breaking:** `compcol::lz4::block::decode_block` now takes a third
-  `raw_max: usize` argument bounding the decoded output. Pass `usize::MAX`
-  to preserve the previous unbounded behavior for trusted input.
+- **Breaking:** `compcol::lz4::block::decode_block` and
+  `compcol::lzo::block::decode_block` now take a third `raw_max: usize`
+  argument bounding the decoded output. Pass `usize::MAX` to preserve the
+  previous unbounded behavior for trusted input.
 
 ## [0.4.7](https://github.com/KarpelesLab/compcol/compare/v0.4.6...v0.4.7) - 2026-05-30
 

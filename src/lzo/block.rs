@@ -383,7 +383,14 @@ fn emit_eos(out: &mut Vec<u8>) {
 ///
 /// `out` is cleared first. On success it contains the decompressed bytes.
 /// Stops when the canonical end-of-stream marker is consumed.
-pub fn decode_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+///
+/// `raw_max` bounds the decoded output: an LZO match instruction is only a
+/// few bytes on the wire but can expand ~255× via length-extension bytes, so
+/// without a ceiling a small malicious block could be coaxed into a
+/// multi-gigabyte allocation (decompression bomb). Any literal or match
+/// append that would push `out.len()` past `raw_max` returns
+/// [`Error::Corrupt`]. Pass `usize::MAX` for trusted input.
+pub fn decode_block(input: &[u8], out: &mut Vec<u8>, raw_max: usize) -> Result<(), Error> {
     out.clear();
     let n = input.len();
     if n == 0 {
@@ -410,6 +417,9 @@ pub fn decode_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
         ip += 1;
         if ip + lit_len > n {
             return Err(Error::UnexpectedEnd);
+        }
+        if out.len() + lit_len > raw_max {
+            return Err(Error::Corrupt);
         }
         out.extend_from_slice(&input[ip..ip + lit_len]);
         ip += lit_len;
@@ -451,6 +461,9 @@ pub fn decode_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
                 if ip + lit_len > n {
                     return Err(Error::UnexpectedEnd);
                 }
+                if out.len() + lit_len > raw_max {
+                    return Err(Error::Corrupt);
+                }
                 out.extend_from_slice(&input[ip..ip + lit_len]);
                 ip += lit_len;
                 state = 4;
@@ -465,8 +478,8 @@ pub fn decode_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
                 let h = input[ip] as usize;
                 ip += 1;
                 let distance = (h << 2) + d_lo + 1;
-                copy_match(out, distance, 2)?;
-                handle_trailing_literals(input, &mut ip, out, s, &mut state, n)?;
+                copy_match(out, distance, 2, raw_max)?;
+                handle_trailing_literals(input, &mut ip, out, s, &mut state, n, raw_max)?;
                 continue;
             } else {
                 // state == 4: 3-byte copy from 2049..3072.
@@ -478,8 +491,8 @@ pub fn decode_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
                 let h = input[ip] as usize;
                 ip += 1;
                 let distance = (h << 2) + d_lo + 2049;
-                copy_match(out, distance, 3)?;
-                handle_trailing_literals(input, &mut ip, out, s, &mut state, n)?;
+                copy_match(out, distance, 3, raw_max)?;
+                handle_trailing_literals(input, &mut ip, out, s, &mut state, n, raw_max)?;
                 continue;
             }
         } else if t < 32 {
@@ -514,8 +527,8 @@ pub fn decode_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
             if distance == 16384 {
                 return Ok(()); // end of stream
             }
-            copy_match(out, distance, length)?;
-            handle_trailing_literals(input, &mut ip, out, s, &mut state, n)?;
+            copy_match(out, distance, length, raw_max)?;
+            handle_trailing_literals(input, &mut ip, out, s, &mut state, n, raw_max)?;
             continue;
         } else if t < 64 {
             // 001L_LLLL — copy from ≤16 KiB.
@@ -545,8 +558,8 @@ pub fn decode_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
             let s = off_word & 0x3;
             let d = off_word >> 2;
             let distance = d + 1;
-            copy_match(out, distance, length)?;
-            handle_trailing_literals(input, &mut ip, out, s, &mut state, n)?;
+            copy_match(out, distance, length, raw_max)?;
+            handle_trailing_literals(input, &mut ip, out, s, &mut state, n, raw_max)?;
             continue;
         } else if t < 128 {
             // 01LD_DDSS — copy 3..4 bytes within 2 KiB.
@@ -560,8 +573,8 @@ pub fn decode_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
             let h = input[ip] as usize;
             ip += 1;
             let distance = (h << 3) + d_lo + 1;
-            copy_match(out, distance, length)?;
-            handle_trailing_literals(input, &mut ip, out, s, &mut state, n)?;
+            copy_match(out, distance, length, raw_max)?;
+            handle_trailing_literals(input, &mut ip, out, s, &mut state, n, raw_max)?;
             continue;
         } else {
             // 1LLD_DDSS — copy 5..8 bytes within 2 KiB.
@@ -575,8 +588,8 @@ pub fn decode_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
             let h = input[ip] as usize;
             ip += 1;
             let distance = (h << 3) + d_lo + 1;
-            copy_match(out, distance, length)?;
-            handle_trailing_literals(input, &mut ip, out, s, &mut state, n)?;
+            copy_match(out, distance, length, raw_max)?;
+            handle_trailing_literals(input, &mut ip, out, s, &mut state, n, raw_max)?;
             continue;
         }
     }
@@ -584,9 +597,21 @@ pub fn decode_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
 
 /// Copy `length` bytes from `out[out.len()-distance..]` (LZ77
 /// overlapping-match semantics) onto the end of `out`.
-fn copy_match(out: &mut Vec<u8>, distance: usize, length: usize) -> Result<(), Error> {
+fn copy_match(
+    out: &mut Vec<u8>,
+    distance: usize,
+    length: usize,
+    raw_max: usize,
+) -> Result<(), Error> {
     if distance == 0 || distance > out.len() {
         return Err(Error::InvalidDistance);
+    }
+    // A match instruction is only a few bytes on the wire but can emit a
+    // large `length` (extension bytes multiply it ~255×). Reject copies that
+    // would push the output past the caller's ceiling before materializing
+    // them — otherwise a tiny block can drive a multi-GiB allocation.
+    if out.len() + length > raw_max {
+        return Err(Error::Corrupt);
     }
     let start = out.len() - distance;
     if distance >= length {
@@ -614,6 +639,7 @@ fn handle_trailing_literals(
     s: usize,
     state: &mut u8,
     n: usize,
+    raw_max: usize,
 ) -> Result<(), Error> {
     if s == 0 {
         *state = 0;
@@ -621,6 +647,9 @@ fn handle_trailing_literals(
     }
     if *ip + s > n {
         return Err(Error::UnexpectedEnd);
+    }
+    if out.len() + s > raw_max {
+        return Err(Error::Corrupt);
     }
     out.extend_from_slice(&input[*ip..*ip + s]);
     *ip += s;
@@ -636,13 +665,32 @@ mod tests {
         let mut encoded = Vec::new();
         encode_block(data, &mut encoded);
         let mut decoded = Vec::new();
-        decode_block(&encoded, &mut decoded).expect("decode");
+        decode_block(&encoded, &mut decoded, usize::MAX).expect("decode");
         assert_eq!(decoded, data);
     }
 
     #[test]
     fn empty() {
         round_trip(&[]);
+    }
+
+    #[test]
+    fn rejects_output_exceeding_raw_max() {
+        // A highly compressible payload decodes to far more than its block
+        // size. Decoding with a tight `raw_max` must fail before allocating
+        // past it; decoding with a cap >= the real size must still succeed.
+        let data = alloc::vec![0xABu8; 4096];
+        let mut encoded = Vec::new();
+        encode_block(&data, &mut encoded);
+        assert!(encoded.len() < data.len(), "should compress");
+
+        let mut decoded = Vec::new();
+        let err = decode_block(&encoded, &mut decoded, 1024).unwrap_err();
+        assert!(matches!(err, Error::Corrupt));
+
+        let mut ok = Vec::new();
+        decode_block(&encoded, &mut ok, data.len()).expect("decode at exact cap");
+        assert_eq!(ok, data);
     }
 
     #[test]
