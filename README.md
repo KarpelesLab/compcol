@@ -60,6 +60,8 @@ flag, and a `compcol` binary turns the library into a Unix-style filter.
 | Delta filter (distance 1..=256) | `delta` | `delta` | full (reversible filter) | full | round-trip identity |
 | ARC Crunch (method 8) | `arc_crunch` | `.arc` | full (12-bit dynamic LZW) | full | own round-trip (no reference fixture) |
 | ARC Squeeze (method 4) | `arc_squeeze` | `.sqz` | full (RLE + static Huffman) | full | own round-trip (no reference fixture) |
+| ARC Squashed (method 9) | `arc_squash` | `.arc` | full (13-bit LZW) | full | own round-trip (no reference fixture) |
+| RLE90 (ARC method 3 / StuffIt method 1) | `rle90` | `.rle90` | full | full | round-trip (`0x90`/DLE scheme) |
 | StuffIt method 5 (LZAH) | `lzah` | `.sit` | `Unsupported` (decode-only) | full (LZSS + 314-symbol adaptive Huffman, 4 KiB window) | **real StuffIt `.sit` fixtures (per-fork CRC-16)** |
 | StuffIt method 13 (LZ+Huffman) | `sit13` | `.sit` | `Unsupported` (decode-only) | full (LZSS + dual 321-symbol Huffman, 64 KiB window, LSB-first) | **real StuffIt `.sit` fixtures (per-fork CRC-16)** |
 | StuffIt 5 Arsenic (method 15) | `arsenic` | `.sit` | `Unsupported` (decode-only) | full (range coder + inverse BWT + MTF/RLE + de-randomization) | **real StuffIt 5 fixtures (in-stream CRC-32 + SHA vs `unar`)** |

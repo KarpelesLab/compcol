@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RLE90 codec** (`rle90`): the `0x90`/DLE run-length variant shared by ARC
+  method 3 ("packed") and classic StuffIt method 1, encoder + decoder.
+  Byte-compatible with the `arc_squeeze` internal RLE90 pre-pass.
+- **ARC Squashed codec** (`arc_squash`, method 9): fixed 13-bit LZW
+  (PKARC/PKPAK variant, no RLE), encoder + decoder.
+
 - **StuffIt 5 Arsenic codec** (`arsenic`, compression method 15): BWT-based —
   a carry-less range/arithmetic decoder (9 adaptive models) → selector-driven
   un-MTF/un-RLE → inverse BWT → optional de-randomization → final RLE →
