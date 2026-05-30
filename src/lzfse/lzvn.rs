@@ -309,7 +309,7 @@ pub(crate) fn decode_block(
                 out.extend_from_slice(&src[sp..sp + l]);
                 sp += l;
                 // Match copy.
-                lz_copy(out, d, m, start_out_len)?;
+                lz_copy(out, d, m, start_out_len, expected_decoded_size)?;
                 d_prev = d;
             }
             OpClass::MedD => {
@@ -328,7 +328,7 @@ pub(crate) fn decode_block(
                 sp += opc_len;
                 out.extend_from_slice(&src[sp..sp + l]);
                 sp += l;
-                lz_copy(out, d, m, start_out_len)?;
+                lz_copy(out, d, m, start_out_len, expected_decoded_size)?;
                 d_prev = d;
             }
             OpClass::LrgD => {
@@ -346,7 +346,7 @@ pub(crate) fn decode_block(
                 sp += opc_len;
                 out.extend_from_slice(&src[sp..sp + l]);
                 sp += l;
-                lz_copy(out, d, m, start_out_len)?;
+                lz_copy(out, d, m, start_out_len, expected_decoded_size)?;
                 d_prev = d;
             }
             OpClass::PreD => {
@@ -367,7 +367,7 @@ pub(crate) fn decode_block(
                 if d_prev == 0 {
                     return Err(Error::Corrupt);
                 }
-                lz_copy(out, d_prev, m, start_out_len)?;
+                lz_copy(out, d_prev, m, start_out_len, expected_decoded_size)?;
             }
             OpClass::SmlL => {
                 // op = 1110LLLL; L literals follow (no match).
@@ -411,7 +411,7 @@ pub(crate) fn decode_block(
                 if d_prev == 0 {
                     return Err(Error::Corrupt);
                 }
-                lz_copy(out, d_prev, m, start_out_len)?;
+                lz_copy(out, d_prev, m, start_out_len, expected_decoded_size)?;
             }
             OpClass::LrgM => {
                 // op = 11110000 MMMMMMMM; M = byte[1] + 16; uses d_prev.
@@ -424,7 +424,7 @@ pub(crate) fn decode_block(
                 if d_prev == 0 {
                     return Err(Error::Corrupt);
                 }
-                lz_copy(out, d_prev, m, start_out_len)?;
+                lz_copy(out, d_prev, m, start_out_len, expected_decoded_size)?;
             }
             OpClass::Eos => {
                 // op = 0x06; followed by 7 bytes (8 total = opc_len).
@@ -452,8 +452,23 @@ pub(crate) fn decode_block(
 
 /// LZ77 match copy: at distance `d`, copy `n` bytes from `out[out.len() - d]`
 /// onwards, byte-by-byte (so overlap of d < n splat-copies correctly).
-fn lz_copy(out: &mut Vec<u8>, d: usize, n: usize, start: usize) -> Result<(), Error> {
+///
+/// `expected` is the block's declared decoded size (`n_raw_bytes`). A
+/// `LrgM` opcode can expand ~135× per iteration, so without a per-copy
+/// ceiling a malicious block could balloon far past its declared size
+/// before the termination check catches the mismatch. Reject any copy
+/// that would push this block's output past `expected`.
+fn lz_copy(
+    out: &mut Vec<u8>,
+    d: usize,
+    n: usize,
+    start: usize,
+    expected: usize,
+) -> Result<(), Error> {
     if d == 0 || d > out.len() - start {
+        return Err(Error::Corrupt);
+    }
+    if (out.len() - start).saturating_add(n) > expected {
         return Err(Error::Corrupt);
     }
     let src_pos = out.len() - d;
