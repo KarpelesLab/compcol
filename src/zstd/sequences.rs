@@ -122,7 +122,10 @@ pub fn decode_sequences(data: &[u8], state: &mut SequencesState) -> Result<Vec<S
     let mut of_state = FseState::init(&of_table, &mut br)?;
     let mut ml_state = FseState::init(&ml_table, &mut br)?;
 
-    let mut sequences: Vec<Sequence> = Vec::with_capacity(n_seq as usize);
+    // Cap only the capacity HINT so a tiny header advertising a huge sequence
+    // count can't force a large reservation before the corresponding sequence
+    // data is parsed; the loop below still pushes exactly `n_seq` entries.
+    let mut sequences: Vec<Sequence> = Vec::with_capacity((n_seq as usize).min(128 * 1024));
 
     for i in 0..n_seq {
         // Per RFC §3.1.1.3.2.1.1 decoding order:
