@@ -262,7 +262,18 @@ impl Decoder {
                         }
                         BlockKind::Lzvn => {
                             // Decode in one shot into output_buf.
-                            let mut block_out = Vec::with_capacity(decoded_size);
+                            //
+                            // Bound the capacity hint by what the payload could
+                            // plausibly produce so an attacker-controlled
+                            // `decoded_size` (n_raw_bytes) cannot force a huge
+                            // up-front allocation (DoS / OOM): a single 1-byte
+                            // LZVN opcode expands to at most ~16 output bytes.
+                            // `decode_block` still enforces the real output size
+                            // against `decoded_size`, so under-hinting only makes
+                            // the Vec grow as actual bytes are produced.
+                            let capacity_hint =
+                                decoded_size.min(payload_len.saturating_mul(16).saturating_add(64));
+                            let mut block_out = Vec::with_capacity(capacity_hint);
                             if let Err(e) = lzvn::decode_block(
                                 &self.input_buf[..payload_len],
                                 payload_len,
