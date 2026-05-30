@@ -61,7 +61,7 @@ flag, and a `compcol` binary turns the library into a Unix-style filter.
 | ARC Crunch (method 8) | `arc_crunch` | `.arc` | full (12-bit dynamic LZW) | full | own round-trip (no reference fixture) |
 | ARC Squeeze (method 4) | `arc_squeeze` | `.sqz` | full (RLE + static Huffman) | full | own round-trip (no reference fixture) |
 | StuffIt method 5 (LZAH) | `lzah` | `.sit` | `Unsupported` (decode-only) | full (LZSS + 314-symbol adaptive Huffman, 4 KiB window) | **real StuffIt `.sit` fixtures (per-fork CRC-16)** |
-| StuffIt method 13 | `sit13` | `.sit` | `Unsupported` | building blocks only (proprietary; only LGPL reference, not copyable) | — |
+| StuffIt method 13 (LZ+Huffman) | `sit13` | `.sit` | `Unsupported` (decode-only) | full (LZSS + dual 321-symbol Huffman, 64 KiB window, LSB-first) | **real StuffIt `.sit` fixtures (per-fork CRC-16)** |
 | RAR 1.x | `rar1` | `.rar` | `Unsupported` (license) | building blocks only (Huffman tables not license-clean) | — |
 | RAR 2.x | `rar2` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + audio predictor | real rar-2.60 fixtures |
 | RAR 3.x | `rar3` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + E8 filter; PPMd & VM filters refused | libarchive RAR3 fixtures |
@@ -89,11 +89,14 @@ are noted in the table above:
 - **BCJ (`bcj`)** and **Delta (`delta`)** are reversible *filters* (from
   the public-domain LZMA SDK lineage); correctness is the
   forward∘inverse identity, verified exhaustively.
-- **StuffIt method 13 (`sit13`)** ships only its tested building blocks
-  (bit reader, Kraft-validated Huffman, bounds-checked LZSS window) behind
-  a decoder that returns `Unsupported`: the format is proprietary and the
-  only public reference is LGPL-licensed, so a conformant payload decoder
-  could be neither cleanly derived nor validated.
+The StuffIt codecs **`lzah` (method 5)** and **`sit13` (method 13)** are, by
+contrast, validated to the highest bar in the table: they were implemented
+clean-room from facts-only functional specifications and decode **real
+`.sit` archives bit-exactly**, verified against the stored per-fork CRC-16.
+Their few fixed interoperability tables (the offset code, the method-13
+meta-code and predefined code-length sets) are functional data required for
+interop, supplied as a separately-licensed adjunct kept out of the clean-room
+spec material.
 
 ## Library usage
 
