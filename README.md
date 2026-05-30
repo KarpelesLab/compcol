@@ -432,4 +432,25 @@ is kept in [`BENCH.md`](./BENCH.md).
 
 ## License
 
-MIT. © 2026 Karpeles Lab Inc.
+MIT. © 2026 Karpeles Lab Inc. See [`LICENSE`](./LICENSE). The MIT terms
+cover this crate's own source code; they grant no rights in any
+third-party trademark or compressed-format specification.
+
+### A note on RAR
+
+`RAR`, `WinRAR`, and `unRAR` are trademarks of Alexander Roshal / RARLAB.
+This project is **not** affiliated with or endorsed by RARLAB.
+
+The `rar2` / `rar3` / `rar5` decoders are **clean-room** reimplementations
+written from public format descriptions and other clean-room readers
+(libarchive, The Unarchiver). **No source code or data tables from
+RARLAB's `unRAR` distribution were used.** RARLAB's unRAR license forbids
+using its source to recreate the RAR *compression* algorithm, so every RAR
+**encoder** in this crate is permanently `Unsupported` by design — the same
+decoder-only posture taken by libarchive, The Unarchiver, and 7-Zip.
+
+`rar1` is `Unsupported` even for decoding: a working RAR1 decoder needs
+static Huffman code-length tables that RAR1 does not transmit, and no
+license-clean published form of those tables is available to reproduce
+here (the building blocks ship, but the tables do not). See the module
+docs in `src/rar1/`, `src/rar2/`, `src/rar3/`, and `src/rar5/` for details.
