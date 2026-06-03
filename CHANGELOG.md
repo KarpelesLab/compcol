@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/KarpelesLab/compcol/compare/v0.5.1...v0.6.0) - 2026-06-03
+
+### Other
+
+- make EncoderConfig/DecoderConfig non_exhaustive + add builders ([#85](https://github.com/KarpelesLab/compcol/pull/85))
+- configurable window — encoder max_distance + decoder window_size ([#84](https://github.com/KarpelesLab/compcol/pull/84))
+- magic-byte format auto-detection + CLI auto-detect on -d ([#82](https://github.com/KarpelesLab/compcol/pull/82))
+- add decode targets for 10 recently-added codecs ([#81](https://github.com/KarpelesLab/compcol/pull/81))
+- add README badges, SECURITY.md, and CONTRIBUTING.md ([#80](https://github.com/KarpelesLab/compcol/pull/80))
+
 ### Added
 
 - **Configurable deflate window** for small-window interop and memory-limited
