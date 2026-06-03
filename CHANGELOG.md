@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Format auto-detection** (`factory::detect`): sniff a stream's leading
+  bytes and return the matching codec name by magic signature (gzip, zlib,
+  xz, zstd, bzip2, lz4-frame, RAR, StuffIt/StuffIt 5), feature-gated so only
+  compiled-in codecs are reported and conservative enough to prefer `None`
+  over a wrong guess. The CLI now auto-detects the format on `-d` when no
+  `-t` is given.
+
 ## [0.5.1](https://github.com/KarpelesLab/compcol/compare/v0.5.0...v0.5.1) - 2026-05-30
 
 ### Other
