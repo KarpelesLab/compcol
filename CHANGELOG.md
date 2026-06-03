@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     a memory knob for constrained systems and a way to validate that an
     encoded stream stays within a given window.
 
+  Both configs gained `with_*` builders (`EncoderConfig::default().with_level(9)
+  .with_max_distance(4096)`, `DecoderConfig::default().with_window_size(4096)`).
+
+### Changed
+
+- **Breaking:** `deflate::EncoderConfig` and `deflate::DecoderConfig` are now
+  `#[non_exhaustive]`. Construct them via `default()` + the `with_*` builders
+  instead of a struct literal; in return, future tuning knobs can be added
+  without breaking downstream code.
+
 - **Format auto-detection** (`factory::detect`): sniff a stream's leading
   bytes and return the matching codec name by magic signature (gzip, zlib,
   xz, zstd, bzip2, lz4-frame, RAR, StuffIt/StuffIt 5), feature-gated so only

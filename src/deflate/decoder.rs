@@ -20,7 +20,11 @@ use crate::traits::{RawDecoder, RawProgress};
 /// If `dictionary` is longer than 32 KiB only the trailing 32 KiB is
 /// retained (the rest is unreachable from any back-reference). An empty
 /// dictionary — the default — is equivalent to the older configless API.
+/// `#[non_exhaustive]`: construct via [`DecoderConfig::default`] and the
+/// `with_*` builders rather than a struct literal, so new options can be added
+/// in future without breaking downstream code.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DecoderConfig {
     /// Bytes to load into the sliding window before decoding. Up to the
     /// last `window_size` bytes are retained.
@@ -43,6 +47,30 @@ impl Default for DecoderConfig {
             dictionary: Vec::new(),
             window_size: WINDOW_SIZE,
         }
+    }
+}
+
+impl DecoderConfig {
+    /// Default configuration: no preset dictionary, full 32 KiB window.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed the sliding window with a preset dictionary (the last
+    /// `window_size` bytes are retained).
+    #[must_use]
+    pub fn with_dictionary(mut self, dictionary: Vec<u8>) -> Self {
+        self.dictionary = dictionary;
+        self
+    }
+
+    /// Set the sliding-window size in bytes (clamped to `1..=WINDOW_SIZE`).
+    /// A smaller window decodes streams produced for a small-window decoder
+    /// and uses less memory; back-references beyond it are rejected.
+    #[must_use]
+    pub fn with_window_size(mut self, window_size: usize) -> Self {
+        self.window_size = window_size;
+        self
     }
 }
 
