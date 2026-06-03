@@ -270,6 +270,21 @@ println!("available algorithms: {:?}", factory::names());
 `factory::extension(name)` returns the conventional file extension for
 each algorithm (e.g. `"gz"` for gzip, `"zst"` for zstd).
 
+`factory::detect(prefix)` sniffs the leading bytes of a compressed stream
+and returns the algorithm name of the most likely codec (gzip, zlib, xz,
+zstd, bzip2, lz4-frame, and the rar/StuffIt container hints), or `None` for
+short/unrecognized input. It is conservative — it prefers `None` over a wrong
+guess — and only ever names codecs compiled into the current build. Formats
+without a magic number (notably brotli, and raw `.lzma`) are intentionally
+not detected.
+
+```rust
+use compcol::factory;
+
+assert_eq!(factory::detect(&[0x1F, 0x8B, 0x08]), Some("gzip"));
+assert_eq!(factory::detect(b"not compressed"), None);
+```
+
 ### Skipping decompressed bytes
 
 Useful for tar-style archive browsing — read a header, skip past the
@@ -311,7 +326,9 @@ cargo install --path . --features "gzip,zstd,brotli,lz4,factory"
 Usage: compcol -t ALGO [OPTIONS] [INPUT]
 
 Required:
-    -t, --type ALGO         Algorithm (use --list to see what's compiled in)
+    -t, --type ALGO         Algorithm (use --list to see what's compiled in).
+                            Optional on -d: if omitted, the format is
+                            auto-detected from the input's magic bytes.
 
 Mode:
     -d, --decompress        Decompress instead of compress
@@ -345,6 +362,9 @@ compcol -t gzip -k README.md         # → README.md.gz, keeps README.md
 
 # Decompress
 compcol -t gzip -d README.md.gz      # → README.md, removes README.md.gz
+
+# Decompress with format auto-detection (no -t needed)
+cat README.md.gz | compcol -d > README.md
 
 # Force overwrite of an existing output file
 compcol -t gzip -f README.md

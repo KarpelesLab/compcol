@@ -163,6 +163,30 @@ fn pipe_round_trip_gzip() {
 }
 
 #[test]
+fn auto_detect_decompress_gzip_via_pipe() {
+    // Compress with an explicit -t, then decompress with NO -t: the binary
+    // must auto-detect gzip from the 1F 8B magic.
+    let input = b"auto-detect me, please, from my magic bytes".repeat(8);
+    let (encoded, _err, code) = run_with_stdin(&["-t", "gzip"], &input);
+    assert_eq!(code, 0);
+    assert_eq!(&encoded[..2], &[0x1F, 0x8B]);
+
+    // No -t on the decompress side.
+    let (decoded, err, code) = run_with_stdin(&["-d"], &encoded);
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn auto_detect_unknown_format_is_usage_error() {
+    // Plain text has no recognizable magic; -d with no -t must fail clearly.
+    let (_out, err, code) = run_with_stdin(&["-d"], b"this is not a compressed stream at all");
+    assert_eq!(code, 2);
+    let s = String::from_utf8_lossy(&err);
+    assert!(s.contains("could not detect format"), "stderr: {s}");
+}
+
+#[test]
 fn pipe_round_trip_zlib() {
     let input = b"compress me through zlib".to_vec();
     let (encoded, _err, code) = run_with_stdin(&["-t", "zlib"], &input);

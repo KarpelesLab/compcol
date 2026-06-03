@@ -407,6 +407,161 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
     }
 }
 
+/// Sniff `prefix` (a leading slice of a compressed stream) and return the
+/// algorithm NAME of the most likely codec, or `None` if unrecognized.
+///
+/// Matching is by well-known magic-byte signatures. Each arm is gated on the
+/// relevant codec feature, so `detect` only ever names a codec that is
+/// actually compiled into this build: a recognized magic for a disabled
+/// feature yields `None` rather than an unusable name.
+///
+/// The function is pure and total over any input: short slices and arbitrary
+/// bytes simply return `None`. It never panics. Checks are ordered so that
+/// longer / stronger magics are tested before weaker ones, and the matching
+/// is deliberately conservative — when a signature is ambiguous or
+/// low-confidence (e.g. raw `.lzma`), `detect` prefers `None` over a wrong
+/// guess.
+///
+/// # Magic signatures recognized
+///
+/// | Format        | Bytes (hex)                  | Returned name           |
+/// |---------------|------------------------------|-------------------------|
+/// | xz            | `FD 37 7A 58 5A 00`          | `"xz"`                  |
+/// | RAR 5         | `52 61 72 21 1A 07 01 00`    | `"rar5"`                |
+/// | RAR 1.5–4     | `52 61 72 21 1A 07 00`       | `"rar3"` (see below)    |
+/// | StuffIt classic | `"SIT!"` … `"rLau"` @ 10   | `"arsenic"` (container) |
+/// | StuffIt 5     | `"StuffIt"`                  | `"arsenic"` (container) |
+/// | gzip          | `1F 8B`                      | `"gzip"`                |
+/// | zstd          | `28 B5 2F FD`                | `"zstd"`                |
+/// | bzip2         | `42 5A 68` (`"BZh"`)         | `"bzip2"`               |
+/// | lz4 frame     | `04 22 4D 18`                | `"lz4-frame"`           |
+/// | zlib          | `78 xx` with `(CMF*256+FLG)%31==0` | `"zlib"`          |
+///
+/// # Formats deliberately not detected
+///
+/// * **brotli** has no magic number at all; a brotli stream starts directly
+///   with the WBITS bits, so it cannot be sniffed and is never returned.
+/// * **raw `.lzma`** begins with a 1-byte properties value (commonly `0x5D`)
+///   followed by a 4-byte little-endian dictionary size. There is no true
+///   magic — `5D 00 00` collides with ordinary data — so it is omitted to
+///   avoid false positives. Use an explicit algorithm for raw LZMA.
+///
+/// # Containers, not single codecs
+///
+/// RAR and StuffIt are **archive containers** that hold per-member streams,
+/// each potentially using a different codec; this crate's `rar*` / `arsenic`
+/// decoders operate on a single member payload, not on the container framing.
+/// `detect` recognizes the container magic and returns a representative codec
+/// name (the newest decoder this build provides for that family) purely as a
+/// format hint. A caller that wants to actually extract members must parse the
+/// container directory first and feed each member to the appropriate decoder;
+/// piping a whole `.rar` / `.sit` file straight into the named decoder will
+/// not work. RAR version disambiguation beyond rar4-vs-rar5 (i.e. rar1 / rar2
+/// / rar3) needs deeper header parsing, so the rar4-era magic maps to a single
+/// representative (`rar3`).
+pub fn detect(prefix: &[u8]) -> Option<&'static str> {
+    let p = prefix;
+
+    // ── Long / strong magics first ──────────────────────────────────────
+
+    // xz: 0xFD '7' 'z' 'X' 'Z' 0x00 (6-byte stream header magic).
+    // The XZ File Format §2.1.1.1.
+    #[cfg(feature = "xz")]
+    if p.starts_with(&[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]) {
+        return Some(crate::xz::Xz::NAME);
+    }
+
+    // RAR: "Rar!\x1A\x07" then a version byte.
+    //   0x00            → RAR 1.5–4.x archive  (RARv4 header block format)
+    //   0x01 0x00       → RAR 5.0 archive
+    // See the RAR archive format notes (RARLAB). RAR is a *container*; this
+    // returns a representative member-codec name as a format hint only.
+    if p.starts_with(&[0x52, 0x61, 0x72, 0x21, 0x1A, 0x07]) {
+        match p.get(6) {
+            #[cfg(feature = "rar5")]
+            Some(0x01) if p.get(7) == Some(&0x00) => return Some(crate::rar5::Rar5::NAME),
+            // RAR4-era magic. The exact 1.5/2/3 split needs deeper header
+            // parsing; return the newest rar4-family decoder compiled in as a
+            // representative hint.
+            Some(0x00) => {
+                #[cfg(feature = "rar3")]
+                return Some(crate::rar3::Rar3::NAME);
+                #[cfg(all(not(feature = "rar3"), feature = "rar2"))]
+                return Some(crate::rar2::Rar2::NAME);
+                #[cfg(all(not(feature = "rar3"), not(feature = "rar2"), feature = "rar1"))]
+                return Some(crate::rar1::Rar1::NAME);
+            }
+            _ => {}
+        }
+    }
+
+    // StuffIt classic: bytes[0..4] == "SIT!" AND bytes[10..14] == "rLau".
+    // (The 4-byte tag plus the "rLau" creator signature at offset 10 is what
+    // distinguishes a real StuffIt 1–4 archive from incidental "SIT!" data.)
+    // This is a *container*; "arsenic" is returned only as a StuffIt format
+    // hint — the caller must parse the archive directory to extract members.
+    #[cfg(feature = "arsenic")]
+    if p.len() >= 14 && &p[0..4] == b"SIT!" && &p[10..14] == b"rLau" {
+        return Some(crate::arsenic::Arsenic::NAME);
+    }
+
+    // StuffIt 5: ASCII "StuffIt" prefix (the StuffIt 5 archive header begins
+    // with the literal magic string "StuffIt (c)..."). Again a container hint.
+    #[cfg(feature = "arsenic")]
+    if p.starts_with(b"StuffIt") {
+        return Some(crate::arsenic::Arsenic::NAME);
+    }
+
+    // ── 4-byte magics ──────────────────────────────────────────────────
+
+    // zstd: little-endian 0xFD2FB528 → bytes 28 B5 2F FD. RFC 8478 §3.1.1.
+    #[cfg(feature = "zstd")]
+    if p.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        return Some(crate::zstd::Zstd::NAME);
+    }
+
+    // lz4 frame: little-endian 0x184D2204 → bytes 04 22 4D 18. LZ4 Frame
+    // Format §4. (The legacy/skippable-frame magics are not detected.)
+    #[cfg(feature = "lz4")]
+    if p.starts_with(&[0x04, 0x22, 0x4D, 0x18]) {
+        return Some(crate::lz4::frame::LZ4Frame::NAME);
+    }
+
+    // ── 3-byte magics ──────────────────────────────────────────────────
+
+    // bzip2: "BZh" (0x42 0x5A 0x68). The 4th byte is the block-size digit
+    // '1'..='9'; we accept any prefix that is at least "BZh".
+    #[cfg(feature = "bzip2")]
+    if p.starts_with(&[0x42, 0x5A, 0x68]) {
+        return Some(crate::bzip2::Bzip2::NAME);
+    }
+
+    // ── 2-byte magics ──────────────────────────────────────────────────
+
+    // gzip: 0x1F 0x8B (RFC 1952 §2.3.1, ID1 ID2).
+    #[cfg(feature = "gzip")]
+    if p.starts_with(&[0x1F, 0x8B]) {
+        return Some(crate::gzip::Gzip::NAME);
+    }
+
+    // zlib: RFC 1950 §2.2. The header is CMF then FLG. For deflate the
+    // compression method (low nibble of CMF) is 8 and CINFO (high nibble) is
+    // ≤ 7, giving CMF == 0x78 for the standard 32 KiB window. The two header
+    // bytes, read big-endian as CMF*256 + FLG, must be a multiple of 31.
+    // Requiring both the 0x78 CMF *and* the %31 checksum keeps this from
+    // firing on arbitrary data (only ~1 in 31 of the 0x78-prefixed pairs
+    // pass). Checked last because it is the weakest of the magics.
+    #[cfg(feature = "zlib")]
+    if let (Some(&cmf), Some(&flg)) = (p.first(), p.get(1))
+        && cmf == 0x78
+        && ((cmf as u16) * 256 + flg as u16).is_multiple_of(31)
+    {
+        return Some(crate::zlib::Zlib::NAME);
+    }
+
+    None
+}
+
 /// Conventional filename extension (without the leading `.`) for the given
 /// algorithm, or `None` if the algorithm isn't compiled in or has no
 /// conventional extension.
@@ -737,4 +892,136 @@ pub const fn names() -> &'static [&'static str] {
         #[cfg(feature = "arc_squash")]
         crate::arc_squash::ArcSquash::NAME,
     ]
+}
+
+#[cfg(test)]
+mod detect_tests {
+    use super::detect;
+    #[cfg(feature = "arsenic")]
+    use alloc::vec::Vec;
+
+    // Short and arbitrary input never panics and never guesses.
+    #[test]
+    fn empty_and_short_input_is_none() {
+        assert_eq!(detect(&[]), None);
+        assert_eq!(detect(&[0x1F]), None); // gzip needs 2 bytes
+        assert_eq!(detect(&[0x28, 0xB5]), None); // zstd needs 4 bytes
+    }
+
+    #[test]
+    fn random_input_is_none() {
+        // A spread of bytes that matches no signature.
+        assert_eq!(detect(&[0x00, 0x01, 0x02, 0x03, 0x04, 0x05]), None);
+        assert_eq!(detect(b"hello, world, this is plain text"), None);
+        // 0xFF.. doesn't collide with any magic.
+        assert_eq!(detect(&[0xFF; 16]), None);
+    }
+
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn detects_gzip() {
+        assert_eq!(detect(&[0x1F, 0x8B, 0x08, 0x00]), Some("gzip"));
+    }
+
+    #[test]
+    #[cfg(feature = "xz")]
+    fn detects_xz() {
+        assert_eq!(
+            detect(&[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0x00, 0x04]),
+            Some("xz")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "zstd")]
+    fn detects_zstd() {
+        assert_eq!(detect(&[0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00]), Some("zstd"));
+    }
+
+    #[test]
+    #[cfg(feature = "bzip2")]
+    fn detects_bzip2() {
+        // "BZh9" — block-size '9'.
+        assert_eq!(detect(b"BZh91AY&SY"), Some("bzip2"));
+    }
+
+    #[test]
+    #[cfg(feature = "lz4")]
+    fn detects_lz4_frame() {
+        assert_eq!(
+            detect(&[0x04, 0x22, 0x4D, 0x18, 0x40, 0x40]),
+            Some("lz4-frame")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "zlib")]
+    fn detects_zlib_when_checksum_valid() {
+        // 0x78 0x9C: 0x789C = 30876 = 31 * 996, divisible by 31 → valid.
+        assert_eq!(detect(&[0x78, 0x9C, 0x00]), Some("zlib"));
+        // 0x78 0x01 (no/low compression): 0x7801 = 30721 = 31 * 991 → valid.
+        assert_eq!(detect(&[0x78, 0x01]), Some("zlib"));
+        // 0x78 0xDA (best compression): 0x78DA = 30938 = 31 * 998 → valid.
+        assert_eq!(detect(&[0x78, 0xDA]), Some("zlib"));
+    }
+
+    #[test]
+    #[cfg(feature = "zlib")]
+    fn rejects_zlib_when_checksum_invalid() {
+        // 0x78 0x00: 0x7800 = 30720, not divisible by 31 → must NOT match.
+        assert_eq!(detect(&[0x78, 0x00, 0x00, 0x00]), None);
+        // 0x78 0x9D: 30877, 30877 % 31 == 1 → must NOT match.
+        assert_eq!(detect(&[0x78, 0x9D]), None);
+    }
+
+    #[test]
+    #[cfg(feature = "rar5")]
+    fn detects_rar5() {
+        // "Rar!\x1A\x07\x01\x00" — RAR 5.0.
+        assert_eq!(
+            detect(&[0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00]),
+            Some("rar5")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "rar3")]
+    fn detects_rar4_era_as_representative() {
+        // "Rar!\x1A\x07\x00" — RAR 1.5–4.x → representative rar3.
+        assert_eq!(
+            detect(&[0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00]),
+            Some("rar3")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "arsenic")]
+    fn detects_stuffit_classic_container() {
+        // "SIT!" + 6 bytes + "rLau".
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"SIT!");
+        buf.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // bytes 4..10
+        buf.extend_from_slice(b"rLau"); // bytes 10..14
+        assert_eq!(detect(&buf), Some("arsenic"));
+
+        // "SIT!" without the "rLau" creator tag must NOT match.
+        let not_sit = b"SIT!\0\0\0\0\0\0XXXX";
+        assert_eq!(detect(not_sit), None);
+    }
+
+    #[test]
+    #[cfg(feature = "arsenic")]
+    fn detects_stuffit5_container() {
+        assert_eq!(detect(b"StuffIt (c)1997"), Some("arsenic"));
+    }
+
+    // brotli has no magic; an arbitrary brotli-ish first byte must not be
+    // mistaken for any format we recognize.
+    #[test]
+    fn brotli_is_not_detectable() {
+        // A typical brotli stream starts with e.g. 0x1B/0x0B/0x21 windows;
+        // none collide with a recognized magic.
+        assert_eq!(detect(&[0x1B, 0x00, 0x00]), None);
+        assert_eq!(detect(&[0x0B, 0x00]), None);
+    }
 }
