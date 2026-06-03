@@ -371,10 +371,7 @@ fn round_trip_mixed_corpus_default_level() {
 // ─── level-specific tests ───────────────────────────────────────────────
 
 fn encode_at_level(input: &[u8], level: u8) -> Vec<u8> {
-    let mut enc = Encoder::with_config(EncoderConfig {
-        level,
-        ..Default::default()
-    });
+    let mut enc = Encoder::with_config(EncoderConfig::default().with_level(level));
     encode_chunked(&mut enc, input, 4096, 4096)
 }
 
@@ -387,10 +384,7 @@ fn round_trip_level_1() {
         b"hello world",
         &b"abcabcabcabcabc".repeat(100)[..],
     ] {
-        let mut enc = Encoder::with_config(EncoderConfig {
-            level: 1,
-            ..Default::default()
-        });
+        let mut enc = Encoder::with_config(EncoderConfig::default().with_level(1));
         let encoded = encode_chunked(&mut enc, input, 4096, 4096);
         let decoded = decode_chunked(&encoded, 4096, 4096).unwrap();
         assert_eq!(decoded, input);
@@ -404,10 +398,7 @@ fn round_trip_level_9() {
         b"hello world",
         &b"abcabcabcabcabc".repeat(100)[..],
     ] {
-        let mut enc = Encoder::with_config(EncoderConfig {
-            level: 9,
-            ..Default::default()
-        });
+        let mut enc = Encoder::with_config(EncoderConfig::default().with_level(9));
         let encoded = encode_chunked(&mut enc, input, 4096, 4096);
         let decoded = decode_chunked(&encoded, 4096, 4096).unwrap();
         assert_eq!(decoded, input);
@@ -437,16 +428,10 @@ fn out_of_range_level_is_clamped() {
     // Level 0 and level 250 should both produce valid streams (clamped to
     // 1 and 9 respectively) — we don't expose a fallible constructor.
     let input = b"the rain in spain falls mainly on the plain";
-    let mut enc_lo = Encoder::with_config(EncoderConfig {
-        level: 0,
-        ..Default::default()
-    });
+    let mut enc_lo = Encoder::with_config(EncoderConfig::default().with_level(0));
     let enc_lo_out = encode_chunked(&mut enc_lo, input, 4096, 4096);
     assert_eq!(decode_chunked(&enc_lo_out, 4096, 4096).unwrap(), input);
-    let mut enc_hi = Encoder::with_config(EncoderConfig {
-        level: 250,
-        ..Default::default()
-    });
+    let mut enc_hi = Encoder::with_config(EncoderConfig::default().with_level(250));
     let enc_hi_out = encode_chunked(&mut enc_hi, input, 4096, 4096);
     assert_eq!(decode_chunked(&enc_hi_out, 4096, 4096).unwrap(), input);
 }
@@ -484,10 +469,7 @@ fn reset_preserves_level_and_allows_reuse() {
     let input_a = b"alpha alpha alpha alpha alpha".as_slice();
     let input_b = b"bravo bravo bravo bravo bravo".as_slice();
 
-    let mut enc = Encoder::with_config(EncoderConfig {
-        level: 9,
-        ..Default::default()
-    });
+    let mut enc = Encoder::with_config(EncoderConfig::default().with_level(9));
     let encoded_a = encode_chunked(&mut enc, input_a, 4096, 4096);
     enc.reset();
     let encoded_b = encode_chunked(&mut enc, input_b, 4096, 4096);
@@ -497,10 +479,7 @@ fn reset_preserves_level_and_allows_reuse() {
 
     // After reset, an encoder configured at level 9 should still be at
     // level 9. Compare with a fresh level-9 encoder on the same input.
-    let mut fresh = Encoder::with_config(EncoderConfig {
-        level: 9,
-        ..Default::default()
-    });
+    let mut fresh = Encoder::with_config(EncoderConfig::default().with_level(9));
     let fresh_b = encode_chunked(&mut fresh, input_b, 4096, 4096);
     assert_eq!(encoded_b, fresh_b, "reset must preserve compression level");
 }
@@ -603,14 +582,8 @@ fn algorithm_encoder_decoder_round_trip() {
 #[test]
 fn algorithm_encoder_with_uses_config() {
     let input = b"abcabcabcabcabcabc".repeat(100);
-    let mut enc_lo = <Deflate as Algorithm>::encoder_with(EncoderConfig {
-        level: 1,
-        ..Default::default()
-    });
-    let mut enc_hi = <Deflate as Algorithm>::encoder_with(EncoderConfig {
-        level: 9,
-        ..Default::default()
-    });
+    let mut enc_lo = <Deflate as Algorithm>::encoder_with(EncoderConfig::default().with_level(1));
+    let mut enc_hi = <Deflate as Algorithm>::encoder_with(EncoderConfig::default().with_level(9));
     let lo = encode_chunked(&mut enc_lo, &input, 4096, 4096);
     let hi = encode_chunked(&mut enc_hi, &input, 4096, 4096);
     assert!(
@@ -742,19 +715,15 @@ fn deflate_decoder_preset_dictionary_decodes_cross_block_backref() {
     );
 
     // With dictionary: decoding succeeds and yields the original payload.
-    let with_dict = Decoder::with_config(DecoderConfig {
-        dictionary: dictionary.clone(),
-        ..Default::default()
-    });
+    let with_dict =
+        Decoder::with_config(DecoderConfig::default().with_dictionary(dictionary.clone()));
     let out = drain_full(with_dict, &encoded).unwrap();
     assert_eq!(out, expected);
 
     // Same fixture via Algorithm::decoder_with — confirms the wiring up
     // through the public type-associated config type is sound.
-    let from_algo: Decoder = Deflate::decoder_with(DecoderConfig {
-        dictionary,
-        ..Default::default()
-    });
+    let from_algo: Decoder =
+        Deflate::decoder_with(DecoderConfig::default().with_dictionary(dictionary));
     let out = drain_full(from_algo, &encoded).unwrap();
     assert_eq!(out, expected);
 }
@@ -779,10 +748,8 @@ fn deflate_decoder_reset_keep_window_preserves_history_for_mszip() {
     // a single-block empty deflate stream (BFINAL=1 BTYPE=01 EOB).
     // That advances the decoder to Done while leaving the window full
     // of the dictionary text.
-    let mut dec = Decoder::with_config(DecoderConfig {
-        dictionary: dictionary.clone(),
-        ..Default::default()
-    });
+    let mut dec =
+        Decoder::with_config(DecoderConfig::default().with_dictionary(dictionary.clone()));
     // Empty fixed-Huffman block: BFINAL=1, BTYPE=01, then EOB (code 256
     // = 7-bit 0b0000000). Packed LSB-first: 0b00000011 = 0x03, 0x00.
     let empty_block = [0x03u8, 0x00];
@@ -807,10 +774,8 @@ fn deflate_decoder_full_reset_drops_dictionary() {
     let dictionary: Vec<u8> = b"the quick brown fox jumps over the lazy dog. ".to_vec();
     let encoded = hex("2bc1a238b3182204569c9887a2431100");
 
-    let mut dec = Decoder::with_config(DecoderConfig {
-        dictionary: dictionary.clone(),
-        ..Default::default()
-    });
+    let mut dec =
+        Decoder::with_config(DecoderConfig::default().with_dictionary(dictionary.clone()));
     let empty_block = [0x03u8, 0x00];
     let mut buf = vec![0u8; 64];
     let (_, _) = dec.decode(&empty_block, &mut buf).unwrap();
@@ -833,10 +798,7 @@ fn deflate_decoder_full_reset_drops_dictionary() {
 #[test]
 fn deflate_decoder_preset_dictionary_long_is_truncated() {
     let huge = vec![0xAAu8; 48 * 1024]; // 48 KiB of one byte
-    let dec = Decoder::with_config(DecoderConfig {
-        dictionary: huge.clone(),
-        ..Default::default()
-    });
+    let dec = Decoder::with_config(DecoderConfig::default().with_dictionary(huge.clone()));
     // Decode an empty block — just smoke-test that construction worked.
     let empty_block = [0x03u8, 0x00];
     let mut buf = vec![0u8; 64];
@@ -872,17 +834,15 @@ fn max_distance_cap_suppresses_far_matches_and_round_trips() {
     input.extend_from_slice(&marker);
 
     // Full 32 KiB window (default): can reference the marker ~8 KiB back.
-    let mut enc_full = Encoder::with_config(EncoderConfig {
-        level: 9,
-        ..Default::default()
-    });
+    let mut enc_full = Encoder::with_config(EncoderConfig::default().with_level(9));
     let full = encode_chunked(&mut enc_full, &input, input.len(), 4096);
 
     // 4 KiB cap: the far marker match is out of range.
-    let mut enc_cap = Encoder::with_config(EncoderConfig {
-        level: 9,
-        max_distance: 4096,
-    });
+    let mut enc_cap = Encoder::with_config(
+        EncoderConfig::default()
+            .with_level(9)
+            .with_max_distance(4096),
+    );
     let capped = encode_chunked(&mut enc_cap, &input, input.len(), 4096);
 
     // Both must decode back to the original.
@@ -918,18 +878,14 @@ fn small_window_decoder_accepts_capped_and_rejects_far_refs() {
     }
     input.extend_from_slice(&marker);
 
-    let win = || {
-        Deflate::decoder_with(DecoderConfig {
-            window_size: 4096,
-            ..Default::default()
-        })
-    };
+    let win = || Deflate::decoder_with(DecoderConfig::default().with_window_size(4096));
 
     // Capped encoder → a 4 KiB-window decoder reads it correctly.
-    let mut enc_cap = Encoder::with_config(EncoderConfig {
-        level: 9,
-        max_distance: 4096,
-    });
+    let mut enc_cap = Encoder::with_config(
+        EncoderConfig::default()
+            .with_level(9)
+            .with_max_distance(4096),
+    );
     let capped = encode_chunked(&mut enc_cap, &input, input.len(), 4096);
     assert_eq!(
         decode_with_decoder(win(), &capped, capped.len(), 4096).unwrap(),
@@ -938,10 +894,7 @@ fn small_window_decoder_accepts_capped_and_rejects_far_refs() {
 
     // Full-window encoder uses the far (~8 KiB) match → the 4 KiB-window
     // decoder rejects it, just like qemu would.
-    let mut enc_full = Encoder::with_config(EncoderConfig {
-        level: 9,
-        ..Default::default()
-    });
+    let mut enc_full = Encoder::with_config(EncoderConfig::default().with_level(9));
     let full = encode_chunked(&mut enc_full, &input, input.len(), 4096);
     let res = decode_with_decoder(win(), &full, full.len(), 4096);
     assert!(

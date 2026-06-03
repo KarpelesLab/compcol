@@ -53,7 +53,11 @@ const WINDOW_MAX: usize = 2 * WINDOW_SIZE;
 /// back-reference farther than 4096 bytes, so set `max_distance: 4096` to
 /// target it. The value is clamped to `1..=WINDOW_SIZE`; it only constrains
 /// the encoder (decoding always supports the full window).
+/// `#[non_exhaustive]`: construct via [`EncoderConfig::default`] and the
+/// `with_*` builders rather than a struct literal, so new tuning knobs can be
+/// added in future without breaking downstream code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EncoderConfig {
     /// Compression level in `1..=9`.
     pub level: u8,
@@ -68,6 +72,29 @@ impl Default for EncoderConfig {
             level: 6,
             max_distance: WINDOW_SIZE,
         }
+    }
+}
+
+impl EncoderConfig {
+    /// Default configuration: level 6, full 32 KiB window.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the compression level (clamped to `1..=9` at encoder build time).
+    #[must_use]
+    pub fn with_level(mut self, level: u8) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// Cap the LZ77 match distance (clamped to `1..=WINDOW_SIZE`). Lower it to
+    /// target a decoder with a smaller sliding window (e.g. `4096` for
+    /// qemu/qcow2's 4 KiB inflate window).
+    #[must_use]
+    pub fn with_max_distance(mut self, max_distance: usize) -> Self {
+        self.max_distance = max_distance;
+        self
     }
 }
 
