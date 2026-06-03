@@ -593,6 +593,7 @@ impl Encoder {
         Self {
             inner: deflate::Encoder::with_config(deflate::EncoderConfig {
                 level: config.level,
+                ..deflate::EncoderConfig::default()
             }),
             crc: Crc32::new(),
             isize_count: 0,

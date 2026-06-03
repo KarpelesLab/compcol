@@ -198,6 +198,7 @@ pub fn encoder_by_name_with_level(name: &str, level: u8) -> Option<Box<dyn Encod
         crate::deflate::Deflate::NAME => Some(Box::new(
             <crate::deflate::Deflate as Algorithm>::encoder_with(crate::deflate::EncoderConfig {
                 level,
+                ..crate::deflate::EncoderConfig::default()
             }),
         )),
         #[cfg(feature = "deflate64")]

@@ -44,15 +44,30 @@ const WINDOW_MAX: usize = 2 * WINDOW_SIZE;
 /// for most use cases.
 ///
 /// Values outside `1..=9` are clamped at encoder construction time.
+///
+/// `max_distance` caps the LZ77 back-reference distance, in bytes. The full
+/// deflate window is 32 KiB (`WINDOW_SIZE`) and that is the default. Lower
+/// it to produce a stream that a decoder using a *smaller* sliding window can
+/// still inflate — for example qemu/qcow2 decompresses clusters with a 4 KiB
+/// window (`inflateInit2(-12)`) and fails with `Z_DATA_ERROR` on any
+/// back-reference farther than 4096 bytes, so set `max_distance: 4096` to
+/// target it. The value is clamped to `1..=WINDOW_SIZE`; it only constrains
+/// the encoder (decoding always supports the full window).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncoderConfig {
     /// Compression level in `1..=9`.
     pub level: u8,
+    /// Maximum LZ77 match distance in bytes (clamped to `1..=WINDOW_SIZE`).
+    /// Default is `WINDOW_SIZE` (the full 32 KiB window).
+    pub max_distance: usize,
 }
 
 impl Default for EncoderConfig {
     fn default() -> Self {
-        Self { level: 6 }
+        Self {
+            level: 6,
+            max_distance: WINDOW_SIZE,
+        }
     }
 }
 
@@ -477,7 +492,7 @@ impl Encoder {
             window: Vec::with_capacity(WINDOW_MAX),
             cursor: 0,
             window_start_abs: 0,
-            match_finder: Box::new(MatchFinder::new()),
+            match_finder: Box::new(MatchFinder::with_max_distance(config.max_distance)),
             block_symbols: Vec::new(),
             block_bytes: Vec::new(),
             bit_writer: BitWriter::new(),
