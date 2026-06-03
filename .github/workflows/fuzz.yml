@@ -46,6 +46,16 @@ jobs:
           - decoder_lzs
           - decoder_lzss
           - decoder_lzham
+          - decoder_lha
+          - decoder_bcj
+          - decoder_delta
+          - decoder_arc_crunch
+          - decoder_arc_squeeze
+          - decoder_arc_squash
+          - decoder_rle90
+          - decoder_lzah
+          - decoder_sit13
+          - decoder_arsenic
     steps:
       - uses: actions/checkout@v6
       - name: Install nightly toolchain

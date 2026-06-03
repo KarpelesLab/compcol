@@ -1,6 +1,6 @@
 #![no_main]
-use libfuzzer_sys::fuzz_target;
 use compcol::{Algorithm as _, Decoder as _};
+use libfuzzer_sys::fuzz_target;
 
 // Smoke property: the decoder must not panic on arbitrary input.
 // libfuzzer feeds us garbage bytes; we drive the decoder over them

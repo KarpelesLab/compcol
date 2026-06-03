@@ -5,8 +5,8 @@
 //! Huffman, FSE primitives, etc.) without having to maintain 20
 //! separate corpora.
 
-use libfuzzer_sys::fuzz_target;
 use compcol::factory;
+use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() {

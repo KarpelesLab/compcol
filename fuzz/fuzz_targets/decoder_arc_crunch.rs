@@ -7,7 +7,7 @@ use libfuzzer_sys::fuzz_target;
 // and discard the result. Any panic, abort, or undefined behavior
 // trips the harness.
 fuzz_target!(|data: &[u8]| {
-    let mut dec = <compcol::lz4::Lz4>::decoder();
+    let mut dec = <compcol::arc_crunch::ArcCrunch>::decoder();
     let mut out = vec![0u8; 64 * 1024];
     let mut consumed = 0;
     let mut steps = 0;
@@ -23,7 +23,6 @@ fuzz_target!(|data: &[u8]| {
         }
         steps += 1;
         if steps > 4096 {
-            // Defensive: pathological inputs shouldn't make us loop.
             return;
         }
     }
