@@ -22,7 +22,9 @@ Usage: compcol -t ALGO [OPTIONS] [INPUT]
 Pure-Rust streaming compression / decompression.
 
 Required:
-    -t, --type ALGO         Algorithm (use --list to see what's compiled in)
+    -t, --type ALGO         Algorithm (use --list to see what's compiled in).
+                            Optional on -d: if omitted, the format is
+                            auto-detected from the input's magic bytes.
 
 Mode:
     -d, --decompress        Decompress instead of compress
@@ -278,6 +280,25 @@ fn codec_err(e: compcol::Error) -> io::Error {
     io::Error::other(format!("{e}"))
 }
 
+/// Read up to `n` bytes from `reader`, returning what was available (possibly
+/// fewer than `n` near EOF, or empty). Used to buffer a prefix for format
+/// auto-detection without losing those bytes — the caller chains them back in
+/// front of the stream.
+fn read_up_to(reader: &mut dyn Read, n: usize) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; n];
+    let mut filled = 0;
+    while filled < n {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(got) => filled += got,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    buf.truncate(filled);
+    Ok(buf)
+}
+
 // ─── output-path derivation ──────────────────────────────────────────────
 
 enum Output {
@@ -285,7 +306,7 @@ enum Output {
     File(PathBuf),
 }
 
-fn derive_output(args: &Args) -> Result<Output, String> {
+fn derive_output(args: &Args, algo: &str) -> Result<Output, String> {
     if args.stdout {
         return Ok(Output::Stdout);
     }
@@ -297,7 +318,6 @@ fn derive_output(args: &Args) -> Result<Output, String> {
         None => return Ok(Output::Stdout),
     };
 
-    let algo = args.algorithm.as_deref().unwrap_or_default();
     let ext = factory::extension(algo).ok_or_else(|| {
         format!("no default extension for algorithm '{algo}'; use -c or -o to pick output")
     })?;
@@ -348,20 +368,21 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
-    let algo = match &args.algorithm {
-        Some(a) => a.clone(),
-        None => {
-            eprintln!("compcol: -t ALGO is required (or pass --list / --help)");
-            return ExitCode::from(2);
-        }
-    };
+    // `-t ALGO` is required for compression, and for decompression unless the
+    // format can be auto-detected from the input's leading magic bytes (see
+    // `run`). Only reject "no algorithm" outright on compress; on decompress
+    // we defer to detection.
+    if args.algorithm.is_none() && !args.decompress {
+        eprintln!("compcol: -t ALGO is required (or pass --list / --help)");
+        return ExitCode::from(2);
+    }
 
     if args.stdout && args.output.is_some() {
         eprintln!("compcol: -c and -o are mutually exclusive");
         return ExitCode::from(2);
     }
 
-    match run(&args, &algo) {
+    match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(RunError::Usage(msg)) => {
             eprintln!("compcol: {msg}");
@@ -385,8 +406,20 @@ impl From<io::Error> for RunError {
     }
 }
 
-fn run(args: &Args, algo: &str) -> Result<(), RunError> {
-    let output = derive_output(args).map_err(RunError::Usage)?;
+/// Number of leading bytes buffered for format auto-detection. The longest
+/// magic we examine is the StuffIt-classic check, which reaches byte 13, so a
+/// 16-byte window is comfortably sufficient.
+const PEEK_LEN: usize = 16;
+
+fn run(args: &Args) -> Result<(), RunError> {
+    if args.decompress && args.level.is_some() {
+        // Decompressors don't have a level — flag it rather than silently
+        // ignore so users notice the mistake. Checked up front, before any
+        // output file is created.
+        return Err(RunError::Usage(
+            "--level is only meaningful on compression (no -d)".into(),
+        ));
+    }
 
     // For in-place mode (input file + no -c/-o), we also remove the input on
     // success unless -k. Capture that decision up front.
@@ -405,6 +438,36 @@ fn run(args: &Args, algo: &str) -> Result<(), RunError> {
     } else {
         Box::new(BufReader::new(io::stdin()))
     };
+
+    // Resolve the algorithm. If the user passed `-t`, use it verbatim. On
+    // decompress with no `-t`, peek the leading bytes (without consuming them
+    // from the logical stream — they're buffered and chained back in below)
+    // and auto-detect the format from its magic bytes.
+    let mut peeked: Vec<u8> = Vec::new();
+    let algo: String = if let Some(a) = &args.algorithm {
+        a.clone()
+    } else {
+        // Only reachable on decompress: main() rejects a missing -t on
+        // compress before calling run().
+        peeked = read_up_to(&mut reader, PEEK_LEN)?;
+        match factory::detect(&peeked) {
+            Some(name) => name.to_string(),
+            None => {
+                return Err(RunError::Usage(
+                    "could not detect format; specify with --algo (e.g. -t gzip)".into(),
+                ));
+            }
+        }
+    };
+    // Re-prepend any bytes consumed for detection so the decoder sees the
+    // whole stream.
+    let mut reader: Box<dyn Read> = if peeked.is_empty() {
+        reader
+    } else {
+        Box::new(io::Cursor::new(peeked).chain(reader))
+    };
+
+    let output = derive_output(args, &algo).map_err(RunError::Usage)?;
 
     // Writer + the path we'd remove on cleanup if anything goes wrong.
     let stdout = io::stdout();
@@ -455,20 +518,13 @@ fn run(args: &Args, algo: &str) -> Result<(), RunError> {
     };
 
     let result = if args.decompress {
-        if args.level.is_some() {
-            // Decompressors don't have a level — flag it rather than
-            // silently ignore so users notice the mistake.
-            return Err(RunError::Usage(
-                "--level is only meaningful on compression (no -d)".into(),
-            ));
-        }
-        let dec = factory::decoder_by_name(algo)
+        let dec = factory::decoder_by_name(&algo)
             .ok_or_else(|| RunError::Usage(format!("unknown algorithm: '{algo}' (use --list)")))?;
         stream_decode(dec, &mut *reader, &mut *writer)
     } else {
         let enc = match args.level {
-            Some(level) => factory::encoder_by_name_with_level(algo, level),
-            None => factory::encoder_by_name(algo),
+            Some(level) => factory::encoder_by_name_with_level(&algo, level),
+            None => factory::encoder_by_name(&algo),
         }
         .ok_or_else(|| RunError::Usage(format!("unknown algorithm: '{algo}' (use --list)")))?;
         stream_encode(enc, &mut *reader, &mut *writer)
