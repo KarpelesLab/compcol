@@ -1,13 +1,18 @@
 #![no_main]
-use compcol::{Algorithm as _, Decoder as _};
+use compcol::Decoder as _;
 use libfuzzer_sys::fuzz_target;
 
 // Smoke property: the decoder must not panic on arbitrary input.
 // libfuzzer feeds us garbage bytes; we drive the decoder over them
 // and discard the result. Any panic, abort, or undefined behavior
 // trips the harness.
-fuzz_target!(|data: &[u8]| {
-    let mut dec = <compcol::lz4::Lz4>::decoder();
+//
+// BCJ is a branch-converter filter, not a true compressor: every byte
+// of input is reversibly transformed. We fuzz two architectures (x86
+// E8/E9 and ARM BL) since each has its own marker-detection state
+// machine. Both use the default `Config`.
+fn drive<A: compcol::Algorithm>(data: &[u8]) {
+    let mut dec = A::decoder();
     let mut out = vec![0u8; 64 * 1024];
     let mut consumed = 0;
     let mut steps = 0;
@@ -23,7 +28,6 @@ fuzz_target!(|data: &[u8]| {
         }
         steps += 1;
         if steps > 4096 {
-            // Defensive: pathological inputs shouldn't make us loop.
             return;
         }
     }
@@ -40,4 +44,9 @@ fuzz_target!(|data: &[u8]| {
             return;
         }
     }
+}
+
+fuzz_target!(|data: &[u8]| {
+    drive::<compcol::bcj::BcjX86>(data);
+    drive::<compcol::bcj::BcjArm>(data);
 });
