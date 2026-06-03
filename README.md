@@ -1,5 +1,10 @@
 # compcol
 
+[![crates.io](https://img.shields.io/crates/v/compcol.svg)](https://crates.io/crates/compcol)
+[![docs.rs](https://img.shields.io/docsrs/compcol)](https://docs.rs/compcol)
+[![CI](https://github.com/KarpelesLab/compcol/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/compcol/actions/workflows/ci.yml)
+[![license](https://img.shields.io/crates/l/compcol.svg)](./LICENSE)
+
 A collection of compression algorithms in pure Rust.
 
 `compcol` puts every supported algorithm — RLE, deflate, Deflate64,
