@@ -191,3 +191,73 @@ path             = "fuzz_targets/decoder_lzham.rs"
 test             = false
 doc              = false
 bench            = false
+
+[[bin]]
+name             = "decoder_lha"
+path             = "fuzz_targets/decoder_lha.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "decoder_bcj"
+path             = "fuzz_targets/decoder_bcj.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "decoder_delta"
+path             = "fuzz_targets/decoder_delta.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "decoder_arc_crunch"
+path             = "fuzz_targets/decoder_arc_crunch.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "decoder_arc_squeeze"
+path             = "fuzz_targets/decoder_arc_squeeze.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "decoder_arc_squash"
+path             = "fuzz_targets/decoder_arc_squash.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "decoder_rle90"
+path             = "fuzz_targets/decoder_rle90.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "decoder_lzah"
+path             = "fuzz_targets/decoder_lzah.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "decoder_sit13"
+path             = "fuzz_targets/decoder_sit13.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "decoder_arsenic"
+path             = "fuzz_targets/decoder_arsenic.rs"
+test             = false
+doc              = false
+bench            = false
