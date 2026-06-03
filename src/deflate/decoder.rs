@@ -20,11 +20,30 @@ use crate::traits::{RawDecoder, RawProgress};
 /// If `dictionary` is longer than 32 KiB only the trailing 32 KiB is
 /// retained (the rest is unreachable from any back-reference). An empty
 /// dictionary — the default — is equivalent to the older configless API.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecoderConfig {
     /// Bytes to load into the sliding window before decoding. Up to the
-    /// last 32 KiB are retained.
+    /// last `window_size` bytes are retained.
     pub dictionary: Vec<u8>,
+    /// Sliding-window size in bytes, clamped to `1..=WINDOW_SIZE` (the full
+    /// 32 KiB deflate window is the default). A smaller window lets the
+    /// decoder read streams produced for a small-window decoder — e.g.
+    /// qemu/qcow2 inflates compressed clusters with a 4 KiB window
+    /// (`inflateInit2(-12)`) — and uses proportionally less memory. Any
+    /// back-reference farther than `window_size` is rejected with
+    /// `Error::InvalidDistance`, so this also lets an encoder prove its
+    /// output stays within a given window (pair with
+    /// `EncoderConfig::max_distance`).
+    pub window_size: usize,
+}
+
+impl Default for DecoderConfig {
+    fn default() -> Self {
+        Self {
+            dictionary: Vec::new(),
+            window_size: WINDOW_SIZE,
+        }
+    }
 }
 
 use super::tables::{
@@ -104,9 +123,14 @@ enum DecState {
 
 pub struct Decoder {
     bit_reader: BitReader,
-    window: Box<[u8; WINDOW_SIZE]>,
+    /// Circular history buffer of `win_cap` bytes (heap-allocated to the
+    /// configured window size, ≤ 32 KiB).
+    window: Box<[u8]>,
+    /// Ring capacity = the sliding-window size = the maximum legal match
+    /// distance. `1..=WINDOW_SIZE`.
+    win_cap: usize,
     window_pos: usize,
-    window_size: usize, // 0..=WINDOW_SIZE; how many valid bytes lie behind window_pos
+    window_size: usize, // 0..=win_cap; how many valid bytes lie behind window_pos
     state: DecState,
     last_block: bool,
     poisoned: bool,
@@ -140,9 +164,18 @@ impl Decoder {
     }
 
     pub fn new() -> Self {
+        Self::with_window_capacity(WINDOW_SIZE)
+    }
+
+    /// Build a decoder whose sliding window holds `cap` bytes (clamped to
+    /// `1..=WINDOW_SIZE`). `cap` is both the history size and the maximum
+    /// legal back-reference distance.
+    fn with_window_capacity(cap: usize) -> Self {
+        let cap = cap.clamp(1, WINDOW_SIZE);
         Self {
             bit_reader: BitReader::new(),
-            window: Box::new([0u8; WINDOW_SIZE]),
+            window: alloc::vec![0u8; cap].into_boxed_slice(),
+            win_cap: cap,
             window_pos: 0,
             window_size: 0,
             state: DecState::BlockHeader,
@@ -157,7 +190,7 @@ impl Decoder {
     /// back-references can reach into it as if it were already-decoded
     /// output.
     pub fn with_config(config: DecoderConfig) -> Self {
-        let mut d = Self::new();
+        let mut d = Self::with_window_capacity(config.window_size);
         d.load_dictionary(&config.dictionary);
         d
     }
@@ -168,7 +201,7 @@ impl Decoder {
     /// (anything older is unreachable from a deflate back-reference).
     /// Replaces any prior window contents.
     pub(crate) fn load_dictionary(&mut self, dict: &[u8]) {
-        let take = dict.len().min(WINDOW_SIZE);
+        let take = dict.len().min(self.win_cap);
         let start = dict.len() - take;
         let bytes = &dict[start..];
         // Reset window state, then write the dictionary as if it had been
@@ -180,8 +213,8 @@ impl Decoder {
         self.window_size = 0;
         for &b in bytes {
             self.window[self.window_pos] = b;
-            self.window_pos = (self.window_pos + 1) % WINDOW_SIZE;
-            if self.window_size < WINDOW_SIZE {
+            self.window_pos = (self.window_pos + 1) % self.win_cap;
+            if self.window_size < self.win_cap {
                 self.window_size += 1;
             }
         }
@@ -222,8 +255,8 @@ impl Decoder {
         output[*written] = byte;
         *written += 1;
         self.window[self.window_pos] = byte;
-        self.window_pos = (self.window_pos + 1) % WINDOW_SIZE;
-        if self.window_size < WINDOW_SIZE {
+        self.window_pos = (self.window_pos + 1) % self.win_cap;
+        if self.window_size < self.win_cap {
             self.window_size += 1;
         }
     }
@@ -701,7 +734,18 @@ impl Decoder {
                             };
                             self.bit_reader.drop_bits(extra_bits as u32);
                             let distance = base_dist + extra;
-                            if distance == 0 || (distance as usize) > self.window_size {
+                            // Reject distance 0, distances reaching before the
+                            // start of produced output, and — for a reduced
+                            // window — anything beyond the configured size
+                            // (`window_size` is itself capped at `win_cap`, so
+                            // the second test only bites before the window has
+                            // filled; the explicit `win_cap` check documents the
+                            // small-window rejection that mirrors zlib's
+                            // `inflateInit2(-wbits)` Z_DATA_ERROR).
+                            if distance == 0
+                                || (distance as usize) > self.window_size
+                                || (distance as usize) > self.win_cap
+                            {
                                 return Err(self.poison(Error::InvalidDistance));
                             }
                             work.phase = HuffmanPhase::EmittingMatch {
@@ -737,11 +781,11 @@ impl Decoder {
                             let out_room = output.len() - *written;
                             let mut chunk = (remaining as usize).min(out_room);
                             if chunk > 0 && d >= chunk {
-                                let src = (self.window_pos + WINDOW_SIZE - d) % WINDOW_SIZE;
+                                let src = (self.window_pos + self.win_cap - d) % self.win_cap;
                                 // Limit chunk so source and destination
                                 // ranges do not wrap the circular window.
-                                let src_room = WINDOW_SIZE - src;
-                                let dst_room = WINDOW_SIZE - self.window_pos;
+                                let src_room = self.win_cap - src;
+                                let dst_room = self.win_cap - self.window_pos;
                                 chunk = chunk.min(src_room).min(dst_room);
                                 if chunk > 0 {
                                     // Copy to output.
@@ -751,10 +795,10 @@ impl Decoder {
                                     // don't overlap because d >= chunk).
                                     self.window.copy_within(src..src + chunk, self.window_pos);
                                     *written += chunk;
-                                    self.window_pos = (self.window_pos + chunk) % WINDOW_SIZE;
-                                    if self.window_size < WINDOW_SIZE {
+                                    self.window_pos = (self.window_pos + chunk) % self.win_cap;
+                                    if self.window_size < self.win_cap {
                                         self.window_size =
-                                            (self.window_size + chunk).min(WINDOW_SIZE);
+                                            (self.window_size + chunk).min(self.win_cap);
                                     }
                                     remaining -= chunk as u16;
                                     progress = true;
@@ -762,7 +806,7 @@ impl Decoder {
                             }
                             while remaining > 0 && *written < output.len() {
                                 let d = distance as usize;
-                                let src = (self.window_pos + WINDOW_SIZE - d) % WINDOW_SIZE;
+                                let src = (self.window_pos + self.win_cap - d) % self.win_cap;
                                 let b = self.window[src];
                                 self.emit_byte(b, output, written);
                                 remaining -= 1;

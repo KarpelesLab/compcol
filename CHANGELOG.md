@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Configurable deflate window** for small-window interop and memory-limited
+  decoding:
+  - `deflate::EncoderConfig::max_distance` caps the LZ77 back-reference
+    distance (clamped to `1..=32768`), so the encoder can target a decoder
+    with a smaller sliding window — e.g. qemu/qcow2 inflates clusters with a
+    4 KiB window (`inflateInit2(-12)`) and rejects farther references.
+  - `deflate::DecoderConfig::window_size` sizes the decoder's history ring
+    (clamped to `1..=32768`, default 32 KiB): it allocates only that much and
+    rejects any back-reference beyond it with `Error::InvalidDistance` — both
+    a memory knob for constrained systems and a way to validate that an
+    encoded stream stays within a given window.
+
 - **Format auto-detection** (`factory::detect`): sniff a stream's leading
   bytes and return the matching codec name by magic signature (gzip, zlib,
   xz, zstd, bzip2, lz4-frame, RAR, StuffIt/StuffIt 5), feature-gated so only

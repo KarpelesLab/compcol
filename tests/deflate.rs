@@ -62,7 +62,15 @@ fn encode_chunked(enc: &mut Encoder, input: &[u8], in_chunk: usize, out_chunk: u
 /// an empty input slice to flush any output the decoder can still produce
 /// from bits already buffered internally, before calling `finish`.
 fn decode_chunked(encoded: &[u8], in_chunk: usize, out_chunk: usize) -> Result<Vec<u8>, Error> {
-    let mut dec = Decoder::new();
+    decode_with_decoder(Decoder::new(), encoded, in_chunk, out_chunk)
+}
+
+fn decode_with_decoder(
+    mut dec: Decoder,
+    encoded: &[u8],
+    in_chunk: usize,
+    out_chunk: usize,
+) -> Result<Vec<u8>, Error> {
     let mut decoded = Vec::new();
     let mut buf = vec![0u8; out_chunk.max(1)];
     let mut i = 0;
@@ -363,7 +371,10 @@ fn round_trip_mixed_corpus_default_level() {
 // ─── level-specific tests ───────────────────────────────────────────────
 
 fn encode_at_level(input: &[u8], level: u8) -> Vec<u8> {
-    let mut enc = Encoder::with_config(EncoderConfig { level });
+    let mut enc = Encoder::with_config(EncoderConfig {
+        level,
+        ..Default::default()
+    });
     encode_chunked(&mut enc, input, 4096, 4096)
 }
 
@@ -376,7 +387,10 @@ fn round_trip_level_1() {
         b"hello world",
         &b"abcabcabcabcabc".repeat(100)[..],
     ] {
-        let mut enc = Encoder::with_config(EncoderConfig { level: 1 });
+        let mut enc = Encoder::with_config(EncoderConfig {
+            level: 1,
+            ..Default::default()
+        });
         let encoded = encode_chunked(&mut enc, input, 4096, 4096);
         let decoded = decode_chunked(&encoded, 4096, 4096).unwrap();
         assert_eq!(decoded, input);
@@ -390,7 +404,10 @@ fn round_trip_level_9() {
         b"hello world",
         &b"abcabcabcabcabc".repeat(100)[..],
     ] {
-        let mut enc = Encoder::with_config(EncoderConfig { level: 9 });
+        let mut enc = Encoder::with_config(EncoderConfig {
+            level: 9,
+            ..Default::default()
+        });
         let encoded = encode_chunked(&mut enc, input, 4096, 4096);
         let decoded = decode_chunked(&encoded, 4096, 4096).unwrap();
         assert_eq!(decoded, input);
@@ -420,10 +437,16 @@ fn out_of_range_level_is_clamped() {
     // Level 0 and level 250 should both produce valid streams (clamped to
     // 1 and 9 respectively) — we don't expose a fallible constructor.
     let input = b"the rain in spain falls mainly on the plain";
-    let mut enc_lo = Encoder::with_config(EncoderConfig { level: 0 });
+    let mut enc_lo = Encoder::with_config(EncoderConfig {
+        level: 0,
+        ..Default::default()
+    });
     let enc_lo_out = encode_chunked(&mut enc_lo, input, 4096, 4096);
     assert_eq!(decode_chunked(&enc_lo_out, 4096, 4096).unwrap(), input);
-    let mut enc_hi = Encoder::with_config(EncoderConfig { level: 250 });
+    let mut enc_hi = Encoder::with_config(EncoderConfig {
+        level: 250,
+        ..Default::default()
+    });
     let enc_hi_out = encode_chunked(&mut enc_hi, input, 4096, 4096);
     assert_eq!(decode_chunked(&enc_hi_out, 4096, 4096).unwrap(), input);
 }
@@ -461,7 +484,10 @@ fn reset_preserves_level_and_allows_reuse() {
     let input_a = b"alpha alpha alpha alpha alpha".as_slice();
     let input_b = b"bravo bravo bravo bravo bravo".as_slice();
 
-    let mut enc = Encoder::with_config(EncoderConfig { level: 9 });
+    let mut enc = Encoder::with_config(EncoderConfig {
+        level: 9,
+        ..Default::default()
+    });
     let encoded_a = encode_chunked(&mut enc, input_a, 4096, 4096);
     enc.reset();
     let encoded_b = encode_chunked(&mut enc, input_b, 4096, 4096);
@@ -471,7 +497,10 @@ fn reset_preserves_level_and_allows_reuse() {
 
     // After reset, an encoder configured at level 9 should still be at
     // level 9. Compare with a fresh level-9 encoder on the same input.
-    let mut fresh = Encoder::with_config(EncoderConfig { level: 9 });
+    let mut fresh = Encoder::with_config(EncoderConfig {
+        level: 9,
+        ..Default::default()
+    });
     let fresh_b = encode_chunked(&mut fresh, input_b, 4096, 4096);
     assert_eq!(encoded_b, fresh_b, "reset must preserve compression level");
 }
@@ -574,8 +603,14 @@ fn algorithm_encoder_decoder_round_trip() {
 #[test]
 fn algorithm_encoder_with_uses_config() {
     let input = b"abcabcabcabcabcabc".repeat(100);
-    let mut enc_lo = <Deflate as Algorithm>::encoder_with(EncoderConfig { level: 1 });
-    let mut enc_hi = <Deflate as Algorithm>::encoder_with(EncoderConfig { level: 9 });
+    let mut enc_lo = <Deflate as Algorithm>::encoder_with(EncoderConfig {
+        level: 1,
+        ..Default::default()
+    });
+    let mut enc_hi = <Deflate as Algorithm>::encoder_with(EncoderConfig {
+        level: 9,
+        ..Default::default()
+    });
     let lo = encode_chunked(&mut enc_lo, &input, 4096, 4096);
     let hi = encode_chunked(&mut enc_hi, &input, 4096, 4096);
     assert!(
@@ -709,13 +744,17 @@ fn deflate_decoder_preset_dictionary_decodes_cross_block_backref() {
     // With dictionary: decoding succeeds and yields the original payload.
     let with_dict = Decoder::with_config(DecoderConfig {
         dictionary: dictionary.clone(),
+        ..Default::default()
     });
     let out = drain_full(with_dict, &encoded).unwrap();
     assert_eq!(out, expected);
 
     // Same fixture via Algorithm::decoder_with — confirms the wiring up
     // through the public type-associated config type is sound.
-    let from_algo: Decoder = Deflate::decoder_with(DecoderConfig { dictionary });
+    let from_algo: Decoder = Deflate::decoder_with(DecoderConfig {
+        dictionary,
+        ..Default::default()
+    });
     let out = drain_full(from_algo, &encoded).unwrap();
     assert_eq!(out, expected);
 }
@@ -742,6 +781,7 @@ fn deflate_decoder_reset_keep_window_preserves_history_for_mszip() {
     // of the dictionary text.
     let mut dec = Decoder::with_config(DecoderConfig {
         dictionary: dictionary.clone(),
+        ..Default::default()
     });
     // Empty fixed-Huffman block: BFINAL=1, BTYPE=01, then EOB (code 256
     // = 7-bit 0b0000000). Packed LSB-first: 0b00000011 = 0x03, 0x00.
@@ -769,6 +809,7 @@ fn deflate_decoder_full_reset_drops_dictionary() {
 
     let mut dec = Decoder::with_config(DecoderConfig {
         dictionary: dictionary.clone(),
+        ..Default::default()
     });
     let empty_block = [0x03u8, 0x00];
     let mut buf = vec![0u8; 64];
@@ -794,6 +835,7 @@ fn deflate_decoder_preset_dictionary_long_is_truncated() {
     let huge = vec![0xAAu8; 48 * 1024]; // 48 KiB of one byte
     let dec = Decoder::with_config(DecoderConfig {
         dictionary: huge.clone(),
+        ..Default::default()
     });
     // Decode an empty block — just smoke-test that construction worked.
     let empty_block = [0x03u8, 0x00];
@@ -801,4 +843,112 @@ fn deflate_decoder_preset_dictionary_long_is_truncated() {
     let mut dec = dec;
     let (_, status) = dec.decode(&empty_block, &mut buf).unwrap();
     assert!(matches!(status, Status::StreamEnd | Status::InputEmpty));
+}
+
+// ─── max_distance cap (small-window decoder interop, e.g. qemu/qcow2) ─────
+
+/// A decoder running a 4 KiB sliding window (zlib `inflateInit2(-12)`, as
+/// qemu/qcow2 uses for compressed clusters) rejects any back-reference
+/// farther than 4096 bytes. `EncoderConfig::max_distance` caps the LZ77
+/// distance so the output stays within such a window. Dependency-free checks:
+///   1. capping still round-trips correctly through our decoder, and
+///   2. the cap actually suppresses the far match — a repeat placed > 4 KiB
+///      back is codable as a match with the full 32 KiB window but not with
+///      the 4 KiB cap, so the capped stream is strictly larger.
+#[test]
+fn max_distance_cap_suppresses_far_matches_and_round_trips() {
+    // 64-byte distinctive marker, then ~8 KiB of incompressible filler, then
+    // the marker again — the second copy is ~8 KiB behind the first.
+    let marker: Vec<u8> = (0..64u16)
+        .map(|i| (i.wrapping_mul(37) ^ 0xA5) as u8)
+        .collect();
+    let mut input = Vec::new();
+    input.extend_from_slice(&marker);
+    let mut s = 0x1234_5678u32;
+    for _ in 0..8192 {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        input.push((s >> 24) as u8);
+    }
+    input.extend_from_slice(&marker);
+
+    // Full 32 KiB window (default): can reference the marker ~8 KiB back.
+    let mut enc_full = Encoder::with_config(EncoderConfig {
+        level: 9,
+        ..Default::default()
+    });
+    let full = encode_chunked(&mut enc_full, &input, input.len(), 4096);
+
+    // 4 KiB cap: the far marker match is out of range.
+    let mut enc_cap = Encoder::with_config(EncoderConfig {
+        level: 9,
+        max_distance: 4096,
+    });
+    let capped = encode_chunked(&mut enc_cap, &input, input.len(), 4096);
+
+    // Both must decode back to the original.
+    assert_eq!(decode_chunked(&full, full.len(), 4096).unwrap(), input);
+    assert_eq!(decode_chunked(&capped, capped.len(), 4096).unwrap(), input);
+
+    // The cap suppressed the far match, so the capped stream can't be smaller.
+    assert!(
+        capped.len() > full.len(),
+        "max_distance cap should suppress the far match (capped={}, full={})",
+        capped.len(),
+        full.len()
+    );
+}
+
+/// End-to-end pairing of the encoder distance cap with the decoder window
+/// cap, reproducing the qemu/qcow2 scenario: a stream encoded with
+/// `max_distance: 4096` decodes under a 4 KiB-window decoder, while the
+/// full-window encoding of the same far-repeat data is *rejected* by that
+/// decoder with `InvalidDistance` — exactly what zlib's `inflateInit2(-12)`
+/// does (Z_DATA_ERROR). A full-window decoder still reads the latter fine.
+#[test]
+fn small_window_decoder_accepts_capped_and_rejects_far_refs() {
+    let marker: Vec<u8> = (0..64u16)
+        .map(|i| (i.wrapping_mul(37) ^ 0xA5) as u8)
+        .collect();
+    let mut input = Vec::new();
+    input.extend_from_slice(&marker);
+    let mut s = 0x1234_5678u32;
+    for _ in 0..8192 {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        input.push((s >> 24) as u8);
+    }
+    input.extend_from_slice(&marker);
+
+    let win = || {
+        Deflate::decoder_with(DecoderConfig {
+            window_size: 4096,
+            ..Default::default()
+        })
+    };
+
+    // Capped encoder → a 4 KiB-window decoder reads it correctly.
+    let mut enc_cap = Encoder::with_config(EncoderConfig {
+        level: 9,
+        max_distance: 4096,
+    });
+    let capped = encode_chunked(&mut enc_cap, &input, input.len(), 4096);
+    assert_eq!(
+        decode_with_decoder(win(), &capped, capped.len(), 4096).unwrap(),
+        input
+    );
+
+    // Full-window encoder uses the far (~8 KiB) match → the 4 KiB-window
+    // decoder rejects it, just like qemu would.
+    let mut enc_full = Encoder::with_config(EncoderConfig {
+        level: 9,
+        ..Default::default()
+    });
+    let full = encode_chunked(&mut enc_full, &input, input.len(), 4096);
+    let res = decode_with_decoder(win(), &full, full.len(), 4096);
+    assert!(
+        matches!(res, Err(Error::InvalidDistance)),
+        "4 KiB-window decoder must reject a >4 KiB back-reference, got {res:?}"
+    );
+
+    // The full 32 KiB-window decoder still reads the full-window stream fine.
+    assert_eq!(decode_chunked(&full, full.len(), 4096).unwrap(), input);
 }

@@ -36,13 +36,30 @@ pub struct MatchFinder {
     /// `prev[pos & PREV_MASK]` is the absolute position of the previous
     /// occurrence of the same hash before `pos`, or NIL.
     prev: Box<[u32; PREV_SIZE]>,
+    /// Hard cap on the match distance the finder will emit, in bytes
+    /// (effective range `1..=WINDOW_SIZE`). The full deflate window is
+    /// `WINDOW_SIZE`; a smaller value lets the encoder produce a stream a
+    /// decoder running a smaller sliding window can still inflate — e.g.
+    /// qemu/qcow2 inflates compressed clusters with a 4 KiB window
+    /// (`inflateInit2(-12)`), which rejects any back-reference farther than
+    /// 4096 bytes.
+    max_distance: usize,
 }
 
 impl MatchFinder {
+    /// Match finder using the full `WINDOW_SIZE` (32 KiB) distance window.
     pub fn new() -> Self {
+        Self::with_max_distance(WINDOW_SIZE)
+    }
+
+    /// Match finder that never emits a back-reference farther than
+    /// `max_distance` bytes. The value is clamped to `1..=WINDOW_SIZE`
+    /// (0 is treated as 1; values above the window are capped to it).
+    pub fn with_max_distance(max_distance: usize) -> Self {
         Self {
             head: Box::new([NIL; HASH_SIZE]),
             prev: Box::new([NIL; PREV_SIZE]),
+            max_distance: max_distance.clamp(1, WINDOW_SIZE),
         }
     }
 
@@ -117,7 +134,7 @@ impl MatchFinder {
         let h = hash3(window[rel], window[rel + 1], window[rel + 2]);
         let idx = (h as usize) & (HASH_SIZE - 1);
 
-        let max_dist = WINDOW_SIZE.min(abs_pos as usize);
+        let max_dist = self.max_distance.min(abs_pos as usize);
         let max_len = MAX_MATCH.min(window.len() - rel);
         if max_len < MIN_MATCH {
             return None;

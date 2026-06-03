@@ -420,6 +420,7 @@ impl Encoder {
         Self {
             inner: deflate::Encoder::with_config(deflate::EncoderConfig {
                 level: config.level,
+                ..deflate::EncoderConfig::default()
             }),
             adler: Adler32::new(),
             header: [cmf, flg],
