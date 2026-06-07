@@ -568,7 +568,12 @@ impl Decoder {
                 return Ok(true);
             }
         }
-        let n = self.num_nodes.unwrap();
+        // `num_nodes` is set above (or on a prior streaming call) before we
+        // reach here; treat an unset count as corrupt rather than panicking.
+        let n = match self.num_nodes {
+            Some(n) => n,
+            None => return Err(Error::Corrupt),
+        };
         // node table: 4·n bytes.
         if self.in_buf.len() - self.in_pos < 4 * n {
             return Ok(false);

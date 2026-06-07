@@ -228,10 +228,14 @@ impl Decoder {
             // AFTER a drop. We follow the same shape — but we need to
             // guarantee the next refill is buffered (2 bytes per word)
             // so we don't panic on partial input.
-            let table = self
-                .table
-                .as_ref()
-                .expect("decode_loop entered without a primed block");
+            // Invariant: a block is always primed before the symbol loop is
+            // entered. Treat a missing table as corrupt input rather than
+            // panicking, so the no-panic-on-untrusted-input guarantee holds
+            // structurally even if that invariant is ever weakened.
+            let table = match self.table.as_ref() {
+                Some(t) => t,
+                None => return Err(self.poison(Error::Corrupt)),
+            };
             let idx = (self.next_bits >> (32 - 15)) as usize;
             let (symbol, len) = table[idx];
             let len = len as u32;
