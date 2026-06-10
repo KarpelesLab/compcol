@@ -912,6 +912,15 @@ fn step_huff(ctx: &mut RunCtx) -> Result<bool, Error> {
                         if src != ctx.window_pos
                             && src + chunk <= win_size
                             && ctx.window_pos + chunk <= win_size
+                            // Ensure the two sub-ranges are non-overlapping so
+                            // the split_at_mut slices stay in bounds. In the
+                            // wrap case (src > window_pos) this guarantees
+                            // dst_start + chunk <= lo_start; without it the
+                            // a[dst_start..dst_start + chunk] slice runs off the
+                            // end of the lower half (len == src) and panics.
+                            // When this fails we fall through to the correct
+                            // byte-by-byte copy loop below.
+                            && chunk + dist <= win_size
                         {
                             let (lo_start, dst_start) = (src, ctx.window_pos);
                             let (lo, hi) = if lo_start < dst_start {
