@@ -413,21 +413,46 @@ fn apply_offset(offset_value: u32, literal_length: u32, prev: &mut [u32; 3]) -> 
 ///
 /// `history` is the previously-decoded output (so back-references can read
 /// from it); decoded bytes are appended to `history`.
+///
+/// `max_block_output` is the per-block decoded-output bound. Per RFC 8478
+/// §3.1.1.2 a single Compressed_Block may decode to at most
+/// `Block_Maximum_Size = min(Window_Size, 128 KiB)` bytes. Without this cap a
+/// malicious block using RLE_Mode FSE tables (e.g. match-length RLE symbol 52,
+/// `ml_base = 65539`, consuming no state bits) emits ~65 KiB per cheap
+/// sequence, letting a ~128 KiB input block expand `history` to multiple GiB
+/// before any output is drained — a decompression-bomb OOM that bypasses the
+/// drained-bytes metering in [`crate::limit::LimitedDecoder`]. We track the
+/// bytes this block appends (literals **and** match copies, plus the trailing
+/// literals) and abort as soon as the running total would exceed the bound.
 pub fn execute_sequences(
     sequences: &[Sequence],
     literals: &[u8],
     history: &mut Vec<u8>,
+    max_block_output: usize,
 ) -> Result<(), Error> {
+    // Bytes appended to `history` by *this* block so far. `history` itself
+    // carries earlier blocks' output, so we meter against this running counter
+    // rather than `history.len()`.
+    let mut block_output = 0usize;
     let mut lit_pos = 0usize;
     for seq in sequences {
         let ll = seq.literal_length as usize;
         if lit_pos + ll > literals.len() {
             return Err(Error::Corrupt);
         }
+        let ml = seq.match_length as usize;
+        // Reject before allocating: a literal-run + match-length that would
+        // push this block past Block_Maximum_Size is a decompression bomb.
+        block_output = block_output
+            .checked_add(ll)
+            .and_then(|n| n.checked_add(ml))
+            .ok_or(Error::Corrupt)?;
+        if block_output > max_block_output {
+            return Err(Error::Corrupt);
+        }
         history.extend_from_slice(&literals[lit_pos..lit_pos + ll]);
         lit_pos += ll;
         let offset = seq.offset as usize;
-        let ml = seq.match_length as usize;
         if offset == 0 || offset > history.len() {
             return Err(Error::Corrupt);
         }
@@ -447,8 +472,14 @@ pub fn execute_sequences(
             }
         }
     }
-    // Trailing literals: leftover bytes copied verbatim.
+    // Trailing literals: leftover bytes copied verbatim. They also count
+    // toward the per-block output bound.
     if lit_pos < literals.len() {
+        let trailing = literals.len() - lit_pos;
+        let total = block_output.checked_add(trailing).ok_or(Error::Corrupt)?;
+        if total > max_block_output {
+            return Err(Error::Corrupt);
+        }
         history.extend_from_slice(&literals[lit_pos..]);
     }
     Ok(())

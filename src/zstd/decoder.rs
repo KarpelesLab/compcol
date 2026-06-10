@@ -663,7 +663,20 @@ impl Decoder {
         let seq_data = &block[after_lit..];
         let seqs = decode_sequences(seq_data, &mut self.seq_state)?;
         // 3. LZ77 reconstruction. Append to history.
-        execute_sequences(&seqs, &lit.literals, &mut self.history)?;
+        //
+        // Per RFC 8478 §3.1.1.2 a single Compressed_Block decodes to at most
+        // Block_Maximum_Size = min(Window_Size, 128 KiB). Enforce that bound on
+        // the bytes this block appends so a malicious block (e.g. RLE_Mode FSE
+        // tables emitting huge match-lengths from cheap sequences) can't expand
+        // `history` to multiple GiB before any output is drained. When no
+        // Window_Descriptor was present (window_size == 0) fall back to the
+        // 128 KiB block cap.
+        let block_max = if self.window_size == 0 {
+            128 * 1024
+        } else {
+            core::cmp::min(self.window_size, 128 * 1024)
+        } as usize;
+        execute_sequences(&seqs, &lit.literals, &mut self.history, block_max)?;
         // Return ownership of comp_buf for reuse.
         self.comp_buf = block;
         self.comp_buf.clear();
