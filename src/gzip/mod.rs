@@ -281,6 +281,13 @@ impl RawDecoder for Decoder {
                     }
                     if self.aux_remaining == 0 {
                         self.phase = self.next_after(DecPhase::ExtraData);
+                        // ExtraLen leaves `aux_idx == 2`; HeaderCrc reuses the
+                        // same counter, so reset it on the transition into the
+                        // CRC-skip phase or the loop there would consume 0 bytes
+                        // and feed the FHCRC field into the deflate decoder.
+                        if self.phase == DecPhase::HeaderCrc {
+                            self.aux_idx = 0;
+                        }
                     } else {
                         return Ok(RawProgress {
                             consumed,
@@ -301,6 +308,10 @@ impl RawDecoder for Decoder {
                     }
                     if found_nul {
                         self.phase = self.next_after(DecPhase::Name);
+                        // See ExtraData arm: HeaderCrc shares `aux_idx`.
+                        if self.phase == DecPhase::HeaderCrc {
+                            self.aux_idx = 0;
+                        }
                     } else {
                         return Ok(RawProgress {
                             consumed,
@@ -321,6 +332,10 @@ impl RawDecoder for Decoder {
                     }
                     if found_nul {
                         self.phase = self.next_after(DecPhase::Comment);
+                        // See ExtraData arm: HeaderCrc shares `aux_idx`.
+                        if self.phase == DecPhase::HeaderCrc {
+                            self.aux_idx = 0;
+                        }
                     } else {
                         return Ok(RawProgress {
                             consumed,
