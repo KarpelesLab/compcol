@@ -612,14 +612,20 @@ impl RawDecoder for Decoder {
                             return Err(Error::Corrupt);
                         }
                         self.decoded.clear();
-                        self.decoded.reserve(payload_len);
+                        // `payload_len` is attacker-declared and validated only
+                        // against max_block_raw, not bytes remaining, so reserve
+                        // a bounded floor and let extend_from_slice grow as real
+                        // bytes arrive (mirrors lz4's frame-decoder reserve cap).
+                        self.decoded.reserve(payload_len.min(64 * 1024));
                         self.decoded_idx = 0;
                         self.phase = DecPhase::RawBlock {
                             remaining: payload_len,
                         };
                     } else {
                         self.block_buf.clear();
-                        self.block_buf.reserve(payload_len);
+                        // Bounded floor; the CompressedBlock phase grows
+                        // `block_buf` incrementally via extend_from_slice.
+                        self.block_buf.reserve(payload_len.min(64 * 1024));
                         self.phase = DecPhase::CompressedBlock {
                             block_len: payload_len,
                             gathered: 0,
