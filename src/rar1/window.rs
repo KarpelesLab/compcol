@@ -125,11 +125,36 @@ impl Window {
         let mask = WINDOW_SIZE - 1;
         let mut src = (self.write_pos + WINDOW_SIZE - distance) & mask;
         let mut dst = self.write_pos;
-        for _ in 0..length {
+        if distance == 1 {
+            // Distance-1 run: one repeated byte.
             let b = self.buf[src];
-            self.buf[dst] = b;
-            src = (src + 1) & mask;
-            dst = (dst + 1) & mask;
+            for _ in 0..length {
+                self.buf[dst] = b;
+                dst = (dst + 1) & mask;
+            }
+        } else if distance >= length {
+            // Non-overlapping: copy in contiguous window segments (no per-byte
+            // mask test inside the run).
+            let mut done = 0usize;
+            while done < length {
+                let run = (length - done)
+                    .min(WINDOW_SIZE - src)
+                    .min(WINDOW_SIZE - dst);
+                for k in 0..run {
+                    self.buf[dst + k] = self.buf[src + k];
+                }
+                src = (src + run) & mask;
+                dst = (dst + run) & mask;
+                done += run;
+            }
+        } else {
+            // Overlapping match: each written byte feeds a later read.
+            for _ in 0..length {
+                let b = self.buf[src];
+                self.buf[dst] = b;
+                src = (src + 1) & mask;
+                dst = (dst + 1) & mask;
+            }
         }
         self.write_pos = dst;
         self.in_flight += length;

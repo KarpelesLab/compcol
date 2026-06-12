@@ -321,14 +321,44 @@ impl RunCtx {
         if off > wlen {
             return Err(Error::InvalidDistance);
         }
-        for _ in 0..length {
-            let src = (self.window_pos + wlen - off) & wmask;
+        // Clamp the run to the declared unpack size (the old loop broke per
+        // byte once `out` reached it — produce exactly the same byte count).
+        let remaining_out = self.unpack_size.saturating_sub(self.out.len() as u64);
+        let length = (length as u64).min(remaining_out) as usize;
+        let mut src = (self.window_pos + wlen - off) & wmask;
+        self.out.reserve(length);
+
+        if off == 1 {
+            // Distance-1 run: one repeated byte. Fill directly.
             let b = self.window[src];
-            self.out.push(b);
-            self.window[self.window_pos] = b;
-            self.window_pos = (self.window_pos + 1) & wmask;
-            if (self.out.len() as u64) >= self.unpack_size {
-                break;
+            for _ in 0..length {
+                self.out.push(b);
+                self.window[self.window_pos] = b;
+                self.window_pos = (self.window_pos + 1) & wmask;
+            }
+        } else if off >= length {
+            // Non-overlapping: src and dst regions are disjoint. Copy in
+            // contiguous window segments (no per-byte recompute of `src`).
+            let mut done = 0usize;
+            while done < length {
+                let run = (length - done).min(wlen - src).min(wlen - self.window_pos);
+                for k in 0..run {
+                    let b = self.window[src + k];
+                    self.out.push(b);
+                    self.window[self.window_pos + k] = b;
+                }
+                src = (src + run) & wmask;
+                self.window_pos = (self.window_pos + run) & wmask;
+                done += run;
+            }
+        } else {
+            // Overlapping match: each written byte feeds a later read.
+            for _ in 0..length {
+                let b = self.window[src];
+                self.out.push(b);
+                self.window[self.window_pos] = b;
+                src = (src + 1) & wmask;
+                self.window_pos = (self.window_pos + 1) & wmask;
             }
         }
         Ok(())

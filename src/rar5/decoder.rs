@@ -501,14 +501,45 @@ impl Decoder {
         }
         let ws = self.window_size;
         let wmask = self.window_mask;
-        for _ in 0..length {
-            let src = (self.window_pos + ws - dist as usize) & wmask;
+        let off = dist as usize;
+        // Clamp the run to the declared unpack total (the old loop broke per
+        // byte once it was reached — produce exactly the same byte count).
+        let produced = self.unpack_so_far + self.out_queue.len() as u64;
+        let remaining = self.unpack_total.saturating_sub(produced);
+        let length_n = (length as u64).min(remaining) as usize;
+        let mut src = (self.window_pos + ws - off) & wmask;
+
+        if off == 1 {
+            // Distance-1 run: one repeated byte.
             let b = self.window[src];
-            self.window[self.window_pos] = b;
-            self.window_pos = (self.window_pos + 1) & wmask;
-            self.out_queue.push_back(b);
-            if self.unpack_so_far + self.out_queue.len() as u64 >= self.unpack_total {
-                break;
+            for _ in 0..length_n {
+                self.window[self.window_pos] = b;
+                self.window_pos = (self.window_pos + 1) & wmask;
+                self.out_queue.push_back(b);
+            }
+        } else if off >= length_n {
+            // Non-overlapping: copy in contiguous window segments.
+            let mut done = 0usize;
+            while done < length_n {
+                let run = (length_n - done).min(ws - src).min(ws - self.window_pos);
+                let sp = self.window_pos;
+                for k in 0..run {
+                    let b = self.window[src + k];
+                    self.window[sp + k] = b;
+                    self.out_queue.push_back(b);
+                }
+                src = (src + run) & wmask;
+                self.window_pos = (self.window_pos + run) & wmask;
+                done += run;
+            }
+        } else {
+            // Overlapping match: each written byte feeds a later read.
+            for _ in 0..length_n {
+                let b = self.window[src];
+                self.window[self.window_pos] = b;
+                src = (src + 1) & wmask;
+                self.window_pos = (self.window_pos + 1) & wmask;
+                self.out_queue.push_back(b);
             }
         }
         self.last_len = length;
