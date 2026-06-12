@@ -456,7 +456,10 @@ pub fn decode_payload(
                 // Literal.
                 out.push(code as u8);
                 ring[ring_pos] = code as u8;
-                ring_pos = (ring_pos + 1) % ring_size;
+                ring_pos += 1;
+                if ring_pos == ring_size {
+                    ring_pos = 0;
+                }
             } else {
                 let count = code - 256 + MIN_MATCH;
                 if count > MAX_MATCH {
@@ -469,17 +472,61 @@ pub fn decode_payload(
                 if offset >= ring_size {
                     return Err(Error::InvalidDistance);
                 }
-                let start = (ring_pos + ring_size - offset - 1) % ring_size;
-                for k in 0..count {
-                    if let Some(n) = expected
-                        && out.len() >= n
-                    {
-                        break;
+                let limit = expected.unwrap_or(usize::MAX);
+                // Clamp the run to the declared output length.
+                let count = count.min(limit.saturating_sub(out.len()));
+                let mut src = (ring_pos + ring_size - offset - 1) % ring_size;
+                // Reserve output once so the per-byte push can't reallocate.
+                out.reserve(count);
+                if offset + 1 >= count {
+                    // Non-overlapping match: source and destination regions are
+                    // disjoint, so copy in at most two contiguous ring segments
+                    // (split only where src or dst wraps the ring). Each segment
+                    // is a straight-line memcpy-style loop with no per-byte
+                    // wrap test.
+                    let mut done = 0usize;
+                    while done < count {
+                        let run = (count - done)
+                            .min(ring_size - src)
+                            .min(ring_size - ring_pos);
+                        // Copy `run` bytes ring[src..] -> out and -> ring[dst..].
+                        for k in 0..run {
+                            let b = ring[src + k];
+                            out.push(b);
+                            ring[ring_pos + k] = b;
+                        }
+                        src += run;
+                        if src == ring_size {
+                            src = 0;
+                        }
+                        ring_pos += run;
+                        if ring_pos == ring_size {
+                            ring_pos = 0;
+                        }
+                        done += run;
                     }
-                    let b = ring[(start + k) % ring_size];
-                    out.push(b);
-                    ring[ring_pos] = b;
-                    ring_pos = (ring_pos + 1) % ring_size;
+                } else if offset == 0 {
+                    // Single-byte run (distance 1): the whole match is one
+                    // repeated byte. Fill directly instead of chasing the ring.
+                    let b = ring[src];
+                    for _ in 0..count {
+                        out.push(b);
+                        ring[ring_pos] = b;
+                        ring_pos += 1;
+                        if ring_pos == ring_size {
+                            ring_pos = 0;
+                        }
+                    }
+                } else {
+                    // Overlapping match (offset+1 < count): each written byte
+                    // feeds a later read, so walk byte-by-byte.
+                    for _ in 0..count {
+                        let b = ring[src];
+                        out.push(b);
+                        ring[ring_pos] = b;
+                        src = (src + 1) % ring_size;
+                        ring_pos = (ring_pos + 1) % ring_size;
+                    }
                 }
             }
             remaining -= 1;
