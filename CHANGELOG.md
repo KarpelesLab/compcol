@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/KarpelesLab/compcol/compare/v0.6.1...v0.6.2) - 2026-06-12
+
+### Other
+
+- changelog entry for codec throughput optimizations
+- bulk match-copy in decode loops
+- bulk LZ77 match-copy in decode window loops
+- bulk match-copy in static-Huffman decode hot loop
+- vectorizable filter loop via direct predecessor indexing
+- single-write LZW string assembly + literal fast path
+- single-write LZW string assembly + literal fast path
+- byte-wide FSA Huffman decoder
+- bulk copy_within for non-overlapping match copies
+- amortize decoder history trim (O(n²) → O(n))
+- recurse SA-IS reduced problem in place (drop per-level copy)
+- cut SA-IS allocations and inline induced-sort hot paths
+- *(snappy)* skip-step accelerator in encoder match search
+- *(lzo)* skip-step accelerator in encoder match search
+- *(lzw)* single-pass string emit, drop scratch stack
+- *(decoders)* bulk overlapping match copy in lz4/lz5/lzo/snappy
+- fetch each FSE entry once per sequence (symbol + advance share load)
+- hoist LL/ML base+extra tables to module-level const
+- inline RevBitReader::read fast path, split wide reads out of line
+- skip zero-bit reads and inline FSE state transitions
+- faster Huffman literal decode via peek/consume
+- widen Huffman fast-path LUT from 9 to 11 bits
+- skip literal context lookup when there is a single tree
+- keep bit accumulator across Huffman LUT hits
+- bulk overlapping match-copy in decoder drain loops (.lzma decode)
+- bulk overlapping match-copy in decode_chunk (xz/lzma2 decode)
+- bulk match-copy in decode_chunk (xz/lzma2 decode)
+- vectorize decoder match-copy incl. overlapping runs
+- replace per-literal modulo with a wrap branch in emit_byte
+- vectorize decoder match-copy incl. overlapping runs
+- bulk-copy literal runs in decoder (~1268 -> ~4600 MB/s, 3.5x)
+- CRC-32 slice-by-8 (642 -> 2525 MB/s, 3.9x)
+
 ### Performance
 
 - **Throughput optimizations across the codec suite**, all preserving
