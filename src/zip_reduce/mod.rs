@@ -586,19 +586,44 @@ impl Decoder {
             // one optional extension byte), far below `buffer_ahead`, so
             // materialising it inline only overshoots the window bound by a
             // bounded amount that the next iteration's `slide_window` reaps.
-            let mut pm = PendingMatch {
-                dist,
-                remaining: len,
-            };
-            while pm.remaining > 0 {
-                let pos = self.produced();
-                let b = if pm.dist > pos {
-                    0u8
+            self.out.reserve(len);
+            let mut remaining = len;
+            // Phase A: any portion of the back-reference that points before the
+            // start of the stream reads as zero. This can only be a contiguous
+            // leading run (`pos` only grows).
+            let pos0 = self.produced();
+            if dist > pos0 {
+                let zeros = (dist - pos0).min(remaining);
+                for _ in 0..zeros {
+                    self.out.push(0);
+                }
+                remaining -= zeros;
+            }
+            // Phase B: real back-reference into already-produced output. `src`
+            // is an index into `self.out`; it and the write head advance in
+            // lockstep, so split by geometry instead of recomputing per byte.
+            if remaining > 0 {
+                let mut src = self.produced() - dist - self.window_base;
+                if dist == 1 {
+                    // Distance-1 run: repeated byte.
+                    let b = self.out[src];
+                    for _ in 0..remaining {
+                        self.out.push(b);
+                    }
+                } else if dist >= remaining {
+                    // Non-overlapping: source range is fully materialised, copy
+                    // it in one shot via copy_within.
+                    let start = self.out.len();
+                    self.out.extend_from_within(src..src + remaining);
+                    debug_assert_eq!(self.out.len(), start + remaining);
                 } else {
-                    self.out[(pos - pm.dist) - self.window_base]
-                };
-                self.out.push(b);
-                pm.remaining -= 1;
+                    // Overlapping match: each written byte feeds a later read.
+                    for _ in 0..remaining {
+                        let b = self.out[src];
+                        self.out.push(b);
+                        src += 1;
+                    }
+                }
             }
         }
         Ok(())

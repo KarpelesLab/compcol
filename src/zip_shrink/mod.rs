@@ -294,11 +294,13 @@ impl Decoder {
             }
         }
 
-        // `stack` now holds the string in reverse; pop into emit_buf.
+        // `stack` now holds the string reversed. The forward-order first byte
+        // is the last one pushed (`stack.last()`). Reverse once and bulk-copy
+        // into `emit_buf` with a single `extend_from_slice`, instead of the
+        // per-byte pop/push loop (which wrote every output byte twice).
         let first = *self.stack.last().ok_or(Error::Corrupt)?;
-        while let Some(b) = self.stack.pop() {
-            self.emit_buf.push(b);
-        }
+        self.stack.reverse();
+        self.emit_buf.extend_from_slice(&self.stack);
         Ok(first)
     }
 

@@ -549,10 +549,43 @@ impl Decoder {
         if len > self.output_left {
             return Err(Error::Corrupt);
         }
-        for _ in 0..len {
-            let src = (self.window_pos + WINDOW_SIZE - dist) & (WINDOW_SIZE - 1);
+        let count = len as usize;
+        let mask = WINDOW_SIZE - 1;
+        let mut src = (self.window_pos + WINDOW_SIZE - dist) & mask;
+        // Bookkeeping that `emit_byte` would do per byte, applied once.
+        self.pending_len += count;
+        self.output_left -= count as u32;
+
+        if dist == 1 {
+            // Distance-1 run: one repeated byte.
             let b = self.window[src];
-            self.emit_byte(b);
+            for _ in 0..count {
+                self.window[self.window_pos] = b;
+                self.window_pos = (self.window_pos + 1) & mask;
+            }
+        } else if dist >= count {
+            // Non-overlapping: copy in contiguous window segments.
+            let mut done = 0usize;
+            while done < count {
+                let run = (count - done)
+                    .min(WINDOW_SIZE - src)
+                    .min(WINDOW_SIZE - self.window_pos);
+                let wp = self.window_pos;
+                for k in 0..run {
+                    self.window[wp + k] = self.window[src + k];
+                }
+                src = (src + run) & mask;
+                self.window_pos = (self.window_pos + run) & mask;
+                done += run;
+            }
+        } else {
+            // Overlapping match: each written byte feeds a later read.
+            for _ in 0..count {
+                let b = self.window[src];
+                self.window[self.window_pos] = b;
+                src = (src + 1) & mask;
+                self.window_pos = (self.window_pos + 1) & mask;
+            }
         }
         Ok(true)
     }
