@@ -214,6 +214,12 @@ fn compress_block(input: &[u8], out: &mut Vec<u8>) {
     };
 
     // Match-or-literal main loop.
+    // Skip-step accelerator: advance faster the longer the matcher goes
+    // without a hit, so incompressible regions are scanned in large strides
+    // (mirrors the reference encoder's `skip`/`bytes_between_hash_lookups`).
+    // A hit resets the stride to 1 byte.
+    let mut search_match_nb: u32 = 1 << 5;
+
     while ip < match_limit {
         let h = hash(input, ip);
         let candidate = table[h] as usize;
@@ -231,9 +237,12 @@ fn compress_block(input: &[u8], out: &mut Vec<u8>) {
             && input[candidate + 3] == input[ip + 3];
 
         if !four_match {
-            ip += 1;
+            let step = (search_match_nb >> 5) as usize;
+            search_match_nb += 1;
+            ip += step;
             continue;
         }
+        search_match_nb = 1 << 5;
 
         // Found a 4-byte match. First, flush any pending literal.
         if next_emit < ip {
