@@ -125,6 +125,11 @@ pub fn encode_block(input: &[u8], out: &mut Vec<u8>) {
     let in_len = input.len();
     let hash_limit = in_len.saturating_sub(4);
 
+    // Skip-step accelerator: count consecutive misses and advance faster the
+    // longer we go without a match, so incompressible data is scanned in big
+    // strides instead of one byte at a time. Reset to 1-byte steps on a hit.
+    let mut search_match_nb: u32 = 1 << 6;
+
     while ip < hash_limit {
         let h = hash4([input[ip], input[ip + 1], input[ip + 2], input[ip + 3]]);
         let candidate = table[h];
@@ -150,9 +155,15 @@ pub fn encode_block(input: &[u8], out: &mut Vec<u8>) {
         }
 
         if !found {
-            ip += 1;
+            // Grow the step the longer we search without a hit. The first
+            // ~64 misses still step 1 byte (keeping the hash table dense for
+            // compressible data); after that the stride ramps up.
+            let step = (search_match_nb >> 6) as usize;
+            search_match_nb += 1;
+            ip += step;
             continue;
         }
+        search_match_nb = 1 << 6;
 
         // Extend the match forward as far as possible.
         let mut match_len = 4usize;
