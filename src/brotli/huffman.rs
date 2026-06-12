@@ -219,13 +219,17 @@ impl HuffmanDecoder {
         let max = self.max_length as u32;
 
         // Fast path: peek PRIMARY_BITS bits, index the LUT, advance the
-        // bit position by the actual code length.
-        if br.remaining() >= PRIMARY_BITS as usize {
-            let idx = br.peek_bits(PRIMARY_BITS) as usize;
-            let entry = self.lut[idx];
+        // bit position by the actual code length. `peek_lut_bits` refills
+        // and returns however many bits (up to PRIMARY_BITS) are buffered;
+        // when the full window is available we resolve in O(1) and consume
+        // only the matched code length, keeping the rest of the
+        // accumulator intact for the next symbol.
+        let (peeked, avail) = br.peek_lut_bits(PRIMARY_BITS);
+        if avail >= PRIMARY_BITS {
+            let entry = self.lut[peeked as usize];
             let len = entry >> LUT_LEN_SHIFT;
             if len > 0 {
-                br.set_position(br.position() + len as usize);
+                br.consume(len);
                 return Ok(entry & LUT_SYM_MASK);
             }
             // Long code (> PRIMARY_BITS) -- fall through to the slow path.
@@ -307,6 +311,18 @@ impl<'a> BitSource<'a> {
         self.nbits = 0;
     }
 
+    /// Advance the logical position by `n` bits that are already buffered
+    /// in `acc`. The caller must guarantee `n <= self.nbits` (e.g. right
+    /// after a `peek_bits(m)` with `m >= n`). Unlike `set_position` this
+    /// keeps the remaining buffered bits, so the hot Huffman fast path does
+    /// not force a refill on every decoded symbol.
+    #[inline]
+    pub(crate) fn consume(&mut self, n: u32) {
+        debug_assert!(n <= self.nbits);
+        self.acc >>= n;
+        self.nbits -= n;
+    }
+
     /// Remaining bits available (still in `data` plus held in `acc`).
     #[allow(dead_code)]
     pub(crate) fn remaining(&self) -> usize {
@@ -364,6 +380,7 @@ impl<'a> BitSource<'a> {
     /// Peek `n` bits (0 < n ≤ 32) without advancing. Caller must
     /// guarantee `n <= remaining()`. Refills the internal accumulator if
     /// fewer than `n` bits are buffered.
+    #[allow(dead_code)]
     pub(crate) fn peek_bits(&mut self, n: u32) -> u32 {
         debug_assert!(n > 0 && n <= 32);
         debug_assert!(n as usize <= self.remaining());
@@ -376,6 +393,28 @@ impl<'a> BitSource<'a> {
         } else {
             (self.acc & ((1u64 << n) - 1)) as u32
         }
+    }
+
+    /// Peek up to `n` bits (1..=32) for the Huffman LUT fast path without
+    /// advancing. Refills once, then returns `(bits, available)` where
+    /// `available = min(nbits, n)` and `bits` holds the low `available`
+    /// bits LSB-first. When `available < n` the caller must fall back to
+    /// the per-bit slow path. Unlike `peek_bits` this never asserts on a
+    /// short tail, so it is safe to call when the stream is nearly drained.
+    #[inline]
+    pub(crate) fn peek_lut_bits(&mut self, n: u32) -> (u32, u32) {
+        if self.nbits < n {
+            self.refill();
+        }
+        let avail = self.nbits.min(n);
+        let bits = if avail == 0 {
+            0
+        } else if avail >= 32 {
+            self.acc as u32
+        } else {
+            (self.acc & ((1u64 << avail) - 1)) as u32
+        };
+        (bits, avail)
     }
 
     /// Read `n` bits (0..=32) as a little-endian integer.
