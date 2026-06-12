@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Throughput optimizations across the codec suite**, all preserving
+  byte-identical decoder output (validated by the existing round-trip and
+  reference-fixture tests) — no `unsafe`, no new dependencies. Highlights:
+  - **deflate / deflate64** decode: vectorized match-copy (contiguous spans +
+    doubling `copy_within` for overlapping runs) — deflate Random decode
+    ~3.5×, deflate64 long-match decode several×; zlib/gzip inherit the gains.
+  - **LZMA / xz** decode: bulk (and overlapping) dictionary match-copy —
+    RLE-heavy `.lzma` decode up to ~6×.
+  - **zstd** decode: inlined backward bit-reader fast path, single-load FSE
+    state transitions, hoisted LL/ML tables — ~1.5× on Huffman/FSE-heavy input.
+  - **brotli** decode: wider Huffman fast LUT, single-tree literal fast path,
+    bit-accumulator kept across LUT hits — literal-heavy decode ~2.3×.
+  - **lz4 / lz5 / lzo / snappy** decode: bulk overlapping match-copy
+    (multi-GB/s); **lzo / snappy** encoder skip-step match search (~6× on
+    incompressible input). **lzw** single-pass string emit.
+  - **xpress-huffman** decode: fixed an O(n²) history-trim to O(n) (orders of
+    magnitude on large inputs); **lznt1** bulk match-copy.
+  - **lha / rar1–5 / zip-implode·reduce·shrink / arc-crunch·squash**: bulk
+    LZSS/LZW window copy; **delta** filter encode ~15× (auto-vectorized);
+    **hpack** byte-wide Huffman decode.
+  - **bzip2** encode: reduced SA-IS suffix-array allocations and in-place
+    recursion (+14–31% on the BWT build, the dominant encode cost).
+  - **checksum**: CRC-32 slice-by-8 (~4×); **rle90** bulk literal copy (~3.5×).
+
 ## [0.6.1](https://github.com/KarpelesLab/compcol/compare/v0.6.0...v0.6.1) - 2026-06-12
 
 ### Other
