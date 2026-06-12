@@ -92,22 +92,173 @@ pub(crate) const CODES: [(u32, u8); 257] = [
     (0x3fffffff, 30),
 ];
 
+#[cfg(test)]
 const MAX_LEN: usize = 30;
 
-/// Canonical decode tables reconstructed from [`CODES`]. Cheap to build
-/// (257-entry sweep); built per decode call.
+// ─── byte FSA fast decoder ───────────────────────────────────────────────
+//
+// Bit-at-a-time canonical decoding is correct but slow (one table probe per
+// input bit). For throughput we precompute a byte-wide finite-state machine
+// over the canonical code's binary trie: each transition consumes a whole
+// input byte and emits 0..=8 complete symbols. A Huffman string then costs
+// exactly one table lookup per input byte instead of ~8 bit probes. The FSA
+// is rebuilt per `decode` call; its construction is a fixed sweep over the
+// trie (≈ states × 256 steps), negligible against any non-trivial input.
+//
+// The byte-for-byte output and every RFC 7541 §5.2 rejection (EOS symbol,
+// over-long padding, non-`1` padding) are identical to the bit-at-a-time
+// path — the FSA is just a faster way to walk the same trie.
+
+/// One byte transition: where to go and what to emit.
+#[derive(Clone, Copy)]
+struct Trans {
+    /// Trie node reached after consuming this byte's 8 bits.
+    next: u16,
+    /// Number of complete symbols emitted while consuming the byte (0..=8).
+    n: u8,
+    /// Set if any consumed bit completed the EOS symbol (→ Corrupt).
+    eos: bool,
+    /// The emitted symbol bytes (only the first `n` are meaningful).
+    out: [u8; 8],
+}
+
+/// Byte FSA: `trans[state * 256 + byte]` gives the transition. State 0 is the
+/// trie root, the only valid end-of-string boundary.
+struct FastTable {
+    trans: Vec<Trans>,
+    /// Per-state padding metadata: `(depth, all_ones)` for the partial path
+    /// from the root to this node. A valid end state has `depth < 8` and
+    /// `all_ones` (the RFC 7541 §5.2 EOS-prefix padding rule).
+    pad: Vec<(u8, bool)>,
+}
+
+impl FastTable {
+    fn build() -> Self {
+        // Canonical binary trie. Node 0 is the root. `child[node][bit]` is the
+        // next node index (0 = unset, since the root is never a child).
+        // `leaf_sym[node]` is the symbol for a leaf, or -1.
+        let mut child: Vec<[u16; 2]> = Vec::new();
+        child.push([0, 0]); // root
+        let mut leaf_sym: Vec<i32> = Vec::new();
+        leaf_sym.push(-1);
+
+        for (sym, &(code, len)) in CODES.iter().enumerate() {
+            let len = len as u32;
+            let mut node = 0usize;
+            for i in (0..len).rev() {
+                let bit = ((code >> i) & 1) as usize;
+                let nxt = child[node][bit];
+                if nxt == 0 {
+                    let new = child.len() as u16;
+                    child.push([0, 0]);
+                    leaf_sym.push(-1);
+                    child[node][bit] = new;
+                    node = new as usize;
+                } else {
+                    node = nxt as usize;
+                }
+            }
+            leaf_sym[node] = sym as i32;
+        }
+
+        let n_states = child.len();
+
+        // Per-node padding metadata: depth from root and whether the path is
+        // all `1`-bits. Leaves reset to the root after emitting, so only
+        // non-leaf nodes are ever a resting state, but we fill every node.
+        let mut pad = alloc::vec![(0u8, true); n_states];
+        // Iterative DFS from the root; children are always added after their
+        // parent, so a single forward pass over node indices in creation
+        // order would also work, but we walk explicitly for clarity.
+        let mut stack = alloc::vec![0usize];
+        while let Some(node) = stack.pop() {
+            let (d, ones) = pad[node];
+            let kids = child[node];
+            for (bit, &c) in kids.iter().enumerate() {
+                if c != 0 {
+                    let c = c as usize;
+                    pad[c] = (d + 1, ones && bit == 1);
+                    stack.push(c);
+                }
+            }
+        }
+
+        // Build a per-nibble transition first (n_states × 16, four bit-steps
+        // each), then compose each byte transition from its two nibble halves.
+        // This costs ≈ n_states·(16·4 + 256·2) build steps instead of
+        // n_states·256·8 — roughly a 4× cheaper construction, which matters
+        // because the table is rebuilt on every `decode` call.
+        struct Nib {
+            next: u16,
+            n: u8,
+            eos: bool,
+            out: [u8; 4],
+        }
+        let mut nib = Vec::with_capacity(n_states * 16);
+        for state in 0..n_states {
+            for half in 0..16u32 {
+                let mut node = state;
+                let mut out = [0u8; 4];
+                let mut n = 0u8;
+                let mut eos = false;
+                for i in (0..4).rev() {
+                    let bit = ((half >> i) & 1) as usize;
+                    node = child[node][bit] as usize;
+                    if leaf_sym[node] >= 0 {
+                        let sym = leaf_sym[node] as u16;
+                        if sym == EOS {
+                            eos = true;
+                        } else {
+                            out[n as usize] = sym as u8;
+                            n += 1;
+                        }
+                        node = 0;
+                    }
+                }
+                nib.push(Nib {
+                    next: node as u16,
+                    n,
+                    eos,
+                    out,
+                });
+            }
+        }
+
+        let mut trans = Vec::with_capacity(n_states * 256);
+        for state in 0..n_states {
+            for byte in 0..256usize {
+                let hi = &nib[state * 16 + (byte >> 4)];
+                let lo = &nib[hi.next as usize * 16 + (byte & 0x0f)];
+                let mut out = [0u8; 8];
+                let hn = hi.n as usize;
+                out[..hn].copy_from_slice(&hi.out[..hn]);
+                let ln = lo.n as usize;
+                out[hn..hn + ln].copy_from_slice(&lo.out[..ln]);
+                trans.push(Trans {
+                    next: lo.next,
+                    n: (hn + ln) as u8,
+                    eos: hi.eos || lo.eos,
+                    out,
+                });
+            }
+        }
+
+        FastTable { trans, pad }
+    }
+}
+
+/// Canonical decode tables reconstructed from [`CODES`], retained only for
+/// the canonicality self-test (which also underpins the FSA's correctness).
+#[cfg(test)]
 struct DecodeTable {
     /// `first_code[len]` = numeric value of the first codeword of length
     /// `len` (1..=30).
     first_code: [u32; MAX_LEN + 1],
-    /// `first_index[len]` = offset into `symbols` of the first codeword of
-    /// length `len`.
-    first_index: [usize; MAX_LEN + 1],
     /// Symbols ordered by (length asc, code asc).
     symbols: Vec<u16>,
-    count: [u32; MAX_LEN + 1],
 }
 
+#[cfg(test)]
 impl DecodeTable {
     fn build() -> Self {
         let mut count = [0u32; MAX_LEN + 1];
@@ -125,35 +276,14 @@ impl DecodeTable {
             }
         }
         let mut first_code = [0u32; MAX_LEN + 1];
-        let mut first_index = [0usize; MAX_LEN + 1];
         let mut code = 0u32;
-        let mut index = 0usize;
         for len in 1..=MAX_LEN {
             first_code[len] = code;
-            first_index[len] = index;
             code = (code + count[len]) << 1;
-            index += count[len] as usize;
         }
         DecodeTable {
             first_code,
-            first_index,
             symbols,
-            count,
-        }
-    }
-
-    /// If `acc` (a value of exactly `len` bits) is a complete codeword,
-    /// return its symbol.
-    fn lookup(&self, acc: u32, len: usize) -> Option<u16> {
-        let c = self.count[len];
-        if c == 0 {
-            return None;
-        }
-        let off = acc.checked_sub(self.first_code[len])?;
-        if off < c {
-            Some(self.symbols[self.first_index[len] + off as usize])
-        } else {
-            None
         }
     }
 }
@@ -193,39 +323,25 @@ pub fn encoded_len(data: &[u8]) -> usize {
 /// bits, padding not consisting of EOS-prefix `1`s, and any appearance of
 /// the EOS symbol — all as [`Error::Corrupt`].
 pub fn decode(data: &[u8]) -> Result<Vec<u8>, Error> {
-    let table = DecodeTable::build();
+    let table = FastTable::build();
     let mut out = Vec::with_capacity(data.len() * 2);
-    let mut acc: u32 = 0;
-    let mut nbits: usize = 0;
+    // Current trie node (state). State 0 = root = clean symbol boundary.
+    let mut state = 0usize;
+    let trans = &table.trans[..];
     for &byte in data {
-        for i in (0..8).rev() {
-            let bit = ((byte >> i) & 1) as u32;
-            acc = (acc << 1) | bit;
-            nbits += 1;
-            if nbits > MAX_LEN {
-                // No codeword is longer than 30 bits.
-                return Err(Error::Corrupt);
-            }
-            if let Some(sym) = table.lookup(acc, nbits) {
-                if sym == EOS {
-                    return Err(Error::Corrupt);
-                }
-                out.push(sym as u8);
-                acc = 0;
-                nbits = 0;
-            }
+        let t = &trans[state * 256 + byte as usize];
+        if t.eos {
+            return Err(Error::Corrupt);
         }
+        // Emit the symbols completed in this byte (0..=8).
+        out.extend_from_slice(&t.out[..t.n as usize]);
+        state = t.next as usize;
     }
     // Trailing bits are padding: must be < 8 bits, all 1s. A prefix-free code
     // guarantees these EOS-prefix 1s cannot complete a real symbol above.
-    if nbits >= 8 {
+    let (depth, all_ones) = table.pad[state];
+    if depth >= 8 || !all_ones {
         return Err(Error::Corrupt);
-    }
-    if nbits > 0 {
-        let mask = (1u32 << nbits) - 1;
-        if acc & mask != mask {
-            return Err(Error::Corrupt);
-        }
     }
     Ok(out)
 }
