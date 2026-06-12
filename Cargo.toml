@@ -50,6 +50,7 @@ all = [
     "lha",
     "bcj", "bcj2", "delta",
     "arc_crunch", "arc_squeeze", "arc_squash",
+    "hpack",
 ]
 # Enables `alloc`-backed conveniences (e.g. the `factory` module, the
 # `compcol::vec` one-shot helpers). Pulled in automatically by features
@@ -239,6 +240,12 @@ arc_squeeze = ["alloc"]
 # block-mode CLEAR code and no header byte (no RLE pre-pass). Encoder and
 # decoder both implemented and validated by round-trip.
 arc_squash = ["alloc"]
+# HTTP/2 HPACK header compression (RFC 7541): static + dynamic indexing
+# tables, integer/string coding, and the §5.2 string Huffman code. The
+# Huffman primitive is also exposed as the `Http2Huffman` codec
+# (name `"h2-huffman"`). The full header codec lives behind its own
+# `compcol::hpack` API (it is stateful over header lists, not a byte stream).
+hpack   = ["alloc"]
 # `compcol::tokio_io` — async mirrors of compcol::io for the tokio
 # runtime. Pulls the tokio dependency for its AsyncRead/AsyncWrite
 # trait definitions; the rest of the crate stays dep-free.

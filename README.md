@@ -61,7 +61,7 @@ flag, and a `compcol` binary turns the library into a Unix-style filter.
 | Microsoft Xpress (plain LZ77) | `xpress` | `.xpress` | full | full (per [MS-XCA] §2.2) | hand-built fixtures |
 | Microsoft Xpress Huffman | `xpress_huffman` | `.xph` | full (LZ77 + canonical Huffman) | full (per [MS-XCA] §2.1; used in WIM / CompactOS NTFS) | hand-built fixtures |
 | LZNT1 (NTFS native compression) | `lznt1` | `.lznt1` | full | full (per [MS-XCA] §2.5; 4 KiB-chunked LZ77, no entropy coding) | hand-built fixtures |
-| LHA / LZH (`-lh1-`/`-lh4-`/`-lh5-`/`-lh6-`/`-lh7-`) | `lha` | `.lzh` | full (lh1 adaptive Huffman; lh4/5/6/7 static Huffman) | full (clean-room from Okumura LZHUF / ar002) | own round-trip (no reference fixture) |
+| LHA / LZH (`-lh1-`/`-lh2-`/`-lh4-`/`-lh5-`/`-lh6-`/`-lh7-`) | `lha` | `.lzh` | full (lh1/lh2 adaptive Huffman; lh4/5/6/7 static Huffman) | full (clean-room from Okumura LZHUF / ar002) | own round-trip (no reference fixture) |
 | BCJ branch filters (x86, ARM, ARMT, ARM64, PPC, SPARC, IA-64, RISC-V) | `bcj` | `bcj-<arch>` | full (reversible filter) | full | round-trip identity (public-domain LZMA SDK transform) |
 | BCJ2 (7z 4-stream x86 filter) | `bcj2` | — | `bcj2::encode` (fn API) | `bcj2::decode` (fn API) | round-trip identity (LZMA SDK algorithm) |
 | Delta filter (distance 1..=256) | `delta` | `delta` | full (reversible filter) | full | round-trip identity |
@@ -76,6 +76,13 @@ flag, and a `compcol` binary turns the library into a Unix-style filter.
 | RAR 2.x | `rar2` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + audio predictor | real rar-2.60 fixtures |
 | RAR 3.x | `rar3` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + E8 filter; PPMd & VM filters refused | libarchive RAR3 fixtures |
 | RAR 5.x | `rar5` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + x86 filter; Delta/ARM refused | RARLAB-CLI fixtures |
+| HTTP/2 HPACK (RFC 7541) | `hpack` | — | full (header codec + `h2-huffman` string codec) | full (static+dynamic tables, integer/string coding) | RFC 7541 Appendix C vectors |
+
+HPACK is HTTP/2's header-compression codec, not a byte-stream codec: it
+operates on `(name, value)` header lists with per-connection dynamic-table
+state, so it lives behind its own `compcol::hpack` API (`HpackEncoder` /
+`HpackDecoder`). The §5.2 string Huffman primitive is also exposed as the
+`Http2Huffman` codec (name `h2-huffman`) through the uniform trait surface.
 
 The RAR encoders are permanently `Unsupported` per RARLAB's unRAR
 license terms (every clean-room RAR reader — libarchive, The

@@ -176,6 +176,9 @@ pub mod arc_squeeze;
 #[cfg(feature = "lha")]
 pub mod lha;
 
+#[cfg(feature = "hpack")]
+pub mod hpack;
+
 #[cfg(feature = "factory")]
 pub mod factory;
 
