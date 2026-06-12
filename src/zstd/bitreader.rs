@@ -179,7 +179,12 @@ impl<'a> RevBitReader<'a> {
     /// Read `n` bits (0..=64) MSB-first from the current backward cursor.
     ///
     /// Bits returned right-justified.
-    #[inline]
+    ///
+    /// The `n <= 56` fast path is `#[inline(always)]` and is the only path the
+    /// FSE/sequence decoders ever take (their reads are at most ~16 bits); the
+    /// rare 57..=64-bit wide path is split into an out-of-line cold function so
+    /// inlining the fast path into hot callers stays cheap.
+    #[inline(always)]
     pub fn read(&mut self, n: u32) -> Result<u64, Error> {
         if n == 0 {
             return Ok(0);
@@ -202,29 +207,35 @@ impl<'a> RevBitReader<'a> {
             self.consumed += n as usize;
             Ok(result)
         } else {
-            // Wide-read path (n in 57..=64): take the top 56 bits in one
-            // shot, then the remaining n-56 bits with a second refill. This
-            // matches the byte-by-byte version's semantics without needing
-            // a u128 accumulator.
-            let high_n = 56u32;
-            let low_n = n - 56;
-            // Top chunk.
-            if self.bits_in_acc < high_n {
-                self.refill();
-            }
-            let high = self.acc >> (64 - high_n);
-            self.acc <<= high_n;
-            self.bits_in_acc -= high_n;
-            // Low chunk.
-            if self.bits_in_acc < low_n {
-                self.refill();
-            }
-            let low = self.acc >> (64 - low_n);
-            self.acc <<= low_n;
-            self.bits_in_acc -= low_n;
-            self.consumed += n as usize;
-            Ok((high << low_n) | low)
+            self.read_wide(n)
         }
+    }
+
+    /// Cold path for 57..=64-bit reads: take the top 56 bits, then the
+    /// remaining `n-56` bits with a second refill. Kept out of line so the
+    /// common small-read path inlines compactly into hot callers.
+    #[cold]
+    #[inline(never)]
+    fn read_wide(&mut self, n: u32) -> Result<u64, Error> {
+        // Matches the byte-by-byte version's semantics without a u128 accumulator.
+        let high_n = 56u32;
+        let low_n = n - 56;
+        // Top chunk.
+        if self.bits_in_acc < high_n {
+            self.refill();
+        }
+        let high = self.acc >> (64 - high_n);
+        self.acc <<= high_n;
+        self.bits_in_acc -= high_n;
+        // Low chunk.
+        if self.bits_in_acc < low_n {
+            self.refill();
+        }
+        let low = self.acc >> (64 - low_n);
+        self.acc <<= low_n;
+        self.bits_in_acc -= low_n;
+        self.consumed += n as usize;
+        Ok((high << low_n) | low)
     }
 }
 
