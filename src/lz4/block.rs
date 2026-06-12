@@ -325,7 +325,8 @@ pub fn decode_block(input: &[u8], out: &mut Vec<u8>, raw_max: usize) -> Result<(
         }
 
         // Non-overlapping match collapses to memcpy; offset==1 is a byte-splat;
-        // otherwise replicate byte-by-byte to handle LZ77 self-overlap.
+        // otherwise replicate in `offset`-sized chunks to handle LZ77
+        // self-overlap while still copying in bulk.
         let start = out.len() - offset;
         if offset >= match_len {
             out.extend_from_within(start..start + match_len);
@@ -333,9 +334,15 @@ pub fn decode_block(input: &[u8], out: &mut Vec<u8>, raw_max: usize) -> Result<(
             let b = out[start];
             out.resize(out.len() + match_len, b);
         } else {
-            for i in 0..match_len {
-                let b = out[start + i];
-                out.push(b);
+            // Overlapping: each round copies the `offset`-byte tail produced so
+            // far. The source region doubles every round, so the number of
+            // rounds is logarithmic in `match_len`.
+            let mut remaining = match_len;
+            while remaining > 0 {
+                let chunk = remaining.min(offset);
+                let s = out.len() - offset;
+                out.extend_from_within(s..s + chunk);
+                remaining -= chunk;
             }
         }
     }
