@@ -288,36 +288,119 @@ fn resolve_table(
 
 // ─── code → (base, extra_bits) lookups (RFC §3.1.1.3.2.1) ────────────────
 
+/// Literal-length code → (base, extra_bits). Spec tables A.4.1 / A.4.2.
+/// Module-level `const` so the inner sequence loop indexes a single rodata
+/// table instead of materialising two stack arrays per call.
+const LL_BASE_EXTRA: [(u32, u32); 36] = [
+    (0, 0),
+    (1, 0),
+    (2, 0),
+    (3, 0),
+    (4, 0),
+    (5, 0),
+    (6, 0),
+    (7, 0),
+    (8, 0),
+    (9, 0),
+    (10, 0),
+    (11, 0),
+    (12, 0),
+    (13, 0),
+    (14, 0),
+    (15, 0),
+    (16, 1),
+    (18, 1),
+    (20, 1),
+    (22, 1),
+    (24, 2),
+    (28, 2),
+    (32, 3),
+    (40, 3),
+    (48, 4),
+    (64, 6),
+    (128, 7),
+    (256, 8),
+    (512, 9),
+    (1024, 10),
+    (2048, 11),
+    (4096, 12),
+    (8192, 13),
+    (16384, 14),
+    (32768, 15),
+    (65536, 16),
+];
+
+/// Match-length code → (base, extra_bits). From the zstd reference tables.
+const ML_BASE_EXTRA: [(u32, u32); 53] = [
+    (3, 0),
+    (4, 0),
+    (5, 0),
+    (6, 0),
+    (7, 0),
+    (8, 0),
+    (9, 0),
+    (10, 0),
+    (11, 0),
+    (12, 0),
+    (13, 0),
+    (14, 0),
+    (15, 0),
+    (16, 0),
+    (17, 0),
+    (18, 0),
+    (19, 0),
+    (20, 0),
+    (21, 0),
+    (22, 0),
+    (23, 0),
+    (24, 0),
+    (25, 0),
+    (26, 0),
+    (27, 0),
+    (28, 0),
+    (29, 0),
+    (30, 0),
+    (31, 0),
+    (32, 0),
+    (33, 0),
+    (34, 0),
+    (35, 1),
+    (37, 1),
+    (39, 1),
+    (41, 1),
+    (43, 2),
+    (47, 2),
+    (51, 3),
+    (59, 3),
+    (67, 4),
+    (83, 4),
+    (99, 5),
+    (131, 7),
+    (259, 8),
+    (515, 9),
+    (1027, 10),
+    (2051, 11),
+    (4099, 12),
+    (8195, 13),
+    (16387, 14),
+    (32771, 15),
+    (65539, 16),
+];
+
+#[inline]
 fn ll_base_extra(code: u8) -> Result<(u32, u32), Error> {
-    if code > 35 {
-        return Err(Error::Corrupt);
-    }
-    // Spec tables A.4.1 / A.4.2: literal-length codes.
-    let bases: [u32; 36] = [
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48,
-        64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
-    ];
-    let extras: [u32; 36] = [
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10,
-        11, 12, 13, 14, 15, 16,
-    ];
-    Ok((bases[code as usize], extras[code as usize]))
+    LL_BASE_EXTRA
+        .get(code as usize)
+        .copied()
+        .ok_or(Error::Corrupt)
 }
 
+#[inline]
 fn ml_base_extra(code: u8) -> Result<(u32, u32), Error> {
-    if code > 52 {
-        return Err(Error::Corrupt);
-    }
-    let bases: [u32; 53] = [
-        3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-        27, 28, 29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515,
-        1027, 2051, 4099, 8195, 16387, 32771, 65539,
-    ];
-    let extras: [u32; 53] = [
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-    ];
-    Ok((bases[code as usize], extras[code as usize]))
+    ML_BASE_EXTRA
+        .get(code as usize)
+        .copied()
+        .ok_or(Error::Corrupt)
 }
 
 /// Translate the `offset_value` produced by the offset FSE+extra-bits sum
