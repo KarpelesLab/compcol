@@ -335,11 +335,25 @@ impl RawDecoder for Decoder {
                                 done: false,
                             });
                         }
-                        output[written] = b;
-                        written += 1;
-                        consumed += 1;
-                        self.last = b;
+                        // Bulk-copy a contiguous run of literal (non-FLAG)
+                        // bytes, bounded by remaining input and output. This
+                        // turns the common literal-heavy stream into a single
+                        // memcpy instead of a per-byte state-machine cycle.
+                        let in_avail = input.len() - consumed;
+                        let out_avail = output.len() - written;
+                        let limit = in_avail.min(out_avail);
+                        let src = &input[consumed..consumed + limit];
+                        // Length of the leading non-FLAG span.
+                        let span = match src.iter().position(|&x| x == FLAG) {
+                            Some(p) => p,
+                            None => limit,
+                        };
+                        // `span >= 1` because src[0] == b != FLAG.
+                        output[written..written + span].copy_from_slice(&src[..span]);
+                        self.last = src[span - 1];
                         self.have_last = true;
+                        written += span;
+                        consumed += span;
                     }
                 }
                 DecState::AwaitCount => {
