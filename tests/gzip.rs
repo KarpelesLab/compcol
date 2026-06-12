@@ -435,6 +435,50 @@ fn decode_with_all_optional_fields() {
     assert_eq!(decoded, b"hello");
 }
 
+#[test]
+fn decode_with_fhcrc_field() {
+    // gzip stream of "hello" with only FHCRC set (FLG = 0x02). The 2-byte
+    // header-CRC field is skipped, not validated.
+    let mut stream = vec![0x1F, 0x8B, 0x08, 0x02, 0, 0, 0, 0, 0, 0x03];
+    stream.extend_from_slice(&[0x12, 0x34]); // FHCRC (skipped)
+    stream.extend_from_slice(&hex("cb48cdc9c90700"));
+    stream.extend_from_slice(&[0x86, 0xa6, 0x10, 0x36, 0x05, 0x00, 0x00, 0x00]);
+    let decoded = decode_chunked(&stream, 1024, 1024).unwrap();
+    assert_eq!(decoded, b"hello");
+}
+
+#[test]
+fn decode_with_fextra_and_fhcrc_fields() {
+    // FEXTRA + FHCRC together (FLG = 0x06). Regression test: the shared
+    // `aux_idx` counter, left at 2 by the FEXTRA length parse, previously
+    // caused the FHCRC skip loop to consume 0 bytes, feeding the 2 header-CRC
+    // bytes into the deflate decoder and corrupting an otherwise valid member.
+    let mut stream = vec![0x1F, 0x8B, 0x08, 0x06, 0, 0, 0, 0, 0, 0x03];
+    stream.extend_from_slice(&[0x04, 0x00]); // XLEN = 4
+    stream.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // extra data
+    stream.extend_from_slice(&[0x12, 0x34]); // FHCRC (skipped)
+    stream.extend_from_slice(&hex("cb48cdc9c90700"));
+    stream.extend_from_slice(&[0x86, 0xa6, 0x10, 0x36, 0x05, 0x00, 0x00, 0x00]);
+    let decoded = decode_chunked(&stream, 1024, 1024).unwrap();
+    assert_eq!(decoded, b"hello");
+}
+
+#[test]
+fn decode_with_all_optional_fields_and_fhcrc() {
+    // FEXTRA + FNAME + FCOMMENT + FHCRC (FLG = 0x1E): exercises the HeaderCrc
+    // entry path through Comment with `aux_idx` still dirty from FEXTRA.
+    let mut stream = vec![0x1F, 0x8B, 0x08, 0x1E, 0, 0, 0, 0, 0, 0x03];
+    stream.extend_from_slice(&[0x03, 0x00]); // XLEN = 3
+    stream.extend_from_slice(&[1, 2, 3]);
+    stream.extend_from_slice(b"name.txt\0");
+    stream.extend_from_slice(b"some comment\0");
+    stream.extend_from_slice(&[0x56, 0x78]); // FHCRC (skipped)
+    stream.extend_from_slice(&hex("cb48cdc9c90700"));
+    stream.extend_from_slice(&[0x86, 0xa6, 0x10, 0x36, 0x05, 0x00, 0x00, 0x00]);
+    let decoded = decode_chunked(&stream, 1024, 1024).unwrap();
+    assert_eq!(decoded, b"hello");
+}
+
 // ─── malformed-header rejection ─────────────────────────────────────────
 
 #[test]

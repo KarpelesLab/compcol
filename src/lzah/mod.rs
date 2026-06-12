@@ -172,7 +172,12 @@ fn preseed_window() -> [u8; WINDOW] {
 
 /// Decode a raw method-5 payload of exactly `expected_len` bytes.
 fn decode_payload(payload: &[u8], expected_len: usize) -> Result<Vec<u8>, Error> {
-    let mut out = Vec::with_capacity(expected_len);
+    // Cap the eager reservation: `expected_len` is an attacker-controlled
+    // out-of-band length, so a crafted entry could declare multiple GiB with a
+    // tiny payload. The `while out.len() < expected_len` loop below enforces the
+    // true bound, so capping the initial reservation changes only allocation
+    // behaviour, not correctness. Mirrors the LHA codecs (static_huff/lzhuf).
+    let mut out = Vec::with_capacity(expected_len.min(1 << 20));
     if expected_len == 0 {
         return Ok(out);
     }

@@ -296,6 +296,20 @@ impl Decoder {
 
         // Now decode symbols 50 at a time, switching tables per group
         // per selector. Stop when EOB (= alpha_size - 1) is seen.
+        //
+        // Anti-bomb bound: a single bzip2 block decodes to at most the
+        // declared block size = level * 100_000 bytes (level 1..=9). The
+        // RLE-2 stream we are reconstructing here (`mtf_indices`) is the
+        // pre-BWT/pre-MTF symbol stream and must not exceed that. We keep
+        // a tiny constant of slack (1024) aligned with the original
+        // per-run headroom, but the bound stays within a couple KB of the
+        // real block size — NOT a multiple of it. Without a *cumulative*
+        // cap a malicious stream can flush a fresh ~8 MB zero-run after
+        // every one of ~900_100 non-zero symbols and inflate this
+        // intermediate buffer to hundreds of GB before any output is
+        // produced (so LimitedDecoder, which only sees output bytes, can't
+        // stop it). Mirrors arsenic's `block.len() + count > block_size`.
+        let max_block_bytes: u64 = self.level as u64 * 100_000 + 1024;
         let eob = (alpha_size - 1) as u16;
         let mut mtf_indices: Vec<u8> = Vec::new();
         // RLE-2 accumulator: each time we see RUNA/RUNB we extend the
@@ -332,9 +346,12 @@ impl Decoder {
                 let contrib = if s == 0 { 1 } else { 2 };
                 zero_run = zero_run.saturating_add(contrib * zero_weight);
                 zero_weight = zero_weight.saturating_mul(2);
-                if zero_run as usize > 900_000 * 9 + 1024 {
-                    // Anti-bomb: a zero run that exceeds the maximum
-                    // possible block content is malformed.
+                // Anti-bomb (cumulative): the already-materialised indices
+                // plus the in-flight zero-run must not exceed the declared
+                // block size. This catches both a single oversized run and
+                // the death-by-a-thousand-runs attack where each non-zero
+                // symbol flushes and resets a fresh run.
+                if mtf_indices.len() as u64 + zero_run as u64 > max_block_bytes {
                     return Err(Error::Corrupt);
                 }
             } else {
@@ -348,10 +365,18 @@ impl Decoder {
                 if idx >= num_used {
                     return Err(Error::Corrupt);
                 }
+                // Anti-bomb (cumulative): bound the literal pushes too.
+                if mtf_indices.len() as u64 + 1 > max_block_bytes {
+                    return Err(Error::Corrupt);
+                }
                 mtf_indices.push(idx as u8);
             }
         }
         if zero_run > 0 {
+            // Anti-bomb (cumulative): final flush must also stay in bounds.
+            if mtf_indices.len() as u64 + zero_run as u64 > max_block_bytes {
+                return Err(Error::Corrupt);
+            }
             mtf_indices.extend(core::iter::repeat_n(0u8, zero_run as usize));
         }
 

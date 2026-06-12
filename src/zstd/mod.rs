@@ -102,7 +102,8 @@ pub mod _internal_test_api {
         let seq_data = &body[lit.consumed..];
         let seqs = super::sequences::decode_sequences(seq_data, &mut seq_state)?;
         let mut out: Vec<u8> = Vec::new();
-        super::sequences::execute_sequences(&seqs, &lit.literals, &mut out)?;
+        // Block_Maximum_Size with an unknown window defaults to the 128 KiB cap.
+        super::sequences::execute_sequences(&seqs, &lit.literals, &mut out, 128 * 1024)?;
         Ok(out)
     }
 

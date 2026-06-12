@@ -13,6 +13,12 @@ use crate::error::Error;
 /// Hard cap on a single block (FORMAT-SPEC §3: blockbits ≤ 24 → 16 MiB).
 const MAX_BLOCK_BITS: u32 = 24;
 
+/// Hard cap on total one-shot decode output. The block loop (`while end_flag
+/// == 0`) is unbounded and the final-RLE layer can expand ~51× per block, so a
+/// small crafted stream could otherwise drive `out` to unbounded size. Matches
+/// the sibling sit13 decoder's `DEFAULT_OUTPUT_CAP`.
+const DEFAULT_OUTPUT_CAP: usize = 256 * 1024 * 1024;
+
 /// Outcome of a full-stream decode attempt.
 pub(crate) enum DecodeOutcome {
     /// The stream was decoded to completion (CRC verified).
@@ -299,6 +305,12 @@ pub(crate) fn decode_stream(data: &[u8]) -> Result<DecodeOutcome, Error> {
         // The final-RLE layer emits one logical output byte per loop turn,
         // consuming `numbytes` inverse-BWT bytes total.
         while byte_count < numbytes as u64 || rle_repeat > 0 {
+            // Bound total output across all blocks. The final-RLE layer can
+            // expand a 16 MiB block ~51×, so the check must live inside the
+            // emit loop, not merely per-block.
+            if out.len() >= DEFAULT_OUTPUT_CAP {
+                return Err(Error::Corrupt);
+            }
             if rle_repeat > 0 {
                 out.push(rle_last);
                 crc = crc32_update(crc, rle_last);

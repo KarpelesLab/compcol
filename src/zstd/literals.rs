@@ -21,8 +21,16 @@ use alloc::vec::Vec;
 
 use crate::error::Error;
 use crate::zstd::bitreader::RevBitReader;
-use crate::zstd::decoder::MAX_WINDOW_SIZE;
 use crate::zstd::huffman::{HuffTable, decode_huffman_tree};
+
+/// Per-block upper bound on a literals section's `Regenerated_Size`. Per RFC
+/// 8478 §3.1.1.3.1.1 a block's literals decode to at most Block_Maximum_Size =
+/// min(Window_Size, 128 KiB) bytes, which is itself capped at 128 KiB. We don't
+/// thread the frame's window size into this module, so we use the unconditional
+/// 128 KiB ceiling — far tighter than MAX_WINDOW_SIZE (128 MiB) and enough to
+/// stop a few header bytes from eagerly allocating ~1 MiB (RLE) / large Huffman
+/// outputs.
+const MAX_BLOCK_REGEN_SIZE: u64 = 128 * 1024;
 
 /// State carried across blocks: the most recently seen Huffman tree (used by
 /// `Treeless_Literals_Block`).
@@ -86,9 +94,10 @@ fn decode_raw_or_rle(block: &[u8], is_rle: bool, sf: u8) -> Result<LiteralsResul
 
     // Guard against decompression-bomb literal blocks: the 20-bit RLE
     // `Regenerated_Size` can request up to ~1 MiB from a few input bytes, and
-    // we materialize it eagerly below. Reject sizes above the conventional
-    // window cap before allocating/resizing.
-    if regen_size as u64 > MAX_WINDOW_SIZE {
+    // we materialize it eagerly below. The per-block Regenerated_Size is
+    // spec-capped at Block_Maximum_Size (<= 128 KiB), so reject anything above
+    // that before allocating/resizing.
+    if regen_size as u64 > MAX_BLOCK_REGEN_SIZE {
         return Err(Error::Corrupt);
     }
 
@@ -176,9 +185,9 @@ fn decode_compressed_literals(
     };
 
     // Same decompression-bomb guard as the Raw/RLE path: reject a
-    // `Regenerated_Size` above the conventional window cap before we allocate
-    // an output buffer sized to it.
-    if regen_size as u64 > MAX_WINDOW_SIZE {
+    // `Regenerated_Size` above Block_Maximum_Size (<= 128 KiB) before we
+    // allocate an output buffer sized to it.
+    if regen_size as u64 > MAX_BLOCK_REGEN_SIZE {
         return Err(Error::Corrupt);
     }
 

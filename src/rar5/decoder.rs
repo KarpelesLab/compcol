@@ -765,14 +765,20 @@ fn decode_distance(bits: &mut BitBuf, dist_slot: u16, ldc: &Huffman) -> Result<u
     if dist_slot as usize >= HUFF_DC {
         return Err(Error::Corrupt);
     }
-    let mut dist: u32;
+    // Accumulate in u64. For slot 63 the base is 0xC0000001 and the
+    // attacker-supplied high/low bits can push the running total past
+    // u32::MAX (e.g. 0xC0000001 + 0x3FFFFFF0 + 0xF == 0x1_0000_0000),
+    // which would overflow a u32 — a debug-build panic and a release-build
+    // wrap. Working in u64 keeps every intermediate exact; we bound-check
+    // before narrowing back to the u32 that `emit_match` consumes.
+    let mut dist: u64;
     let dbits: u32;
     if dist_slot < 4 {
         dbits = 0;
-        dist = 1 + dist_slot as u32;
+        dist = 1 + dist_slot as u64;
     } else {
         dbits = (dist_slot as u32 / 2) - 1;
-        dist = 1 + ((2 | (dist_slot as u32 & 1)) << dbits);
+        dist = 1 + ((2 | (dist_slot as u64 & 1)) << dbits);
     }
     if dbits > 0 {
         if dbits >= 4 {
@@ -791,16 +797,23 @@ fn decode_distance(bits: &mut BitBuf, dist_slot: u16, ldc: &Huffman) -> Result<u
                     high = (high << chunk) | part;
                     remaining -= chunk;
                 }
-                dist += high << 4;
+                dist += (high as u64) << 4;
             }
-            let low = ldc.decode(bits)? as u32;
+            let low = ldc.decode(bits)? as u64;
             dist += low;
         } else {
-            let extra = bits.read(dbits)?;
+            let extra = bits.read(dbits)? as u64;
             dist += extra;
         }
     }
-    Ok(dist)
+    // A distance above u32::MAX cannot be a valid back-reference (the window
+    // is at most 4 GiB and `emit_match` works in u32), so reject it here
+    // before the narrowing cast rather than letting it wrap. `emit_match`
+    // applies the precise `> window_size` bound on the in-range value.
+    if dist > u32::MAX as u64 {
+        return Err(Error::InvalidDistance);
+    }
+    Ok(dist as u32)
 }
 
 /// Read a filter descriptor immediately after the main code emits 256.
@@ -874,5 +887,29 @@ mod tests {
         assert_eq!(adjust_length(3, 0x101), 4);
         assert_eq!(adjust_length(3, 0x2001), 5);
         assert_eq!(adjust_length(3, 0x4_0001), 6);
+    }
+
+    /// Regression: slot 63 with maximal attacker-supplied extra/low bits used
+    /// to overflow the u32 distance accumulator. base = 0xC0000001, the 26
+    /// high bits add 0x3FFFFFF0 (→ 0xFFFFFFF1), and the LDC low (15) would
+    /// push it to 0x1_0000_0000 — an `attempt to add with overflow` panic in
+    /// the dev profile (overflow-checks on) and a silent wrap in release.
+    /// The fix accumulates in u64 and rejects distances above u32::MAX with
+    /// `InvalidDistance` before narrowing. This test panics if unfixed.
+    #[test]
+    fn slot_63_max_bits_does_not_overflow() {
+        // Complete 16-symbol LDC code, every symbol length 4. Canonical
+        // assignment gives symbol 15 the all-ones code 0b1111, so an
+        // all-ones bitstream decodes the low nibble to 15 (the maximum).
+        let ldc = Huffman::from_lengths(&[4u8; HUFF_LDC]).unwrap();
+        let mut br = BitBuf::new();
+        // 26 high bits + 4 LDC bits = 30 bits; supply 8 bytes of 1s so the
+        // 16-bit peeks never run dry.
+        br.reset(&[0xFF; 8], 8);
+        // Must return an error rather than panicking or wrapping.
+        assert_eq!(
+            decode_distance(&mut br, 63, &ldc),
+            Err(Error::InvalidDistance)
+        );
     }
 }
