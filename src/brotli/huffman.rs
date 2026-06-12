@@ -21,8 +21,10 @@ use crate::error::Error;
 
 /// Primary-LUT width for the fast-path symbol lookup. Codes of length
 /// ≤ `PRIMARY_BITS` resolve in O(1); longer codes fall back to the
-/// per-bit walk.
-const PRIMARY_BITS: u32 = 9;
+/// per-bit walk. Brotli codes cap at length 15; an 11-bit table resolves
+/// the vast majority of literal/distance symbols in one indexed load
+/// (2048 u32 = 8 KiB per tree) while still fitting comfortably in L1.
+const PRIMARY_BITS: u32 = 11;
 const PRIMARY_SIZE: usize = 1 << PRIMARY_BITS;
 
 /// Packed (symbol, length) entry in the primary LUT. The low 16 bits hold
