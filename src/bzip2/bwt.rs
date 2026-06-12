@@ -149,50 +149,67 @@ fn sa_is_inner(text: &[i32], sa: &mut [i32], alphabet_size: usize) {
     //    suffix i+1 is S-type. Otherwise L-type.
     //
     //    `t[i] == true` ⇒ S-type.
+    //
+    //    While we classify, collect the LMS positions (left-to-right)
+    //    once so we don't have to rescan the type array later.
     let mut t = vec![false; n];
     t[n - 1] = true;
+    // An LMS position is an S-type whose left neighbour is L-type. We
+    // know `t[i+1]` as we walk right-to-left, so we can detect the LMS
+    // at `i+1` the moment we set `t[i]` (it is LMS iff t[i+1] && !t[i]).
+    let mut lms_positions: Vec<i32> = Vec::new();
     for i in (0..n - 1).rev() {
-        t[i] = if text[i] < text[i + 1] {
+        let si = if text[i] < text[i + 1] {
             true
         } else if text[i] == text[i + 1] {
             t[i + 1]
         } else {
             false
         };
+        t[i] = si;
+        // i+1 is LMS iff it is S-type (t[i+1]) and i is L-type (!si).
+        if t[i + 1] && !si {
+            lms_positions.push((i + 1) as i32);
+        }
     }
+    // We pushed LMS positions in descending order; reverse for ascending.
+    lms_positions.reverse();
+    let n1 = lms_positions.len();
 
     // 2. Compute bucket sizes (count of each symbol in `text`).
+    //    `counts` holds the per-symbol counts; `bucket` is a reusable
+    //    scratch into which we materialise either bucket starts or ends.
     let mut counts = vec![0i32; alphabet_size];
     for &c in text {
         counts[c as usize] += 1;
     }
+    let mut bucket = vec![0i32; alphabet_size];
 
     // 3. Step A: place LMS suffixes at the END of their buckets in `sa`.
     sa.fill(-1);
-    let mut ends = bucket_ends(&counts);
-    for (i, &c_i) in text.iter().enumerate().take(n).skip(1) {
-        if is_lms(&t, i) {
-            let c = c_i as usize;
-            ends[c] -= 1;
-            sa[ends[c] as usize] = i as i32;
-        }
+    fill_bucket_ends(&counts, &mut bucket);
+    for &p in &lms_positions {
+        let c = text[p as usize] as usize;
+        bucket[c] -= 1;
+        sa[bucket[c] as usize] = p;
     }
 
     // 4. Induced sort of L-suffixes (left-to-right pass).
-    induce_sort_l(text, sa, &t, &counts);
+    induce_sort_l(text, sa, &t, &counts, &mut bucket);
 
     // 5. Induced sort of S-suffixes (right-to-left pass).
-    induce_sort_s(text, sa, &t, &counts);
+    induce_sort_s(text, sa, &t, &counts, &mut bucket);
 
     // 6. Compact LMS suffixes to the front of SA (preserving the order
     //    we just induced) and name them by their LMS-substring identity.
-    let mut n1 = 0usize;
+    let mut j1 = 0usize;
     for i in 0..n {
         if sa[i] >= 0 && is_lms(&t, sa[i] as usize) {
-            sa[n1] = sa[i];
-            n1 += 1;
+            sa[j1] = sa[i];
+            j1 += 1;
         }
     }
+    debug_assert_eq!(j1, n1);
     // Clear the rest as a workspace for naming.
     for slot in sa.iter_mut().take(n).skip(n1) {
         *slot = -1;
@@ -266,21 +283,11 @@ fn sa_is_inner(text: &[i32], sa: &mut [i32], alphabet_size: usize) {
         sa_is_inner(&reduced_text, sa1, new_alpha);
     }
 
-    // 8. Recover positions of LMS suffixes in the original text.
-    //    The trailing region currently holds the reduced text; we need
-    //    to translate name-indices in sa1 back to original positions.
-    //    We rebuild a list of LMS positions in left-to-right order.
-    let mut lms_positions: Vec<i32> = Vec::with_capacity(n1);
-    for (i, &is_s) in t.iter().enumerate().take(n).skip(1) {
-        if is_s && !t[i - 1] {
-            lms_positions.push(i as i32);
-        }
-    }
-    debug_assert_eq!(lms_positions.len(), n1);
-
-    // Translate: sa1[i] = index-of-LMS in original. Reuse trailing area
-    // as scratch for translated positions, then place them at bucket
-    // ends.
+    // 8. Recover positions of LMS suffixes in the original text using
+    //    the `lms_positions` list (in left-to-right order) we collected
+    //    during classification. sa1[i] is the rank/index in that list.
+    //    Translate the sorted LMS order (currently in sa[..n1]) into
+    //    original positions, in place.
     for slot in sa.iter_mut().take(n1) {
         let idx = *slot as usize; // recursive SA gave us the LMS index in left-to-right order.
         *slot = lms_positions[idx];
@@ -292,72 +299,80 @@ fn sa_is_inner(text: &[i32], sa: &mut [i32], alphabet_size: usize) {
 
     // 9. Place sorted LMS suffixes at the ENDS of their buckets in SA,
     //    in the order produced by the recursive call.
-    let mut ends = bucket_ends(&counts);
-    // Move them from positions 0..n1 to bucket-end positions, going
-    // right-to-left to preserve relative order within each bucket.
+    //
+    //    The sorted LMS positions sit in sa[..n1]. We scatter them to
+    //    bucket ends going right-to-left. Because scattering reads from
+    //    the front of `sa` while writing toward bucket ends (which are
+    //    at indices >= the read cursor for every symbol except possibly
+    //    the sentinel — and the sentinel bucket holds exactly the single
+    //    n-1 suffix that is never LMS), a destructive in-place scatter
+    //    could clobber a not-yet-read entry. To stay safe and simple we
+    //    snapshot the n1 sorted positions, clear `sa`, then scatter.
     let mut lms_sorted: Vec<i32> = Vec::with_capacity(n1);
     lms_sorted.extend_from_slice(&sa[..n1]);
     for slot in sa.iter_mut().take(n) {
         *slot = -1;
     }
+    fill_bucket_ends(&counts, &mut bucket);
     for &pos in lms_sorted.iter().rev() {
         let c = text[pos as usize] as usize;
-        ends[c] -= 1;
-        sa[ends[c] as usize] = pos;
+        bucket[c] -= 1;
+        sa[bucket[c] as usize] = pos;
     }
 
     // 10. Final induced sorts: L then S.
-    induce_sort_l(text, sa, &t, &counts);
-    induce_sort_s(text, sa, &t, &counts);
+    induce_sort_l(text, sa, &t, &counts, &mut bucket);
+    induce_sort_s(text, sa, &t, &counts, &mut bucket);
 }
 
 /// `true` iff suffix `i` is S-type AND suffix `i-1` is L-type (left-
 /// most S in a run). Suffix 0 is never an LMS in our convention.
+#[inline(always)]
 fn is_lms(t: &[bool], i: usize) -> bool {
     i > 0 && t[i] && !t[i - 1]
 }
 
-/// Compute exclusive prefix sums giving the *start* index of each
-/// bucket in SA.
-fn bucket_starts(counts: &[i32]) -> Vec<i32> {
-    let mut s = Vec::with_capacity(counts.len());
+/// Materialise the *start* index of each bucket (exclusive prefix sum
+/// of `counts`) into the reusable scratch `out`.
+#[inline]
+fn fill_bucket_starts(counts: &[i32], out: &mut [i32]) {
     let mut acc = 0i32;
-    for &c in counts {
-        s.push(acc);
+    for (o, &c) in out.iter_mut().zip(counts.iter()) {
+        *o = acc;
         acc += c;
     }
-    s
 }
 
-/// Compute the *end* (one-past-last) index of each bucket in SA.
-fn bucket_ends(counts: &[i32]) -> Vec<i32> {
-    let mut e = Vec::with_capacity(counts.len());
+/// Materialise the *end* (one-past-last) index of each bucket
+/// (inclusive prefix sum of `counts`) into the reusable scratch `out`.
+#[inline]
+fn fill_bucket_ends(counts: &[i32], out: &mut [i32]) {
     let mut acc = 0i32;
-    for &c in counts {
+    for (o, &c) in out.iter_mut().zip(counts.iter()) {
         acc += c;
-        e.push(acc);
+        *o = acc;
     }
-    e
 }
 
 /// Induced sort of L-type suffixes. Scans `sa` left-to-right; for each
 /// non-negative entry `sa[i] = j`, if `j > 0` and suffix `j-1` is
 /// L-type, place `j-1` at the next free slot at the START of bucket
-/// `text[j-1]`.
-fn induce_sort_l(text: &[i32], sa: &mut [i32], t: &[bool], counts: &[i32]) {
+/// `text[j-1]`. `bucket` is reusable scratch of length `alphabet_size`.
+fn induce_sort_l(text: &[i32], sa: &mut [i32], t: &[bool], counts: &[i32], bucket: &mut [i32]) {
     let n = text.len();
-    let mut starts = bucket_starts(counts);
+    fill_bucket_starts(counts, bucket);
     for i in 0..n {
-        if sa[i] <= 0 {
+        let v = sa[i];
+        if v <= 0 {
             continue; // -1 or 0 — we handle 0 by not predecessing.
         }
-        let j = (sa[i] as usize) - 1;
+        let j = (v as usize) - 1;
         if !t[j] {
             // L-type.
             let c = text[j] as usize;
-            let slot = starts[c] as usize;
-            sa[slot] = j as i32;
-            starts[c] += 1;
+            let slot = bucket[c];
+            sa[slot as usize] = j as i32;
+            bucket[c] = slot + 1;
         }
     }
 }
@@ -365,20 +380,22 @@ fn induce_sort_l(text: &[i32], sa: &mut [i32], t: &[bool], counts: &[i32]) {
 /// Induced sort of S-type suffixes. Scans `sa` right-to-left; for each
 /// non-negative entry `sa[i] = j`, if `j > 0` and suffix `j-1` is
 /// S-type, place `j-1` at the next free slot at the END of bucket
-/// `text[j-1]`.
-fn induce_sort_s(text: &[i32], sa: &mut [i32], t: &[bool], counts: &[i32]) {
+/// `text[j-1]`. `bucket` is reusable scratch of length `alphabet_size`.
+fn induce_sort_s(text: &[i32], sa: &mut [i32], t: &[bool], counts: &[i32], bucket: &mut [i32]) {
     let n = text.len();
-    let mut ends = bucket_ends(counts);
+    fill_bucket_ends(counts, bucket);
     for i in (0..n).rev() {
-        if sa[i] <= 0 {
+        let v = sa[i];
+        if v <= 0 {
             continue;
         }
-        let j = (sa[i] as usize) - 1;
+        let j = (v as usize) - 1;
         if t[j] {
             // S-type.
             let c = text[j] as usize;
-            ends[c] -= 1;
-            sa[ends[c] as usize] = j as i32;
+            let slot = bucket[c] - 1;
+            bucket[c] = slot;
+            sa[slot as usize] = j as i32;
         }
     }
 }
@@ -547,6 +564,43 @@ mod tests {
         let (l, origin) = bwt_forward(&data);
         let back = bwt_inverse(&l, origin);
         assert_eq!(back, data);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    #[ignore]
+    fn timing_bwt_forward() {
+        extern crate std;
+        let n = 900_000usize;
+        let lorem_src = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, \
+sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
+        let mut lorem = Vec::with_capacity(n);
+        while lorem.len() < n {
+            lorem.extend_from_slice(lorem_src);
+        }
+        lorem.truncate(n);
+        let zeros = vec![0u8; n];
+        let mut random = Vec::with_capacity(n);
+        let mut state: u32 = 0xDEAD_BEEF;
+        for _ in 0..n {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            random.push((state >> 16) as u8);
+        }
+        for (name, data) in [("lorem", &lorem), ("zeros", &zeros), ("random", &random)] {
+            let _ = bwt_forward(data);
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                let (l, _o) = bwt_forward(data);
+                let el = t.elapsed().as_secs_f64();
+                std::hint::black_box(&l);
+                if el < best {
+                    best = el;
+                }
+            }
+            let mbps = (n as f64) / best / 1e6;
+            std::eprintln!("BWT {name}: {:.2} ms  {:.1} MB/s", best * 1e3, mbps);
+        }
     }
 
     #[test]
