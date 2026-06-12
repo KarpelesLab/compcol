@@ -2157,6 +2157,11 @@ impl Decoder {
             htree_d.push(Self::read_prefix_code(src, num_dist_codes)?);
         }
 
+        // When there is a single literal Huffman tree the context map is
+        // all zeroes, so literal decoding can skip the per-byte context
+        // lookup entirely (the tree index is constant 0).
+        let single_literal_tree = ntreesl == 1;
+
         // ─── decoding loop ───
         let mut emitted: u32 = 0;
         let mut block_type_l: u32 = 0;
@@ -2232,20 +2237,43 @@ impl Decoder {
             let copy_len = COPY_BASE[copy_code as usize] + copy_extra;
 
             // Emit `insert_len` literals.
-            for _ in 0..insert_len {
-                if emitted >= mlen {
-                    return Err(Error::Corrupt);
+            if single_literal_tree {
+                // Single literal Huffman tree: the context map is all
+                // zeroes, so the per-byte context computation and the
+                // `cmapl` lookup are dead work — the tree index is always
+                // 0. (Block-type switches still drive `block_len_l`, but
+                // they never change which tree we use here.)
+                let tree = &htree_l[0];
+                for _ in 0..insert_len {
+                    if emitted >= mlen {
+                        return Err(Error::Corrupt);
+                    }
+                    maybe_switch!(block_len_l, block_type_l, prev_block_type_l, group_l);
+                    block_len_l -= 1;
+                    let sym = tree.decode(src)?;
+                    if sym > 255 {
+                        return Err(Error::Corrupt);
+                    }
+                    self.emit_literal(sym as u8);
+                    emitted += 1;
                 }
-                maybe_switch!(block_len_l, block_type_l, prev_block_type_l, group_l);
-                block_len_l -= 1;
-                let cid = context::literal_context(cmodes[block_type_l as usize], self.p1, self.p2);
-                let tree_idx = cmapl[(64 * block_type_l + cid as u32) as usize] as usize;
-                let sym = htree_l[tree_idx].decode(src)?;
-                if sym > 255 {
-                    return Err(Error::Corrupt);
+            } else {
+                for _ in 0..insert_len {
+                    if emitted >= mlen {
+                        return Err(Error::Corrupt);
+                    }
+                    maybe_switch!(block_len_l, block_type_l, prev_block_type_l, group_l);
+                    block_len_l -= 1;
+                    let cid =
+                        context::literal_context(cmodes[block_type_l as usize], self.p1, self.p2);
+                    let tree_idx = cmapl[(64 * block_type_l + cid as u32) as usize] as usize;
+                    let sym = htree_l[tree_idx].decode(src)?;
+                    if sym > 255 {
+                        return Err(Error::Corrupt);
+                    }
+                    self.emit_literal(sym as u8);
+                    emitted += 1;
                 }
-                self.emit_literal(sym as u8);
-                emitted += 1;
             }
 
             if emitted >= mlen {
