@@ -138,12 +138,20 @@ impl Decoder {
                     if out.len() + length > CHUNK_SIZE {
                         return Err(Error::Corrupt);
                     }
-                    // Byte-by-byte copy from the chunk's own output so
-                    // far. Self-overlap is permitted (offset < length).
                     let src_start = pos - offset;
-                    for k in 0..length {
-                        let b = out[src_start + k];
-                        out.push(b);
+                    if offset >= length {
+                        // Non-overlapping: the source range is fully
+                        // populated already, so grow the buffer and bulk
+                        // copy in one shot instead of byte-by-byte.
+                        out.resize(pos + length, 0);
+                        out.copy_within(src_start..src_start + length, pos);
+                    } else {
+                        // Self-overlapping run (offset < length): each
+                        // emitted byte feeds the next, so copy one at a time.
+                        for k in 0..length {
+                            let b = out[src_start + k];
+                            out.push(b);
+                        }
                     }
                 }
             }
