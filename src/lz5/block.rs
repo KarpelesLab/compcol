@@ -274,11 +274,15 @@ fn copy_match(out: &mut Vec<u8>, offset: usize, match_len: usize, cap: usize) ->
         let b = out[start];
         out.resize(out.len() + match_len, b);
     } else {
-        // Self-overlap — must copy byte-by-byte so back-references read
-        // from already-written bytes.
-        for i in 0..match_len {
-            let b = out[start + i];
-            out.push(b);
+        // Self-overlap — copy in `offset`-sized chunks. Each round duplicates
+        // the tail produced so far, doubling the source region, so the loop
+        // runs a logarithmic number of times instead of once per byte.
+        let mut remaining = match_len;
+        while remaining > 0 {
+            let chunk = remaining.min(offset);
+            let s = out.len() - offset;
+            out.extend_from_within(s..s + chunk);
+            remaining -= chunk;
         }
     }
     Ok(())

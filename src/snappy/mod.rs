@@ -540,10 +540,15 @@ fn copy_from_back(
         let b = out[start];
         out.resize(out.len() + length, b);
     } else {
-        // Self-overlapping (RLE-style) — must replicate byte-by-byte.
-        for i in 0..length {
-            let b = out[start + i];
-            out.push(b);
+        // Self-overlapping (RLE-style) — copy in `offset`-sized chunks. Each
+        // round duplicates the tail produced so far, doubling the source
+        // region, so the loop runs a logarithmic number of times.
+        let mut remaining = length;
+        while remaining > 0 {
+            let chunk = remaining.min(offset);
+            let s = out.len() - offset;
+            out.extend_from_within(s..s + chunk);
+            remaining -= chunk;
         }
     }
     Ok(())

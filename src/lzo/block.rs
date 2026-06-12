@@ -622,10 +622,15 @@ fn copy_match(
         let b = out[start];
         out.resize(out.len() + length, b);
     } else {
-        // Self-overlap (LZ77 RLE-style): replicate byte-by-byte.
-        for i in 0..length {
-            let b = out[start + i];
-            out.push(b);
+        // Self-overlap (LZ77 RLE-style): copy in `distance`-sized chunks. Each
+        // round duplicates the tail produced so far, doubling the source
+        // region, so the loop runs a logarithmic number of times.
+        let mut remaining = length;
+        while remaining > 0 {
+            let chunk = remaining.min(distance);
+            let s = out.len() - distance;
+            out.extend_from_within(s..s + chunk);
+            remaining -= chunk;
         }
     }
     Ok(())
