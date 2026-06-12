@@ -200,6 +200,13 @@ doc              = false
 bench            = false
 
 [[bin]]
+name             = "decoder_h2_huffman"
+path             = "fuzz_targets/decoder_h2_huffman.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
 name             = "decoder_bcj"
 path             = "fuzz_targets/decoder_bcj.rs"
 test             = false

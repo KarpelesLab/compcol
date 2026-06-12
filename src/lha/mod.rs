@@ -1,5 +1,5 @@
-//! LHA / LZH compression methods: `-lh1-`, `-lh4-`, `-lh5-`, `-lh6-`,
-//! `-lh7-`.
+//! LHA / LZH compression methods: `-lh1-`, `-lh2-`, `-lh4-`, `-lh5-`,
+//! `-lh6-`, `-lh7-`.
 //!
 //! These are LZSS sliding-dictionary back-reference schemes whose
 //! literal/length and position codes are Huffman-coded. They are the
@@ -7,7 +7,9 @@
 //! like the rar/zip-method codecs elsewhere in this crate.
 //!
 //! - `lh1`: 4 KiB dictionary, **adaptive** Huffman (the classic LZHUF
-//!   scheme of Yoshizaki & Okumura).
+//!   scheme of Yoshizaki & Okumura), fixed position code.
+//! - `lh2`: 8 KiB dictionary, **adaptive** Huffman for both literals/lengths
+//!   *and* positions (see [`dynamic_huff`]).
 //! - `lh4`: 4 KiB dictionary, static Huffman.
 //! - `lh5`: 16 KiB dictionary, static Huffman — the dominant method.
 //! - `lh6`: 64 KiB dictionary, static Huffman.
@@ -16,7 +18,9 @@
 //! `lh4`/`lh5`/`lh6`/`lh7` share the static-Huffman block structure
 //! (Okumura's public-domain ar002 layout — see [`static_huff`]) and differ
 //! only in dictionary size and the number of position-code bits. `lh1`
-//! uses the adaptive-Huffman tree-update scheme (see [`lzhuf`]).
+//! uses the adaptive-Huffman tree-update scheme (see [`lzhuf`]); `lh2`
+//! extends it to an 8 KiB window with an adaptive position tree (see
+//! [`dynamic_huff`]).
 //!
 //! ## Framing — none
 //!
@@ -27,8 +31,8 @@
 //!
 //! - `lh4`/`lh5`/`lh6`/`lh7` are block-structured and self-terminate — decode
 //!   the input and call `finish()`, like any other codec here.
-//! - `lh1` is a continuous, size-terminated stream with no in-band end, so its
-//!   decoder needs the uncompressed length out of band via
+//! - `lh1` and `lh2` are continuous, size-terminated streams with no in-band
+//!   end, so their decoders need the uncompressed length out of band via
 //!   [`DecoderConfig::with_len`] (the size a container reader already has).
 //!   `with_len` is accepted by every method and bounds decompressed size for
 //!   decompression-bomb safety.
@@ -52,6 +56,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 mod bits;
+pub mod dynamic_huff;
 mod huffman;
 pub mod lzhuf;
 pub mod static_huff;
@@ -65,6 +70,7 @@ use static_huff::Params;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Method {
     Lh1,
+    Lh2,
     Lh4,
     Lh5,
     Lh6,
@@ -75,14 +81,17 @@ impl Method {
     fn name(self) -> &'static str {
         match self {
             Method::Lh1 => "lh1",
+            Method::Lh2 => "lh2",
             Method::Lh4 => "lh4",
             Method::Lh5 => "lh5",
             Method::Lh6 => "lh6",
             Method::Lh7 => "lh7",
         }
     }
+    /// `lh4`/`lh5`/`lh6`/`lh7` use the static-Huffman block structure; `lh1`
+    /// and `lh2` use adaptive (dynamic) Huffman.
     fn is_static(self) -> bool {
-        !matches!(self, Method::Lh1)
+        !matches!(self, Method::Lh1 | Method::Lh2)
     }
 }
 
@@ -154,6 +163,12 @@ define_method!(
     "LHA `-lh1-`: 4 KiB dictionary, adaptive Huffman (LZHUF)."
 );
 define_method!(
+    Lh2,
+    Lh2,
+    "lh2",
+    "LHA `-lh2-`: 8 KiB dictionary, adaptive Huffman for literals/lengths and positions."
+);
+define_method!(
     Lh4,
     Lh4,
     "lh4",
@@ -207,11 +222,13 @@ impl Encoder {
     }
 
     fn finalize(&mut self) {
-        let payload = if self.method.is_static() {
-            let params = Params::for_method(self.method.name());
-            static_huff::encode_payload(&self.input, params)
-        } else {
-            lzhuf::encode_payload(&self.input)
+        let payload = match self.method {
+            Method::Lh1 => lzhuf::encode_payload(&self.input),
+            Method::Lh2 => dynamic_huff::encode_payload(&self.input),
+            _ => {
+                let params = Params::for_method(self.method.name());
+                static_huff::encode_payload(&self.input, params)
+            }
         };
         self.output.extend_from_slice(&payload);
     }
@@ -302,13 +319,16 @@ impl Decoder {
             let params = Params::for_method(self.method.name());
             static_huff::decode_payload(payload, self.expected_len, params)?
         } else {
-            // lh1 (LZHUF) is a continuous, size-terminated code stream with no
-            // in-band end marker — the uncompressed length must be supplied
-            // out of band via `DecoderConfig::with_len`. Without it we cannot
-            // know where the data ends (the trailing bits are padding), so we
-            // refuse rather than emit garbage.
+            // lh1 (LZHUF) and lh2 are continuous, size-terminated code streams
+            // with no in-band end marker — the uncompressed length must be
+            // supplied out of band via `DecoderConfig::with_len`. Without it
+            // we cannot know where the data ends (the trailing bits are
+            // padding), so we refuse rather than emit garbage.
             match self.expected_len {
-                Some(n) => lzhuf::decode_payload(payload, n)?,
+                Some(n) => match self.method {
+                    Method::Lh2 => dynamic_huff::decode_payload(payload, n)?,
+                    _ => lzhuf::decode_payload(payload, n)?,
+                },
                 None if payload.is_empty() => Vec::new(),
                 None => return Err(Error::Unsupported),
             }

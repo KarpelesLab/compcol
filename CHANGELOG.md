@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **HTTP/2 HPACK header compression** (RFC 7541) behind the new `hpack`
+  feature. `compcol::hpack::{HpackEncoder, HpackDecoder}` implement the full
+  header codec — static + dynamic indexing tables, N-bit-prefix integers,
+  string literals, and all field representations (indexed, literal
+  with/without indexing, never-indexed, dynamic-table size update). Validated
+  byte-for-byte against the RFC 7541 Appendix C worked examples. The §5.2
+  string Huffman primitive is also exposed as the `Http2Huffman` codec
+  (name `h2-huffman`) through the uniform `Encoder`/`Decoder` traits.
+- **LHA `-lh2-`** added to the `lha` feature: 8 KiB-window LZSS with adaptive
+  (dynamic) Huffman for both literals/lengths and match positions. Like `lh1`
+  it is continuous and size-terminated, so its decoder takes the uncompressed
+  length via `DecoderConfig::with_len`. Clean-room, round-trip validated.
+
 ## [0.6.0](https://github.com/KarpelesLab/compcol/compare/v0.5.1...v0.6.0) - 2026-06-03
 
 ### Other
