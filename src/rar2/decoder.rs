@@ -544,13 +544,43 @@ impl RunCtx {
         if remaining > cap {
             remaining = cap;
         }
-        while remaining > 0 {
-            let src = (self.window_pos + WINDOW_SIZE - off) & WINDOW_MASK;
+        output.reserve(remaining);
+        let mut src = (self.window_pos + WINDOW_SIZE - off) & WINDOW_MASK;
+
+        if off == 1 {
+            // Distance-1 run: one repeated byte.
             let b = self.window[src];
-            self.window[self.window_pos] = b;
-            self.window_pos = (self.window_pos + 1) & WINDOW_MASK;
-            output.push(b);
-            remaining -= 1;
+            for _ in 0..remaining {
+                self.window[self.window_pos] = b;
+                self.window_pos = (self.window_pos + 1) & WINDOW_MASK;
+                output.push(b);
+            }
+        } else if off >= remaining {
+            // Non-overlapping: copy in contiguous window segments.
+            let mut done = 0usize;
+            while done < remaining {
+                let run = (remaining - done)
+                    .min(WINDOW_SIZE - src)
+                    .min(WINDOW_SIZE - self.window_pos);
+                let sp = self.window_pos;
+                for k in 0..run {
+                    let b = self.window[src + k];
+                    self.window[sp + k] = b;
+                    output.push(b);
+                }
+                src = (src + run) & WINDOW_MASK;
+                self.window_pos = (self.window_pos + run) & WINDOW_MASK;
+                done += run;
+            }
+        } else {
+            // Overlapping match: each written byte feeds a later read.
+            for _ in 0..remaining {
+                let b = self.window[src];
+                self.window[self.window_pos] = b;
+                src = (src + 1) & WINDOW_MASK;
+                self.window_pos = (self.window_pos + 1) & WINDOW_MASK;
+                output.push(b);
+            }
         }
         Ok(())
     }
