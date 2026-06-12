@@ -518,8 +518,6 @@ pub struct Decoder {
     /// in forward order. `emit_head` is the read cursor.
     emit_buf: Vec<u8>,
     emit_head: usize,
-    /// Scratch stack used while reversing a decoded string.
-    stack: Vec<u8>,
     /// Once `finish` has nothing more to flush.
     completed: bool,
 }
@@ -542,7 +540,6 @@ impl Decoder {
             codes_in_group: 0,
             emit_buf: Vec::new(),
             emit_head: 0,
-            stack: Vec::with_capacity(max_size),
             completed: false,
         }
     }
@@ -629,17 +626,20 @@ impl Decoder {
     /// Decode the string represented by `code`, pushing characters forward
     /// into `self.emit_buf`. Updates `self.finchar` to the first character.
     fn decode_string_to_emit_buf(&mut self, mut code: u32) {
-        self.stack.clear();
+        // Walk the prefix chain straight into `emit_buf`. Suffixes come out
+        // deepest-last (reverse order), so we append them followed by the
+        // first character, then reverse just the region we wrote. This avoids
+        // the separate scratch stack and its second copy pass — a single walk
+        // plus one in-place reverse (tight, cache-friendly).
+        let start = self.emit_buf.len();
         while code >= 256 {
-            self.stack.push(self.suffix[code as usize]);
+            self.emit_buf.push(self.suffix[code as usize]);
             code = self.prefix[code as usize] as u32;
         }
         let first = code as u8;
         self.finchar = first;
         self.emit_buf.push(first);
-        while let Some(b) = self.stack.pop() {
-            self.emit_buf.push(b);
-        }
+        self.emit_buf[start..].reverse();
     }
 
     /// Drain `self.emit_buf` (from `self.emit_head`) into `out`, returning
@@ -827,7 +827,6 @@ impl RawDecoder for Decoder {
         self.codes_in_group = 0;
         self.emit_buf.clear();
         self.emit_head = 0;
-        self.stack.clear();
         self.completed = false;
     }
 }
