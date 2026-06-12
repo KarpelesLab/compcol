@@ -127,6 +127,8 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         #[cfg(feature = "lha")]
         crate::lha::Lh1::NAME => Some(Box::new(<crate::lha::Lh1 as Algorithm>::encoder())),
         #[cfg(feature = "lha")]
+        crate::lha::Lh2::NAME => Some(Box::new(<crate::lha::Lh2 as Algorithm>::encoder())),
+        #[cfg(feature = "lha")]
         crate::lha::Lh4::NAME => Some(Box::new(<crate::lha::Lh4 as Algorithm>::encoder())),
         #[cfg(feature = "lha")]
         crate::lha::Lh5::NAME => Some(Box::new(<crate::lha::Lh5 as Algorithm>::encoder())),
@@ -134,6 +136,10 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         crate::lha::Lh6::NAME => Some(Box::new(<crate::lha::Lh6 as Algorithm>::encoder())),
         #[cfg(feature = "lha")]
         crate::lha::Lh7::NAME => Some(Box::new(<crate::lha::Lh7 as Algorithm>::encoder())),
+        #[cfg(feature = "hpack")]
+        crate::hpack::Http2Huffman::NAME => Some(Box::new(
+            <crate::hpack::Http2Huffman as Algorithm>::encoder(),
+        )),
         #[cfg(feature = "bcj")]
         crate::bcj::BcjX86::NAME => Some(Box::new(<crate::bcj::BcjX86 as Algorithm>::encoder())),
         #[cfg(feature = "bcj")]
@@ -359,6 +365,8 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         #[cfg(feature = "lha")]
         crate::lha::Lh1::NAME => Some(Box::new(<crate::lha::Lh1 as Algorithm>::decoder())),
         #[cfg(feature = "lha")]
+        crate::lha::Lh2::NAME => Some(Box::new(<crate::lha::Lh2 as Algorithm>::decoder())),
+        #[cfg(feature = "lha")]
         crate::lha::Lh4::NAME => Some(Box::new(<crate::lha::Lh4 as Algorithm>::decoder())),
         #[cfg(feature = "lha")]
         crate::lha::Lh5::NAME => Some(Box::new(<crate::lha::Lh5 as Algorithm>::decoder())),
@@ -366,6 +374,10 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         crate::lha::Lh6::NAME => Some(Box::new(<crate::lha::Lh6 as Algorithm>::decoder())),
         #[cfg(feature = "lha")]
         crate::lha::Lh7::NAME => Some(Box::new(<crate::lha::Lh7 as Algorithm>::decoder())),
+        #[cfg(feature = "hpack")]
+        crate::hpack::Http2Huffman::NAME => Some(Box::new(
+            <crate::hpack::Http2Huffman as Algorithm>::decoder(),
+        )),
         #[cfg(feature = "bcj")]
         crate::bcj::BcjX86::NAME => Some(Box::new(<crate::bcj::BcjX86 as Algorithm>::decoder())),
         #[cfg(feature = "bcj")]
@@ -701,6 +713,9 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     if str_eq(name, "lh1") && cfg!(feature = "lha") {
         return Some("lzh");
     }
+    if str_eq(name, "lh2") && cfg!(feature = "lha") {
+        return Some("lzh");
+    }
     if str_eq(name, "lh4") && cfg!(feature = "lha") {
         return Some("lzh");
     }
@@ -861,6 +876,8 @@ pub const fn names() -> &'static [&'static str] {
         #[cfg(feature = "lha")]
         crate::lha::Lh1::NAME,
         #[cfg(feature = "lha")]
+        crate::lha::Lh2::NAME,
+        #[cfg(feature = "lha")]
         crate::lha::Lh4::NAME,
         #[cfg(feature = "lha")]
         crate::lha::Lh5::NAME,
@@ -868,6 +885,8 @@ pub const fn names() -> &'static [&'static str] {
         crate::lha::Lh6::NAME,
         #[cfg(feature = "lha")]
         crate::lha::Lh7::NAME,
+        #[cfg(feature = "hpack")]
+        crate::hpack::Http2Huffman::NAME,
         #[cfg(feature = "bcj")]
         crate::bcj::BcjX86::NAME,
         #[cfg(feature = "bcj")]

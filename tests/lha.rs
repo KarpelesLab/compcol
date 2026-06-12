@@ -1,7 +1,7 @@
 #![cfg(feature = "lha")]
 //! Streaming round-trip + error-path tests for the LHA/LZH methods.
 
-use compcol::lha::{DecoderConfig, Lh1, Lh4, Lh5, Lh6, Lh7};
+use compcol::lha::{DecoderConfig, Lh1, Lh2, Lh4, Lh5, Lh6, Lh7};
 use compcol::{Algorithm, Decoder, Encoder, Error, Status};
 
 /// Encode `data` with `enc`, feeding `in_chunk` bytes at a time and
@@ -187,6 +187,38 @@ fn roundtrip_lh1() {
 }
 
 #[test]
+fn roundtrip_lh2() {
+    // lh2 is continuous + size-terminated like lh1, so it needs with_len.
+    for data in sample_inputs() {
+        roundtrip_mode::<Lh2>(&data, true);
+    }
+}
+
+#[test]
+fn lh2_without_len_refuses() {
+    // Non-empty lh2 stream with no out-of-band length must error (it has no
+    // in-band end marker), not emit garbage.
+    let data = b"some data to compress with lh2, repeated a bit".repeat(8);
+    let payload = encode_chunked(Lh2::encoder(), &data, 1 << 16, 1 << 16);
+    let mut dec = Lh2::decoder(); // default config: no expected_len
+    let mut out = vec![0u8; 4096];
+    let _ = dec.decode(&payload, &mut out); // buffers the stream
+    assert!(matches!(dec.finish(&mut out), Err(Error::Unsupported)));
+}
+
+#[test]
+fn large_window_match_lh2() {
+    // A match reachable only with lh2's 8 KiB window.
+    let mut data = vec![0u8; 20_000];
+    for (i, b) in data.iter_mut().enumerate() {
+        *b = (i % 241) as u8;
+    }
+    let head: Vec<u8> = data[..6000].to_vec();
+    data.extend_from_slice(&head);
+    roundtrip_mode::<Lh2>(&data, true);
+}
+
+#[test]
 fn large_window_match_lh7() {
     // A match at a distance only reachable with the 128 KiB lh7 window.
     let mut data = vec![0u8; 100_000];
@@ -276,7 +308,7 @@ fn names_registered() {
     #[cfg(feature = "factory")]
     {
         let names = compcol::factory::names();
-        for n in ["lh1", "lh4", "lh5", "lh6", "lh7"] {
+        for n in ["lh1", "lh2", "lh4", "lh5", "lh6", "lh7"] {
             assert!(names.contains(&n), "{n} not registered");
             assert!(compcol::factory::encoder_by_name(n).is_some());
             assert!(compcol::factory::decoder_by_name(n).is_some());
