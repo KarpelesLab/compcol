@@ -529,6 +529,44 @@ impl LzmaCore {
         (distance as usize) < n
     }
 
+    /// Bulk-copy up to `n` non-overlapping match bytes (requires
+    /// `distance + 1 >= n`) from the dictionary into both `out[*written..]`
+    /// and back into the dict. Returns the number of bytes copied; may be
+    /// less than `n` when the source or destination range wraps the circular
+    /// dict, in which case the caller falls back to the per-byte loop for
+    /// the remainder. Caller must guarantee `dict_has(distance)` and that
+    /// `out` has at least `n` bytes of room from `*written`.
+    fn dict_copy_match_bulk(
+        &mut self,
+        distance: u32,
+        n: usize,
+        out: &mut [u8],
+        written: &mut usize,
+    ) -> usize {
+        let dist1 = distance as usize + 1;
+        let src = if self.dict_pos >= dist1 {
+            self.dict_pos - dist1
+        } else {
+            self.dict.len() - (dist1 - self.dict_pos)
+        };
+        let src_room = self.dict.len() - src;
+        let dst_room = self.dict.len() - self.dict_pos;
+        let chunk = n.min(src_room).min(dst_room);
+        if chunk == 0 {
+            return 0;
+        }
+        out[*written..*written + chunk].copy_from_slice(&self.dict[src..src + chunk]);
+        self.dict.copy_within(src..src + chunk, self.dict_pos);
+        *written += chunk;
+        self.dict_pos += chunk;
+        if self.dict_pos >= self.dict.len() {
+            self.dict_pos = 0;
+            self.dict_full = true;
+        }
+        self.output_pos += chunk as u64;
+        chunk
+    }
+
     fn pos_state(&self) -> u32 {
         (self.output_pos as u32) & self.pos_mask
     }
@@ -755,17 +793,32 @@ impl LzmaCore {
                 PacketOutcome::Match { length } => {
                     let mut remaining = length as usize;
                     let distance = self.rep0;
+                    if !self.dict_has(distance) {
+                        return Err(Error::Corrupt);
+                    }
+                    // A match that would write past the chunk's declared
+                    // output size is malformed.
+                    if remaining > target - written {
+                        return Err(Error::Corrupt);
+                    }
+                    // Fast path: when the match is non-overlapping
+                    // (distance + 1 >= remaining) the source bytes already
+                    // exist contiguously behind `dict_pos`, so we can bulk
+                    // `copy_from_slice` / `copy_within` instead of stepping
+                    // byte by byte. `dict_copy_match_bulk` copies as much as
+                    // it can without crossing the circular dict boundary and
+                    // returns the count; the per-byte loop handles any
+                    // wrapped remainder and the overlapping case.
+                    if distance as usize + 1 >= remaining {
+                        let did = self.dict_copy_match_bulk(distance, remaining, out, &mut written);
+                        remaining -= did;
+                    }
                     while remaining > 0 {
                         if !self.dict_has(distance) {
                             return Err(Error::Corrupt);
                         }
                         let b = self.dict_get(distance);
                         self.dict_put(b);
-                        if written >= target {
-                            // Matches that overshoot the per-chunk size cap
-                            // are malformed.
-                            return Err(Error::Corrupt);
-                        }
                         out[written] = b;
                         written += 1;
                         remaining -= 1;
