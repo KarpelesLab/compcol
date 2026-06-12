@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/KarpelesLab/compcol/compare/v0.6.0...v0.6.1) - 2026-06-12
+
+### Other
+
+- Security hardening: fix decompression bombs, OOB panic, and overflow in decoders ([#88](https://github.com/KarpelesLab/compcol/pull/88))
+- Add HTTP/2 HPACK (RFC 7541) and LHA -lh2- codecs ([#89](https://github.com/KarpelesLab/compcol/pull/89))
+- replace two decoder-path unwrap/expect with error returns ([#86](https://github.com/KarpelesLab/compcol/pull/86))
+
 ### Added
 
 - **HTTP/2 HPACK header compression** (RFC 7541) behind the new `hpack`
