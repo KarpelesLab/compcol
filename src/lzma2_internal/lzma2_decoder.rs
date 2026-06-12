@@ -567,6 +567,55 @@ impl LzmaCore {
         chunk
     }
 
+    /// Bulk-copy up to `n` *overlapping* match bytes (`distance + 1 < n`)
+    /// from the dictionary into both `out[*written..]` and the dict. The
+    /// source window `[src, dict_pos)` is `dist1` bytes long and is repeated
+    /// forward to fill the run; we extend it by `copy_within` in growing
+    /// windows so each byte read was already written in a previous window.
+    /// Only the contiguous portion that neither wraps the circular dict nor
+    /// overruns is handled here; the caller's per-byte loop covers the rest.
+    /// Returns the number of bytes copied. Caller must guarantee
+    /// `dict_has(distance)` and `out` room for `n` bytes from `*written`.
+    fn dict_copy_match_overlap(
+        &mut self,
+        distance: u32,
+        n: usize,
+        out: &mut [u8],
+        written: &mut usize,
+    ) -> usize {
+        let dist1 = distance as usize + 1;
+        // Source must not wrap: it begins `dist1` bytes behind dict_pos.
+        if self.dict_pos < dist1 {
+            return 0;
+        }
+        let dst = self.dict_pos;
+        let src = dst - dist1;
+        // Destination must not wrap during the whole run.
+        let dst_room = self.dict.len() - dst;
+        let chunk = n.min(dst_room);
+        if chunk == 0 {
+            return 0;
+        }
+        // Self-overlapping forward fill: copy in doubling windows so each
+        // read targets bytes written by an earlier iteration.
+        let mut filled = dist1.min(chunk);
+        self.dict.copy_within(src..src + filled, dst);
+        while filled < chunk {
+            let take = filled.min(chunk - filled);
+            self.dict.copy_within(dst..dst + take, dst + filled);
+            filled += take;
+        }
+        out[*written..*written + chunk].copy_from_slice(&self.dict[dst..dst + chunk]);
+        *written += chunk;
+        self.dict_pos += chunk;
+        if self.dict_pos >= self.dict.len() {
+            self.dict_pos = 0;
+            self.dict_full = true;
+        }
+        self.output_pos += chunk as u64;
+        chunk
+    }
+
     fn pos_state(&self) -> u32 {
         (self.output_pos as u32) & self.pos_mask
     }
@@ -811,6 +860,12 @@ impl LzmaCore {
                     // wrapped remainder and the overlapping case.
                     if distance as usize + 1 >= remaining {
                         let did = self.dict_copy_match_bulk(distance, remaining, out, &mut written);
+                        remaining -= did;
+                    } else {
+                        // Overlapping run (e.g. RLE-style fills): replicate
+                        // the source window forward in bulk.
+                        let did =
+                            self.dict_copy_match_overlap(distance, remaining, out, &mut written);
                         remaining -= did;
                     }
                     while remaining > 0 {
