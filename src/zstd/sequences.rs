@@ -127,6 +127,12 @@ pub fn decode_sequences(data: &[u8], state: &mut SequencesState) -> Result<Vec<S
     // data is parsed; the loop below still pushes exactly `n_seq` entries.
     let mut sequences: Vec<Sequence> = Vec::with_capacity((n_seq as usize).min(128 * 1024));
 
+    // Table sizes are loop-invariant; hoist them so the per-sequence advance
+    // doesn't reload `entries.len()` three times.
+    let ll_size = ll_table.size();
+    let ml_size = ml_table.size();
+    let of_size = of_table.size();
+
     for i in 0..n_seq {
         // Per RFC §3.1.1.3.2.1.1 decoding order:
         //   1. Read literal_length extra bits.
@@ -134,9 +140,16 @@ pub fn decode_sequences(data: &[u8], state: &mut SequencesState) -> Result<Vec<S
         //   3. Read match_length extra bits.
         // Then advance ll, ml, of states (in that order) by reading their
         // num_bits. Final sequence skips the advance.
-        let ll_sym = ll_state.symbol(&ll_table) as u8;
-        let ml_sym = ml_state.symbol(&ml_table) as u8;
-        let of_sym = of_state.symbol(&of_table) as u8;
+        //
+        // Fetch each state's table entry once: it yields both the symbol (used
+        // now) and the (num_bits, base_state) recipe reused by advance_with
+        // below, so we index each FSE table only once per sequence.
+        let ll_entry = ll_state.entry(&ll_table);
+        let ml_entry = ml_state.entry(&ml_table);
+        let of_entry = of_state.entry(&of_table);
+        let ll_sym = ll_entry.symbol as u8;
+        let ml_sym = ml_entry.symbol as u8;
+        let of_sym = of_entry.symbol as u8;
 
         let (ll_base, ll_extra) = ll_base_extra(ll_sym)?;
         let (ml_base, ml_extra) = ml_base_extra(ml_sym)?;
@@ -176,10 +189,11 @@ pub fn decode_sequences(data: &[u8], state: &mut SequencesState) -> Result<Vec<S
             break;
         }
 
-        // Advance states: LL, ML, OF (RFC ordering).
-        ll_state.advance(&ll_table, &mut br)?;
-        ml_state.advance(&ml_table, &mut br)?;
-        of_state.advance(&of_table, &mut br)?;
+        // Advance states: LL, ML, OF (RFC ordering), reusing the entries we
+        // already fetched for this state above.
+        ll_state.advance_with(ll_entry, ll_size, &mut br)?;
+        ml_state.advance_with(ml_entry, ml_size, &mut br)?;
+        of_state.advance_with(of_entry, of_size, &mut br)?;
     }
 
     // Stash tables for potential Repeat_Mode reuse next block.
