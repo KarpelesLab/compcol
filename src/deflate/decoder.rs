@@ -278,12 +278,19 @@ impl Decoder {
     }
 
     /// Write one byte to both the sliding window and the caller's output.
+    #[inline]
     fn emit_byte(&mut self, byte: u8, output: &mut [u8], written: &mut usize) {
         debug_assert!(*written < output.len());
         output[*written] = byte;
         *written += 1;
         self.window[self.window_pos] = byte;
-        self.window_pos = (self.window_pos + 1) % self.win_cap;
+        // `win_cap` is a runtime value, so `% win_cap` would lower to an
+        // integer division; a single wrap branch is far cheaper on the
+        // per-literal hot path.
+        self.window_pos += 1;
+        if self.window_pos == self.win_cap {
+            self.window_pos = 0;
+        }
         if self.window_size < self.win_cap {
             self.window_size += 1;
         }
