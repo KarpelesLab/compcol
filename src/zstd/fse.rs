@@ -347,15 +347,24 @@ impl FseState {
     }
 
     /// Return the current symbol (without advancing state).
+    #[inline]
     pub fn symbol(&self, table: &FseTable) -> u16 {
         table.entries[self.state as usize].symbol
     }
 
     /// Advance: read `num_bits` from the reader and update state.
+    #[inline]
     pub fn advance(&mut self, table: &FseTable, br: &mut RevBitReader<'_>) -> Result<(), Error> {
         let e = table.entries[self.state as usize];
-        let extra = br.read(e.num_bits as u32)? as u16;
-        let next = e.base_state.wrapping_add(extra);
+        // Most table entries carry a non-trivial `num_bits`, but a meaningful
+        // fraction are 0 (max-probability symbols); skip the bit-reader call
+        // entirely in that case — `base_state` is already the next state.
+        let next = if e.num_bits == 0 {
+            e.base_state
+        } else {
+            let extra = br.read(e.num_bits as u32)? as u16;
+            e.base_state.wrapping_add(extra)
+        };
         if (next as usize) >= table.size() {
             return Err(Error::Corrupt);
         }
