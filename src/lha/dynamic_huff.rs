@@ -8,13 +8,12 @@
 //! symbol, so no tables are carried in the stream.
 //!
 //! Coding, per symbol:
-//! - A literal/length symbol from the **char tree** (alphabet
-//!   [`NC`] = 510: 256 byte literals + 254 length codes for match lengths
-//!   3..=256). Symbol `< 256` is a literal; `256 + (len - MIN_MATCH)` is a
-//!   match of that length.
+//! - A literal/length symbol from the **char tree** (alphabet `NC` = 510:
+//!   256 byte literals + 254 length codes for match lengths 3..=256). Symbol
+//!   `< 256` is a literal; `256 + (len - MIN_MATCH)` is a match of that length.
 //! - For a match, a **position-class** symbol `p` from the **position tree**
-//!   (alphabet [`NP`] = 14), where `p` is the number of significant bits of
-//!   the ring distance-1. For `p >= 2`, the low `p - 1` bits follow raw.
+//!   (alphabet `NP` = 14), where `p` is the number of significant bits of the
+//!   ring distance-1. For `p >= 2`, the low `p - 1` bits follow raw.
 //!
 //! Like `lh1`, the raw `-lh2-` stream is continuous and size-terminated (no
 //! in-band end marker), so the decoder needs the uncompressed length out of

@@ -356,10 +356,7 @@ mod tests {
         // canonical (so the decoder's first_code math is correct).
         let table = DecodeTable::build();
         assert_eq!(table.symbols.len(), 257);
-        let mut next = [0u32; MAX_LEN + 1];
-        for len in 1..=MAX_LEN {
-            next[len] = table.first_code[len];
-        }
+        let mut next = table.first_code;
         for &sym in &table.symbols {
             let (code, len) = CODES[sym as usize];
             let l = len as usize;
@@ -374,7 +371,9 @@ mod tests {
         let enc = encode(b"www.example.com");
         assert_eq!(
             enc,
-            [0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff]
+            [
+                0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff
+            ]
         );
         assert_eq!(decode(&enc).unwrap(), b"www.example.com");
 

@@ -2,7 +2,7 @@
 //! Integration tests for the HPACK module: the public header-codec API, the
 //! `Http2Huffman` streaming codec, and factory-by-name lookup.
 
-use compcol::hpack::{HeaderField, Http2Huffman, HpackDecoder, HpackEncoder};
+use compcol::hpack::{HeaderField, HpackDecoder, HpackEncoder, Http2Huffman};
 use compcol::{Algorithm, Decoder, Encoder, Status};
 
 /// Drive a streaming encoder to completion over the whole input.
@@ -72,7 +72,9 @@ fn http2_huffman_known_vector() {
     let encoded = run_enc(Http2Huffman::encoder(), b"www.example.com");
     assert_eq!(
         encoded,
-        [0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff]
+        [
+            0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff
+        ]
     );
 }
 

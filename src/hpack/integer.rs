@@ -57,9 +57,7 @@ pub fn decode_int(buf: &[u8], pos: usize, n: u32) -> Result<(usize, usize), Erro
         if shift >= usize::BITS {
             return Err(Error::Corrupt);
         }
-        let add = (b & 0x7f)
-            .checked_shl(shift)
-            .ok_or(Error::Corrupt)?;
+        let add = (b & 0x7f).checked_shl(shift).ok_or(Error::Corrupt)?;
         value = value.checked_add(add).ok_or(Error::Corrupt)?;
         if b & 0x80 == 0 {
             break;
@@ -107,7 +105,7 @@ mod tests {
     fn overlong_continuation_rejected() {
         // Many 0x80 bytes never terminate within usize → Corrupt, not a hang.
         let mut buf = alloc::vec![0xffu8]; // 5-bit prefix max
-        buf.extend(core::iter::repeat(0x80).take(64));
+        buf.extend(core::iter::repeat_n(0x80, 64));
         buf.push(0x00);
         assert!(matches!(decode_int(&buf, 0, 5), Err(Error::Corrupt)));
     }
