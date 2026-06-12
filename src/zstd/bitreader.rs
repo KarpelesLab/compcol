@@ -91,8 +91,11 @@ impl<'a> RevBitReader<'a> {
         self.consumed >= self.available
     }
 
-    /// Give back `n` previously-read bits. Required by the Huffman decoder
-    /// which peeks `max_bits` and then keeps only the actual code length.
+    /// Give back `n` previously-read bits by rewinding the cursor and rebuilding
+    /// the accumulator. Retained as a general bit-reader primitive (and exercised
+    /// by tests); the Huffman decoder now uses the cheaper [`Self::peek_bits`] +
+    /// [`Self::consume`] pair instead, which avoids this per-symbol reseed.
+    #[allow(dead_code)]
     pub fn unread(&mut self, n: u32) {
         let n_usize = n as usize;
         debug_assert!(self.consumed >= n_usize);
@@ -103,8 +106,8 @@ impl<'a> RevBitReader<'a> {
         self.reseed_from_consumed();
     }
 
-    /// Rebuild the internal accumulator from `consumed`. Called from `unread`,
-    /// which is rare (one call per Huffman symbol at most).
+    /// Rebuild the internal accumulator from `consumed`. Called from `unread`.
+    #[allow(dead_code)]
     fn reseed_from_consumed(&mut self) {
         // Position of the next bit to deliver in global bit numbering.
         let next_bit = self.available - 1 - self.consumed;
@@ -133,9 +136,50 @@ impl<'a> RevBitReader<'a> {
         }
     }
 
+    /// Peek up to `peek_bits` bits MSB-first **without** consuming them,
+    /// returning them right-justified in a `u64` alongside the number of real
+    /// payload bits available in that window.
+    ///
+    /// `peek_bits` must be in `1..=56`. When fewer than `peek_bits` payload
+    /// bits remain, the low-order positions of the returned value are zero
+    /// (the accumulator shifts in zeros at the bottom), which is exactly what
+    /// a left-justified canonical-code lookup expects. The second return value
+    /// is `min(peek_bits, remaining)` so the caller can detect truncation.
+    ///
+    /// Used by the Huffman decoder to index a fixed-width lookup table and then
+    /// [`Self::consume`] only the matched code's actual length — avoiding the
+    /// expensive `read` + `unread` reseed that the old per-symbol path paid.
+    #[inline]
+    pub fn peek_bits(&mut self, peek_bits: u32) -> (u64, u32) {
+        debug_assert!((1..=56).contains(&peek_bits));
+        if self.bits_in_acc < peek_bits {
+            self.refill();
+        }
+        let remaining = self.available - self.consumed;
+        let avail = core::cmp::min(peek_bits as usize, remaining) as u32;
+        let raw = self.acc >> (64 - peek_bits);
+        (raw, avail)
+    }
+
+    /// Consume `n` bits previously inspected via [`Self::peek_bits`]. The caller
+    /// must ensure `n` does not exceed the bits the matching peek reported as
+    /// available and that `consumed + n <= available`.
+    #[inline]
+    pub fn consume(&mut self, n: u32) {
+        debug_assert!(n <= self.bits_in_acc);
+        debug_assert!(self.consumed + n as usize <= self.available);
+        if n == 0 {
+            return;
+        }
+        self.acc <<= n;
+        self.bits_in_acc -= n;
+        self.consumed += n as usize;
+    }
+
     /// Read `n` bits (0..=64) MSB-first from the current backward cursor.
     ///
     /// Bits returned right-justified.
+    #[inline]
     pub fn read(&mut self, n: u32) -> Result<u64, Error> {
         if n == 0 {
             return Ok(0);
