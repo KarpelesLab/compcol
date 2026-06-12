@@ -35,7 +35,7 @@
 //!
 //! Crafted streams never panic: the classic LZW KwKwK case and any
 //! out-of-range / not-yet-assigned code return [`Error::Corrupt`]; the
-//! dictionary and the decoded-string stack are bounded by `1 << 13`; every
+//! dictionary and the decoded-string scratch are bounded by `1 << 13`; every
 //! dictionary index is bounds-checked.
 //!
 //! ## References
@@ -347,7 +347,7 @@ pub struct Decoder {
     /// Decoded characters waiting to flush, forward order.
     emit_buf: Vec<u8>,
     emit_head: usize,
-    /// Scratch stack used while reversing a decoded string.
+    /// Fixed-size scratch used while reversing a decoded string.
     stack: Vec<u8>,
     completed: bool,
 }
@@ -366,7 +366,9 @@ impl Decoder {
             finchar: 0,
             emit_buf: Vec::new(),
             emit_head: 0,
-            stack: Vec::with_capacity(max_size),
+            // Fixed-size reverse-assembly scratch: a decoded string is at most
+            // `MAX_CODE` bytes, so its tail always fits.
+            stack: vec![0u8; max_size],
             completed: false,
         }
     }
@@ -396,26 +398,37 @@ impl Decoder {
     /// Returns `Err(Corrupt)` if the parent chain is malformed (too long or
     /// out of range) — defends against crafted streams.
     fn decode_string(&mut self, mut code: u32) -> Result<(), Error> {
-        self.stack.clear();
-        let limit = MAX_CODE as usize;
-        let mut hops = 0usize;
+        // Fast path: a bare literal is a length-1 string — emit directly.
+        if code < 256 {
+            let first = code as u8;
+            self.finchar = first;
+            self.emit_buf.push(first);
+            return Ok(());
+        }
+        // Walk the prefix chain back-to-front into the fixed-size scratch, then
+        // bulk-copy the forward-order slice into emit_buf with one
+        // extend_from_slice. This avoids the old per-byte push/pop round trip
+        // (each output byte written twice).
+        let scratch = &mut self.stack[..];
+        let mut i = scratch.len();
         while code >= 256 {
-            if code as usize >= self.prefix.len() {
+            // `i == 0` means the chain is longer than any valid string: a
+            // malformed / cyclic prefix table. Reject rather than underflow.
+            if code as usize >= self.prefix.len() || i == 0 {
                 return Err(Error::Corrupt);
             }
-            self.stack.push(self.suffix[code as usize]);
+            i -= 1;
+            scratch[i] = self.suffix[code as usize];
             code = self.prefix[code as usize] as u32;
-            hops += 1;
-            if hops > limit {
-                return Err(Error::Corrupt);
-            }
+        }
+        if i == 0 {
+            return Err(Error::Corrupt);
         }
         let first = code as u8;
         self.finchar = first;
-        self.emit_buf.push(first);
-        while let Some(b) = self.stack.pop() {
-            self.emit_buf.push(b);
-        }
+        i -= 1;
+        scratch[i] = first;
+        self.emit_buf.extend_from_slice(&scratch[i..]);
         Ok(())
     }
 
@@ -544,7 +557,7 @@ impl RawDecoder for Decoder {
         self.finchar = 0;
         self.emit_buf.clear();
         self.emit_head = 0;
-        self.stack.clear();
+        // `stack` is fixed-size scratch overwritten on every use; leave it.
         self.completed = false;
     }
 }
