@@ -30,28 +30,27 @@ pub struct HuffTable {
 
 impl HuffTable {
     /// Decode one symbol from `br`, consuming exactly its bit length.
+    ///
+    /// Fast path: peek `max_bits` (without consuming), index the lookup table,
+    /// then consume only the matched code's actual length. Peeking returns the
+    /// next `max_bits` already left-justified, so the index is `raw` directly —
+    /// no `read`+`unread` reseed per symbol.
+    #[inline]
     pub fn decode(&self, br: &mut RevBitReader<'_>) -> Result<u8, Error> {
-        if br.remaining() == 0 {
-            return Err(Error::Corrupt);
-        }
         let max = self.max_bits as u32;
-        let avail = br.remaining() as u32;
-        let take = core::cmp::min(max, avail);
-        let raw = br.read(take)?;
-        // Left-justify into a `max`-bit window so the table index matches the
-        // canonical MSB-first code regardless of how many bits remained.
-        let idx = (raw << (max - take)) as usize;
-        if idx >= self.lookup.len() {
+        let (raw, avail) = br.peek_bits(max);
+        if avail == 0 {
             return Err(Error::Corrupt);
         }
+        let idx = raw as usize;
+        // `idx` is in `0..(1 << max)` by construction of `peek_bits`, and the
+        // lookup table is sized `1 << max`, so the index is always in range.
+        debug_assert!(idx < self.lookup.len());
         let (sym, len) = self.lookup[idx];
-        if len == 0 || (len as u32) > take {
+        if len == 0 || len as u32 > avail {
             return Err(Error::Corrupt);
         }
-        // Give back any bits we consumed beyond the actual code length.
-        if take > len as u32 {
-            br.unread(take - len as u32);
-        }
+        br.consume(len as u32);
         Ok(sym)
     }
 }
