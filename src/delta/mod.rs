@@ -168,19 +168,36 @@ impl RawEncoder for Encoder {
         self.hist.check()?;
         let n = input.len().min(output.len());
         let h = &mut self.hist;
-        for i in 0..n {
+        let dist = h.dist;
+
+        // Phase 1: the first `dist` outputs subtract bytes from the ring
+        // history (previous calls / the all-zero seed).
+        let seed = dist.min(n);
+        for i in 0..seed {
             let orig = input[i];
-            // history[i - dist] is the original byte we are about to
-            // overwrite at the ring cursor.
             let prev = h.buf[h.pos];
-            // Modular subtraction is the defined transform (see module docs).
             output[i] = orig.wrapping_sub(prev);
-            // Store the *original* byte for future positions.
             h.buf[h.pos] = orig;
             h.pos += 1;
-            if h.pos == h.dist {
+            if h.pos == dist {
                 h.pos = 0;
             }
+        }
+        // Phase 2: for `i >= dist` the predecessor is `input[i - dist]` (the
+        // input *is* the original stream), so read it directly and drop the
+        // ring modulo branch and history accesses from the hot loop.
+        for i in dist..n {
+            output[i] = input[i].wrapping_sub(input[i - dist]);
+        }
+        // Phase 3: refresh the ring from the last `dist` *original* (input)
+        // bytes, matching the byte-by-byte cursor/layout (see the decoder for
+        // the derivation).
+        if n >= dist {
+            let pos_final = (h.pos + (n % dist)) % dist;
+            for k in 0..dist {
+                h.buf[(pos_final + k) % dist] = input[n - dist + k];
+            }
+            h.pos = pos_final;
         }
         Ok(RawProgress {
             consumed: n,
@@ -228,16 +245,45 @@ impl RawDecoder for Decoder {
         self.hist.check()?;
         let n = input.len().min(output.len());
         let h = &mut self.hist;
-        for i in 0..n {
+        let dist = h.dist;
+
+        // Phase 1: the first `dist` outputs depend on the ring history (bytes
+        // from previous calls / the all-zero seed). Reconstruct them through
+        // the ring exactly as before.
+        let seed = dist.min(n);
+        for i in 0..seed {
             let prev = h.buf[h.pos];
-            // Reconstruct the original byte: inverse of wrapping_sub.
             let orig = input[i].wrapping_add(prev);
             output[i] = orig;
             h.buf[h.pos] = orig;
             h.pos += 1;
-            if h.pos == h.dist {
+            if h.pos == dist {
                 h.pos = 0;
             }
+        }
+        // Phase 2: once `i >= dist`, `output[i - dist]` is the original byte we
+        // need — read it straight from the output buffer. This drops both the
+        // ring modulo branch and the history load/store from the hot loop and
+        // exposes a simple `out[i] = in[i] + out[i-dist]` recurrence.
+        for i in dist..n {
+            output[i] = input[i].wrapping_add(output[i - dist]);
+        }
+        // Phase 3: refresh the ring from the last `dist` reconstructed bytes so
+        // the next call continues seamlessly. (When `n < dist` the ring was
+        // already fully advanced byte-by-byte in phase 1 and is correct.)
+        //
+        // After processing `n` bytes the byte-by-byte algorithm leaves
+        // `pos = (p0 + n) % dist` and `buf[(pos + k) % dist] = output[n-dist+k]`
+        // for k in 0..dist (each slot holds its most recent write). Reproduce
+        // exactly that state. With `seed == dist` here, `h.pos` is back at `p0`,
+        // so the final cursor is `(p0 + n) % dist == (h.pos + (n % dist)) %
+        // dist`.
+        if n >= dist {
+            let pos_final = (h.pos + (n % dist)) % dist;
+            for k in 0..dist {
+                h.buf[(pos_final + k) % dist] = output[n - dist + k];
+            }
+            h.pos = pos_final;
         }
         Ok(RawProgress {
             consumed: n,
