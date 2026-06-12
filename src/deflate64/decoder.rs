@@ -662,37 +662,76 @@ impl Decoder {
                                 work.phase = HuffmanPhase::NextSymbol;
                                 continue;
                             }
-                            // Bulk-copy the non-overlapping run; the byte loop
-                            // handles overlap (distance < remaining) and any
-                            // wrap-around inside the circular window.
+                            // Copy the match run in contiguous, non-wrapping
+                            // spans. Non-overlapping spans use a single
+                            // copy_within + copy_from_slice; overlapping spans
+                            // (distance < remaining) replicate the d-byte
+                            // pattern with an expanding doubling copy instead
+                            // of one byte at a time.
                             let d = distance as usize;
-                            let out_room = output.len() - *written;
-                            let mut chunk = (remaining as usize).min(out_room);
-                            if chunk > 0 && d >= chunk {
-                                let src = (self.window_pos + WINDOW_SIZE - d) % WINDOW_SIZE;
-                                let src_room = WINDOW_SIZE - src;
-                                let dst_room = WINDOW_SIZE - self.window_pos;
-                                chunk = chunk.min(src_room).min(dst_room);
-                                if chunk > 0 {
-                                    output[*written..*written + chunk]
-                                        .copy_from_slice(&self.window[src..src + chunk]);
-                                    self.window.copy_within(src..src + chunk, self.window_pos);
-                                    *written += chunk;
-                                    self.window_pos = (self.window_pos + chunk) % WINDOW_SIZE;
-                                    if self.window_size < WINDOW_SIZE {
-                                        self.window_size =
-                                            (self.window_size + chunk).min(WINDOW_SIZE);
-                                    }
-                                    remaining -= chunk as u32;
-                                    progress = true;
-                                }
-                            }
                             while remaining > 0 && *written < output.len() {
-                                let d = distance as usize;
-                                let src = (self.window_pos + WINDOW_SIZE - d) % WINDOW_SIZE;
-                                let b = self.window[src];
-                                self.emit_byte(b, output, written);
-                                remaining -= 1;
+                                let out_room = output.len() - *written;
+                                let src = if self.window_pos >= d {
+                                    self.window_pos - d
+                                } else {
+                                    self.window_pos + WINDOW_SIZE - d
+                                };
+                                let dst_room = WINDOW_SIZE - self.window_pos;
+                                let src_room = WINDOW_SIZE - src;
+                                let span = (remaining as usize)
+                                    .min(out_room)
+                                    .min(dst_room)
+                                    .min(src_room);
+                                if span == 0 {
+                                    break;
+                                }
+
+                                if d >= span {
+                                    let wp = self.window_pos;
+                                    self.window.copy_within(src..src + span, wp);
+                                    output[*written..*written + span]
+                                        .copy_from_slice(&self.window[wp..wp + span]);
+                                    *written += span;
+                                    self.window_pos = wp + span;
+                                } else if src + d == self.window_pos {
+                                    let start = self.window_pos; // == src + d
+                                    let mut produced = 0usize;
+                                    while produced < span {
+                                        let copy = d.min(span - produced);
+                                        self.window.copy_within(
+                                            src + produced..src + produced + copy,
+                                            start + produced,
+                                        );
+                                        produced += copy;
+                                    }
+                                    output[*written..*written + span]
+                                        .copy_from_slice(&self.window[start..start + span]);
+                                    *written += span;
+                                    self.window_pos = start + span;
+                                } else {
+                                    // Rare: overlapping source wraps the ring.
+                                    let start = self.window_pos;
+                                    for i in 0..span {
+                                        let s = if start + i >= d {
+                                            start + i - d
+                                        } else {
+                                            start + i + WINDOW_SIZE - d
+                                        };
+                                        let b = self.window[s];
+                                        self.window[start + i] = b;
+                                        output[*written] = b;
+                                        *written += 1;
+                                    }
+                                    self.window_pos = start + span;
+                                }
+
+                                if self.window_pos == WINDOW_SIZE {
+                                    self.window_pos = 0;
+                                }
+                                if self.window_size < WINDOW_SIZE {
+                                    self.window_size = (self.window_size + span).min(WINDOW_SIZE);
+                                }
+                                remaining -= span as u32;
                                 progress = true;
                             }
                             if remaining == 0 {
