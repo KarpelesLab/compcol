@@ -126,7 +126,15 @@ impl Decoder {
     fn emit_byte(&mut self, b: u8) {
         self.decoded.push(b);
         self.out_history.push(b);
-        if self.out_history.len() > MAX_DISTANCE {
+        // Trim the retained history so it never grows without bound, but do
+        // it amortized: a naive `drain` back to `MAX_DISTANCE` on every byte
+        // shifts the whole 64 KiB buffer per emit, which is O(n²) over the
+        // stream. Instead let it grow to `2 * MAX_DISTANCE` and only then drop
+        // the oldest half, keeping at least the last `MAX_DISTANCE` bytes.
+        // Every read into `out_history` is relative to its current `len()` and
+        // bounded by `MAX_DISTANCE` (validated above against `out_history.len()`),
+        // so retaining that many is always sufficient. Amortized O(1) per byte.
+        if self.out_history.len() >= 2 * MAX_DISTANCE {
             let drop = self.out_history.len() - MAX_DISTANCE;
             self.out_history.drain(0..drop);
         }
