@@ -503,6 +503,51 @@ impl LzmaCore {
         chunk
     }
 
+    /// Bulk-copy up to `n` *overlapping* match bytes (`distance + 1 < n`,
+    /// e.g. RLE-style runs) from the dict into both `output[*written..]` and
+    /// the dict. The `dist1`-byte source window behind `dict_pos` is
+    /// replicated forward via doubling `copy_within` windows so each read
+    /// targets bytes written by an earlier window. Only the contiguous
+    /// portion that does not wrap the circular dict is handled; the caller's
+    /// per-byte loop covers the wrap remainder. Returns bytes copied. Caller
+    /// must guarantee `dict_has(distance)` and `n` bytes of output room.
+    fn dict_copy_match_overlap(
+        &mut self,
+        distance: u32,
+        n: usize,
+        output: &mut [u8],
+        written: &mut usize,
+    ) -> usize {
+        let dist1 = distance as usize + 1;
+        // Source window must not wrap: it starts `dist1` bytes behind dict_pos.
+        if self.dict_pos < dist1 {
+            return 0;
+        }
+        let dst = self.dict_pos;
+        let src = dst - dist1;
+        let dst_room = self.dict.len() - dst;
+        let chunk = n.min(dst_room);
+        if chunk == 0 {
+            return 0;
+        }
+        let mut filled = dist1.min(chunk);
+        self.dict.copy_within(src..src + filled, dst);
+        while filled < chunk {
+            let take = filled.min(chunk - filled);
+            self.dict.copy_within(dst..dst + take, dst + filled);
+            filled += take;
+        }
+        output[*written..*written + chunk].copy_from_slice(&self.dict[dst..dst + chunk]);
+        *written += chunk;
+        self.dict_pos += chunk;
+        if self.dict_pos >= self.dict.len() {
+            self.dict_pos = 0;
+            self.dict_full = true;
+        }
+        self.output_pos += chunk as u64;
+        chunk
+    }
+
     fn dict_has(&self, distance: u32) -> bool {
         let n = if self.dict_full {
             self.dict.len()
@@ -1043,6 +1088,14 @@ impl Decoder {
                             core.finished = true;
                             pm.remaining = 0;
                         }
+                    } else if want > 0 {
+                        // Overlapping run: replicate the source window forward.
+                        let did = core.dict_copy_match_overlap(pm.distance, want, output, written);
+                        pm.remaining -= did as u32;
+                        if matches!(core.uncompressed_size, Some(t) if core.output_pos >= t) {
+                            core.finished = true;
+                            pm.remaining = 0;
+                        }
                     }
                     while pm.remaining > 0 && *written < output.len() {
                         if !core.dict_has(pm.distance) {
@@ -1142,6 +1195,14 @@ impl Decoder {
                     let want = (remaining as usize).min(out_room).min(cap_by_size);
                     if want > 0 && (distance as usize + 1) >= want {
                         let did = core.dict_copy_match_bulk(distance, want, output, written);
+                        remaining -= did as u32;
+                        if matches!(core.uncompressed_size, Some(t) if core.output_pos >= t) {
+                            core.finished = true;
+                            remaining = 0;
+                        }
+                    } else if want > 0 {
+                        // Overlapping run: replicate the source window forward.
+                        let did = core.dict_copy_match_overlap(distance, want, output, written);
                         remaining -= did as u32;
                         if matches!(core.uncompressed_size, Some(t) if core.output_pos >= t) {
                             core.finished = true;
