@@ -39,7 +39,7 @@
 //!
 //! Crafted streams never panic: the classic LZW KwKwK case and any
 //! out-of-range / not-yet-assigned code return [`Error::Corrupt`]; the
-//! dictionary and the decoded-string stack are bounded by `1 << maxbits`;
+//! dictionary and the decoded-string scratch are bounded by `1 << maxbits`;
 //! every dictionary index is bounds-checked and width arithmetic is checked.
 //!
 //! ## References
@@ -386,7 +386,7 @@ pub struct Decoder {
     /// Decoded characters waiting to flush, forward order.
     emit_buf: Vec<u8>,
     emit_head: usize,
-    /// Scratch stack used while reversing a decoded string.
+    /// Scratch buffer used while reversing a decoded string.
     stack: Vec<u8>,
     completed: bool,
 }
@@ -408,7 +408,9 @@ impl Decoder {
             finchar: 0,
             emit_buf: Vec::new(),
             emit_head: 0,
-            stack: Vec::with_capacity(max_size),
+            // Fixed-size reverse-assembly scratch: a decoded string is at most
+            // `1 << maxbits` ≤ `max_size` bytes, so its tail always fits.
+            stack: vec![0u8; max_size],
             completed: false,
         }
     }
@@ -439,27 +441,48 @@ impl Decoder {
     /// Decode `code` into `emit_buf` (forward order); updates `finchar`.
     /// Returns `Err(Corrupt)` if the parent chain is malformed (too long or
     /// out of range) — defends against crafted streams.
+    ///
+    /// The chain is walked once, writing the reversed string straight into a
+    /// reserved tail region of `emit_buf` (deepest suffix last). This avoids
+    /// the previous scratch-stack round trip (every byte was written twice:
+    /// once pushed, once popped) — each output byte is now written exactly
+    /// once.
     fn decode_string(&mut self, mut code: u32) -> Result<(), Error> {
-        self.stack.clear();
-        let limit = 1usize << self.maxbits;
-        let mut hops = 0usize;
+        // `stack` is a fixed-size scratch (length == 1 << MAX_BITS, allocated
+        // once). We walk the prefix chain writing the string back-to-front into
+        // its tail, then bulk-copy the assembled forward-order slice into
+        // `emit_buf` with a single vectorised `extend_from_slice`. This avoids
+        // both the old per-byte `emit_buf.push` (a capacity check per byte) and
+        // any per-call zero-initialisation.
+        // Fast path: a bare literal (very common on incompressible input) is a
+        // length-1 string — emit it directly and skip the reverse-assembly.
+        if code < 256 {
+            let first = code as u8;
+            self.finchar = first;
+            self.emit_buf.push(first);
+            return Ok(());
+        }
+        let scratch = &mut self.stack[..];
+        let mut i = scratch.len();
         while code >= 256 {
-            if code as usize >= self.prefix.len() {
+            // `i` reaching 0 means the chain is longer than any valid string
+            // (> 1 << maxbits): a malformed / cyclic prefix table. Reject
+            // rather than underflow.
+            if code as usize >= self.prefix.len() || i == 0 {
                 return Err(Error::Corrupt);
             }
-            self.stack.push(self.suffix[code as usize]);
+            i -= 1;
+            scratch[i] = self.suffix[code as usize];
             code = self.prefix[code as usize] as u32;
-            hops += 1;
-            if hops > limit {
-                return Err(Error::Corrupt);
-            }
+        }
+        if i == 0 {
+            return Err(Error::Corrupt);
         }
         let first = code as u8;
         self.finchar = first;
-        self.emit_buf.push(first);
-        while let Some(b) = self.stack.pop() {
-            self.emit_buf.push(b);
-        }
+        i -= 1;
+        scratch[i] = first;
+        self.emit_buf.extend_from_slice(&scratch[i..]);
         Ok(())
     }
 
@@ -621,7 +644,7 @@ impl RawDecoder for Decoder {
         self.finchar = 0;
         self.emit_buf.clear();
         self.emit_head = 0;
-        self.stack.clear();
+        // `stack` is fixed-size scratch overwritten on every use; leave it.
         self.completed = false;
     }
 }
