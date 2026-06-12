@@ -71,9 +71,29 @@ impl Crc32 {
 
     pub fn update(&mut self, data: &[u8]) {
         let mut s = self.state;
-        for &b in data {
+
+        // Slice-by-8: consume eight bytes per iteration using eight
+        // precomputed tables. This shortens the per-byte dependency chain
+        // and branch/load count versus the byte-at-a-time loop while
+        // producing identical CRCs.
+        let mut chunks = data.chunks_exact(8);
+        for c in &mut chunks {
+            let lo = u32::from_le_bytes([c[0], c[1], c[2], c[3]]) ^ s;
+            let hi = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+            s = CRC32_TABLE8[7][(lo & 0xFF) as usize]
+                ^ CRC32_TABLE8[6][((lo >> 8) & 0xFF) as usize]
+                ^ CRC32_TABLE8[5][((lo >> 16) & 0xFF) as usize]
+                ^ CRC32_TABLE8[4][(lo >> 24) as usize]
+                ^ CRC32_TABLE8[3][(hi & 0xFF) as usize]
+                ^ CRC32_TABLE8[2][((hi >> 8) & 0xFF) as usize]
+                ^ CRC32_TABLE8[1][((hi >> 16) & 0xFF) as usize]
+                ^ CRC32_TABLE8[0][(hi >> 24) as usize];
+        }
+
+        // Tail: fewer than 8 bytes remain.
+        for &b in chunks.remainder() {
             let idx = ((s ^ b as u32) & 0xFF) as usize;
-            s = (s >> 8) ^ CRC32_TABLE[idx];
+            s = (s >> 8) ^ CRC32_TABLE8[0][idx];
         }
         self.state = s;
     }
@@ -94,13 +114,18 @@ impl Default for Crc32 {
     }
 }
 
-/// Build the standard 256-entry table at compile time.
+/// Slice-by-8 tables, built at compile time. `CRC32_TABLE8[0]` is the
+/// standard 256-entry CRC-32 table; `CRC32_TABLE8[n]` for `n >= 1` advances
+/// the CRC by an extra byte position, so eight bytes can be folded per
+/// iteration. See Intel's "Slicing-by-8" technique.
 #[cfg(any(feature = "gzip", test))]
-const CRC32_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
-    let mut i = 0u32;
+const CRC32_TABLE8: [[u32; 256]; 8] = {
+    let mut tables = [[0u32; 256]; 8];
+
+    // Base table (slice 0): the standard reflected CRC-32 step.
+    let mut i = 0usize;
     while i < 256 {
-        let mut c = i;
+        let mut c = i as u32;
         let mut k = 0;
         while k < 8 {
             c = if c & 1 != 0 {
@@ -110,10 +135,24 @@ const CRC32_TABLE: [u32; 256] = {
             };
             k += 1;
         }
-        table[i as usize] = c;
+        tables[0][i] = c;
         i += 1;
     }
-    table
+
+    // Each subsequent table folds in one more zero byte:
+    // table[n][i] = (table[n-1][i] >> 8) ^ table[0][table[n-1][i] & 0xFF].
+    let mut n = 1usize;
+    while n < 8 {
+        let mut j = 0usize;
+        while j < 256 {
+            let prev = tables[n - 1][j];
+            tables[n][j] = (prev >> 8) ^ tables[0][(prev & 0xFF) as usize];
+            j += 1;
+        }
+        n += 1;
+    }
+
+    tables
 };
 
 #[cfg(test)]
