@@ -346,16 +346,30 @@ impl FseState {
         Ok(Self { state: s })
     }
 
+    /// Return the table entry for the current state. The entry carries the
+    /// emitted symbol plus the `(num_bits, base_state)` recipe for the next
+    /// transition; fetching it once lets a caller read the symbol and then
+    /// [`Self::advance_with`] using the same load instead of re-indexing.
+    #[inline]
+    pub fn entry(&self, table: &FseTable) -> FseEntry {
+        table.entries[self.state as usize]
+    }
+
     /// Return the current symbol (without advancing state).
     #[inline]
     pub fn symbol(&self, table: &FseTable) -> u16 {
         table.entries[self.state as usize].symbol
     }
 
-    /// Advance: read `num_bits` from the reader and update state.
+    /// Advance using a pre-fetched [`FseEntry`] (from [`Self::entry`]) for the
+    /// *current* state, avoiding a second bounds-checked table index.
     #[inline]
-    pub fn advance(&mut self, table: &FseTable, br: &mut RevBitReader<'_>) -> Result<(), Error> {
-        let e = table.entries[self.state as usize];
+    pub fn advance_with(
+        &mut self,
+        e: FseEntry,
+        table_size: usize,
+        br: &mut RevBitReader<'_>,
+    ) -> Result<(), Error> {
         // Most table entries carry a non-trivial `num_bits`, but a meaningful
         // fraction are 0 (max-probability symbols); skip the bit-reader call
         // entirely in that case — `base_state` is already the next state.
@@ -365,11 +379,18 @@ impl FseState {
             let extra = br.read(e.num_bits as u32)? as u16;
             e.base_state.wrapping_add(extra)
         };
-        if (next as usize) >= table.size() {
+        if (next as usize) >= table_size {
             return Err(Error::Corrupt);
         }
         self.state = next;
         Ok(())
+    }
+
+    /// Advance: read `num_bits` from the reader and update state.
+    #[inline]
+    pub fn advance(&mut self, table: &FseTable, br: &mut RevBitReader<'_>) -> Result<(), Error> {
+        let e = table.entries[self.state as usize];
+        self.advance_with(e, table.size(), br)
     }
 }
 
