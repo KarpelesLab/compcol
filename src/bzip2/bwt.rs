@@ -273,14 +273,17 @@ fn sa_is_inner(text: &[i32], sa: &mut [i32], alphabet_size: usize) {
             sa1_area[name_of_pos as usize] = i as i32;
         }
     } else {
-        // Recurse on the reduced text. We need a slice of length n1 for
-        // sa1, and the reduced text occupies the trailing n1 cells.
+        // Recurse on the reduced text in place, with no copy. The
+        // reduced text occupies the trailing n1 cells (t1_area[..n1])
+        // and the sub-suffix-array is written into the leading n1 cells
+        // (sa1_area[..n1]). These come from the two disjoint halves of
+        // `split_at_mut`, so we can hold an immutable borrow of the text
+        // and a mutable borrow of the output simultaneously. They are
+        // guaranteed non-overlapping because n1 <= n/2 (no two adjacent
+        // positions are both LMS), hence n1 <= n - n1.
+        let reduced_text: &[i32] = &t1_area[..n1];
         let sa1 = &mut sa1_area[..n1];
-        // The reduced text is t1_area[..n1] but we want to pass it as
-        // an immutable slice. We must copy to avoid aliasing.
-        let mut reduced_text: Vec<i32> = Vec::with_capacity(n1);
-        reduced_text.extend_from_slice(&t1_area[..n1]);
-        sa_is_inner(&reduced_text, sa1, new_alpha);
+        sa_is_inner(reduced_text, sa1, new_alpha);
     }
 
     // 8. Recover positions of LMS suffixes in the original text using
