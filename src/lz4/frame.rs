@@ -142,6 +142,12 @@ pub struct EncoderConfig {
     /// `true` (default) = append xxHash32 of the raw content at the
     /// frame end. Matches `lz4 -c`.
     pub content_checksum: bool,
+    /// Block-compression level forwarded to
+    /// [`block::encode_block_level`]. Low levels use the fast greedy parse;
+    /// higher levels engage the HC hash-chain match finder with lazy matching
+    /// for a better ratio. The emitted bitstream is a valid LZ4 block in every
+    /// case. Default `0` (fast path, matching `lz4 -c`'s default speed).
+    pub level: u8,
 }
 
 impl Default for EncoderConfig {
@@ -151,6 +157,7 @@ impl Default for EncoderConfig {
             block_independence: false,
             block_checksum: false,
             content_checksum: true,
+            level: 0,
         }
     }
 }
@@ -421,7 +428,7 @@ impl Encoder {
 
         // Compress into a scratch buffer.
         let mut compressed = Vec::with_capacity(block::compress_bound(self.raw.len()));
-        block::encode_block(&self.raw, &mut compressed);
+        block::encode_block_level(&self.raw, &mut compressed, self.cfg.level);
 
         self.staged.clear();
         // Choose the smaller of compressed / raw. The LZ4 Frame spec

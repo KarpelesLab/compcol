@@ -39,14 +39,28 @@ pub const BLOCK_SIZE: usize = 64 * 1024;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Lz4;
 
+/// Encoder configuration for the LZ4 block stream.
+///
+/// The only tunable is the compression `level`, which selects the parse
+/// strategy in [`block::encode_block_level`]: low levels use the fast greedy
+/// matcher (LZ4's speed crown), higher levels engage the HC hash-chain match
+/// finder with lazy matching for a better ratio. The bitstream is identical
+/// either way. Default `0` (fast path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EncoderConfig {
+    /// Compression level. `0` = fast greedy (default); higher values engage
+    /// the HC match finder with deeper search.
+    pub level: u8,
+}
+
 impl Algorithm for Lz4 {
     const NAME: &'static str = "lz4";
     type Encoder = Encoder;
     type Decoder = Decoder;
-    type EncoderConfig = ();
+    type EncoderConfig = EncoderConfig;
     type DecoderConfig = ();
-    fn encoder_with(_: ()) -> Encoder {
-        Encoder::new()
+    fn encoder_with(c: EncoderConfig) -> Encoder {
+        Encoder::with_level(c.level)
     }
     fn decoder_with(_: ()) -> Decoder {
         Decoder::new()
@@ -76,16 +90,25 @@ pub struct Encoder {
     compressed_idx: usize,
     terminator_idx: u8,
     phase: EncPhase,
+    /// Compression level forwarded to [`block::encode_block_level`].
+    level: u8,
 }
 
 impl Encoder {
     pub fn new() -> Self {
+        Self::with_level(0)
+    }
+
+    /// Construct an encoder at the given compression `level`. `0` keeps the
+    /// fast greedy parse; higher levels engage the HC match finder.
+    pub fn with_level(level: u8) -> Self {
         Self {
             raw: Vec::with_capacity(BLOCK_SIZE),
             compressed: Vec::with_capacity(block::compress_bound(BLOCK_SIZE) + 4),
             compressed_idx: 0,
             terminator_idx: 0,
             phase: EncPhase::Buffering,
+            level,
         }
     }
 
@@ -106,7 +129,7 @@ impl Encoder {
         // clearing it. The block encoder clears its `out` arg, so we use a
         // temporary buffer and concatenate.
         let mut tmp = Vec::with_capacity(block::compress_bound(self.raw.len()));
-        block::encode_block(&self.raw, &mut tmp);
+        block::encode_block_level(&self.raw, &mut tmp, self.level);
         // The block format never emits zero bytes for a non-empty input;
         // even a single-byte input becomes at least a 1-byte token plus the
         // literal byte itself.

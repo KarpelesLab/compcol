@@ -255,6 +255,19 @@ pub fn encoder_by_name_with_level(name: &str, level: u8) -> Option<Box<dyn Encod
         crate::bzip2::Bzip2::NAME => Some(Box::new(
             <crate::bzip2::Bzip2 as Algorithm>::encoder_with(crate::bzip2::EncoderConfig { level }),
         )),
+        #[cfg(feature = "lz4")]
+        crate::lz4::Lz4::NAME => Some(Box::new(<crate::lz4::Lz4 as Algorithm>::encoder_with(
+            crate::lz4::EncoderConfig { level },
+        ))),
+        #[cfg(feature = "lz4")]
+        crate::lz4::frame::LZ4Frame::NAME => Some(Box::new(
+            <crate::lz4::frame::LZ4Frame as Algorithm>::encoder_with(
+                crate::lz4::frame::EncoderConfig {
+                    level,
+                    ..crate::lz4::frame::EncoderConfig::default()
+                },
+            ),
+        )),
         // Non-leveled algorithms: ignore `level`, return default encoder.
         _ => encoder_by_name(name),
     }
