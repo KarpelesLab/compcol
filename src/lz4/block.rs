@@ -50,9 +50,15 @@ const HC_HASH_TABLE_SIZE: usize = 1 << HC_HASH_LOG;
 /// are bounded by the streaming wrapper to fit in a `u32`.
 const HASH_EMPTY: u32 = u32::MAX;
 
-/// Lowest level that engages the HC parse. Levels below this use the fast
-/// greedy parse (preserving LZ4's speed crown).
+/// Lowest level that engages the HC (hash-chain + lazy) parse. Levels below
+/// this use the fast greedy parse (preserving LZ4's speed crown).
 const HC_LEVEL_THRESHOLD: u8 = 3;
+
+/// Lowest level that engages the price-based optimal parse. Levels in
+/// `HC_LEVEL_THRESHOLD..OPT_LEVEL_THRESHOLD` use the lazy HC parse; this level
+/// and above run a forward dynamic-programming parse that minimises the
+/// encoded byte cost.
+const OPT_LEVEL_THRESHOLD: u8 = 10;
 
 /// Hash 4 bytes down to `HASH_LOG` bits.
 ///
@@ -103,10 +109,11 @@ pub fn encode_block(input: &[u8], out: &mut Vec<u8>) {
     let mut anchor: usize = 0; // start of the current pending literal run
 
     // Position of the last byte we are allowed to start a match at. Anything
-    // past `match_limit` must be emitted as trailing literals.
+    // past `match_limit` must be emitted as trailing literals. (Note this is
+    // the *match-start* bound, len - MFLIMIT, which is stricter than the
+    // hashable bound len - MIN_MATCH - LAST_LITERALS — the spec forbids a
+    // match starting in the final MFLIMIT bytes.)
     let match_limit = input.len() - MFLIMIT;
-    // Position of the last byte we are allowed to *read* a 4-byte hash from.
-    let hash_limit = input.len() - MIN_MATCH - LAST_LITERALS;
 
     // The first byte is never the start of a match in our matcher; insert it
     // into the table so subsequent positions can refer to it.
@@ -123,7 +130,14 @@ pub fn encode_block(input: &[u8], out: &mut Vec<u8>) {
         // skip faster over incompressible data instead of probing every byte.
         let mut match_pos;
         loop {
-            if ip > hash_limit {
+            // A match may only *start* at or before `match_limit` (the spec
+            // requires the last match to begin at least MFLIMIT bytes before
+            // the block end). `hash_limit` (len - 4 - 5) is larger than
+            // `match_limit` (len - 12), so bounding the probe at `hash_limit`
+            // could find a match starting in the forbidden tail region — a
+            // block the strict reference decoder rejects. Stop at
+            // `match_limit`; the rest becomes trailing literals.
+            if ip > match_limit {
                 emit_last_literals(&input[anchor..], out);
                 return;
             }
@@ -220,7 +234,11 @@ pub fn encode_block_level(input: &[u8], out: &mut Vec<u8>, level: u8) {
         encode_block(input, out);
         return;
     }
-    encode_block_hc(input, out, level);
+    if level < OPT_LEVEL_THRESHOLD {
+        encode_block_hc(input, out, level);
+        return;
+    }
+    encode_block_optimal(input, out, level);
 }
 
 /// Map a compression level to a hash-chain search depth (`nb_attempts`).
@@ -440,6 +458,249 @@ fn encode_block_hc(input: &[u8], out: &mut Vec<u8>, level: u8) {
         ip = match_end;
     }
 
+    emit_last_literals(&input[anchor..], out);
+}
+
+/// Encoded byte cost of `litlen` literals, per the LZ4 token/run-length rules.
+///
+/// The literal payload is `litlen` bytes; if `litlen >= 15` the run-length
+/// nibble overflows and one or more extension bytes are appended:
+/// `1 + (litlen - 15) / 255`. The token nibble itself is billed once per
+/// sequence (see [`sequence_overhead`]), not here.
+#[inline]
+fn literals_price(litlen: usize) -> usize {
+    let mut price = litlen;
+    if litlen >= 15 {
+        price += 1 + (litlen - 15) / 255;
+    }
+    price
+}
+
+/// Marginal cost of extending a literal run from length `run` to `run + 1`:
+/// always 1 byte for the new literal, plus 1 more whenever the new length
+/// crosses a run-length extension boundary (15, then every 255 after).
+#[inline]
+fn marginal_literal_price(run: usize) -> usize {
+    1 + (literals_price(run + 1) - literals_price(run) - 1)
+}
+
+/// Fixed per-sequence overhead beyond the coupled literals: 1 token byte +
+/// 2 offset bytes, plus the match-length run-extension bytes once the match
+/// length nibble overflows (`mlen >= 19`).
+#[inline]
+fn sequence_overhead(mlen: usize) -> usize {
+    let mut price = 1 + 2; // token + 16-bit offset
+    if mlen >= ML_MASK_PLUS_MIN {
+        price += 1 + (mlen - ML_MASK_PLUS_MIN) / 255;
+    }
+    price
+}
+
+/// `ML_MASK (15) + MINMATCH (4)` — the match length at which the match-length
+/// nibble first overflows into extension bytes.
+const ML_MASK_PLUS_MIN: usize = 15 + MIN_MATCH;
+
+/// Match length at or beyond which the optimal parse stops enumerating every
+/// shorter length and simply takes the whole match. A match this long is
+/// effectively always worth taking in full (3 bytes of overhead amortised over
+/// 64+ bytes), and the cap keeps the per-position inner loop bounded so highly
+/// repetitive inputs stay near-linear instead of O(n²). Mirrors the role of
+/// `sufficient_len` in the reference LZ4-HC optimal parser.
+const OPT_SUFFICIENT_LEN: usize = 64;
+
+/// One step of the chosen parse path, recovered by backtracking the DP.
+#[derive(Clone, Copy)]
+struct OptStep {
+    /// Length of the literal run preceding this position's incoming edge.
+    litlen: usize,
+    /// `match_pos` of the incoming match, or `usize::MAX` for a literal step.
+    match_pos: usize,
+    /// Match length of the incoming edge (0 for a literal step).
+    match_len: usize,
+}
+
+/// Price-based optimal parse (top levels).
+///
+/// Runs a forward dynamic program over the block: `price[i]` is the minimal
+/// encoded byte cost to reach position `i`. Each position can advance by a
+/// single literal (marginal literal price, tracking the run length so the
+/// run-length token overflow is charged accurately) or by any match found via
+/// the hash-chain finder (sequence overhead + the literal run it terminates).
+/// Backtracking recovers the cheapest path, which is then emitted with the
+/// shared sequence emitter — so the bitstream stays a valid LZ4 block.
+fn encode_block_optimal(input: &[u8], out: &mut Vec<u8>, level: u8) {
+    out.clear();
+    if input.is_empty() {
+        return;
+    }
+    if input.len() < MFLIMIT + 1 {
+        emit_last_literals(input, out);
+        return;
+    }
+
+    let n = input.len();
+    let nb_attempts = nb_attempts_for_level(level);
+
+    let mut head = alloc::vec![HASH_EMPTY; HC_HASH_TABLE_SIZE];
+    let mut chain = alloc::vec![HASH_EMPTY; n];
+
+    let match_limit = n - MFLIMIT; // last position a match may start at
+    let hash_limit = n - MIN_MATCH - LAST_LITERALS; // last hashable position
+    let forward_limit = n - LAST_LITERALS; // last 5 bytes stay literal
+
+    // DP arrays over positions 0..=n.
+    // `price[i]` = min cost to encode input[0..i].
+    // `run[i]` = literal-run length ending at i on the best path to i.
+    // `step[i]` = the incoming edge used to reach i (for backtracking).
+    let mut price = alloc::vec![usize::MAX; n + 1];
+    let mut run = alloc::vec![0usize; n + 1];
+    let mut step = alloc::vec![
+        OptStep {
+            litlen: 0,
+            match_pos: usize::MAX,
+            match_len: 0,
+        };
+        n + 1
+    ];
+    price[0] = 0;
+
+    // Insert all positions up to `up_to` (exclusive) that are hashable.
+    let mut inserted_through = 0usize;
+    macro_rules! insert_up_to {
+        ($up_to:expr) => {{
+            let up_to = $up_to;
+            while inserted_through < up_to && inserted_through <= hash_limit {
+                hc_insert(input, inserted_through, &mut head, &mut chain);
+                inserted_through += 1;
+            }
+        }};
+    }
+
+    let mut i = 0usize;
+    while i < n {
+        if price[i] == usize::MAX {
+            i += 1;
+            continue; // unreachable position
+        }
+        let cur_price = price[i];
+        let cur_run = run[i];
+
+        // Literal edge: advance one byte, extending the literal run.
+        {
+            let lit_cost = cur_price + marginal_literal_price(cur_run);
+            if lit_cost < price[i + 1] {
+                price[i + 1] = lit_cost;
+                run[i + 1] = cur_run + 1;
+                step[i + 1] = OptStep {
+                    litlen: cur_run + 1,
+                    match_pos: usize::MAX,
+                    match_len: 0,
+                };
+            }
+        }
+
+        // Match edges: only valid starting positions can begin a match, and
+        // only where a 4-byte hash is readable.
+        if i > match_limit || i > hash_limit {
+            i += 1;
+            continue;
+        }
+        insert_up_to!(i + 1);
+        let found = hc_longest_match(input, i, &head, &chain, nb_attempts, forward_limit);
+        let (best_pos, best_len) = match found {
+            Some(f) => f,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+
+        // The literal run that *would* precede this match was already paid for
+        // in `cur_price`/`cur_run`. Emitting a match terminates that run, so
+        // the new sequence's coupled-literal price equals what we already
+        // charged for the run — i.e. taking the match adds only the sequence
+        // overhead. (The token nibble that also encodes the literal length is
+        // the single token byte we add here.)
+        //
+        // For a sufficiently long match, shorter splits are never preferable:
+        // record the full-length edge, insert the positions it covers so later
+        // matches can chain inside it, and fast-forward past the interior. This
+        // keeps highly-repetitive inputs near-linear (no O(n²) DP sweep), while
+        // the global DP still chooses among long matches and literal runs.
+        if best_len >= OPT_SUFFICIENT_LEN {
+            let end = i + best_len;
+            let cost = cur_price + sequence_overhead(best_len);
+            if cost < price[end] {
+                price[end] = cost;
+                run[end] = 0;
+                step[end] = OptStep {
+                    litlen: cur_run,
+                    match_pos: best_pos,
+                    match_len: best_len,
+                };
+            }
+            insert_up_to!(end);
+            i = end;
+            continue;
+        }
+
+        // Short match: enumerate every length in [MIN_MATCH, best_len]; a
+        // shorter match can line up a cheaper continuation, which is exactly
+        // what the DP weighs.
+        for mlen in MIN_MATCH..=best_len {
+            let end = i + mlen;
+            if end > n {
+                break;
+            }
+            let cost = cur_price + sequence_overhead(mlen);
+            if cost < price[end] {
+                price[end] = cost;
+                run[end] = 0;
+                step[end] = OptStep {
+                    litlen: cur_run,
+                    match_pos: best_pos,
+                    match_len: mlen,
+                };
+            }
+        }
+        i += 1;
+    }
+
+    // Backtrack from n to 0, collecting the path edges in reverse.
+    let mut path: Vec<OptStep> = Vec::new();
+    let mut pos = n;
+    while pos > 0 {
+        let s = step[pos];
+        if s.match_pos == usize::MAX {
+            // Literal edge: step back one byte. Collapse a contiguous literal
+            // run into the match step that follows; here we just step.
+            pos -= 1;
+        } else {
+            path.push(s);
+            pos -= s.match_len;
+        }
+    }
+    path.reverse();
+
+    // Replay forward, emitting literals then each match.
+    let mut anchor = 0usize;
+    for s in &path {
+        let match_start = {
+            // The match's start position is the end-of-literal-run point. We
+            // reconstruct it from the literal run length recorded on the edge.
+            anchor + s.litlen
+        };
+        let offset = (match_start - s.match_pos) as u16;
+        let match_excess = s.match_len - MIN_MATCH;
+        emit_sequence(
+            &input[anchor..match_start],
+            s.litlen,
+            offset,
+            match_excess,
+            out,
+        );
+        anchor = match_start + s.match_len;
+    }
     emit_last_literals(&input[anchor..], out);
 }
 
@@ -702,5 +963,95 @@ mod tests {
             hc.len(),
             fast.len()
         );
+    }
+
+    /// Walk an encoded block and assert it obeys the strict end-of-block rules
+    /// the reference `lz4` decoder enforces: the last 5 bytes are literals, and
+    /// no match starts within the final `MFLIMIT` (12) bytes of the block.
+    ///
+    /// `raw_len` is the decoded length (so we can compute output positions).
+    fn assert_eob_rules(encoded: &[u8], raw_len: usize) {
+        if encoded.is_empty() {
+            assert_eq!(raw_len, 0);
+            return;
+        }
+        let mut i = 0usize;
+        let mut outpos = 0usize;
+        let n = encoded.len();
+        loop {
+            let token = encoded[i];
+            i += 1;
+            let mut lit = (token >> 4) as usize;
+            if lit == 15 {
+                loop {
+                    let b = encoded[i];
+                    i += 1;
+                    lit += b as usize;
+                    if b != 255 {
+                        break;
+                    }
+                }
+            }
+            i += lit;
+            outpos += lit;
+            if i == n {
+                // Closing literal-only sequence: the spec requires the final
+                // run be at least LAST_LITERALS bytes (unless the whole block
+                // is shorter than that).
+                if raw_len >= LAST_LITERALS {
+                    assert!(
+                        lit >= LAST_LITERALS,
+                        "final literal run {lit} < {LAST_LITERALS}"
+                    );
+                }
+                break;
+            }
+            // A match follows. Its start in the decoded stream is `outpos`.
+            let match_start = outpos;
+            assert!(
+                match_start + MFLIMIT <= raw_len,
+                "match starts at {match_start}, within MFLIMIT of end {raw_len}"
+            );
+            i += 2; // offset
+            let mut ml = (token & 0x0F) as usize;
+            if ml == 15 {
+                loop {
+                    let b = encoded[i];
+                    i += 1;
+                    ml += b as usize;
+                    if b != 255 {
+                        break;
+                    }
+                }
+            }
+            ml += MIN_MATCH;
+            outpos += ml;
+        }
+        assert_eq!(outpos, raw_len, "decoded length mismatch");
+    }
+
+    #[test]
+    fn end_of_block_rules_all_levels() {
+        // Construct an input whose best parse lands a match right up against
+        // the end of the block — exactly the case that previously produced a
+        // block the reference decoder rejected (a match starting inside the
+        // final MFLIMIT bytes).
+        let mut v = Vec::new();
+        for _ in 0..400 {
+            v.extend_from_slice(b"alpha beta gamma delta epsilon ");
+        }
+        // Append a tail that repeats earlier content so a match is tempting at
+        // the very end.
+        v.extend_from_slice(b"alpha beta gamma delta epsilon");
+
+        for level in 0..=12u8 {
+            let mut enc = Vec::new();
+            encode_block_level(&v, &mut enc, level);
+            assert_eob_rules(&enc, v.len());
+            // And it must still round-trip.
+            let mut dec = Vec::new();
+            decode_block(&enc, &mut dec, usize::MAX).expect("decode");
+            assert_eq!(dec, v, "round-trip at level {level}");
+        }
     }
 }
