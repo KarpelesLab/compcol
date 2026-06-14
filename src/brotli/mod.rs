@@ -58,6 +58,7 @@ use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
 
 mod context;
 mod dictionary;
+mod encoder_ctx;
 mod encoder_dict;
 mod encoder_huffman;
 mod encoder_iac;
@@ -118,26 +119,27 @@ impl LevelParams {
         // Clamp instead of returning Err — keeping the public surface
         // infallible matches the reference brotli CLI's behaviour.
         let q = if quality > 11 { 11 } else { quality };
-        // (max_chain, nice_match, use_dict)
-        let (max_chain, nice_match, use_dict) = match q {
-            0 => (2, 8, false),
-            1 => (4, 16, false),
-            2 => (8, 24, false),
-            3 => (16, 32, false),
-            4 => (24, 48, true),
-            5 => (48, 96, true),
-            6 => (64, 128, true),
-            7 => (96, 192, true),
-            8 => (160, 256, true),
-            9 => (256, 384, true),
-            10 => (512, 768, true),
+        // (max_chain, nice_match, use_dict, cost_match)
+        let (max_chain, nice_match, use_dict, cost_match) = match q {
+            0 => (2, 8, false, false),
+            1 => (4, 16, false, false),
+            2 => (8, 24, false, false),
+            3 => (16, 32, false, false),
+            4 => (24, 48, true, true),
+            5 => (48, 96, true, true),
+            6 => (64, 128, true, true),
+            7 => (96, 192, true, true),
+            8 => (160, 256, true, true),
+            9 => (256, 384, true, true),
+            10 => (512, 768, true, true),
             // 11 (and clamp-from-above)
-            _ => (1024, 1024, true),
+            _ => (1024, 1024, true, true),
         };
         Self {
             finder: encoder_lz77::FinderParams {
                 max_chain,
                 nice_match,
+                cost_match,
             },
             use_dict,
         }
@@ -261,6 +263,12 @@ pub struct Encoder {
     /// this stream. Mirrors the decoder's `total_out` and is used to
     /// compute `max_dist` for static-dictionary references.
     prev_total_out: u64,
+    /// The two output bytes immediately preceding the next meta-block —
+    /// the decoder's persistent `p1`/`p2` at block start. Used by the
+    /// encoder's literal-context model to compute each literal's context
+    /// id. Both 0 at stream start (matching the decoder).
+    prev_out1: u8,
+    prev_out2: u8,
     /// Lazily built static-dictionary index for encoder-side dictionary
     /// references. The index is ~80 KiB and is reused across meta-blocks.
     dict_index: Option<Rc<DictIndex>>,
@@ -376,6 +384,8 @@ impl Encoder {
             seen_any_input: false,
             ring: DistRing::new(),
             prev_total_out: 0,
+            prev_out1: 0,
+            prev_out2: 0,
             dict_index: None,
             id_transforms: None,
             params: LevelParams::from_quality(config.quality),
@@ -445,6 +455,8 @@ impl Encoder {
         // to allocate a separate Vec and drain. The drain happens after
         // we've finished encoding so the borrow doesn't conflict.
         let pending_view = &self.pending[..mlen];
+        let prev_out1 = self.prev_out1;
+        let prev_out2 = self.prev_out2;
         encode_meta_block(
             &mut self.bw,
             &mut self.out,
@@ -452,11 +464,22 @@ impl Encoder {
             is_last,
             &mut self.ring,
             self.prev_total_out,
+            prev_out1,
+            prev_out2,
             dict_index.as_deref(),
             id_transforms.as_deref().map(|v| v.as_slice()),
             self.params,
             scratch,
         );
+        // Carry the last two output bytes of this block into the next
+        // block's literal-context state (mirrors the decoder's p1/p2).
+        if mlen >= 2 {
+            self.prev_out2 = self.pending[mlen - 2];
+            self.prev_out1 = self.pending[mlen - 1];
+        } else if mlen == 1 {
+            self.prev_out2 = self.prev_out1;
+            self.prev_out1 = self.pending[0];
+        }
         self.pending.drain(..mlen);
         self.prev_total_out += mlen as u64;
     }
@@ -578,6 +601,8 @@ impl RawEncoder for Encoder {
         self.seen_any_input = false;
         self.ring = DistRing::new();
         self.prev_total_out = 0;
+        self.prev_out1 = 0;
+        self.prev_out2 = 0;
         // Keep `dict_index`, `id_transforms`, `params`, and `scratch` —
         // they're immutable tables / configuration / capacity we'd
         // rebuild identically. `scratch` is `prepare()`d before the next
@@ -627,6 +652,7 @@ fn lz77_to_commands(
     id_transforms: Option<&[encoder_dict::IdTransform]>,
     prev_total_out: u64,
     finder_params: encoder_lz77::FinderParams,
+    ring_start: DistRing,
     scratch: &mut EncScratch,
 ) {
     use encoder_lz77::{MAX_MATCH, MIN_MATCH};
@@ -670,6 +696,12 @@ fn lz77_to_commands(
     }
     let payload_len = payload.len();
     let mut pos = 0usize;
+    // Local distance ring, mirroring the one `plan_commands` will rebuild,
+    // so the repeat-distance preference sees the same recent distances the
+    // decoder will. Backref distances push (unless they equal the current
+    // last distance — short code 0 does not push); dictionary refs never
+    // push. This must stay in lockstep with `plan_commands`.
+    let mut ring = ring_start;
 
     // We mirror the decoder's `total_out`: it's `prev_total_out` plus
     // the number of input bytes encoded so far in this meta-block. For
@@ -687,15 +719,84 @@ fn lz77_to_commands(
         let mut best_dict_tr_id: u8 = 0;
         let mut best_dict_emit_len: u32 = 0;
 
-        // 1) In-window LZ77 match.
-        if pos + MIN_MATCH <= payload_len
-            && let Some((len, dist)) = mf.find_match(payload, pos, finder_params)
-        {
+        // 1) In-window LZ77 match. At higher qualities we use the
+        //    cost-aware finder, which prefers closer (cheaper-distance)
+        //    matches over marginally longer far ones.
+        let found = if pos + MIN_MATCH <= payload_len {
+            if finder_params.cost_match {
+                mf.find_match_cost(payload, pos, finder_params)
+            } else {
+                mf.find_match(payload, pos, finder_params)
+            }
+        } else {
+            None
+        };
+        if let Some((len, dist)) = found {
             let len = len.min(MAX_MATCH).min(payload_len - pos);
             if len >= MIN_MATCH {
                 best_len = len;
                 best_kind = 1;
                 best_match_dist = dist as u32;
+            }
+        }
+
+        // 1b) Repeat-distance preference. A match reachable at one of the
+        //     four most-recent distances encodes its distance as a cheap
+        //     short code (≈4 bits, no extra) instead of a full symbol plus
+        //     up to 24 extra bits, so even a shorter repeat-distance match
+        //     usually wins on total bits. Distance coding is ~58% of our
+        //     output, so this is the dominant ratio lever.
+        //
+        //     We compare candidates by an approximate *gain* model:
+        //       gain(len, dist) = len * VALUE_PER_BYTE - distance_cost(dist)
+        //     where a covered byte is worth ~`VALUE_PER_BYTE` bits and a
+        //     far distance costs ~log2(dist) extra bits plus its symbol.
+        //     The candidate with the highest gain is taken; ties favour the
+        //     longer match.
+        if pos + MIN_MATCH <= payload_len && best_kind != 2 {
+            // Bit cost of a distance: ring distances are short codes;
+            // everything else pays its symbol + extra bits (~log2(d)).
+            let last1 = ring.nth_last(1);
+            let dist_cost = |d: u32, is_repeat: bool| -> i64 {
+                if is_repeat {
+                    // Short code: ~2 bits when it is the last distance
+                    // (code 0), ~5 bits for the other ring slots.
+                    if d as i32 == last1 { 2 } else { 5 }
+                } else {
+                    // Symbol (~6 bits) + extra (~floor(log2(d))).
+                    let lg = 31 - d.max(1).leading_zeros();
+                    (6 + lg) as i64
+                }
+            };
+            const VALUE_PER_BYTE: i64 = 6;
+
+            // Baseline gain from the longest match (if any).
+            let mut best_gain: i64 = if best_kind == 1 {
+                best_len as i64 * VALUE_PER_BYTE - dist_cost(best_match_dist, false)
+            } else {
+                i64::MIN
+            };
+
+            for n in 1u32..=4 {
+                let rd = ring.nth_last(n);
+                if rd <= 0 {
+                    continue;
+                }
+                let rd = rd as usize;
+                if rd > pos {
+                    continue;
+                }
+                let rl = encoder_lz77::match_len_at(payload, pos, rd);
+                if rl < MIN_MATCH {
+                    continue;
+                }
+                let gain = rl as i64 * VALUE_PER_BYTE - dist_cost(rd as u32, true);
+                if gain > best_gain {
+                    best_gain = gain;
+                    best_len = rl;
+                    best_kind = 1;
+                    best_match_dist = rd as u32;
+                }
             }
         }
 
@@ -762,6 +863,16 @@ fn lz77_to_commands(
             } else {
                 best_dict_word_len as u32
             };
+            // Mirror the ring update `plan_commands` will perform: a
+            // back-reference pushes its distance unless it equals the
+            // current last distance (short code 0, which does not push);
+            // dictionary references never push.
+            if best_kind == 1 {
+                let d = best_match_dist as i32;
+                if d != ring.nth_last(1) {
+                    ring.push(d);
+                }
+            }
             cmds.push(Command {
                 insert: core::mem::replace(&mut pending, next_pending),
                 copy_len,
@@ -1078,8 +1189,12 @@ fn plan_commands(
 }
 
 /// Build the meta-block header bits *up to but not including* the
-/// prefix codes. `is_last` controls whether ISLAST/ISLASTEMPTY are
-/// emitted; on the last meta-block ISUNCOMPRESSED is omitted.
+/// literal context mode. `is_last` controls whether ISLAST/ISLASTEMPTY
+/// are emitted; on the last meta-block ISUNCOMPRESSED is omitted.
+///
+/// The CMODE / NTREESL / literal-context-map / NTREESD fields are emitted
+/// separately by the caller (see [`write_literal_context_header`]) since
+/// they depend on whether the encoder chose to model literal contexts.
 fn write_meta_block_header(bw: &mut BitWriter, out: &mut Vec<u8>, mlen: u32, is_last: bool) {
     debug_assert!(mlen >= 1 && mlen <= MAX_BLOCK as u32);
     // ISLAST
@@ -1106,12 +1221,85 @@ fn write_meta_block_header(bw: &mut BitWriter, out: &mut Vec<u8>, mlen: u32, is_
     bw.write(0, 2, out);
     // NDIRECT = 0 (4 bits)
     bw.write(0, 4, out);
-    // CMODE[0] = 0 (LSB6). 2 bits per CMODE entry; NBLTYPESL = 1 so one entry.
-    bw.write(0, 2, out);
-    // NTREESL = 1 → "0"
+}
+
+/// Emit CMODE[0], NTREESL + (optional) literal context map, and NTREESD.
+///
+/// When `num_lit_trees == 1` this reproduces the legacy single-tree
+/// header: CMODE is irrelevant (one tree, all-zero map), NTREESL=1,
+/// NTREESD=1. When `num_lit_trees >= 2` it emits the chosen context mode,
+/// NTREESL, and the literal context map `cmap` (one tree index per
+/// context, 0..63).
+fn write_literal_context_header(
+    bw: &mut BitWriter,
+    out: &mut Vec<u8>,
+    cmode: u32,
+    num_lit_trees: u32,
+    cmap: &[u8],
+) {
+    // CMODE[0] (2 bits). With a single tree the value is decode-irrelevant
+    // (the context map is all zero), so 0 (LSB6) keeps the legacy bytes.
+    let cmode_bits = if num_lit_trees >= 2 { cmode } else { 0 };
+    bw.write(cmode_bits, 2, out);
+    if num_lit_trees >= 2 {
+        // NTREESL = num_lit_trees, encoded with the nbltypes scheme.
+        write_nbltypes(bw, out, num_lit_trees);
+        // Literal context map of size 64 * NBLTYPESL = 64.
+        write_context_map(bw, out, cmap, num_lit_trees);
+    } else {
+        // NTREESL = 1 → "0".
+        bw.write(0, 1, out);
+    }
+    // NTREESD = 1 → "0" (we never split distance trees).
     bw.write(0, 1, out);
-    // (No literal context map since NTREESL = 1.)
-    // NTREESD = 1 → "0"
+}
+
+/// Encode a count using brotli's NBLTYPES / NTREES variable-length code
+/// (§9.2 "1 + ..."). Inverse of [`Decoder::read_nbltypes`].
+fn write_nbltypes(bw: &mut BitWriter, out: &mut Vec<u8>, value: u32) {
+    debug_assert!(value >= 1);
+    if value == 1 {
+        bw.write(0, 1, out);
+        return;
+    }
+    // First bit 1, then 3-bit selector N, then N extra bits.
+    bw.write(1, 1, out);
+    if value == 2 {
+        // N = 0 → value 2.
+        bw.write(0, 3, out);
+        return;
+    }
+    // value = (1 << n) + 1 + extra, with extra < (1 << n).
+    let v = value - 1; // value - 1 = (1<<n) + extra
+    let n = 31 - v.leading_zeros(); // floor(log2(v)) since v >= 2
+    let extra = v - (1u32 << n);
+    debug_assert!(extra < (1u32 << n));
+    bw.write(n, 3, out);
+    bw.write(extra, n, out);
+}
+
+/// Emit a context map (literal or distance) using the simplest valid
+/// encoding: RLEMAX=0 (no zero-run codes), a prefix code over `ntrees`
+/// symbols built from the map's own value frequencies, the map values
+/// verbatim, then IMTF=0 (no move-to-front).
+///
+/// Inverse of [`read_context_map`].
+fn write_context_map(bw: &mut BitWriter, out: &mut Vec<u8>, map: &[u8], ntrees: u32) {
+    debug_assert!(ntrees >= 2);
+    // RLEMAX = 0 → single "0" bit, no extra.
+    bw.write(0, 1, out);
+    // Prefix code over the `ntrees` map symbols. Build from frequencies.
+    let mut freq = alloc::vec![0u32; ntrees as usize];
+    for &m in map {
+        freq[m as usize] += 1;
+    }
+    let strategy = pick_huffman_strategy(&freq, ntrees as usize);
+    let codes = emit_prefix_code(bw, out, &strategy, ntrees);
+    // Emit each map entry as a symbol.
+    for &m in map {
+        write_symbol(bw, out, &strategy, &codes, m as u32);
+    }
+    // IMTF = 0.
     bw.write(0, 1, out);
 }
 
@@ -1171,6 +1359,8 @@ fn encode_meta_block(
     is_last: bool,
     ring: &mut DistRing,
     prev_total_out: u64,
+    prev1: u8,
+    prev2: u8,
     dict_index: Option<&DictIndex>,
     id_transforms: Option<&[IdTransform]>,
     level: LevelParams,
@@ -1181,73 +1371,99 @@ fn encode_meta_block(
     // Window size = 1 << WBITS = 1 << 16 (the encoder always picks WBITS=16).
     const WINDOW_SIZE: u32 = 1 << 16;
 
-    // 1. Run LZ77 + command construction in a single fused pass.
+    // 1. Run LZ77 + command construction in a single fused pass. The
+    //    match finder is given a copy of the block-start distance ring so
+    //    its repeat-distance preference matches what `plan_commands`/the
+    //    decoder will see; `plan_commands` then advances the real ring.
     lz77_to_commands(
         payload,
         dict_index,
         id_transforms,
         prev_total_out,
         level.finder,
+        *ring,
         scratch,
     );
     // 2. Plan + tally frequencies in a single pass.
     plan_commands(mlen, ring, prev_total_out, WINDOW_SIZE, scratch);
 
-    // 3. Pick Huffman strategies (operates on the scratch frequency tables).
-    let lit_strategy = pick_huffman_strategy(&scratch.lit_freq, 256);
+    // 3. Decide whether to model literal contexts. We do so when the
+    //    encoder is on a dictionary-enabled tier (quality ≥ 4) and the
+    //    payload is large enough to amortise multiple prefix-code
+    //    headers. Below that threshold the single-tree path wins on
+    //    overhead.
+    let lit_model = if level.use_dict && payload.len() >= 1024 {
+        build_literal_context_model(payload, prev1, prev2, scratch)
+    } else {
+        None
+    };
+
+    // 4. Pick Huffman strategies. For literals, either a single tree
+    //    (legacy) or one tree per cluster.
     let ic_strategy = pick_huffman_strategy(&scratch.ic_freq, 704);
     let dist_strategy = pick_huffman_strategy(&scratch.dist_freq, 64);
 
-    // 4. Write the meta-block header.
-    write_meta_block_header(bw, out, mlen, is_last);
+    match lit_model {
+        Some(model) if model.num_trees >= 2 => {
+            encode_meta_block_with_contexts(
+                bw,
+                out,
+                payload,
+                mlen,
+                is_last,
+                prev1,
+                prev2,
+                &ic_strategy,
+                &dist_strategy,
+                &model,
+                scratch,
+            );
+        }
+        _ => {
+            // Legacy single-literal-tree path.
+            let lit_strategy = pick_huffman_strategy(&scratch.lit_freq, 256);
+            write_meta_block_header(bw, out, mlen, is_last);
+            write_literal_context_header(bw, out, 0, 1, &[]);
+            let lit_codes = emit_prefix_code(bw, out, &lit_strategy, 256);
+            let ic_codes = emit_prefix_code(bw, out, &ic_strategy, 704);
+            let dist_codes = emit_prefix_code(bw, out, &dist_strategy, 64);
 
-    // 5. Emit prefix codes.
-    let lit_codes = emit_prefix_code(bw, out, &lit_strategy, 256);
-    let ic_codes = emit_prefix_code(bw, out, &ic_strategy, 704);
-    let dist_codes = emit_prefix_code(bw, out, &dist_strategy, 64);
-
-    // 6. Emit the command stream.
-    // Specialise on the common all-complex case so the hot inner loop
-    // skips the per-symbol match dispatch in `write_symbol`. For most
-    // inputs (Lorem, mixed text) the literal alphabet is dense (≥ 16
-    // distinct bytes) so this picks up the complex branch.
-    let scratch_view: &EncScratch = scratch;
-    let cmds_len = scratch_view.cmds.len();
-    for i in 0..cmds_len {
-        let sym = scratch_view.ic_sym[i];
-        write_symbol(bw, out, &ic_strategy, &ic_codes, sym);
-        let (ieb, iev) = scratch_view.ins_extra[i];
-        if ieb > 0 {
-            bw.write(iev, ieb, out);
-        }
-        let (ceb, cev) = scratch_view.copy_extra[i];
-        if ceb > 0 {
-            bw.write(cev, ceb, out);
-        }
-        // Inline the literal-emission fast path for the common complex
-        // strategy: a single bounds-check + length lookup + reverse +
-        // write per byte, with no per-byte enum dispatch.
-        let insert = &scratch_view.cmds[i].insert;
-        match &lit_strategy {
-            HuffStrategy::Complex(lengths) => {
-                for &b in insert {
-                    let len = lengths[b as usize] as u32;
-                    debug_assert!(len > 0);
-                    let code = lit_codes[b as usize];
-                    let rev = reverse_bits(code as u32, len);
-                    bw.write(rev, len, out);
+            let scratch_view: &EncScratch = scratch;
+            let cmds_len = scratch_view.cmds.len();
+            for i in 0..cmds_len {
+                let sym = scratch_view.ic_sym[i];
+                write_symbol(bw, out, &ic_strategy, &ic_codes, sym);
+                let (ieb, iev) = scratch_view.ins_extra[i];
+                if ieb > 0 {
+                    bw.write(iev, ieb, out);
                 }
-            }
-            _ => {
-                for &b in insert {
-                    write_symbol(bw, out, &lit_strategy, &lit_codes, b as u32);
+                let (ceb, cev) = scratch_view.copy_extra[i];
+                if ceb > 0 {
+                    bw.write(cev, ceb, out);
                 }
-            }
-        }
-        if let Some((dcode, ndb, dextra)) = scratch_view.dist_enc[i] {
-            write_symbol(bw, out, &dist_strategy, &dist_codes, dcode);
-            if ndb > 0 {
-                bw.write(dextra, ndb, out);
+                let insert = &scratch_view.cmds[i].insert;
+                match &lit_strategy {
+                    HuffStrategy::Complex(lengths) => {
+                        for &b in insert {
+                            let len = lengths[b as usize] as u32;
+                            debug_assert!(len > 0);
+                            let code = lit_codes[b as usize];
+                            let rev = reverse_bits(code as u32, len);
+                            bw.write(rev, len, out);
+                        }
+                    }
+                    _ => {
+                        for &b in insert {
+                            write_symbol(bw, out, &lit_strategy, &lit_codes, b as u32);
+                        }
+                    }
+                }
+                if let Some((dcode, ndb, dextra)) = scratch_view.dist_enc[i] {
+                    write_symbol(bw, out, &dist_strategy, &dist_codes, dcode);
+                    if ndb > 0 {
+                        bw.write(dextra, ndb, out);
+                    }
+                }
             }
         }
     }
@@ -1259,6 +1475,165 @@ fn encode_meta_block(
     //    need to — bits flow into the next meta-block's header.
     if is_last {
         bw.align(out);
+    }
+}
+
+/// Build the per-context literal histograms for this meta-block and run
+/// the clustering. Returns `None` when the model collapses to a single
+/// tree (caller falls back to the legacy single-tree path).
+///
+/// `prev1`/`prev2` are the two output bytes preceding the block. The
+/// literal bytes are exactly the `insert` runs of the planned commands;
+/// their output positions follow the command cursor, and `p1`/`p2` for
+/// each literal are the two immediately-preceding output bytes (which —
+/// since the decoded output equals `payload` — we read straight from
+/// `payload`).
+fn build_literal_context_model(
+    payload: &[u8],
+    prev1: u8,
+    prev2: u8,
+    scratch: &EncScratch,
+) -> Option<encoder_ctx::LiteralContextModel> {
+    use encoder_ctx::NUM_CONTEXTS;
+
+    // First, count total literals — bail cheaply when there are too few to
+    // benefit from per-context trees.
+    let total_lits: u64 = scratch.cmds.iter().map(|c| c.insert.len() as u64).sum();
+    if total_lits < 256 {
+        return None;
+    }
+
+    // Evaluate each candidate context mode: tally per-context histograms,
+    // cluster, and keep the model with the lowest estimated cost. The
+    // histogram pass is O(literals) per mode and cheap next to LZ77.
+    let mut best: Option<encoder_ctx::LiteralContextModel> = None;
+    for &mode in &encoder_ctx::CANDIDATE_MODES {
+        let mut histograms: Vec<[u32; 256]> = alloc::vec![[0u32; 256]; NUM_CONTEXTS];
+        let mut g: usize = 0;
+        for c in &scratch.cmds {
+            for &b in &c.insert {
+                let p1 = if g >= 1 { payload[g - 1] } else { prev1 };
+                let p2 = if g >= 2 {
+                    payload[g - 2]
+                } else if g == 1 {
+                    prev1
+                } else {
+                    prev2
+                };
+                let cid = encoder_ctx::context_id(mode, p1, p2) as usize;
+                histograms[cid][b as usize] += 1;
+                g += 1;
+            }
+            match c.kind {
+                CopyKind::Backref { .. } => g += c.copy_len as usize,
+                CopyKind::Dict { emit_len, .. } => g += emit_len as usize,
+                CopyKind::None => {}
+            }
+        }
+        let model = encoder_ctx::cluster(mode, histograms, encoder_ctx::MAX_LITERAL_TREES);
+        match &best {
+            Some(b) if b.est_cost_bits <= model.est_cost_bits => {}
+            _ => best = Some(model),
+        }
+    }
+
+    match best {
+        Some(model) if model.num_trees >= 2 => Some(model),
+        _ => None,
+    }
+}
+
+/// Emit a meta-block using literal context modeling: one literal Huffman
+/// tree per cluster, selected per byte through the context map.
+#[allow(clippy::too_many_arguments)]
+fn encode_meta_block_with_contexts(
+    bw: &mut BitWriter,
+    out: &mut Vec<u8>,
+    payload: &[u8],
+    mlen: u32,
+    is_last: bool,
+    prev1: u8,
+    prev2: u8,
+    ic_strategy: &HuffStrategy,
+    dist_strategy: &HuffStrategy,
+    model: &encoder_ctx::LiteralContextModel,
+    scratch: &EncScratch,
+) {
+    let _ = mlen;
+    let num_trees = model.num_trees as usize;
+
+    // Per-tree literal frequency tables: fold each context's histogram
+    // into its assigned tree.
+    let mut tree_freqs: Vec<[u32; 256]> = alloc::vec![[0u32; 256]; num_trees];
+    for (cid, hist) in model.histograms.iter().enumerate() {
+        let t = model.cmap[cid] as usize;
+        let dst = &mut tree_freqs[t];
+        for (d, h) in dst.iter_mut().zip(hist.iter()) {
+            *d += *h;
+        }
+    }
+
+    // Build a strategy + code table per tree.
+    let lit_strategies: Vec<HuffStrategy> = tree_freqs
+        .iter()
+        .map(|f| pick_huffman_strategy(f, 256))
+        .collect();
+
+    // Header.
+    write_meta_block_header(bw, out, mlen, is_last);
+    write_literal_context_header(bw, out, model.mode as u32, model.num_trees, &model.cmap);
+
+    // Literal prefix codes (one per tree), in tree-index order.
+    let mut lit_codes: Vec<Vec<u16>> = Vec::with_capacity(num_trees);
+    for strat in &lit_strategies {
+        lit_codes.push(emit_prefix_code(bw, out, strat, 256));
+    }
+    // IC + distance prefix codes.
+    let ic_codes = emit_prefix_code(bw, out, ic_strategy, 704);
+    let dist_codes = emit_prefix_code(bw, out, dist_strategy, 64);
+
+    // Emit the command stream, selecting a literal tree per byte from its
+    // context. `g` tracks the output position so we can read p1/p2 from
+    // `payload` (output == payload for this block).
+    let cmds_len = scratch.cmds.len();
+    let mut g: usize = 0;
+    for i in 0..cmds_len {
+        let sym = scratch.ic_sym[i];
+        write_symbol(bw, out, ic_strategy, &ic_codes, sym);
+        let (ieb, iev) = scratch.ins_extra[i];
+        if ieb > 0 {
+            bw.write(iev, ieb, out);
+        }
+        let (ceb, cev) = scratch.copy_extra[i];
+        if ceb > 0 {
+            bw.write(cev, ceb, out);
+        }
+        for &b in &scratch.cmds[i].insert {
+            let p1 = if g >= 1 { payload[g - 1] } else { prev1 };
+            let p2 = if g >= 2 {
+                payload[g - 2]
+            } else if g == 1 {
+                prev1
+            } else {
+                prev2
+            };
+            let cid = encoder_ctx::context_id(model.mode, p1, p2) as usize;
+            let t = model.cmap[cid] as usize;
+            write_symbol(bw, out, &lit_strategies[t], &lit_codes[t], b as u32);
+            g += 1;
+        }
+        if let Some((dcode, ndb, dextra)) = scratch.dist_enc[i] {
+            write_symbol(bw, out, dist_strategy, &dist_codes, dcode);
+            if ndb > 0 {
+                bw.write(dextra, ndb, out);
+            }
+        }
+        // Advance output cursor past the copy.
+        match scratch.cmds[i].kind {
+            CopyKind::Backref { .. } => g += scratch.cmds[i].copy_len as usize,
+            CopyKind::Dict { emit_len, .. } => g += emit_len as usize,
+            CopyKind::None => {}
+        }
     }
 }
 
