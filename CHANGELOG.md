@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `compcol::lzma2::Encoder` is now a normal (stateful) struct
+  instead of the former permanently-`Unsupported` unit-struct stub, because the
+  working encoder buffers chunk state. As a result it **no longer implements
+  `Copy`** and can no longer be constructed via a unit-struct literal; construct
+  it through `Lzma2::encoder()` as with every other codec. It still derives
+  `Debug` + `Clone`. (No effect on the decoder or any other codec.)
 - **lz5 (Lizard) Huffman sub-streams** stay `Unsupported`, now with a precise
   rationale in the module docs: the Huff0 entropy stage selects X1/X2 from
   `(regenSize, comprLen)` at runtime and there is no reference encoder or

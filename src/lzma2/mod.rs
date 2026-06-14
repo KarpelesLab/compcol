@@ -225,6 +225,11 @@ enum EncPhase {
 /// (dict + props + state) at the chunk boundary, emitting a compressed chunk
 /// (control `0xE0`) when that shrinks the data and an uncompressed chunk
 /// (control `0x01`) otherwise.
+///
+/// Note: unlike the former permanently-`Unsupported` stub (a unit struct),
+/// the working encoder buffers state, so it is a normal struct and is no
+/// longer `Copy` — construct it via [`Lzma2::encoder()`](crate::Algorithm).
+#[derive(Debug, Clone)]
 pub struct Encoder {
     phase: EncPhase,
     /// Staged bytes for the current chunk (or end marker), drained to the
