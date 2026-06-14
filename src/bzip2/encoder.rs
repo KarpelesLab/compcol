@@ -28,7 +28,7 @@ use super::bwt::bwt_forward;
 use super::crc::Crc32;
 use super::huffman::{MAX_CODE_LEN, build_canonical_codes, build_canonical_lengths};
 use super::mtf::mtf_forward_reduced;
-use super::rle::{rle1_forward, rle2_forward};
+use super::rle::{Rle1Encoder, rle1_forward, rle2_forward};
 
 /// Tunables for the bzip2 encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,8 +71,15 @@ enum Phase {
 
 pub struct Encoder {
     config: EncoderConfig,
-    /// Per-block input buffer (post-RLE-1 will be derived from this).
+    /// Per-block raw input buffer. Retained verbatim because the block
+    /// CRC is computed over the raw bytes; `encode_block` re-runs RLE-1
+    /// over it. Block boundaries, however, are governed by the *post*-
+    /// RLE-1 size tracked in `rle1` (matching reference bzip2's
+    /// `nblock`-based blocking), not by `pending.len()`.
     pending: Vec<u8>,
+    /// Streaming RLE-1 size tracker mirroring `pending`. Used only to
+    /// decide when the current block has reached the post-RLE-1 cap.
+    rle1: Rle1Encoder,
     /// Encoded bytes waiting to be returned to the caller.
     out: Vec<u8>,
     /// Index into `out` of the next byte to deliver.
@@ -99,6 +106,7 @@ impl Encoder {
         Self {
             config,
             pending: Vec::new(),
+            rle1: Rle1Encoder::new(),
             out: Vec::new(),
             out_idx: 0,
             header_written: false,
@@ -108,8 +116,8 @@ impl Encoder {
         }
     }
 
-    /// Maximum number of raw-input bytes per block, before RLE-1. We
-    /// follow the reference upper bound `level * 100_000 - 19`; the
+    /// Maximum number of post-RLE-1 bytes per block. We follow the
+    /// reference upper bound `level * 100_000 - 19`; the
     /// `-19` cushions the worst-case expansion of pathological inputs
     /// passing through the post-MTF / Huffman layers.
     fn block_input_cap(&self) -> usize {
@@ -135,6 +143,8 @@ impl Encoder {
     /// `pending` to empty afterwards.
     fn encode_block(&mut self) {
         let block: Vec<u8> = core::mem::take(&mut self.pending);
+        // Reset the RLE-1 size tracker for the next block.
+        self.rle1 = Rle1Encoder::new();
         // Sanity: a "no input" block is not produced — we only call
         // encode_block when pending is non-empty.
         debug_assert!(!block.is_empty());
@@ -181,45 +191,23 @@ impl Encoder {
 
         let alpha_size = num_used + 2; // includes EOB
         // Step 7: choose number of Huffman tables. bzip2 chooses
-        // 2..=6 based on the per-block symbol-count buckets. For a
-        // simple encoder we use a fixed mapping that always produces
-        // a valid stream.
+        // 2..=6 based on the per-block symbol-count buckets.
         let num_tables = pick_num_tables(symbols.len());
 
-        // Step 8: assign each 50-symbol group a Huffman table id, then
-        // build per-table code-length tables from per-table frequency
-        // counts. We use the simplest possible split: all groups use
-        // the same single table, replicated `num_tables` times. This
-        // is valid bzip2 — the spec only requires 2..=6 distinct
-        // tables to be present in the header, and selectors to be in
-        // 0..num_tables. Reusing one table is wasteful (gives up the
-        // compression edge that having multiple specialised tables
-        // would provide) but always correct.
-        //
-        // However, the spec demands 2..=6 tables — exactly one is
-        // **not** allowed. So we ship two identical-length tables and
-        // assign half the groups to table 0 and half to table 1; this
-        // satisfies the structural requirements without changing the
-        // bitstream costs vs a single-table encoder.
+        // Step 8: build the multi-table Huffman assignment exactly the
+        // way reference bzip2's `sendMTFValues` does: initialise the
+        // tables by partitioning the cumulative-frequency space, then
+        // run a fixed number of refinement passes that (a) assign each
+        // 50-symbol group to whichever table codes it cheapest and
+        // (b) rebuild each table from the symbols of the groups
+        // assigned to it. This is where the compression edge over a
+        // single shared table comes from.
         let num_selectors_total = symbols.len().div_ceil(50);
         debug_assert!(num_selectors_total >= 1);
         debug_assert!(num_selectors_total <= MAX_SELECTORS);
 
-        let mut freqs = vec![0u32; alpha_size];
-        for &s in &symbols {
-            freqs[s as usize] += 1;
-        }
-        let table_lengths = build_canonical_lengths(&freqs, MAX_CODE_LEN);
-
-        // Build per-table copies (all identical). num_tables ≥ 2.
-        let tables: Vec<Vec<u8>> = (0..num_tables).map(|_| table_lengths.clone()).collect();
-
-        // Each group's selector is just the group index modulo
-        // num_tables — but we keep them all 0 so frequency-weighted
-        // length design (which we don't do here) is trivially the
-        // same. Reference bzip2's selector design picks the cheapest
-        // table per group; we just pick table 0 everywhere.
-        let selectors: Vec<u8> = vec![0u8; num_selectors_total];
+        let (tables, selectors) =
+            optimize_tables(&symbols, alpha_size, num_tables, num_selectors_total);
 
         // Build canonical codes for each table.
         let codes: Vec<Vec<u32>> = tables
@@ -437,6 +425,145 @@ fn pick_num_tables(n_symbols: usize) -> usize {
     }
 }
 
+/// Number of refinement passes over the table/selector assignment.
+/// Reference bzip2 uses `BZ_N_ITERS = 4`.
+const HUFF_N_ITERS: usize = 4;
+
+/// Symbol-group size used when assigning selectors. Reference bzip2
+/// uses `BZ_G_SIZE = 50`.
+const HUFF_GROUP_SIZE: usize = 50;
+
+/// A code length placeholder used during table initialisation/cost
+/// scoring. Mirrors reference bzip2's `BZ_LESSER_ICOST` (0) and
+/// `BZ_GREATER_ICOST` (15).
+const ICOST_LESSER: u8 = 0;
+const ICOST_GREATER: u8 = 15;
+
+/// Build `num_tables` Huffman code-length tables and a per-group
+/// selector list using reference bzip2's `sendMTFValues` strategy.
+///
+/// Returns `(tables, selectors)` where `tables[t]` is the per-symbol
+/// code-length array (length `alpha_size`) for table `t`, and
+/// `selectors[g]` is the table id (0..num_tables) chosen for the g-th
+/// 50-symbol group.
+fn optimize_tables(
+    symbols: &[u16],
+    alpha_size: usize,
+    num_tables: usize,
+    num_groups: usize,
+) -> (Vec<Vec<u8>>, Vec<u8>) {
+    // Global symbol frequencies across the whole block.
+    let mut global_freq = vec![0u32; alpha_size];
+    for &s in symbols {
+        global_freq[s as usize] += 1;
+    }
+
+    // ── Initial table construction ────────────────────────────────
+    //
+    // Faithful port of reference bzip2's `sendMTFValues` initialiser:
+    // partition the alphabet into `num_tables` contiguous bands of
+    // (roughly) equal total frequency, walking symbols low→high. Band
+    // `nPart-1` (i.e. tables fill from the highest id down to 0) covers
+    // the next slice of low symbols; in-band symbols get the cheap
+    // placeholder length, the rest the expensive one. There is an
+    // odd-iteration back-off that nudges the band boundary, matching
+    // the reference exactly so our initial assignment — and therefore
+    // the refinement that follows — tracks bzip2's.
+    let mut tables: Vec<Vec<u8>> = (0..num_tables)
+        .map(|_| vec![ICOST_GREATER; alpha_size])
+        .collect();
+    {
+        let n_mtf = symbols.len() as i64;
+        let mut n_part = num_tables as i64;
+        let mut rem_f = n_mtf;
+        let mut gs = 0i64;
+        while n_part > 0 {
+            let t_freq = rem_f / n_part;
+            let mut ge = gs - 1;
+            let mut a_freq = 0i64;
+            while a_freq < t_freq && ge < alpha_size as i64 - 1 {
+                ge += 1;
+                a_freq += global_freq[ge as usize] as i64;
+            }
+            // Odd-iteration back-off: if this isn't the first part, the
+            // boundary lands above `gs`, the part index parity is odd,
+            // and backing off keeps `a_freq` closer to the target.
+            if ge > gs
+                && n_part != num_tables as i64
+                && n_part != 1
+                && ((num_tables as i64 - n_part) % 2 == 1)
+            {
+                a_freq -= global_freq[ge as usize] as i64;
+                ge -= 1;
+            }
+
+            let lens = &mut tables[(n_part - 1) as usize];
+            for (v, slot) in lens.iter_mut().enumerate() {
+                let vi = v as i64;
+                if vi >= gs && vi <= ge {
+                    *slot = ICOST_LESSER;
+                } else {
+                    *slot = ICOST_GREATER;
+                }
+            }
+
+            n_part -= 1;
+            gs = ge + 1;
+            rem_f -= a_freq;
+        }
+    }
+
+    let mut selectors = vec![0u8; num_groups];
+
+    // ── Refinement passes ─────────────────────────────────────────
+    for _iter in 0..HUFF_N_ITERS {
+        // Per-table accumulated frequencies for this pass.
+        let mut table_freq: Vec<Vec<u32>> = vec![vec![0u32; alpha_size]; num_tables];
+
+        // For each group: score it under every table, pick the cheapest,
+        // record the selector, and fold the group's symbols into the
+        // winning table's frequency accumulator.
+        let mut g = 0usize;
+        let mut group_idx = 0usize;
+        while g < symbols.len() {
+            let end = (g + HUFF_GROUP_SIZE).min(symbols.len());
+            let group = &symbols[g..end];
+
+            // Cost of coding this group under each table.
+            let mut best_table = 0usize;
+            let mut best_cost = u64::MAX;
+            for (t, lens) in tables.iter().enumerate() {
+                let mut cost = 0u64;
+                for &s in group {
+                    cost += lens[s as usize] as u64;
+                }
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_table = t;
+                }
+            }
+
+            selectors[group_idx] = best_table as u8;
+            let acc = &mut table_freq[best_table];
+            for &s in group {
+                acc[s as usize] += 1;
+            }
+
+            group_idx += 1;
+            g = end;
+        }
+
+        // Rebuild each table from the frequencies of the groups assigned
+        // to it. A table with no assigned groups keeps coverage via the
+        // `+1` floor inside `build_canonical_lengths`.
+        for (t, freq) in table_freq.iter().enumerate() {
+            tables[t] = build_canonical_lengths(freq, MAX_CODE_LEN);
+        }
+    }
+
+    (tables, selectors)
+}
+
 impl Default for Encoder {
     fn default() -> Self {
         Self::new()
@@ -469,16 +596,20 @@ impl RawEncoder for Encoder {
             });
         }
 
-        // Now accept input, filling up to the per-block cap. If we
-        // fill, encode that block, drain to output, repeat.
+        // Now accept input, filling each block up to the per-block
+        // *post-RLE-1* cap (reference bzip2 sizes blocks by `nblock`,
+        // the RLE-1 output length). We feed bytes through both the raw
+        // buffer (kept for the CRC and the in-block RLE-1 re-run) and
+        // the streaming size tracker, cutting a block the moment the
+        // tracked RLE-1 length reaches the cap. When a block fills we
+        // encode it, drain to output, and continue.
         while consumed < input.len() {
-            let space = cap - self.pending.len();
-            let take = space.min(input.len() - consumed);
-            self.pending
-                .extend_from_slice(&input[consumed..consumed + take]);
-            consumed += take;
+            let b = input[consumed];
+            self.pending.push(b);
+            self.rle1.push(b);
+            consumed += 1;
 
-            if self.pending.len() == cap {
+            if self.rle1.encoded_len() >= cap {
                 self.encode_block();
                 self.flush_full_bytes();
                 self.drain_out(output, &mut written);
@@ -549,6 +680,7 @@ impl RawEncoder for Encoder {
 
     fn raw_reset(&mut self) {
         self.pending.clear();
+        self.rle1 = Rle1Encoder::new();
         self.out.clear();
         self.out_idx = 0;
         self.header_written = false;
