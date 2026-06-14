@@ -20,15 +20,17 @@
 //!
 //! ## Encoding (length design + emit)
 //!
-//! For the encoder we just need a length-limited prefix code over the
-//! observed symbol frequencies of one Huffman group; bzip2's reference
-//! design uses an iterative "moffat" package-merge fallback, but for
-//! correctness alone a textbook Huffman tree with depth clamping to
-//! the 20-bit ceiling is sufficient. We implement Huffman by repeated
-//! merging of the two smallest-weight nodes; if any code length
-//! exceeds the ceiling, we scale weights up and retry, which is the
-//! simple fixpoint mentioned in *Managing Gigabytes* (Witten, Moffat,
-//! Bell) §2.4 and in the bzip2 source's `sendMTFValues` epilogue.
+//! For the encoder we need a length-limited prefix code over the
+//! observed symbol frequencies of one Huffman group. We port reference
+//! bzip2's `BZ2_hbMakeCodeLengths` directly: a min-heap tree build whose
+//! key packs the cumulative frequency in the high bits and the subtree
+//! depth in the low 8 bits, so equal-frequency merges prefer the
+//! shallower subtree. That depth-aware tiebreak reproduces bzip2's exact
+//! per-table bit costs. Code lengths are capped at 17 bits (bzip2's
+//! design limit since 1.0.3); if any code exceeds the cap the
+//! frequencies are halved and the build is retried, exactly as in the
+//! reference. The decode side still accepts up to 20 bits for
+//! compatibility with streams from pre-1.0.3 encoders.
 
 extern crate alloc;
 use alloc::vec;
@@ -215,100 +217,173 @@ impl DecodeTable {
 /// Compute per-symbol Huffman code lengths from frequency counts.
 ///
 /// `freqs[i] > 0` is treated as "symbol i is used"; symbols with
-/// `freqs[i] == 0` are assigned the smallest possible nonzero length
-/// (so the table still covers them even if they don't appear). The
-/// returned lengths are clamped to `max_len` by iteratively scaling
-/// down the weights when the natural Huffman depth exceeds the cap.
+/// `freqs[i] == 0` are assigned a small nonzero weight (so the table
+/// still covers them even if they don't appear). The returned lengths
+/// are clamped to `max_len` (reference bzip2 designs with `maxLen = 17`;
+/// callers pass `MAX_CODE_LEN = 20`, but bzip2's own length builder is
+/// run with 17 so the encoder never emits codes longer than that).
 ///
-/// This is a textbook two-pass Huffman: build a tree by repeatedly
-/// merging the two minimum-weight items; if the resulting longest path
-/// exceeds the cap, halve all weights and try again. Halving converges
-/// because the alphabet is at most 258 symbols (256 bytes + RUNA/RUNB +
-/// EOB) so the natural Huffman depth is bounded by O(log φ(n)) ≈ 14 at
-/// reasonable distributions; the cap of 20 bits is loose, so we rarely
-/// need more than one or two retries even on degenerate inputs.
+/// This is a faithful port of reference bzip2's `BZ2_hbMakeCodeLengths`
+/// (`huffman.c`). It builds the Huffman tree with a min-heap whose key
+/// packs the cumulative frequency in the high bits and the subtree
+/// depth in the low 8 bits, so that among equal-frequency merge
+/// candidates the **shallower** subtree is preferred. That depth-aware
+/// tiebreak yields more balanced trees (shorter maximum code length and
+/// marginally better total cost on large blocks) than a frequency-only
+/// textbook Huffman build, and is what lets our output match the
+/// reference's per-table bit costs. If any code still exceeds `max_len`
+/// the frequencies are halved and the build is retried, exactly as in
+/// the reference.
 pub(crate) fn build_canonical_lengths(freqs: &[u32], max_len: usize) -> Vec<u8> {
-    let n = freqs.len();
-    let mut weights: Vec<u32> = freqs.iter().map(|&f| if f == 0 { 1 } else { f }).collect();
+    // bzip2 caps the design length at 17; honour whatever the caller
+    // passes but never exceed 17 internally so we stay byte-for-byte
+    // compatible with reference output where it matters.
+    let design_max = max_len.min(17);
+    hb_make_code_lengths(freqs, design_max)
+}
+
+/// Direct port of `BZ2_hbMakeCodeLengths`. Weights pack
+/// `frequency << 8 | depth`; merges add the frequencies and set the
+/// depth to `1 + max(depth_a, depth_b)`.
+fn hb_make_code_lengths(freqs: &[u32], max_len: usize) -> Vec<u8> {
+    let alpha_size = freqs.len();
+    if alpha_size == 0 {
+        return Vec::new();
+    }
+    if alpha_size == 1 {
+        return vec![1];
+    }
+
+    // Nodes and heap entries are 1-based; index 0 is a sentinel, exactly
+    // as in the C source. `weight`/`parent` need room for up to
+    // `2*alpha_size` nodes (leaves + internal), `heap` for `alpha_size+2`.
+    let cap_nodes = alpha_size * 2 + 2;
+    let mut weight = vec![0i64; cap_nodes];
+    let mut parent = vec![0i32; cap_nodes];
+    let mut heap = vec![0i32; alpha_size + 2];
+
+    // Initial leaf weights: (freq or 1) << 8, depth 0 in the low byte.
+    let mut cur_freq: Vec<i64> = freqs
+        .iter()
+        .map(|&f| if f == 0 { 1i64 } else { f as i64 })
+        .collect();
+
+    const DEPTH_MASK: i64 = 0x0000_00ff;
+    fn weight_of(w: i64) -> i64 {
+        w & !DEPTH_MASK
+    }
+    fn depth_of(w: i64) -> i64 {
+        w & DEPTH_MASK
+    }
+    fn add_weights(a: i64, b: i64) -> i64 {
+        (weight_of(a) + weight_of(b)) | (1 + core::cmp::max(depth_of(a), depth_of(b)))
+    }
 
     loop {
-        let lengths = compute_lengths(&weights);
-        let mx = lengths.iter().copied().max().unwrap_or(0) as usize;
-        if mx <= max_len {
-            // Symbols that weren't actually used still get a non-zero
-            // length (we initialised their weights to 1); the table
-            // serialiser may treat them however it wants. bzip2 just
-            // emits the canonical code anyway.
+        for i in 0..alpha_size {
+            weight[i + 1] = cur_freq[i] << 8;
+        }
+
+        let mut n_nodes = alpha_size as i32;
+        let mut n_heap = 0i32;
+
+        heap[0] = 0;
+        weight[0] = 0;
+        parent[0] = -2;
+
+        // UPHEAP / DOWNHEAP operate on `heap`, keyed by `weight`.
+        for i in 1..=alpha_size as i32 {
+            parent[i as usize] = -1;
+            n_heap += 1;
+            heap[n_heap as usize] = i;
+            // UPHEAP(n_heap)
+            let mut zz = n_heap;
+            let tmp = heap[zz as usize];
+            while weight[tmp as usize] < weight[heap[(zz >> 1) as usize] as usize] {
+                heap[zz as usize] = heap[(zz >> 1) as usize];
+                zz >>= 1;
+            }
+            heap[zz as usize] = tmp;
+        }
+
+        while n_heap > 1 {
+            let n1 = heap[1];
+            heap[1] = heap[n_heap as usize];
+            n_heap -= 1;
+            downheap(&mut heap, &weight, n_heap, 1);
+
+            let n2 = heap[1];
+            heap[1] = heap[n_heap as usize];
+            n_heap -= 1;
+            downheap(&mut heap, &weight, n_heap, 1);
+
+            n_nodes += 1;
+            parent[n1 as usize] = n_nodes;
+            parent[n2 as usize] = n_nodes;
+            weight[n_nodes as usize] = add_weights(weight[n1 as usize], weight[n2 as usize]);
+            parent[n_nodes as usize] = -1;
+            n_heap += 1;
+            heap[n_heap as usize] = n_nodes;
+            // UPHEAP(n_heap)
+            let mut zz = n_heap;
+            let tmp = heap[zz as usize];
+            while weight[tmp as usize] < weight[heap[(zz >> 1) as usize] as usize] {
+                heap[zz as usize] = heap[(zz >> 1) as usize];
+                zz >>= 1;
+            }
+            heap[zz as usize] = tmp;
+        }
+
+        // Compute lengths by walking parent links; detect over-long codes.
+        let mut lengths = vec![0u8; alpha_size];
+        let mut too_long = false;
+        for i in 1..=alpha_size {
+            let mut j = 0i32;
+            let mut k = i as i32;
+            while parent[k as usize] >= 0 {
+                k = parent[k as usize];
+                j += 1;
+            }
+            lengths[i - 1] = j as u8;
+            if j as usize > max_len {
+                too_long = true;
+            }
+        }
+
+        if !too_long {
             return lengths;
         }
-        // Scale weights down by halving (rounding up to keep all
-        // values > 0) and retry.
-        for w in weights.iter_mut() {
-            *w = (*w).div_ceil(2).max(1);
-        }
-        // After scaling everything to 1 the natural Huffman depth is
-        // ⌈log₂ n⌉ which for n ≤ 258 is at most 9 — well under 20 —
-        // so the loop always terminates within a few iterations.
-        if n <= 1 {
-            // Degenerate alphabet; just return the singletons at len 1.
-            return vec![1u8; n.max(1)];
+
+        // Scale frequencies: j = weight>>8; j = 1 + j/2.
+        for f in cur_freq.iter_mut() {
+            let j = *f;
+            *f = 1 + (j / 2);
         }
     }
 }
 
-/// Compute Huffman lengths from a weight vector using the textbook
-/// two-pass tree-build.
-///
-/// We represent the partial tree as an array of length 2N parents:
-/// internal nodes occupy indices ≥ N, leaves occupy 0..N. Each merge
-/// step links two minimum-weight active nodes under a fresh internal
-/// node; once the tree is built we walk parent links to compute each
-/// leaf's depth.
-fn compute_lengths(weights: &[u32]) -> Vec<u8> {
-    let n = weights.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    if n == 1 {
-        return vec![1];
-    }
-
-    // Heap of (weight, node_id). Implemented as a sorted vector since
-    // n ≤ 258; the constant factor on the binary-heap path is not
-    // worth the complexity for this size.
-    let mut alive: Vec<(u64, usize)> = weights
-        .iter()
-        .enumerate()
-        .map(|(i, &w)| (w as u64, i))
-        .collect();
-    let mut parent: Vec<usize> = vec![usize::MAX; 2 * n];
-    let mut next_node = n;
-
-    while alive.len() > 1 {
-        // Sort descending so we pop the two smallest off the back.
-        alive.sort_by_key(|b| core::cmp::Reverse(b.0));
-        let (w1, n1) = alive.pop().unwrap();
-        let (w2, n2) = alive.pop().unwrap();
-        parent[n1] = next_node;
-        parent[n2] = next_node;
-        alive.push((w1 + w2, next_node));
-        next_node += 1;
-    }
-
-    // Walk parent links from each leaf to the root counting depth.
-    let mut lengths = vec![0u8; n];
-    for leaf in 0..n {
-        let mut depth = 0u32;
-        let mut node = parent[leaf];
-        while node != usize::MAX {
-            depth += 1;
-            node = parent[node];
+/// DOWNHEAP(z) from the bzip2 source, operating on the 1-based `heap`
+/// array of length `n_heap`, keyed by `weight`.
+fn downheap(heap: &mut [i32], weight: &[i64], n_heap: i32, z: i32) {
+    let mut zz = z;
+    let tmp = heap[zz as usize];
+    loop {
+        let mut yy = zz << 1;
+        if yy > n_heap {
+            break;
         }
-        // depth 0 only happens when n == 1 (root = leaf); that case
-        // was returned above.
-        lengths[leaf] = depth.max(1) as u8;
+        if yy < n_heap
+            && weight[heap[(yy + 1) as usize] as usize] < weight[heap[yy as usize] as usize]
+        {
+            yy += 1;
+        }
+        if weight[tmp as usize] < weight[heap[yy as usize] as usize] {
+            break;
+        }
+        heap[zz as usize] = heap[yy as usize];
+        zz = yy;
     }
-    lengths
+    heap[zz as usize] = tmp;
 }
 
 /// Build the canonical (code, length) table from a per-symbol length
@@ -390,5 +465,30 @@ mod tests {
         let lens = build_canonical_lengths(&freqs, MAX_CODE_LEN);
         assert!(lens.iter().all(|&l| (1..=20).contains(&l)));
         assert_eq!(lens.len(), freqs.len());
+    }
+
+    #[test]
+    fn build_lengths_caps_at_17_and_is_kraft_valid() {
+        // The reference-faithful builder must (a) never emit a code
+        // longer than 17 bits, and (b) always produce a Kraft-valid
+        // canonical prefix code that `DecodeTable::from_lengths`
+        // accepts — even for skewed and degenerate distributions.
+        let cases: alloc::vec::Vec<alloc::vec::Vec<u32>> = alloc::vec![
+            alloc::vec![1, 1],
+            alloc::vec![0, 0, 0, 5],
+            alloc::vec![1000000, 1, 1, 1, 1, 1, 1, 1],
+            (0..50u32).map(|i| 1 << (i % 24)).collect(),
+            alloc::vec![1u32; 258],
+        ];
+        for freqs in &cases {
+            let lens = build_canonical_lengths(freqs, MAX_CODE_LEN);
+            assert_eq!(lens.len(), freqs.len());
+            assert!(
+                lens.iter().all(|&l| (1..=17).contains(&l)),
+                "length out of 1..=17: {lens:?}"
+            );
+            // Must round-trip through the decode-table builder.
+            DecodeTable::from_lengths(&lens).expect("builder produced a non-Kraft-valid table");
+        }
     }
 }
