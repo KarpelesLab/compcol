@@ -222,6 +222,41 @@ fn round_trip_mixed_corpus() {
     round_trip(&input);
 }
 
+#[test]
+fn round_trip_large_compressible_multiblock() {
+    // 1.5 MB of zeros. Post-RLE-1 this is tiny, but it exercises the
+    // RLE-1-size-based block fill in the encoder (reference bzip2 sizes
+    // blocks by post-RLE-1 length, not raw input). Round-trips through
+    // the library decoder regardless of how compressible the data is.
+    let input = vec![0u8; 1_500_000];
+    let encoded = encode_all(&input);
+    let decoded = decode_chunked(&encoded, 4096, 4096).unwrap();
+    assert_eq!(decoded.len(), input.len());
+    assert_eq!(decoded, input);
+}
+
+#[test]
+fn round_trip_low_level_forces_multiple_blocks() {
+    // At level 1 (≈100 KB post-RLE-1 cap) a ~250 KB low-redundancy
+    // payload spans several blocks, exercising the multi-table Huffman
+    // optimisation and selector encoding across block boundaries.
+    let mut state: u32 = 0x1234_5678;
+    let mut input = Vec::with_capacity(250_000);
+    while input.len() < 250_000 {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        input.push((state >> 16) as u8);
+        input.push((state >> 8) as u8);
+        // Inject some structure so the BWT/MTF/Huffman path is non-trivial.
+        if input.len() % 64 == 0 {
+            input.extend_from_slice(b"compcol-bzip2-multiblock ");
+        }
+    }
+    let mut enc = Encoder::with_config(EncoderConfig { level: 1 });
+    let encoded = encode_chunked(&mut enc, &input, 7919, 4096);
+    let decoded = decode_chunked(&encoded, 4096, 4096).unwrap();
+    assert_eq!(decoded, input);
+}
+
 // ─── streaming chunk sizes ─────────────────────────────────────────────
 
 #[test]
