@@ -103,7 +103,7 @@ const NIL: u32 = u32::MAX;
 /// raise `nice_match` (the length at which the chain walk gives up and
 /// accepts the current match). This is the same speed-vs-ratio knob that
 /// xz-utils exposes — we just expose a small subset.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct EncoderParams {
     pub max_chain: usize,
     pub nice_match: u32,
