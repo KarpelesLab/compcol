@@ -342,25 +342,30 @@ fn lzvn_one_byte_at_a_time() {
     assert_eq!(out, HELLO_WORLD);
 }
 
-// ─── bvx2 (LZFSE v2) is documented Unsupported in this build ─────────────
+// ─── bvx2 (LZFSE v2) is now decoded ──────────────────────────────────────
+//
+// The bvx2 decoder itself is validated by round-trip against this crate's
+// own spec-conformant v2 encoder in `src/lzfse/lzfse_v2.rs` (in-crate unit
+// tests, which can reach the `#[cfg(test)]` encoder helper). From the public
+// integration surface we only assert that a *malformed* bvx2 header is
+// rejected cleanly (no panic, no Unsupported) — proving the v2 arm is wired
+// in and reaches real header parsing rather than the old Unsupported stub.
 
 #[test]
-fn bvx2_block_returns_unsupported() {
-    // Construct a stream that starts with bvx2 magic. The decoder should
-    // read the magic, peek at the v2 header (need 28 bytes after magic
-    // for the fixed-size portion), and then return Unsupported.
+fn bvx2_malformed_header_rejected_without_panic() {
+    // A bvx2 magic followed by 32 zero header bytes is not a valid v2 block
+    // (the frequency tables would not sum to the FSE state counts). The
+    // decoder must reject it as Corrupt rather than returning Unsupported or
+    // panicking.
     let mut stream = b"bvx2".to_vec();
-    // 28 bytes of arbitrary header bytes — content doesn't matter because
-    // we return Unsupported before interpreting them.
     stream.extend_from_slice(&[0u8; 32]);
 
     let mut dec = Decoder::new();
     let mut buf = [0u8; 256];
-    // Feed all input. Expect Err(Unsupported) at some point.
     let r = dec.decode(&stream, &mut buf);
     assert!(
-        matches!(r, Err(Error::Unsupported)),
-        "expected Unsupported on bvx2 block, got {:?}",
+        matches!(r, Err(Error::Corrupt) | Err(Error::UnexpectedEnd)),
+        "expected Corrupt/UnexpectedEnd on malformed bvx2 block, got {:?}",
         r
     );
 }

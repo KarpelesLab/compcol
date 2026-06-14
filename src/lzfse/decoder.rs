@@ -59,10 +59,12 @@ enum State {
 enum BlockKind {
     Uncompressed,
     Lzvn,
-    /// `bvx2` returns Unsupported once we've parsed its header far enough
-    /// to know we hit it; this variant exists so the state machine can
-    /// surface that decision uniformly with the other block kinds.
+    /// `bvx2` (LZFSE v2): FSE + LZ77. Decoded by [`lzfse_v2::decode_block`]
+    /// once the whole block (variable-length header + both payload streams)
+    /// is buffered.
     V2,
+    /// `bvx1` (LZFSE v1, uncompressed-freq variant): not emitted by modern
+    /// encoders; returns [`Error::Unsupported`].
     V1,
 }
 
@@ -216,23 +218,56 @@ impl Decoder {
                         };
                     }
                     BlockKind::V2 => {
-                        // We don't decode v2 in this build, but we need to
-                        // skip past the block cleanly so callers don't
-                        // confuse "block we can't decode" with "garbage".
-                        // Parse the n_payload_bytes field from the header.
-                        if self.input_buf.len() < lzfse_v2::V2_HEADER_FIXED_BYTES {
+                        // The v2 header is variable-length (FSE frequency
+                        // tables follow the fixed packed fields). Buffer the
+                        // fixed 28 bytes (post-magic: n_raw + three u64 words)
+                        // first so we can read `header_size` and the payload
+                        // sizes, then arrange to buffer the whole block (header
+                        // + payload) before decoding it in one shot.
+                        let fixed = lzfse_v2::V2_HEADER_FIXED_BYTES;
+                        if self.input_buf.len() < fixed {
                             return Ok(RawProgress {
                                 consumed,
                                 written,
                                 done: false,
                             });
                         }
-                        // We *could* skip past the v2 block, but the spec is
-                        // explicit that the encoder may mix block types
-                        // freely. Returning Unsupported here is the
-                        // documented behaviour for v2 in this build.
-                        self.poisoned = true;
-                        return Err(Error::Unsupported);
+                        let header_size = match lzfse_v2::parse_header_size(&self.input_buf) {
+                            Ok(h) => h as usize,
+                            Err(e) => {
+                                self.poisoned = true;
+                                return Err(e);
+                            }
+                        };
+                        let n_payload = match lzfse_v2::parse_payload_size(&self.input_buf) {
+                            Ok(n) => n as usize,
+                            Err(e) => {
+                                self.poisoned = true;
+                                return Err(e);
+                            }
+                        };
+                        // `header_size` includes the 4-byte magic we already
+                        // dropped; remaining block bytes after the magic are
+                        // `header_size - 4 + n_payload`.
+                        let header_len = match header_size.checked_sub(4) {
+                            Some(h) if h >= fixed => h,
+                            _ => {
+                                self.poisoned = true;
+                                return Err(Error::Corrupt);
+                            }
+                        };
+                        let block_len = match header_len.checked_add(n_payload) {
+                            Some(b) => b,
+                            None => {
+                                self.poisoned = true;
+                                return Err(Error::Corrupt);
+                            }
+                        };
+                        self.state = State::AwaitPayload {
+                            kind: BlockKind::V2,
+                            payload_len: block_len,
+                            decoded_size: 0,
+                        };
                     }
                     BlockKind::V1 => {
                         self.poisoned = true;
@@ -287,7 +322,33 @@ impl Decoder {
                             self.input_buf.drain(..payload_len);
                             self.state = State::AwaitMagic;
                         }
-                        BlockKind::V2 | BlockKind::V1 => {
+                        BlockKind::V2 => {
+                            // The whole block (header + both payload streams)
+                            // is now buffered in `payload_len` bytes. Decode in
+                            // one shot. Bound the up-front output reservation by
+                            // a payload-derived hint (an FSE block can expand
+                            // more than LZVN, but is still bounded; the decoder
+                            // enforces the exact `n_raw_bytes` internally).
+                            let cap_hint = payload_len.saturating_mul(32).saturating_add(1 << 16);
+                            let mut block_out = Vec::new();
+                            match lzfse_v2::decode_block(
+                                &self.input_buf[..payload_len],
+                                &mut block_out,
+                                cap_hint,
+                            ) {
+                                Ok(consumed_block) => {
+                                    debug_assert_eq!(consumed_block, payload_len);
+                                }
+                                Err(e) => {
+                                    self.poisoned = true;
+                                    return Err(e);
+                                }
+                            }
+                            self.output_buf.append(&mut block_out);
+                            self.input_buf.drain(..payload_len);
+                            self.state = State::AwaitMagic;
+                        }
+                        BlockKind::V1 => {
                             // Unreachable — header step would have errored.
                             self.poisoned = true;
                             return Err(Error::Unsupported);
