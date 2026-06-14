@@ -715,38 +715,60 @@ fn best_at(
     max_chain: usize,
     nice_match: usize,
 ) -> (usize, usize, bool) {
-    // Repeat-offset probes. The reference encoder gives these strong
-    // preference because they're nearly free in the offset stream.
-    let mut best_len: usize = 0;
-    let mut best_dist: usize = 0;
-    let mut best_is_rep1: bool = false;
+    // Repeat-offset probes. A repeat offset costs only the FSE code (1..=3) in
+    // the offset stream and — crucially — emits NO offset extra bits, whereas
+    // a fresh offset at distance D spends ~log2(D) FSE-code bits PLUS ~log2(D)
+    // extra bits. On real corpora those offset extra bits are the single
+    // largest part of the output, so a repeat match that is several bytes
+    // shorter than the best fresh match is often still the cheaper encoding.
+    let mut rep_len: usize = 0;
+    let mut rep_dist: usize = 0;
+    let mut rep_is_rep1: bool = false;
     for (i, &d) in block_offsets.iter().enumerate() {
         let len = matcher.check_repeat_offset(buffer, pos, d as usize);
         // Prefer earlier rep slots on ties (they encode in fewer bits and
         // don't perturb the ring).
-        if len > best_len {
-            best_len = len;
-            best_dist = d as usize;
-            best_is_rep1 = i == 0;
-            if best_len >= nice_match {
-                return (best_dist, best_len, best_is_rep1);
+        if len > rep_len {
+            rep_len = len;
+            rep_dist = d as usize;
+            rep_is_rep1 = i == 0;
+        }
+    }
+    if rep_len >= nice_match {
+        return (rep_dist, rep_len, rep_is_rep1);
+    }
+
+    // Hash-chain probe (longest fresh match).
+    let fresh = matcher.find_match(buffer, pos, buffer.len(), max_chain, nice_match);
+
+    match fresh {
+        Some(m) if rep_len >= MIN_MATCH => {
+            // Both a repeat and a fresh candidate exist. The fresh match must
+            // beat the repeat by enough length to pay for the offset bits it
+            // spends that the repeat avoids. A fresh offset at distance D costs
+            // roughly `2 * log2(D + 3)` bits more than a repeat; each matched
+            // byte is worth ~6 bits, so require the fresh match to be longer by
+            // at least `2 * log2(D) / 6` bytes.
+            let val = m.distance as u32 + 3;
+            let log2d = 31 - val.leading_zeros();
+            let margin = ((2 * log2d) / 6).max(1) as usize;
+            if m.length >= rep_len + margin {
+                (
+                    m.distance,
+                    m.length,
+                    m.distance == block_offsets[0] as usize,
+                )
+            } else {
+                (rep_dist, rep_len, rep_is_rep1)
             }
         }
+        Some(m) => (
+            m.distance,
+            m.length,
+            m.distance == block_offsets[0] as usize,
+        ),
+        None => (rep_dist, rep_len, rep_is_rep1),
     }
-
-    // Hash-chain probe. The matcher already returns the longest such match.
-    if let Some(m) = matcher.find_match(buffer, pos, buffer.len(), max_chain, nice_match) {
-        // For a fresh-offset match to beat a repeat match, it has to be
-        // strictly longer — repeat-offset matches save bits in the offset
-        // stream, so equal lengths favour the repeat.
-        if m.length > best_len {
-            best_len = m.length;
-            best_dist = m.distance;
-            best_is_rep1 = best_dist == block_offsets[0] as usize;
-        }
-    }
-
-    (best_dist, best_len, best_is_rep1)
 }
 
 /// Pick the best per-table FSE mode (Predefined or FSE_Compressed) given the
