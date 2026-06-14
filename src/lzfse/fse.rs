@@ -20,6 +20,27 @@
 //! the symbol is a `u8`; for L/M/D, a base value and a count of extra value
 //! bits are stored.
 //!
+//! ## Table construction (general, k/k-1 split)
+//!
+//! Table construction matches Apple's `fse_init_decoder_table`: the `f`
+//! slots spread for a symbol are **not** all assigned the same bit-width.
+//! With `n_states = 2^L` (always a power of two) and per-symbol frequency
+//! `f` (arbitrary, `1..=n_states`, summing to `n_states`):
+//!
+//! ```text
+//! k  = L - floor(log2(f))          // == clz(f) - clz(n_states)
+//! j0 = ((2 * n_states) >> k) - f
+//! for i in 0..f (i = the i-th slot for this symbol, in spread order):
+//!     if i < j0:  entry.k = k;     entry.delta = ((f + i) << k) - n_states
+//!     else:       entry.k = k - 1; entry.delta = (i - j0) << (k - 1)
+//! ```
+//!
+//! The first `j0` slots consume `k` bits, the remaining `f - j0` consume
+//! `k - 1` bits. When `f` is a power of two `j0 == f` and the table
+//! degenerates to a single bit-width per symbol; for general `f` the split
+//! is required to tile `[0, n_states)` exactly. This is the algorithm real
+//! Apple-produced LZFSE v2 streams rely on.
+//!
 //! Frequency tables in the v2 block header are encoded with the custom
 //! variable-width scheme implemented by [`decode_freq_table`].
 
@@ -71,29 +92,32 @@ pub(crate) fn build_literal_decoder(freq: &[u16], n_states: usize) -> Result<Vec
     let mut t = 0usize;
     let step = spread_step(n_states);
     let mask = n_states - 1;
-    let n_states_log2 = n_states.trailing_zeros();
+    let n_states_log2 = n_states.trailing_zeros() as i32;
     for (s, &f) in freq.iter().enumerate() {
         let f = f as usize;
         if f == 0 {
             continue;
         }
-        let k = if f == 1 {
-            n_states_log2 as i32
-        } else {
-            let ceil = 32 - (f as u32 - 1).leading_zeros();
-            n_states_log2 as i32 - ceil as i32
-        };
+        // k = L - floor(log2(f)) = clz(f) - clz(n_states); j0 splits the
+        // symbol's slots into a k-bit prefix and a (k-1)-bit suffix.
+        let floor_log2 = 31 - (f as u32).leading_zeros() as i32;
+        let k = n_states_log2 - floor_log2;
         if k < 0 {
             return Err(Error::Corrupt);
         }
         let k = k as u32;
+        let j0 = (((2 * n_states) >> k) as i32) - f as i32;
         for i in 0..f {
             while occupied[t] {
                 t = (t + step) & mask;
             }
-            let delta = ((f as i32 + i as i32) << k) - n_states as i32;
+            let (ek, delta) = if (i as i32) < j0 {
+                (k, ((f as i32 + i as i32) << k) - n_states as i32)
+            } else {
+                (k - 1, (i as i32 - j0) << (k - 1))
+            };
             table[t] = FseEntry {
-                k: k as u8,
+                k: ek as u8,
                 symbol: s as u8,
                 delta: delta as i16,
             };
@@ -129,29 +153,32 @@ pub(crate) fn build_lmd_decoder(
     let mut t = 0usize;
     let step = spread_step(n_states);
     let mask = n_states - 1;
-    let n_states_log2 = n_states.trailing_zeros();
+    let n_states_log2 = n_states.trailing_zeros() as i32;
     for (s, &f) in freq.iter().enumerate() {
         let f = f as usize;
         if f == 0 {
             continue;
         }
-        let k = if f == 1 {
-            n_states_log2 as i32
-        } else {
-            let ceil = 32 - (f as u32 - 1).leading_zeros();
-            n_states_log2 as i32 - ceil as i32
-        };
+        // k = L - floor(log2(f)); j0 splits the symbol's slots into a k-bit
+        // prefix and a (k-1)-bit suffix (see module docs).
+        let floor_log2 = 31 - (f as u32).leading_zeros() as i32;
+        let k = n_states_log2 - floor_log2;
         if k < 0 {
             return Err(Error::Corrupt);
         }
         let k = k as u32;
+        let j0 = (((2 * n_states) >> k) as i32) - f as i32;
         for i in 0..f {
             while occupied[t] {
                 t = (t + step) & mask;
             }
-            let delta = ((f as i32 + i as i32) << k) - n_states as i32;
+            let (ek, delta) = if (i as i32) < j0 {
+                (k, ((f as i32 + i as i32) << k) - n_states as i32)
+            } else {
+                (k - 1, (i as i32 - j0) << (k - 1))
+            };
             table[t] = LmdVEntry {
-                total_bits: (k as u8) + bits_per_symbol[s],
+                total_bits: (ek as u8) + bits_per_symbol[s],
                 value_bits: bits_per_symbol[s],
                 delta: delta as i16,
                 v_base: base_per_symbol[s],
@@ -259,4 +286,120 @@ pub(crate) fn decode_freq_table(
         pos += nbits;
     }
     Ok((freqs, pos))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Core FSE invariant: for **each symbol** the `f` entries that carry it
+    /// must, via their `[delta, delta + 2^k)` next-state ranges, tile
+    /// `[0, n_states)` exactly once — that is what lets the encoder transition
+    /// to that symbol from any state. This holds **iff** the k/k-1 split is
+    /// implemented correctly; a regression to a single bit-width per symbol
+    /// breaks the tiling for any non-power-of-two frequency. The check is
+    /// independent of any encoder.
+    fn assert_literal_table_bijective(freq: &[u16], n_states: usize) {
+        let table = build_literal_decoder(freq, n_states).expect("table builds");
+        assert_eq!(table.len(), n_states);
+        // Per-symbol coverage of the next-state space.
+        let mut hits = vec![vec![0u32; n_states]; freq.len()];
+        for e in &table {
+            let span = 1usize << e.k;
+            let base = e.delta as i32;
+            for off in 0..span as i32 {
+                let next = base + off;
+                assert!(
+                    (0..n_states as i32).contains(&next),
+                    "next {next} out of range for entry {e:?}"
+                );
+                hits[e.symbol as usize][next as usize] += 1;
+            }
+        }
+        for (sym, &f) in freq.iter().enumerate() {
+            if f == 0 {
+                assert!(
+                    hits[sym].iter().all(|&h| h == 0),
+                    "absent symbol {sym} has table entries"
+                );
+                continue;
+            }
+            for (s, &h) in hits[sym].iter().enumerate() {
+                assert_eq!(
+                    h, 1,
+                    "symbol {sym}: state {s} reachable {h} times (expected exactly 1)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn literal_table_bijective_non_dyadic() {
+        // Deliberately non-power-of-two frequency sets that sum to 1024.
+        // A single-`k` table builder cannot tile [0,1024) for any of these.
+        assert_literal_table_bijective(&[3, 5, 1000, 16], 1024);
+        assert_literal_table_bijective(&[300, 700, 24], 1024);
+        // Many singletons + one large symbol (1 is non-dyadic-adjacent edge).
+        let mut f = vec![1u16; 24];
+        f[0] = 1024 - 23;
+        assert_literal_table_bijective(&f, 1024);
+        // Skewed but smooth distribution (sums to 1024).
+        assert_literal_table_bijective(&[100, 101, 103, 107, 109, 504], 1024);
+    }
+
+    #[test]
+    fn literal_table_bijective_dyadic_still_ok() {
+        // The power-of-two case (j0 == f) must still tile correctly.
+        assert_literal_table_bijective(&[512, 256, 256], 1024);
+        assert_literal_table_bijective(&[1024], 1024);
+    }
+
+    #[test]
+    fn lmd_table_built_for_non_dyadic_freqs() {
+        // L stream: 64 states, a non-power-of-two split across symbols.
+        let mut freq = vec![0u16; 20];
+        freq[0] = 30;
+        freq[1] = 20;
+        freq[2] = 7;
+        freq[3] = 5;
+        freq[16] = 2; // a symbol carrying extra value bits
+        let extra = [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 3, 5, 8];
+        let base = [
+            0i32, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 20, 28, 60,
+        ];
+        let table = build_lmd_decoder(&freq, 64, &extra, &base).expect("lmd table builds");
+        assert_eq!(table.len(), 64);
+        // For each symbol the state-transition portion (total_bits-value_bits)
+        // must tile [0,64). Group entries by symbol via v_base, which is
+        // unique per symbol in `base`.
+        let mut hits: Vec<vec::Vec<u32>> = (0..20).map(|_| vec![0u32; 64]).collect();
+        for e in &table {
+            let sym = base
+                .iter()
+                .position(|&b| b == e.v_base)
+                .expect("known base");
+            let kbits = e.total_bits - e.value_bits;
+            let span = 1usize << kbits;
+            for off in 0..span as i32 {
+                let next = e.delta as i32 + off;
+                assert!((0..64).contains(&next));
+                hits[sym][next as usize] += 1;
+            }
+        }
+        for (sym, &f) in freq.iter().enumerate() {
+            if f == 0 {
+                continue;
+            }
+            assert!(
+                hits[sym].iter().all(|&h| h == 1),
+                "lmd symbol {sym} not bijective over states"
+            );
+        }
+    }
+
+    #[test]
+    fn non_power_of_two_table_size_rejected() {
+        // The table SIZE must be 2^L even though per-symbol freqs are general.
+        assert!(build_literal_decoder(&[5, 5], 10).is_err());
+    }
 }

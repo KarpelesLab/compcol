@@ -31,11 +31,16 @@
 //!   returns [`Error::Unsupported`].
 //! - `bvx2` (LZFSE v2 compressed) blocks: **decoder implemented** — the core
 //!   LZFSE block type (LZ77 commands entropy-coded with Finite State
-//!   Entropy). Validated by round-trip against this crate's own
-//!   spec-conformant v2 encoder (no Apple reference fixtures are available in
-//!   this environment, so Apple-interop is best-effort but follows the
-//!   documented wire format precisely). See the internal `lzfse_v2` module
-//!   for the layout reference and validation/interop notes.
+//!   Entropy). The FSE table construction matches Apple's general
+//!   `fse_init_decoder_table` (k/k-1 split), so arbitrary per-symbol
+//!   frequencies decode, not only power-of-two normalizations. Validated by
+//!   round-trip against this crate's own spec-conformant general-frequency v2
+//!   encoder, including deliberately non-dyadic distributions and a
+//!   hand-frozen non-dyadic block (no Apple reference fixtures are available
+//!   in this environment, so Apple-interop is best-effort but follows the
+//!   documented wire format and real table-construction algorithm). See the
+//!   internal `lzfse_v2` module for the layout reference and
+//!   validation/interop notes.
 //!
 //! Real LZFSE files produced by Apple's encoders mix these block types
 //! freely: small payloads land in `bvxn`, large ones in `bvx2`, and short

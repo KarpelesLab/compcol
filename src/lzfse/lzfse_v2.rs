@@ -15,20 +15,29 @@
 //! ([`encode_block`], `#[cfg(test)]`): we assert `decode(encode(x)) == x`
 //! over empty / small / text / repetitive / random / multi-block inputs,
 //! including inputs large enough to force a genuine FSE-coded block. The
-//! encoder builds FSE frequency tables from the L/M/D/LIT histograms,
-//! FSE-encodes the interleaved literal and LMD streams in reverse, and packs
-//! the v2 header exactly per the documented wire layout.
+//! encoder builds FSE frequency tables from the L/M/D/LIT histograms with the
+//! standard quantized (nearest) normalization — producing **general,
+//! non-power-of-two frequencies** — FSE-encodes the interleaved literal and
+//! LMD streams in reverse, and packs the v2 header exactly per the documented
+//! wire layout. Round-trip tests deliberately include skewed, non-dyadic
+//! literal distributions and small (singleton) match-count histograms, plus
+//! one hand-frozen non-dyadic block decoded independently of the encoder, so
+//! a regression to a single bit-width per symbol would fail.
 //!
-//! Interop with Apple-produced `bvx2` is **best-effort**: the decoder
-//! follows the documented format precisely (the same header layout, the same
-//! L/M/D base/extra-bit tables, the same frequency-table encoding, and the
-//! same reverse FSE bit convention), but has not been cross-checked against
-//! a real Apple stream here. One concrete simplification is that this
-//! crate's FSE table construction ([`super::fse`]) uses a single bit-count
-//! per symbol, which is exact only for power-of-two normalized frequencies;
-//! the test encoder therefore emits power-of-two frequency tables. An Apple
-//! stream that uses the general (mixed `k`/`k+1`) FSE normalization would
-//! need the more general table builder. See the gap note below.
+//! The FSE table construction ([`super::fse`]) now matches Apple's general
+//! `fse_init_decoder_table` (the **k/k-1 split**: a symbol's `f` spread slots
+//! are partitioned into a `k`-bit prefix and a `(k-1)`-bit suffix at the
+//! boundary `j0 = (2·n_states >> k) − f`), so arbitrary per-symbol
+//! frequencies are handled — not just power-of-two normalizations. The table
+//! *size* is always `2^L`; only the per-symbol frequencies are general.
+//!
+//! Interop with Apple-produced `bvx2` is therefore **best-effort but follows
+//! the real table-construction algorithm**: the decoder mirrors the
+//! documented format precisely (the same header layout, the same L/M/D
+//! base/extra-bit tables, the same frequency-table encoding, the same reverse
+//! FSE bit convention, and now the same general FSE table construction). It
+//! has still not been cross-checked against an actual Apple-produced stream
+//! in this environment, so full Apple-stream interop remains unverified here.
 //!
 //! ## Wire format reference (v2 header, authoritative)
 //!
@@ -465,10 +474,10 @@ pub(crate) fn decode_block(
 // ───────────────────────── test-only encoder ─────────────────────────────
 //
 // A spec-conformant `bvx2` encoder used only to validate the decoder by
-// round-trip. It uses a greedy LZ parser, power-of-two FSE frequency
-// normalization (the only normalization this crate's single-bit-count FSE
-// table builder reconstructs exactly), and the documented header/payload
-// packing.
+// round-trip. It uses a greedy LZ parser, the standard quantized (nearest)
+// FSE frequency normalization producing general, non-power-of-two
+// frequencies, encode slots that exactly invert the decoder's general k/k-1
+// FSE table, and the documented header/payload packing.
 
 #[cfg(test)]
 pub(crate) use test_encoder::encode_block;
@@ -488,9 +497,16 @@ mod test_encoder {
     }
 
     /// Build per-symbol encode slots that exactly invert
-    /// `fse::build_literal_decoder` / `build_lmd_decoder`. Frequencies must be
-    /// powers of two (or the f==1 case) so the single-`k`-per-symbol decode
-    /// table tiles `[0, n_states)`.
+    /// `fse::build_literal_decoder` / `build_lmd_decoder`, including the
+    /// general k/k-1 split. Frequencies are arbitrary (`1..=n_states`) and
+    /// must sum to `n_states`; the per-symbol slot set tiles `[0, n_states)`.
+    ///
+    /// Each decode entry maps a current state `t` to a `(next_state, k_bits)`
+    /// pull. The encoder inverts this: given the *next* state `cur` it finds
+    /// the slot whose `[lo, hi]` next-state range contains `cur`, emits
+    /// `cur - lo` in `k` bits and moves the running state to that slot's `t`.
+    /// A slot in the `i < j0` region uses `k` bits, otherwise `k - 1` bits —
+    /// matching the decode table exactly.
     fn build_enc_slots(freq: &[u16], n_states: usize) -> Vec<Vec<EncSlot>> {
         let mut slots: Vec<Vec<EncSlot>> = (0..freq.len()).map(|_| Vec::new()).collect();
         let mut occ = vec![false; n_states];
@@ -503,22 +519,23 @@ mod test_encoder {
             if f == 0 {
                 continue;
             }
-            let k = if f == 1 {
-                log2
-            } else {
-                let ceil = 32 - (f as u32 - 1).leading_zeros();
-                log2 - ceil as i32
-            };
+            let floor_log2 = 31 - (f as u32).leading_zeros() as i32;
+            let k = log2 - floor_log2;
+            let j0 = (((2 * n_states) >> k) as i32) - f as i32;
             for i in 0..f {
                 while occ[t] {
                     t = (t + step) & mask;
                 }
-                let delta = ((f as i32 + i as i32) << k) - n_states as i32;
+                let (ek, delta) = if (i as i32) < j0 {
+                    (k, ((f as i32 + i as i32) << k) - n_states as i32)
+                } else {
+                    (k - 1, (i as i32 - j0) << (k - 1))
+                };
                 slots[s].push(EncSlot {
                     t,
-                    k: k as u8,
+                    k: ek as u8,
                     lo: delta,
-                    hi: delta + (1i32 << k) - 1,
+                    hi: delta + (1i32 << ek) - 1,
                 });
                 occ[t] = true;
                 t = (t + step) & mask;
@@ -614,16 +631,18 @@ mod test_encoder {
         }
     }
 
-    fn prev_pow2(x: u64) -> u64 {
-        if x == 0 {
-            return 0;
-        }
-        1u64 << (63 - x.leading_zeros())
-    }
-
-    /// Normalize a histogram to power-of-two frequencies summing to
-    /// `n_states`, giving every present symbol at least 1.
-    fn normalize_pow2(hist: &[u32], n_states: usize) -> Vec<u16> {
+    /// Normalize a histogram to **general** (arbitrary, not power-of-two)
+    /// frequencies summing exactly to `n_states`, giving every present symbol
+    /// at least 1. This is the standard quantized normalization: scale each
+    /// count by `n_states / total`, round to nearest, force present symbols to
+    /// 1, then correct the running sum by nudging the largest entry (which can
+    /// absorb ±1 changes without dropping a present symbol to 0).
+    ///
+    /// The resulting per-symbol frequencies are deliberately *not* coerced to
+    /// powers of two — the decoder's general k/k-1 table builder handles them
+    /// directly. Singletons and skewed (non-dyadic) distributions are
+    /// produced as-is so the round-trip exercises the general FSE path.
+    pub(super) fn normalize_general(hist: &[u32], n_states: usize) -> Vec<u16> {
         let n = hist.len();
         let total: u64 = hist.iter().map(|&h| h as u64).sum();
         let mut freq = vec![0u16; n];
@@ -631,73 +650,41 @@ mod test_encoder {
             freq[0] = n_states as u16;
             return freq;
         }
+        // Nearest-rounding scale, with a floor of 1 for every present symbol.
         let mut assigned: i64 = 0;
         for (i, &h) in hist.iter().enumerate() {
             if h == 0 {
                 continue;
             }
-            let target = (h as u64 * n_states as u64) / total;
-            let p2 = prev_pow2(target.max(1));
-            freq[i] = p2 as u16;
-            assigned += p2 as i64;
+            let scaled = (h as u64 * n_states as u64 + total / 2) / total;
+            let f = scaled.max(1).min(n_states as u64) as i64;
+            freq[i] = f as u16;
+            assigned += f;
         }
         let target = n_states as i64;
-        // Reduce overshoot by halving the largest divisible entries.
-        while assigned > target {
-            let (idx, val) = freq
-                .iter()
-                .enumerate()
-                .filter(|&(_, &f)| f > 1)
-                .map(|(i, &f)| (i, f))
-                .max_by_key(|&(_, f)| f)
-                .expect("an entry > 1 must exist while overshooting");
-            freq[idx] = val / 2;
-            assigned -= (val / 2) as i64;
-        }
-        // Fill any deficit with power-of-two chunks, doubling existing
-        // entries when that fits, else placing a fresh chunk on a spare
-        // symbol, else merging into symbol 0 (kept a power of two by only
-        // adding equal-or-smaller chunks last).
-        while assigned < target {
-            let deficit = (target - assigned) as u64;
-            // Try doubling the largest entry if it fits exactly within deficit.
-            let candidate = freq
-                .iter()
-                .enumerate()
-                .filter(|&(_, &f)| f > 0 && (f as u64) <= deficit)
-                .max_by_key(|&(_, &f)| f)
-                .map(|(i, &f)| (i, f));
-            if let Some((idx, val)) = candidate {
-                freq[idx] = val * 2;
-                assigned += val as i64;
+        // Correct the sum. Each step adjusts the symbol that can absorb the
+        // change: when overshooting, the largest entry with `f > 1`; when
+        // undershooting, simply the largest entry. This converges because the
+        // largest entry is at least `n_states / n` which exceeds the total
+        // correction magnitude (bounded by `n`).
+        while assigned != target {
+            if assigned > target {
+                let (idx, _) = freq
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &f)| f > 1)
+                    .max_by_key(|&(_, &f)| f)
+                    .expect("an entry > 1 exists while overshooting");
+                freq[idx] -= 1;
+                assigned -= 1;
             } else {
-                // Place a power-of-two chunk no larger than the deficit on a
-                // spare (zero) symbol.
-                let chunk = prev_pow2(deficit);
-                if let Some(spare) = freq.iter().position(|&f| f == 0) {
-                    freq[spare] = chunk as u16;
-                    assigned += chunk as i64;
-                } else {
-                    // No spare: bump symbol 0 (still leaves a valid sum; the
-                    // result need not be a single power of two per symbol for
-                    // correctness — build_enc_slots only requires each present
-                    // freq be a power of two, which `chunk` is, and merging
-                    // two powers of two of equal size yields a power of two).
-                    // To stay safe, only merge when freq[0] == chunk.
-                    if freq[0] as u64 == chunk {
-                        freq[0] = (chunk * 2) as u16;
-                        assigned += chunk as i64;
-                    } else {
-                        // Fall back: split deficit as 1s onto distinct spares
-                        // is impossible here, so promote symbol 0 to next pow2.
-                        let cur = freq[0] as u64;
-                        let next = cur.next_power_of_two().max(1);
-                        let add = next - cur;
-                        let add = add.min(deficit);
-                        freq[0] = (cur + add) as u16;
-                        assigned += add as i64;
-                    }
-                }
+                let (idx, _) = freq
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|&(_, &f)| f)
+                    .expect("non-empty alphabet");
+                freq[idx] += 1;
+                assigned += 1;
             }
         }
         debug_assert_eq!(assigned, target);
@@ -843,10 +830,10 @@ mod test_encoder {
             });
         }
 
-        let lit_freq = normalize_pow2(&lit_hist, LIT_STATES);
-        let l_freq = normalize_pow2(&l_hist, L_STATES);
-        let m_freq = normalize_pow2(&m_hist, M_STATES);
-        let d_freq = normalize_pow2(&d_hist, D_STATES);
+        let lit_freq = normalize_general(&lit_hist, LIT_STATES);
+        let l_freq = normalize_general(&l_hist, L_STATES);
+        let m_freq = normalize_general(&m_hist, M_STATES);
+        let d_freq = normalize_general(&d_hist, D_STATES);
 
         let lit_slots = build_enc_slots(&lit_freq, LIT_STATES);
         let l_slots = build_enc_slots(&l_freq, L_STATES);
@@ -1218,6 +1205,144 @@ mod tests {
             }
         }
         assert_eq!(out, data);
+    }
+
+    /// A hand-frozen `bvx2` stream, independent of this crate's encoder.
+    ///
+    /// It is a literals-only block (`n_matches == 0`) whose **literal
+    /// frequency table is deliberately non-dyadic**: the high-frequency
+    /// literal symbol `0x3d` (`=`) has frequency 1000 and the rare symbol
+    /// `0x3e` (`>`) has 24 (sum 1024 = LIT_STATES). Neither is a power of two,
+    /// so decoding correctly *requires* the general k/k-1 FSE table
+    /// construction — a single-`k` decoder cannot build a table that tiles
+    /// `[0,1024)` for these frequencies and mis-decodes the literals.
+    ///
+    /// The bytes (post-magic header + freq tables + literal FSE payload, then
+    /// the `bvx$` EOS) were generated once and frozen here; this test does not
+    /// call the encoder, so it guards against the encoder and decoder sharing
+    /// the same table-construction bug. The four literals decode to the exact
+    /// ASCII string `=>==`.
+    const HAND_VECTOR: &[u8] = &[
+        0x62, 0x76, 0x78, 0x32, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
+        0x50, 0x48, 0x40, 0x8f, 0x04, 0x12, 0x00, 0x00, 0x00, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x8f, 0x02, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x8f, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0xc0, 0x43, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0x76, 0x78, 0x24,
+    ];
+
+    #[test]
+    fn hand_vector_non_dyadic_decodes_to_known_string() {
+        // Decode the frozen, encoder-independent vector through the public
+        // streaming decoder and assert the exact output.
+        let mut dec = Decoder::new();
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 64];
+        let mut pos = 0usize;
+        loop {
+            let RawProgress {
+                consumed,
+                written,
+                done,
+            } = dec.raw_decode(&HAND_VECTOR[pos..], &mut buf).unwrap();
+            pos += consumed;
+            out.extend_from_slice(&buf[..written]);
+            if done {
+                break;
+            }
+            if consumed == 0 && written == 0 {
+                let RawProgress { written, done, .. } = dec.raw_finish(&mut buf).unwrap();
+                out.extend_from_slice(&buf[..written]);
+                if done || written == 0 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(out, b"=>==", "hand vector decoded to {out:?}");
+    }
+
+    #[test]
+    fn normalize_general_produces_non_dyadic_freqs() {
+        // A skewed histogram must normalize to general (non-power-of-two)
+        // frequencies that sum exactly to n_states and give every present
+        // symbol at least 1. A regression that snapped to powers of two would
+        // be visible here.
+        use super::test_encoder::normalize_general;
+        let hist = [1000u32, 3, 17, 250, 0, 1];
+        let freq = normalize_general(&hist, 1024);
+        assert_eq!(freq.iter().map(|&f| f as u32).sum::<u32>(), 1024);
+        // Absent symbol stays 0; present symbols are >= 1.
+        assert_eq!(freq[4], 0);
+        for (i, &h) in hist.iter().enumerate() {
+            if h > 0 {
+                assert!(freq[i] >= 1, "present symbol {i} dropped to 0");
+            }
+        }
+        // At least one present symbol is genuinely non-power-of-two.
+        assert!(
+            freq.iter().any(|&f| f > 0 && !f.is_power_of_two()),
+            "expected a non-power-of-two frequency, got {freq:?}"
+        );
+    }
+
+    /// Round-trip a payload whose literal histogram is deliberately skewed so
+    /// the normalized FSE frequencies are non-dyadic. A regression to a
+    /// single-`k` decode table would corrupt the result.
+    fn rt_assert_non_dyadic_lit(data: &[u8]) {
+        use super::test_encoder::normalize_general;
+        // Recompute the literal histogram the way encode_block does, but only
+        // over true literals would require the parser; instead assert on a
+        // raw-byte histogram, which upper-bounds the literal alphabet and is a
+        // good proxy for "this input yields a non-dyadic literal table".
+        let mut hist = vec![0u32; 256];
+        for &b in data {
+            hist[b as usize] += 1;
+        }
+        let freq = normalize_general(&hist, LIT_STATES);
+        assert!(
+            freq.iter().any(|&f| f > 0 && !f.is_power_of_two()),
+            "test input does not exercise a non-dyadic table"
+        );
+        rt_block(data);
+    }
+
+    #[test]
+    fn block_roundtrip_non_dyadic_literals() {
+        // Skewed-but-not-dyadic byte distributions (counts chosen so the
+        // 1024-state normalization lands on non-powers-of-two).
+        let mut data = Vec::new();
+        data.extend(core::iter::repeat_n(b'a', 1000));
+        data.extend(core::iter::repeat_n(b'b', 333));
+        data.extend(core::iter::repeat_n(b'c', 77));
+        data.extend(core::iter::repeat_n(b'd', 7));
+        data.push(b'e'); // a singleton
+        rt_assert_non_dyadic_lit(&data);
+
+        // A 3-symbol skew (~70/29/1 split).
+        let mut d2 = Vec::new();
+        d2.extend(core::iter::repeat_n(b'x', 700));
+        d2.extend(core::iter::repeat_n(b'y', 290));
+        d2.extend(core::iter::repeat_n(b'z', 11));
+        rt_assert_non_dyadic_lit(&d2);
+    }
+
+    #[test]
+    fn block_roundtrip_small_match_counts() {
+        // Few, varied matches produce small non-power-of-two L/M/D histograms
+        // (e.g. a single match → a singleton frequency in each LMD table).
+        // Each must round-trip through the general k/k-1 LMD tables.
+        let cases: &[&[u8]] = &[
+            b"abcabc",                         // one short match
+            b"abcdeabcde_xyzxyz",              // two matches, different lens
+            b"AAAABBBBCCCCAAAABBBBCCCC",       // a couple of medium matches
+            b"the cat sat on the mat the cat", // overlapping repeats
+        ];
+        for c in cases {
+            rt_block(c);
+        }
     }
 
     #[test]
