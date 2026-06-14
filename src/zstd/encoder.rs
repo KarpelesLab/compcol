@@ -108,7 +108,21 @@ pub(crate) struct LevelParams {
     /// take the later match if it's meaningfully longer. Mirrors zstd's
     /// `lazy`/`lazy2` strategies (we do single-step lookahead only).
     pub lazy_search: bool,
+    /// When true, the parser runs a price-based optimal parse (forward DP over
+    /// the whole block) instead of greedy/lazy. Enabled at high levels where
+    /// the extra CPU is acceptable. Mirrors zstd's `btopt`/`btultra`.
+    pub optimal: bool,
 }
+
+/// Lowest level at which the optimal parser is used.
+const OPTIMAL_LEVEL: u8 = 17;
+
+/// Per-position hash-chain depth cap for the optimal parser. The DP visits
+/// every position, so an uncapped chain (up to 16384 at level 22) makes each
+/// block quadratic; this bound keeps encode time reasonable while preserving
+/// nearly all of the ratio (the DP's win comes from length/repeat pricing,
+/// not from exhaustive chain walks).
+const OPTIMAL_MAX_CHAIN: usize = 4096;
 
 impl LevelParams {
     /// Clamp `level` to `1..=22` and expand to match-finder tuning. The
@@ -122,118 +136,37 @@ impl LevelParams {
         // Lazy parsing kicks in at level 4 — matches zstd's reference table
         // where `lazy` strategies start at level 4.
         let lazy_search = level >= 4;
-        match level {
-            1 => Self {
-                max_chain: 4,
-                nice_match: 8,
-                lazy_search,
-            },
-            2 => Self {
-                max_chain: 8,
-                nice_match: 12,
-                lazy_search,
-            },
-            3 => Self {
-                max_chain: 16,
-                nice_match: 16,
-                lazy_search,
-            },
-            4 => Self {
-                max_chain: 24,
-                nice_match: 24,
-                lazy_search,
-            },
-            5 => Self {
-                max_chain: 32,
-                nice_match: 32,
-                lazy_search,
-            },
-            6 => Self {
-                max_chain: 48,
-                nice_match: 48,
-                lazy_search,
-            },
-            7 => Self {
-                max_chain: 64,
-                nice_match: 64,
-                lazy_search,
-            },
-            8 => Self {
-                max_chain: 96,
-                nice_match: 96,
-                lazy_search,
-            },
-            9 => Self {
-                max_chain: 128,
-                nice_match: 128,
-                lazy_search,
-            },
-            10 => Self {
-                max_chain: 192,
-                nice_match: 160,
-                lazy_search,
-            },
-            11 => Self {
-                max_chain: 256,
-                nice_match: 192,
-                lazy_search,
-            },
-            12 => Self {
-                max_chain: 384,
-                nice_match: 224,
-                lazy_search,
-            },
-            13 => Self {
-                max_chain: 512,
-                nice_match: 256,
-                lazy_search,
-            },
-            14 => Self {
-                max_chain: 768,
-                nice_match: 384,
-                lazy_search,
-            },
-            15 => Self {
-                max_chain: 1024,
-                nice_match: 512,
-                lazy_search,
-            },
-            16 => Self {
-                max_chain: 1536,
-                nice_match: 768,
-                lazy_search,
-            },
-            17 => Self {
-                max_chain: 2048,
-                nice_match: 1024,
-                lazy_search,
-            },
-            18 => Self {
-                max_chain: 3072,
-                nice_match: 1536,
-                lazy_search,
-            },
-            19 => Self {
-                max_chain: 4096,
-                nice_match: 2048,
-                lazy_search,
-            },
-            20 => Self {
-                max_chain: 6144,
-                nice_match: 3072,
-                lazy_search,
-            },
-            21 => Self {
-                max_chain: 8192,
-                nice_match: 4096,
-                lazy_search,
-            },
+        let optimal = level >= OPTIMAL_LEVEL;
+        let (max_chain, nice_match) = match level {
+            1 => (4, 8),
+            2 => (8, 12),
+            3 => (16, 16),
+            4 => (24, 24),
+            5 => (32, 32),
+            6 => (48, 48),
+            7 => (64, 64),
+            8 => (96, 96),
+            9 => (128, 128),
+            10 => (192, 160),
+            11 => (256, 192),
+            12 => (384, 224),
+            13 => (512, 256),
+            14 => (768, 384),
+            15 => (1024, 512),
+            16 => (1536, 768),
+            17 => (2048, 1024),
+            18 => (3072, 1536),
+            19 => (4096, 2048),
+            20 => (6144, 3072),
+            21 => (8192, 4096),
             // 22 (and clamp-from-above)
-            _ => Self {
-                max_chain: 16384,
-                nice_match: super::matcher::MAX_MATCH,
-                lazy_search,
-            },
+            _ => (16384, super::matcher::MAX_MATCH),
+        };
+        Self {
+            max_chain,
+            nice_match,
+            lazy_search,
+            optimal,
         }
     }
 }
@@ -350,15 +283,47 @@ impl Encoder {
         // each position first — a repeat-offset match costs 1 bit in the
         // offset stream vs. ~log2(distance) bits for a fresh offset, so even
         // short repeats are cheap wins.
-        let mut sequences: Vec<Seq> = Vec::new();
-        let mut literals: Vec<u8> = Vec::with_capacity(buffer.len());
-        let mut lit_start: usize = 0;
-        let mut pos: usize = 0;
-        let mut block_offsets = self.prev_offsets;
         let lazy = self.params.lazy_search;
         let buf_len = buffer.len();
         let max_chain = self.params.max_chain;
         let nice_match = self.params.nice_match;
+
+        // High levels: price-based optimal parse over the whole block. The DP
+        // probes a match candidate at every input position, so we cap the
+        // per-position chain depth to keep the per-block cost bounded — the DP
+        // recovers most of the ratio from trying lengths and repeat offsets
+        // rather than from exhaustive chain walks.
+        if self.params.optimal {
+            let opt_chain = max_chain.min(OPTIMAL_MAX_CHAIN);
+            let (sequences, new_offsets) = optimal_parse(
+                &mut self.matcher,
+                buffer,
+                self.prev_offsets,
+                opt_chain,
+                nice_match,
+            );
+            if sequences.is_empty() {
+                return None;
+            }
+            return finish_compressed_block(
+                buffer,
+                &sequences,
+                new_offsets,
+                self.prev_huff_lengths.as_ref(),
+            )
+            .map(|(body, new_lengths, committed_offsets)| {
+                self.prev_offsets = committed_offsets;
+                if let Some(lengths) = new_lengths {
+                    self.prev_huff_lengths = Some(lengths);
+                }
+                body
+            });
+        }
+
+        let mut sequences: Vec<Seq> = Vec::new();
+        let mut lit_start: usize = 0;
+        let mut pos: usize = 0;
+        let mut block_offsets = self.prev_offsets;
 
         // Invariant: positions in [0, next_insert) have already been spliced
         // into the matcher's hash chain. We advance `next_insert` lazily.
@@ -422,7 +387,6 @@ impl Encoder {
             let literal_run = best_pos - lit_start;
             let offset_value =
                 assign_offset(best_dist as u32, literal_run as u32, &mut block_offsets);
-            literals.extend_from_slice(&buffer[lit_start..best_pos]);
             sequences.push(Seq {
                 literal_length: literal_run as u32,
                 match_length: best_len as u32,
@@ -440,214 +404,234 @@ impl Encoder {
             lit_start = pos;
         }
 
+        let _ = lit_start;
         if sequences.is_empty() {
             return None;
         }
 
-        // Trailing literals: from lit_start to end of buffer.
-        let trailing_literals = &buffer[lit_start..];
-
-        // Build all literal bytes (LZ77 literals + trailing) for use in
-        // literals-section construction.
-        let mut all_literals: Vec<u8> =
-            Vec::with_capacity(literals.len() + trailing_literals.len());
-        all_literals.extend_from_slice(&literals);
-        all_literals.extend_from_slice(trailing_literals);
-
-        // Build literals section. Try Huffman first (with optional Treeless
-        // reuse of the previous block's tree); fall back to raw.
-        let (lit_section, new_lengths) =
-            build_literals_section(&all_literals, self.prev_huff_lengths.as_ref());
-
-        // Build sequences section.
-        let seq_section = self.build_sequences_section(&sequences);
-
-        let total = lit_section.len() + seq_section.len();
-        let raw_size = buffer.len();
-        if total >= raw_size {
-            return None; // Not worth compressing.
-        }
-
-        // Commit the per-block offset history and (if we emitted a Huffman
-        // tree) the new lengths to the encoder state.
-        self.prev_offsets = block_offsets;
-        if let Some(lengths) = new_lengths {
-            self.prev_huff_lengths = Some(lengths);
-        }
-
-        let mut body = Vec::with_capacity(total);
-        body.extend_from_slice(&lit_section);
-        body.extend_from_slice(&seq_section);
-        Some(body)
-    }
-
-    /// Build the sequence section bytes: header (count + symbol-modes byte)
-    /// followed by the FSE-encoded sequence bitstream.
-    ///
-    /// Per-table mode selection: for each of LL/OF/ML we try the predefined
-    /// distribution against a custom FSE_Compressed_Mode distribution built
-    /// from this block's actual code histogram. Whichever produces the
-    /// smaller estimated byte count wins.
-    fn build_sequences_section(&self, sequences: &[Seq]) -> Vec<u8> {
-        let n = sequences.len() as u32;
-
-        // Pre-compute (code, extra_bits, extra_val) for each sequence.
-        let mut ll_codes: Vec<u8> = Vec::with_capacity(sequences.len());
-        let mut ml_codes: Vec<u8> = Vec::with_capacity(sequences.len());
-        let mut of_codes: Vec<u8> = Vec::with_capacity(sequences.len());
-        let mut ll_extras: Vec<(u32, u32)> = Vec::with_capacity(sequences.len());
-        let mut ml_extras: Vec<(u32, u32)> = Vec::with_capacity(sequences.len());
-        let mut of_extras: Vec<(u32, u32)> = Vec::with_capacity(sequences.len());
-
-        for s in sequences {
-            let (oc, oe_bits, oe_val) = of_code(s.offset_value);
-            of_codes.push(oc);
-            of_extras.push((oe_bits, oe_val));
-
-            let (lc, le_bits, le_val) = ll_code(s.literal_length);
-            ll_codes.push(lc);
-            ll_extras.push((le_bits, le_val));
-
-            let (mc, me_bits, me_val) = ml_code(s.match_length);
-            ml_codes.push(mc);
-            ml_extras.push((me_bits, me_val));
-        }
-
-        // Pick per-table mode and build the encoders + any header bytes.
-        let (ll_enc, ll_mode, ll_header) = pick_table(
-            &ll_codes,
-            &DEFAULT_LL_COUNTS,
-            DEFAULT_LL_ACCURACY_LOG,
-            9,
-            35,
-        );
-        let (of_enc, of_mode, of_header) = pick_table(
-            &of_codes,
-            &DEFAULT_OF_COUNTS,
-            DEFAULT_OF_ACCURACY_LOG,
-            8,
-            31,
-        );
-        let (ml_enc, ml_mode, ml_header) = pick_table(
-            &ml_codes,
-            &DEFAULT_ML_COUNTS,
-            DEFAULT_ML_ACCURACY_LOG,
-            9,
-            52,
-        );
-
-        // Build the sequences-section bytes.
-        let mut out = encode_sequence_count(n);
-        // Symbol_Compression_Modes byte: bits [7:6]=LL_Mode, [5:4]=OF_Mode,
-        // [3:2]=ML_Mode, [1:0]=Reserved.
-        let modes: u8 = (ll_mode << 6) | (of_mode << 4) | (ml_mode << 2);
-        out.push(modes);
-        out.extend_from_slice(&ll_header);
-        out.extend_from_slice(&of_header);
-        out.extend_from_slice(&ml_header);
-
-        // FSE-encode the symbol streams.
-        let mut writer = RevBitWriter::new();
-        let n_seq = sequences.len();
-
-        // Reverse encoding pattern. Init states from the LAST sequence.
-        let mut ll_state = ll_enc.init_state(ll_codes[n_seq - 1] as usize);
-        let mut of_state = of_enc.init_state(of_codes[n_seq - 1] as usize);
-        let mut ml_state = ml_enc.init_state(ml_codes[n_seq - 1] as usize);
-
-        // For each sequence (processed in reverse), write to the bitstream
-        // in the EXACT REVERSE of the decoder's read order.
-        //
-        // Decoder per-sequence read order (recall §3.1.1.3.2.1):
-        //   1. OF_extra_bits (number = of_code value)
-        //   2. ML_extra_bits
-        //   3. LL_extra_bits
-        //   4. (only if not last sequence): LL_advance, ML_advance, OF_advance.
-        //
-        // The reverse-bitstream writer is "first-written = last-read". So if
-        // we walk sequences i = n-1 → 0:
-        //   For i = n-1 (DECODER's last sequence): write extras only, in
-        //     reverse read order: write LL_extra first, then ML_extra, then
-        //     OF_extra.
-        //   For i < n-1: write the FSE advance bits for THIS sequence's
-        //     transition (out_OF, then out_ML, then out_LL — reverse of the
-        //     decoder's LL, ML, OF advance read order), THEN write the
-        //     extras (LL, ML, OF reversed).
-        //
-        // FSE advance bits are emitted by `encode_symbol(state, sym)`.
-        // The bits returned correspond to the decoder's read at that
-        // advance step.
-        //
-        // To produce the correct interleaving, we structure the loop:
-        //   for i in (0..n_seq).rev() {
-        //       if i == n_seq - 1 {
-        //           // No advance for the last decoder-side sequence.
-        //       } else {
-        //           // Advance: encode the transition FROM sequence i+1's
-        //           // state INTO sequence i's state for each of OF, ML, LL.
-        //           // Decoder reads advance order LL, ML, OF — so we write
-        //           // OF first (most recently read), then ML, then LL.
-        //           of_state = self.of_enc.encode_symbol(of_state, of_codes[i] as usize, &mut writer);
-        //           ml_state = self.ml_enc.encode_symbol(ml_state, ml_codes[i] as usize, &mut writer);
-        //           ll_state = self.ll_enc.encode_symbol(ll_state, ll_codes[i] as usize, &mut writer);
-        //       }
-        //       // Extras: decoder reads OF, ML, LL — write LL, ML, OF.
-        //       writer.write_bits(ll_extras[i].1 as u64, ll_extras[i].0);
-        //       writer.write_bits(ml_extras[i].1 as u64, ml_extras[i].0);
-        //       writer.write_bits(of_extras[i].1 as u64, of_extras[i].0);
-        //   }
-        //
-        // Hmm wait — encode_symbol(state, sym) consumes the CURRENT state
-        // (which corresponds to the decoder's PRE-advance state) and
-        // produces NEW state (decoder's POST-advance state). The bits
-        // written are the bits the decoder reads to perform the advance.
-        //
-        // The decoder advances at the END of sequence i (using sequence i's
-        // current state to compute next_state for sequence i+1). So the
-        // bits FOR THIS ADVANCE are read at the END of sequence i's
-        // processing. From sequence i+1's POV, the state was set up by
-        // this advance.
-        //
-        // We're processing sequences in reverse (i from n-1 to 0). When
-        // i = n-2, we're handling the SECOND-TO-LAST sequence (decoder-
-        // side). The advance bits at this point are the ones the decoder
-        // reads at the END of i=n-2 to set up i=n-1's state. So we encode
-        // the transition FROM sequence n-2's state INTO n-1's state.
-        //
-        // In our reverse loop, "current state" represents sequence n-1's
-        // initial state (set up via init_state). After encode_symbol with
-        // ll_codes[n-2], the state will represent sequence n-2's initial
-        // state. The BITS written reflect the (current → new) transition
-        // i.e. n-2 → n-1 advance (since current = n-1 before).
-        //
-        // So `encode_symbol(state_for_seq_iplus1, codes[i])` writes the
-        // bits the decoder reads at the end of seq i to advance from
-        // seq_i.state to seq_(i+1).state. ✓
-        for i in (0..n_seq).rev() {
-            if i == n_seq - 1 {
-                // No advance bits for the decoder's last sequence.
-            } else {
-                of_state = of_enc.encode_symbol(of_state, of_codes[i] as usize, &mut writer);
-                ml_state = ml_enc.encode_symbol(ml_state, ml_codes[i] as usize, &mut writer);
-                ll_state = ll_enc.encode_symbol(ll_state, ll_codes[i] as usize, &mut writer);
+        finish_compressed_block(
+            buffer,
+            &sequences,
+            block_offsets,
+            self.prev_huff_lengths.as_ref(),
+        )
+        .map(|(body, new_lengths, committed_offsets)| {
+            self.prev_offsets = committed_offsets;
+            if let Some(lengths) = new_lengths {
+                self.prev_huff_lengths = Some(lengths);
             }
-            // Extras: decoder reads OF, ML, LL — write LL, ML, OF.
-            writer.write_bits(ll_extras[i].1 as u64, ll_extras[i].0);
-            writer.write_bits(ml_extras[i].1 as u64, ml_extras[i].0);
-            writer.write_bits(of_extras[i].1 as u64, of_extras[i].0);
-        }
+            body
+        })
+    }
+}
 
-        // Write final FSE states (decoder reads these via init in order
-        // LL, OF, ML — we write reverse: ML, OF, LL).
-        ml_enc.write_final_state(ml_state, &mut writer);
-        of_enc.write_final_state(of_state, &mut writer);
-        ll_enc.write_final_state(ll_state, &mut writer);
+/// Shared back half of block compression: reconstruct the literal byte stream
+/// from the chosen sequences, build the literals + sequences sections, and
+/// return `(body, new_huff_lengths, committed_offsets)` if the compressed body
+/// beats a Raw_Block. The caller commits the returned state. Free function so
+/// both the greedy/lazy and the optimal parsers can share it without aliasing
+/// `self.pending` (which `buffer` borrows) against `&mut self`.
+fn finish_compressed_block(
+    buffer: &[u8],
+    sequences: &[Seq],
+    block_offsets: [u32; 3],
+    prev_huff_lengths: Option<&HuffLengths>,
+) -> Option<(Vec<u8>, Option<HuffLengths>, [u32; 3])> {
+    // Reconstruct all literal bytes by replaying the sequences: each sequence
+    // emits `literal_length` literals from the cursor, then skips
+    // `match_length` matched bytes. Trailing bytes after the last sequence are
+    // literals too.
+    let mut all_literals: Vec<u8> = Vec::with_capacity(buffer.len());
+    let mut cursor = 0usize;
+    for s in sequences {
+        let ll = s.literal_length as usize;
+        all_literals.extend_from_slice(&buffer[cursor..cursor + ll]);
+        cursor += ll + s.match_length as usize;
+    }
+    all_literals.extend_from_slice(&buffer[cursor..]);
 
-        let bitstream = writer.finish();
-        out.extend_from_slice(&bitstream);
-        out
+    let (lit_section, new_lengths) = build_literals_section(&all_literals, prev_huff_lengths);
+    let seq_section = build_sequences_section(sequences);
+
+    let total = lit_section.len() + seq_section.len();
+    if total >= buffer.len() {
+        return None; // Not worth compressing.
     }
 
+    let mut body = Vec::with_capacity(total);
+    body.extend_from_slice(&lit_section);
+    body.extend_from_slice(&seq_section);
+    Some((body, new_lengths, block_offsets))
+}
+
+/// Build the sequence section bytes: header (count + symbol-modes byte)
+/// followed by the FSE-encoded sequence bitstream.
+///
+/// Per-table mode selection: for each of LL/OF/ML we try the predefined
+/// distribution against a custom FSE_Compressed_Mode distribution built from
+/// this block's actual code histogram. Whichever produces the smaller
+/// estimated byte count wins.
+fn build_sequences_section(sequences: &[Seq]) -> Vec<u8> {
+    let n = sequences.len() as u32;
+
+    // Pre-compute (code, extra_bits, extra_val) for each sequence.
+    let mut ll_codes: Vec<u8> = Vec::with_capacity(sequences.len());
+    let mut ml_codes: Vec<u8> = Vec::with_capacity(sequences.len());
+    let mut of_codes: Vec<u8> = Vec::with_capacity(sequences.len());
+    let mut ll_extras: Vec<(u32, u32)> = Vec::with_capacity(sequences.len());
+    let mut ml_extras: Vec<(u32, u32)> = Vec::with_capacity(sequences.len());
+    let mut of_extras: Vec<(u32, u32)> = Vec::with_capacity(sequences.len());
+
+    for s in sequences {
+        let (oc, oe_bits, oe_val) = of_code(s.offset_value);
+        of_codes.push(oc);
+        of_extras.push((oe_bits, oe_val));
+
+        let (lc, le_bits, le_val) = ll_code(s.literal_length);
+        ll_codes.push(lc);
+        ll_extras.push((le_bits, le_val));
+
+        let (mc, me_bits, me_val) = ml_code(s.match_length);
+        ml_codes.push(mc);
+        ml_extras.push((me_bits, me_val));
+    }
+
+    // Pick per-table mode and build the encoders + any header bytes.
+    let (ll_enc, ll_mode, ll_header) = pick_table(
+        &ll_codes,
+        &DEFAULT_LL_COUNTS,
+        DEFAULT_LL_ACCURACY_LOG,
+        9,
+        35,
+    );
+    let (of_enc, of_mode, of_header) = pick_table(
+        &of_codes,
+        &DEFAULT_OF_COUNTS,
+        DEFAULT_OF_ACCURACY_LOG,
+        8,
+        31,
+    );
+    let (ml_enc, ml_mode, ml_header) = pick_table(
+        &ml_codes,
+        &DEFAULT_ML_COUNTS,
+        DEFAULT_ML_ACCURACY_LOG,
+        9,
+        52,
+    );
+
+    // Build the sequences-section bytes.
+    let mut out = encode_sequence_count(n);
+    // Symbol_Compression_Modes byte: bits [7:6]=LL_Mode, [5:4]=OF_Mode,
+    // [3:2]=ML_Mode, [1:0]=Reserved.
+    let modes: u8 = (ll_mode << 6) | (of_mode << 4) | (ml_mode << 2);
+    out.push(modes);
+    out.extend_from_slice(&ll_header);
+    out.extend_from_slice(&of_header);
+    out.extend_from_slice(&ml_header);
+
+    // FSE-encode the symbol streams.
+    let mut writer = RevBitWriter::new();
+    let n_seq = sequences.len();
+
+    // Reverse encoding pattern. Init states from the LAST sequence.
+    let mut ll_state = ll_enc.init_state(ll_codes[n_seq - 1] as usize);
+    let mut of_state = of_enc.init_state(of_codes[n_seq - 1] as usize);
+    let mut ml_state = ml_enc.init_state(ml_codes[n_seq - 1] as usize);
+
+    // For each sequence (processed in reverse), write to the bitstream
+    // in the EXACT REVERSE of the decoder's read order.
+    //
+    // Decoder per-sequence read order (recall §3.1.1.3.2.1):
+    //   1. OF_extra_bits (number = of_code value)
+    //   2. ML_extra_bits
+    //   3. LL_extra_bits
+    //   4. (only if not last sequence): LL_advance, ML_advance, OF_advance.
+    //
+    // The reverse-bitstream writer is "first-written = last-read". So if
+    // we walk sequences i = n-1 → 0:
+    //   For i = n-1 (DECODER's last sequence): write extras only, in
+    //     reverse read order: write LL_extra first, then ML_extra, then
+    //     OF_extra.
+    //   For i < n-1: write the FSE advance bits for THIS sequence's
+    //     transition (out_OF, then out_ML, then out_LL — reverse of the
+    //     decoder's LL, ML, OF advance read order), THEN write the
+    //     extras (LL, ML, OF reversed).
+    //
+    // FSE advance bits are emitted by `encode_symbol(state, sym)`.
+    // The bits returned correspond to the decoder's read at that
+    // advance step.
+    //
+    // To produce the correct interleaving, we structure the loop:
+    //   for i in (0..n_seq).rev() {
+    //       if i == n_seq - 1 {
+    //           // No advance for the last decoder-side sequence.
+    //       } else {
+    //           // Advance: encode the transition FROM sequence i+1's
+    //           // state INTO sequence i's state for each of OF, ML, LL.
+    //           // Decoder reads advance order LL, ML, OF — so we write
+    //           // OF first (most recently read), then ML, then LL.
+    //           of_state = self.of_enc.encode_symbol(of_state, of_codes[i] as usize, &mut writer);
+    //           ml_state = self.ml_enc.encode_symbol(ml_state, ml_codes[i] as usize, &mut writer);
+    //           ll_state = self.ll_enc.encode_symbol(ll_state, ll_codes[i] as usize, &mut writer);
+    //       }
+    //       // Extras: decoder reads OF, ML, LL — write LL, ML, OF.
+    //       writer.write_bits(ll_extras[i].1 as u64, ll_extras[i].0);
+    //       writer.write_bits(ml_extras[i].1 as u64, ml_extras[i].0);
+    //       writer.write_bits(of_extras[i].1 as u64, of_extras[i].0);
+    //   }
+    //
+    // Hmm wait — encode_symbol(state, sym) consumes the CURRENT state
+    // (which corresponds to the decoder's PRE-advance state) and
+    // produces NEW state (decoder's POST-advance state). The bits
+    // written are the bits the decoder reads to perform the advance.
+    //
+    // The decoder advances at the END of sequence i (using sequence i's
+    // current state to compute next_state for sequence i+1). So the
+    // bits FOR THIS ADVANCE are read at the END of sequence i's
+    // processing. From sequence i+1's POV, the state was set up by
+    // this advance.
+    //
+    // We're processing sequences in reverse (i from n-1 to 0). When
+    // i = n-2, we're handling the SECOND-TO-LAST sequence (decoder-
+    // side). The advance bits at this point are the ones the decoder
+    // reads at the END of i=n-2 to set up i=n-1's state. So we encode
+    // the transition FROM sequence n-2's state INTO n-1's state.
+    //
+    // In our reverse loop, "current state" represents sequence n-1's
+    // initial state (set up via init_state). After encode_symbol with
+    // ll_codes[n-2], the state will represent sequence n-2's initial
+    // state. The BITS written reflect the (current → new) transition
+    // i.e. n-2 → n-1 advance (since current = n-1 before).
+    //
+    // So `encode_symbol(state_for_seq_iplus1, codes[i])` writes the
+    // bits the decoder reads at the end of seq i to advance from
+    // seq_i.state to seq_(i+1).state. ✓
+    for i in (0..n_seq).rev() {
+        if i == n_seq - 1 {
+            // No advance bits for the decoder's last sequence.
+        } else {
+            of_state = of_enc.encode_symbol(of_state, of_codes[i] as usize, &mut writer);
+            ml_state = ml_enc.encode_symbol(ml_state, ml_codes[i] as usize, &mut writer);
+            ll_state = ll_enc.encode_symbol(ll_state, ll_codes[i] as usize, &mut writer);
+        }
+        // Extras: decoder reads OF, ML, LL — write LL, ML, OF.
+        writer.write_bits(ll_extras[i].1 as u64, ll_extras[i].0);
+        writer.write_bits(ml_extras[i].1 as u64, ml_extras[i].0);
+        writer.write_bits(of_extras[i].1 as u64, of_extras[i].0);
+    }
+
+    // Write final FSE states (decoder reads these via init in order
+    // LL, OF, ML — we write reverse: ML, OF, LL).
+    ml_enc.write_final_state(ml_state, &mut writer);
+    of_enc.write_final_state(of_state, &mut writer);
+    ll_enc.write_final_state(ll_state, &mut writer);
+
+    let bitstream = writer.finish();
+    out.extend_from_slice(&bitstream);
+    out
+}
+
+impl Encoder {
     /// Flush `pending` as a single block (RLE / compressed / raw — whichever
     /// is smallest). Sets `last` on the block header.
     fn flush_block(&mut self, last: bool) {
@@ -691,6 +675,208 @@ impl Encoder {
         }
         drained
     }
+}
+
+// ─── price-based optimal parser ───────────────────────────────────────────
+
+/// Estimated bit cost of a literal byte (~Huffman-coded text/code literal).
+/// Only the literal-vs-match trade-off depends on it, not correctness.
+const LIT_PRICE: u32 = 9;
+
+/// Estimated bit cost of the offset part of a match: the FSE offset code plus
+/// its extra bits, with a distance matching one of the active repeat offsets
+/// priced near-free (repeats emit a tiny FSE code and NO offset extra bits).
+fn offset_price(distance: u32, reps: &[u32; 3], ll: u32) -> u32 {
+    let is_rep = if ll > 0 {
+        distance == reps[0] || distance == reps[1] || distance == reps[2]
+    } else {
+        distance == reps[1] || distance == reps[2] || (reps[0] > 1 && distance == reps[0] - 1)
+    };
+    if is_rep {
+        return 4;
+    }
+    // Fresh offset: `code` extra bits (the literal low bits of the distance)
+    // plus the FSE-coded offset code itself (~5 bits amortised). The FSE code
+    // adapts to the block, so it is NOT another `log2(D)` — charging that would
+    // double-count and push the DP away from good long-distance matches.
+    let val = distance + 3;
+    let code = 31 - val.leading_zeros();
+    code + 5
+}
+
+/// Estimated bit cost of the literal-length / match-length FSE codes plus
+/// their extra bits for a sequence with the given run/length.
+fn ll_ml_price(literal_length: u32, match_length: u32) -> u32 {
+    let (_lc, lb, _lv) = ll_code(literal_length);
+    let (_mc, mb, _mv) = ml_code(match_length);
+    10 + lb + mb
+}
+
+/// Update the repeat-offset ring after a match (mirrors `assign_offset`'s
+/// transitions) and return the new ring. Used to carry rep state along the
+/// optimal-parse DP path.
+fn advance_reps(distance: u32, literal_length: u32, reps: &[u32; 3]) -> [u32; 3] {
+    let mut r = *reps;
+    let _ = assign_offset(distance, literal_length, &mut r);
+    r
+}
+
+/// Price-based optimal parse of `buffer` into a sequence list.
+///
+/// Forward dynamic program: `price[i]` is the cheapest estimated bit cost to
+/// encode `buffer[0..i]`. Each position can be reached by emitting a literal
+/// (advance 1) or a match of some length (advance L). Match candidates come
+/// from the hash chain plus the three active repeat offsets, and every length
+/// from `MIN_MATCH` up to a candidate's max is priced — so the DP can pick a
+/// slightly shorter match that lands on a cheaper (closer or repeated) offset.
+/// Repeat offsets are priced near-free, which is where most of the win over
+/// greedy/lazy parsing comes from (their offset extra bits dominate output).
+///
+/// Returns the chosen sequences (in order) and the final repeat-offset ring.
+fn optimal_parse(
+    matcher: &mut MatchFinder,
+    buffer: &[u8],
+    init_offsets: [u32; 3],
+    max_chain: usize,
+    nice_match: usize,
+) -> (Vec<Seq>, [u32; 3]) {
+    let n = buffer.len();
+    if n < MIN_MATCH + 1 {
+        return (Vec::new(), init_offsets);
+    }
+
+    // Insert every hashable position up front so chain walks see the whole
+    // block (back-references only look earlier, so insertion order within the
+    // block doesn't affect correctness).
+    matcher.resize_for(n);
+    for i in 0..n.saturating_sub(3) {
+        matcher.insert(buffer, i);
+    }
+
+    const INF: u32 = u32::MAX;
+    let mut price: Vec<u32> = vec![INF; n + 1];
+    // Back-pointer: (prev_pos, match_len, match_dist). match_len == 0 → literal.
+    let mut back: Vec<(u32, u32, u32)> = vec![(0, 0, 0); n + 1];
+    let mut reps_at: Vec<[u32; 3]> = vec![init_offsets; n + 1];
+    price[0] = 0;
+
+    // Step length sparsely for long matches to bound DP work. Dense up to 128
+    // (where most matches live), then coarser.
+    let push_len = |l: usize, max_l: usize| -> usize {
+        let step = if l < 128 { 1 } else { 32 };
+        let next = l + step;
+        if next > max_l && l < max_l {
+            max_l
+        } else {
+            next
+        }
+    };
+
+    let mut cands: Vec<crate::zstd::matcher::Match> = Vec::new();
+
+    for i in 0..n {
+        let base = price[i];
+        if base == INF {
+            continue;
+        }
+        let cur_reps = reps_at[i];
+
+        // Option A: emit a literal.
+        let lit_cand = base.saturating_add(LIT_PRICE);
+        if lit_cand < price[i + 1] {
+            price[i + 1] = lit_cand;
+            back[i + 1] = (i as u32, 0, 0);
+            reps_at[i + 1] = cur_reps;
+        }
+
+        if i + MIN_MATCH > n {
+            continue;
+        }
+        // Proxy literal-length for offset rep-aliasing: the common case is a
+        // sequence following some literals (LL>0, reps map to codes 1..=3).
+        let ll_proxy = 1u32;
+
+        // Option B1: repeat-offset matches at the three active distances.
+        for &d in &cur_reps {
+            if d == 0 || (d as usize) > i {
+                continue;
+            }
+            let m = matcher.check_repeat_offset(buffer, i, d as usize);
+            if m >= MIN_MATCH {
+                let max_l = m.min(n - i);
+                let off = offset_price(d, &cur_reps, ll_proxy);
+                let mut l = MIN_MATCH;
+                while l <= max_l {
+                    let cost = base
+                        .saturating_add(off)
+                        .saturating_add(ll_ml_price(0, l as u32));
+                    if cost < price[i + l] {
+                        price[i + l] = cost;
+                        back[i + l] = (i as u32, l as u32, d);
+                        reps_at[i + l] = advance_reps(d, ll_proxy, &cur_reps);
+                    }
+                    if l == max_l {
+                        break;
+                    }
+                    l = push_len(l, max_l);
+                }
+            }
+        }
+
+        // Option B2: fresh hash-chain matches.
+        matcher.collect_matches(buffer, i, n, max_chain, nice_match, &mut cands);
+        for c in &cands {
+            let d = c.distance as u32;
+            let max_l = c.length.min(n - i);
+            let off = offset_price(d, &cur_reps, ll_proxy);
+            let mut l = MIN_MATCH;
+            while l <= max_l {
+                let cost = base
+                    .saturating_add(off)
+                    .saturating_add(ll_ml_price(0, l as u32));
+                if cost < price[i + l] {
+                    price[i + l] = cost;
+                    back[i + l] = (i as u32, l as u32, d);
+                    reps_at[i + l] = advance_reps(d, ll_proxy, &cur_reps);
+                }
+                if l == max_l {
+                    break;
+                }
+                l = push_len(l, max_l);
+            }
+        }
+    }
+
+    // Backtrack to recover the chosen steps, then emit sequences forward.
+    let mut steps: Vec<(u32, u32)> = Vec::new(); // (match_len, match_dist); 0 = literal
+    let mut i = n;
+    while i > 0 {
+        let (prev, mlen, mdist) = back[i];
+        steps.push((mlen, mdist));
+        i = prev as usize;
+    }
+    steps.reverse();
+
+    let mut sequences: Vec<Seq> = Vec::new();
+    let mut block_offsets = init_offsets;
+    let mut pending_literals: u32 = 0;
+    for (mlen, mdist) in steps {
+        if mlen == 0 {
+            pending_literals += 1;
+            continue;
+        }
+        let offset_value = assign_offset(mdist, pending_literals, &mut block_offsets);
+        sequences.push(Seq {
+            literal_length: pending_literals,
+            match_length: mlen,
+            offset_value,
+        });
+        pending_literals = 0;
+    }
+    // Trailing literals are emitted by the block builder; drop the counter.
+    let _ = pending_literals;
+
+    (sequences, block_offsets)
 }
 
 /// Find the best (distance, length) match at `pos`, mixing repeat-offset
