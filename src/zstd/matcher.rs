@@ -202,6 +202,76 @@ impl MatchFinder {
         let len = match_extend(buffer, src, pos, max_len);
         if len >= MIN_MATCH { len } else { 0 }
     }
+
+    /// Collect distinct-length match candidates for `buffer[pos..]` for the
+    /// optimal parser. Walks the hash chain (bounded by `max_chain`) and, for
+    /// each length value reachable, records the *smallest distance* that
+    /// achieves it — a shorter distance is always at least as cheap to encode.
+    ///
+    /// Returns `(length, distance)` pairs with strictly increasing length, so
+    /// the price DP can try every length tier from `MIN_MATCH` up to the
+    /// longest match and weigh each against its offset cost. Stops early once a
+    /// match reaches `nice_match`.
+    pub fn collect_matches(
+        &self,
+        buffer: &[u8],
+        pos: usize,
+        window: usize,
+        max_chain: usize,
+        nice_match: usize,
+        out: &mut Vec<Match>,
+    ) {
+        out.clear();
+        if pos + MIN_MATCH > buffer.len() || pos + 4 > buffer.len() {
+            return;
+        }
+        let h = hash4(&buffer[pos..pos + 4]) as usize;
+        let max_dist = window.min(pos);
+        let max_len = MAX_MATCH.min(buffer.len() - pos);
+        if max_len < MIN_MATCH {
+            return;
+        }
+
+        let mut best_len: usize = MIN_MATCH - 1;
+        let mut cur = self.head[h];
+        let mut steps = 0usize;
+
+        while cur != NIL && steps < max_chain {
+            let cur_pos = cur as usize;
+            if cur_pos >= pos {
+                cur = self.prev[cur_pos];
+                steps += 1;
+                continue;
+            }
+            let dist = pos - cur_pos;
+            if dist > max_dist {
+                break;
+            }
+            // Cheap rejection: can't beat the longest length we already have.
+            if best_len >= max_len {
+                break;
+            }
+            if buffer[cur_pos + best_len] == buffer[pos + best_len] {
+                let len = match_extend(buffer, cur_pos, pos, max_len);
+                if len > best_len {
+                    // New longest tier. Because we walk the chain from the most
+                    // recent position downward, the first candidate to reach a
+                    // given length is at the smallest distance — exactly what
+                    // we want for cheap offsets.
+                    out.push(Match {
+                        length: len,
+                        distance: dist,
+                    });
+                    best_len = len;
+                    if len >= nice_match {
+                        break;
+                    }
+                }
+            }
+            cur = self.prev[cur_pos];
+            steps += 1;
+        }
+    }
 }
 
 /// Extend a match forward up to `max_len` bytes, comparing `buffer[a..]`
