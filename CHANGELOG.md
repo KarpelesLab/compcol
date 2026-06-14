@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Raw LZMA2 encoder** (`lzma2`): `compcol::lzma2::Lzma2` now encodes as well
+  as decodes — it emits the raw 7-Zip LZMA2 chunk stream (full dict/props/state
+  reset per chunk, uncompressed-chunk fallback when compression would expand,
+  `0x00` end marker), reusing the xz LZMA2 chunk codec. The dictionary size is
+  out of band (the 7z coder property); the encoder uses the 4 MiB default so a
+  default-config decoder round-trips. Validated by round-trip and by decoding
+  the output through the shared xz LZMA2 codec.
+- **LZFSE `bvx2` decoding** (`lzfse`): the core LZFSE v2 block type (LZ77 +
+  Finite State Entropy) now decodes — full v2 header parse, 4-way interleaved
+  literal FSE, three interleaved L/M/D FSE streams (reverse bitstreams), and LZ
+  reconstruction. The FSE table construction matches Apple's general
+  `fse_init_decoder_table` (the `k`/`k-1` split), so arbitrary frequency tables
+  are handled, not just power-of-two ones. Validated by round-trip against an
+  in-crate v2 encoder plus a frozen hand-written non-dyadic vector; there is no
+  Apple `lzfse` tool in the build environment, so real-stream interop is
+  best-effort but follows the documented format precisely. `bvx1` (v1) remains
+  `Unsupported`.
+
+### Changed
+
+- **lz5 (Lizard) Huffman sub-streams** stay `Unsupported`, now with a precise
+  rationale in the module docs: the Huff0 entropy stage selects X1/X2 from
+  `(regenSize, comprLen)` at runtime and there is no reference encoder or
+  fixture available to validate a decoder bit-exactly, so — consistent with the
+  crate's `lzham`/`sit13` policy — it is left honest rather than shipped blind.
+  The docs record the concrete reuse path (zstd's X1 Huff0 decoder + an X2
+  decoder + the `HUF_selectDecoder` heuristic) for a future round with fixtures.
+
+
+### Added
+
 - **HTTP/3 QPACK header compression** (RFC 9204) behind the new `qpack`
   feature. `compcol::qpack::{QpackEncoder, QpackDecoder}` — full decoder
   (static table, dynamic table built from the encoder-stream instructions, and

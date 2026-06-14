@@ -47,14 +47,14 @@ flag, and a `compcol` binary turns the library into a Unix-style filter.
 | LZW (`compress(1)` `.Z`) | `lzw` | `.lzw` | full | full | `compress(1)` / `uncompress(1)` |
 | LZMA (legacy `.lzma`) | `lzma` | `.lzma` | full | full | `python3 -m lzma` (FORMAT_ALONE) |
 | xz | `xz` | `.xz` | compressed-LZMA2 chunks + uncompressed fallback | full envelope + all reset variants | `xz(1)` both directions |
-| Raw LZMA2 (7z coder 21) | `lzma2` | `.lzma2` | `Unsupported` (decode-only) | full (raw LZMA2 chunk stream; reuses the xz LZMA2 engine) | round-trip vs the xz LZMA2 encoder |
+| Raw LZMA2 (7z coder 21) | `lzma2` | `.lzma2` | full (raw LZMA2 chunk stream; reuses the xz LZMA2 engine) | full (raw LZMA2 chunk stream; reuses the xz LZMA2 engine) | round-trip + cross-decode via the shared xz LZMA2 codec |
 | Zstandard (RFC 8478) | `zstd` | `.zst` | LZ77 + Huffman literals + FSE_Compressed_Mode sequences + repeat offsets + RLE blocks | full Compressed_Block | `zstd(1)` both directions |
 | Brotli (RFC 7932) | `brotli` | `.br` | LZ77 + length-limited Huffman + 704-symbol IC alphabet + static-dictionary refs | full (with 122 KiB static dictionary) | `brotli(1)` both directions |
 | LZO (LZO1X-1) | `lzo` | `.lzo` | LZ77 hash matcher | full | `python3 -c "import lzo"` |
 | LZX (Microsoft CAB / WIM) | `lzx` | `.lzx` | uncompressed blocks only | full (verbatim + aligned-offset + uncompressed; E8 filter) | — |
 | Amiga LZX (original 1995 Forbes) | `amiga_lzx` | — (`.lzx` claimed by MS LZX) | uncompressed blocks only | full (verbatim + aligned + uncompressed; fixed 64 KiB window, no chunk reset, no E8 filter) | — |
 | Quantum (Stac, old CAB) | `quantum` | `.q` | `Unsupported` (no public encoder exists) | full (libmspack-equivalent) | libmspack regression fixtures |
-| LZFSE (Apple) | `lzfse` | `.lzfse` | `Unsupported` (decoder-only) | `bvx-` raw + `bvxn` (LZVN); `bvx2` returns `Unsupported` | hand-built fixtures (no Apple toolchain bundled) |
+| LZFSE (Apple) | `lzfse` | `.lzfse` | `Unsupported` (decoder-only) | `bvx-` raw + `bvxn` (LZVN) + `bvx2` (LZ77 + FSE); `bvx1` returns `Unsupported` | round-trip (bvx2 vs own FSE encoder; no Apple toolchain bundled) |
 | ADC (Apple DMG) | `adc` | `.adc` | LZSS-style greedy match-finder | full | hand-built fixtures |
 | bzip2 | `bzip2` | `.bz2` | full (RLE-1 + SA-IS BWT + MTF + RLE-2 + dynamic Huffman) | full | `bzip2(1)` both directions |
 | PPMd (Shkarin's PPMII variant H) | `ppmd` | `.ppmd` | `Unsupported` (decoder-only; PPM model is intricate) | full (used in 7z / RAR3+ / ZIP method 98) | `python3 ppmd-cffi` |
@@ -427,7 +427,7 @@ lzw     = ["alloc"]
 lzo     = ["alloc"]
 lzx     = ["alloc"]
 quantum = ["alloc"]
-lzfse   = ["alloc"]            # decoder-only, bvx2 returns Unsupported
+lzfse   = ["alloc"]            # decoder-only; bvx-/bvxn/bvx2, bvx1 Unsupported
 adc     = ["alloc"]
 rar1    = ["alloc"]
 rar2    = ["alloc"]
