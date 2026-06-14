@@ -29,9 +29,34 @@
 //! **Decoder**: implemented for the **LZ4 codeword path with all
 //! sub-streams stored raw** (the most common shape produced by the
 //! reference CLI at levels 10..=19 on non-tiny inputs). Frames whose
-//! blocks use the LIZv1 sequence format (levels 20..=29) or any
-//! Huffman-coded sub-stream (levels 30+) are rejected with
-//! [`Error::Unsupported`]. The frame-level uncompressed block path
+//! blocks use the LIZv1 sequence format (levels 20..=29, 40..=49) or any
+//! Huffman-coded sub-stream are rejected with [`Error::Unsupported`].
+//!
+//! The Huffman path stays `Unsupported` for a concrete, validation-first
+//! reason rather than mere absence of effort. Lizard's entropy stage is
+//! Huff0 (`HUF_decompress` from Yann Collet's FiniteStateEntropy), the
+//! same family as zstd's literals Huffman, and each Huffman sub-stream is
+//! framed as a 6-byte header (3-byte LE regenerated size + 3-byte LE
+//! compressed size) then the Huff0 payload. But the *generic*
+//! `HUF_decompress` Lizard calls selects between **X1** (single-symbol)
+//! and **X2** (double-symbol) decode tables via `HUF_selectDecoder`, and
+//! that choice is **recomputed from the regenerated/compressed sizes,
+//! never stored in the stream**. This crate's Huff0 decoder
+//! (`src/zstd/huffman.rs`) is X1-only and is private to the `zstd`
+//! module; it covers neither X2 nor the size-driven selector. With no
+//! `lizard` CLI and no Huff0 fixtures in this environment, the only
+//! "test" available would be a round-trip against a hand-written
+//! X1-only encoder, which would always pick X1 and therefore validate
+//! nothing about real (possibly X2) blocks. Per the crate's
+//! `lzham`/`sit13` policy, an unvalidatable decoder is worse than an
+//! honest `Unsupported`, so we do not ship one.
+//!
+//! A future round could lift this once validation is possible: expose
+//! zstd's X1 Huff0 decoder as `pub(crate)`, add an X2 decoder plus the
+//! `HUF_selectDecoder` heuristic, and validate against fixtures from the
+//! `lizard` CLI (e.g. `lizard -30`). The 6-byte sub-stream header and the
+//! 4-stream jump table (three LE u16 sizes) already match formats this
+//! crate parses elsewhere. The frame-level uncompressed block path
 //! (high bit on block-size word) is handled fully, so frames where
 //! every block stored raw decode without ever exercising the sequence
 //! loop. Block checksums (FLG bit 4) and external dictionaries are

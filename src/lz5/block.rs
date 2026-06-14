@@ -10,6 +10,19 @@
 //! Only the LZ4-codeword sequence loop (levels 10..=19, 30..=39) with
 //! all sub-streams stored raw (no Huffman entropy stage) is
 //! implemented; everything else returns [`Error::Unsupported`].
+//!
+//! Two paths stay `Unsupported` for documented, validation-driven
+//! reasons (see the inline comments at the `huffman_bits` and LIZv1
+//! rejections below):
+//!
+//!  * **Huff0 entropy stage** (any sub-stream flag bit set): Lizard's
+//!    generic `HUF_decompress` recomputes an X1-vs-X2 decoder choice
+//!    that is never carried in the stream; the crate has only an X1
+//!    Huff0 decoder (private to `zstd`), and there is no `lizard` CLI
+//!    or fixture here to validate an X2 decoder against. A round-trip
+//!    against our own X1-only encoder would prove nothing.
+//!  * **LIZv1 codewords** (levels 20..=29, 40..=49): a separate, larger
+//!    sequence format, out of scope for this round.
 
 use alloc::vec::Vec;
 
@@ -61,6 +74,12 @@ pub fn decode_compressed_block(input: &[u8], out: &mut Vec<u8>, cap: usize) -> R
     // Lizard groups levels by decompression strategy:
     //   10..=19, 30..=39  →  LZ4 codewords (this build supports)
     //   20..=29, 40..=49  →  LIZv1 codewords (not supported)
+    //
+    // LIZv1 is a distinct, larger sequence format (`Lizard_decompress_LIZv1`
+    // vs `Lizard_decompress_LZ4` in the reference): different token layout,
+    // explicit `lengths`/`offset16`/`offset24` streams, and a 24-bit offset
+    // path. Implementing it is a separate effort from the Huffman stage and
+    // is out of scope for this round, so it stays `Unsupported`.
     let is_lz4_mode = matches!(clevel, 10..=19 | 30..=39);
     if !is_lz4_mode {
         return Err(Error::Unsupported);
@@ -96,8 +115,38 @@ pub fn decode_compressed_block(input: &[u8], out: &mut Vec<u8>, cap: usize) -> R
     if res & FLAG_LEN != 0 {
         return Err(Error::Corrupt);
     }
-    // Any Huffman bit set on a sub-stream means we'd need to FSE-Huffman
-    // decode that stream. Out of scope.
+    // Any Huffman bit set on a sub-stream means the stream is entropy-coded
+    // with Huff0 (Yann Collet's FiniteStateEntropy library) and must be
+    // `HUF_decompress`'d before the sequence loop runs. Each such sub-stream
+    // is framed as a 6-byte header (3-byte LE regenerated size + 3-byte LE
+    // compressed size) followed by `compressed_size` bytes of Huff0 payload
+    // (`Lizard_readStream` → `HUF_decompress(op, regenSize, ip + 6, comprLen)`).
+    //
+    // This stays `Unsupported`. The decision is deliberate, not a TODO —
+    // there is no faithful way to *validate* such a decoder in this
+    // environment, and the crate's policy (see `lzham`, `sit13`) is to mark
+    // formats we cannot validate bit-exactly as `Unsupported` rather than
+    // ship a blind decoder. Concretely:
+    //
+    //   * The crate already has a Huff0 decoder in `src/zstd/huffman.rs`, but
+    //     it is (a) private to the `zstd` module (`mod huffman;`, not
+    //     reachable from here without re-exporting it) and (b) implements
+    //     only the **X1** (single-symbol) decode table that zstd's *literals*
+    //     spec restricts itself to.
+    //   * Lizard calls the *generic* `HUF_decompress`, which selects **X1 or
+    //     X2** (double-symbol) at runtime via `HUF_selectDecoder`. That
+    //     choice is **recomputed from (regenSize, comprLen)** and is **never
+    //     stored in the stream**, so a conformant decoder must implement both
+    //     X1 and X2 *and* reproduce `HUF_selectDecoder`'s timing heuristic
+    //     exactly. The crate has no X2 decoder anywhere. (The 4-stream jump
+    //     table — three LE u16 sizes — does match zstd's literals framing, so
+    //     that part would be reusable; the X1/X2 split is the blocker.)
+    //   * The lz5 encoder here is store-only, and there is no `lizard` CLI or
+    //     Huff0 fixture in this environment. A round-trip against a
+    //     hand-written X1-only encoder would always select X1 and "pass"
+    //     while proving nothing about a real (possibly X2) Lizard block — a
+    //     self-validating fiction. Absent a real fixture or reference
+    //     encoder there is no honest round-trip, so we do not ship.
     let huffman_bits = res & (FLAG_LITERALS | FLAG_FLAGS | FLAG_OFFSET16 | FLAG_OFFSET24);
     if huffman_bits != 0 {
         return Err(Error::Unsupported);
