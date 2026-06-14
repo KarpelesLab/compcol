@@ -79,6 +79,93 @@ pub(crate) fn rle1_forward(input: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Streaming RLE-1 encoder used by the block-builder.
+///
+/// Reference bzip2 sizes each block by its **post-RLE-1** length
+/// (`nblock`), not by the count of raw input bytes — so on compressible
+/// data it packs more raw bytes into a 900 KB block than a raw-input cap
+/// would. To match that (and the reference's block count and ratio) we
+/// feed raw bytes through this incremental encoder and cut a block once
+/// the emitted length reaches the per-block cap.
+///
+/// The encoder tracks the in-progress run across `push` calls so a run
+/// straddling a call boundary is encoded identically to the one-shot
+/// [`rle1_forward`].
+pub(crate) struct Rle1Encoder {
+    out: Vec<u8>,
+    /// Byte value of the current run (valid iff `run > 0`).
+    run_byte: u8,
+    /// Length of the current pending run (1..=255 while building).
+    run: usize,
+}
+
+impl Rle1Encoder {
+    pub(crate) fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            run_byte: 0,
+            run: 0,
+        }
+    }
+
+    /// Current emitted (post-RLE-1) length, **including** the bytes the
+    /// pending run will contribute once flushed. Used by the caller to
+    /// decide when a block is full.
+    pub(crate) fn encoded_len(&self) -> usize {
+        self.out.len() + Self::run_cost(self.run)
+    }
+
+    /// How many output bytes a finished run of `run` identical bytes
+    /// costs: runs <4 are verbatim, runs >=4 cost 4 literals + 1 count.
+    fn run_cost(run: usize) -> usize {
+        if run == 0 {
+            0
+        } else if run < 4 {
+            run
+        } else {
+            5
+        }
+    }
+
+    /// Flush the pending run into `out`.
+    fn flush_run(&mut self) {
+        let b = self.run_byte;
+        if self.run == 0 {
+            return;
+        }
+        if self.run < 4 {
+            for _ in 0..self.run {
+                self.out.push(b);
+            }
+        } else {
+            self.out.push(b);
+            self.out.push(b);
+            self.out.push(b);
+            self.out.push(b);
+            self.out.push((self.run - 4) as u8);
+        }
+        self.run = 0;
+    }
+
+    /// Feed one raw byte.
+    pub(crate) fn push(&mut self, b: u8) {
+        if self.run > 0 && b == self.run_byte && self.run < 255 {
+            self.run += 1;
+            return;
+        }
+        // Different byte, or the 255-cap reached: flush and start anew.
+        self.flush_run();
+        self.run_byte = b;
+        self.run = 1;
+    }
+
+    /// Finish: flush the pending run and return the encoded block.
+    pub(crate) fn finish(mut self) -> Vec<u8> {
+        self.flush_run();
+        self.out
+    }
+}
+
 /// Invert bzip2's RLE-1 pre-pass. Streaming-friendly: consumes the full
 /// `input` and returns the reconstituted raw bytes.
 pub(crate) fn rle1_inverse(input: &[u8]) -> Vec<u8> {
@@ -262,6 +349,60 @@ mod tests {
         assert_eq!(r[..5], [b'a', b'a', b'a', b'a', 251]);
         assert_eq!(r[5], b'a');
         assert_eq!(rle1_inverse(&r), v);
+    }
+
+    /// Feed `input` through the streaming encoder one byte at a time
+    /// and return the finished output.
+    fn rle1_stream(input: &[u8]) -> Vec<u8> {
+        let mut e = Rle1Encoder::new();
+        for &b in input {
+            e.push(b);
+        }
+        e.finish()
+    }
+
+    #[test]
+    fn rle1_stream_matches_oneshot() {
+        // The streaming encoder must produce byte-for-byte the same
+        // output as the one-shot `rle1_forward` on a range of inputs,
+        // including run-straddling and the 255-cap boundary.
+        let cases: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"a".to_vec(),
+            b"abcabc".to_vec(),
+            b"aaaa".to_vec(),
+            b"aaaaaaa".to_vec(),
+            vec![b'a'; 255],
+            vec![b'a'; 256],
+            vec![b'a'; 600],
+            {
+                let mut v = vec![b'x'; 300];
+                v.extend(vec![b'y'; 5]);
+                v.extend(b"zzz");
+                v.extend(vec![b'q'; 1000]);
+                v
+            },
+        ];
+        for c in &cases {
+            assert_eq!(rle1_stream(c), rle1_forward(c), "mismatch len {}", c.len());
+        }
+    }
+
+    #[test]
+    fn rle1_stream_encoded_len_tracks_output() {
+        // `encoded_len()` must equal the final output length at finish,
+        // including the pending run's contribution.
+        for n in [0usize, 1, 3, 4, 5, 254, 255, 256, 700] {
+            let input = vec![b'a'; n];
+            let mut e = Rle1Encoder::new();
+            for &b in &input {
+                e.push(b);
+            }
+            let predicted = e.encoded_len();
+            let out = e.finish();
+            assert_eq!(predicted, out.len(), "encoded_len mismatch for n={n}");
+            assert_eq!(out, rle1_forward(&input));
+        }
     }
 
     #[test]
