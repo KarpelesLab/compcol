@@ -115,7 +115,7 @@ pub(crate) struct LevelParams {
 }
 
 /// Lowest level at which the optimal parser is used.
-const OPTIMAL_LEVEL: u8 = 17;
+const OPTIMAL_LEVEL: u8 = 13;
 
 /// Per-position hash-chain depth cap for the optimal parser. The DP visits
 /// every position, so an uncapped chain (up to 16384 at level 22) makes each
