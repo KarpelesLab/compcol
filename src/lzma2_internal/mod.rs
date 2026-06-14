@@ -8,8 +8,9 @@
 
 pub(crate) mod lzma2_decoder;
 
-// The LZMA payload *encoder* is only needed by the `.xz` container encoder
-// and by round-trip tests; a raw `lzma2`-only build (decode-only) would
-// otherwise carry it as dead code.
-#[cfg(any(feature = "xz", test))]
+// The LZMA payload *encoder* backs both the `.xz` container encoder and the
+// raw LZMA2 encoder ([`crate::lzma2::Encoder`]); it is also exercised by
+// round-trip tests. A build with neither `xz` nor `lzma2` would otherwise
+// carry it as dead code.
+#[cfg(any(feature = "xz", feature = "lzma2", test))]
 pub(crate) mod lzma2_encoder;

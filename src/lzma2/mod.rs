@@ -54,6 +54,27 @@
 //! machinery used by [`crate::xz`] (the shared `LzmaCore`); this module only
 //! adds the raw chunk framing and self-termination handling. There is no
 //! re-implementation of LZMA here.
+//!
+//! ## Encoder
+//!
+//! The [`Encoder`] produces the same raw LZMA2 chunk stream the decoder
+//! consumes, reusing the shared `encode_lzma_chunk` range coder from
+//! [`crate::xz`]'s internals — no LZMA re-implementation. Every chunk is a
+//! full-reset chunk (control byte `0xE0` for compressed, `0x01` for
+//! uncompressed) so each chunk is independently decodable; an uncompressed
+//! chunk is emitted as a fallback whenever compression would expand the data.
+//! The stream is terminated by a single `0x00` end-marker byte.
+//!
+//! ### Dictionary-size contract
+//!
+//! A raw LZMA2 stream carries **no** dictionary size in band — that value is
+//! the 7z coder property the decoder receives out of band (via
+//! [`DecoderConfig::with_dict_prop`] / [`DecoderConfig::with_dict_size`]).
+//! The encoder bounds its match distances by a fixed 4 MiB dictionary (the
+//! [`crate::xz`] default), so a decoder built with the default config — which
+//! also uses a 4 MiB window — round-trips the output exactly. If you transport
+//! this stream inside a 7z container, advertise a dictionary size of at least
+//! 4 MiB in the coder property.
 
 #![cfg_attr(docsrs, doc(cfg(feature = "lzma2")))]
 
@@ -74,12 +95,13 @@ const MAX_DICT: usize = 128 * 1024 * 1024;
 /// LZMA2 default and the size [`crate::xz`] uses).
 const DEFAULT_DICT: usize = 4 * 1024 * 1024;
 
-/// Raw LZMA2 stream codec (7-Zip coder id 21). Decode-only.
+/// Raw LZMA2 stream codec (7-Zip coder id 21).
 ///
-/// The encoder is a permanent [`Error::Unsupported`] stub: 7z LZMA2 framing
-/// is produced by the [`crate::xz`] encoder path, and there is no need for a
-/// standalone raw LZMA2 encoder. See the [module docs](self) for the stream
-/// shape.
+/// Both directions are implemented: the [`Encoder`] emits a raw LZMA2 chunk
+/// stream (full-reset chunks + `0x00` end marker) bounded by a 4 MiB
+/// dictionary, and the [`Decoder`] consumes that stream. The dictionary size
+/// is out of band (see the [module docs](self#dictionary-size-contract)); a
+/// default-config decoder round-trips the default-config encoder's output.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Lzma2;
 
@@ -138,7 +160,7 @@ impl Algorithm for Lzma2 {
     type EncoderConfig = ();
     type DecoderConfig = DecoderConfig;
     fn encoder_with(_: ()) -> Encoder {
-        Encoder
+        Encoder::new()
     }
     fn decoder_with(cfg: DecoderConfig) -> Decoder {
         Decoder::new(cfg)
@@ -157,24 +179,282 @@ fn resolve_dict_size(cfg: &DecoderConfig) -> Result<usize, Error> {
     Ok(raw.clamp(4096, MAX_DICT))
 }
 
-// ─── encoder stub ─────────────────────────────────────────────────────────
+// ─── encoder ──────────────────────────────────────────────────────────────
 
-/// Raw LZMA2 encoder stub: permanently returns [`Error::Unsupported`].
+use crate::lzma2_internal::lzma2_encoder::{EncoderParams, LZMA2_PROPS_BYTE, encode_lzma_chunk};
+
+/// Dictionary size (in bytes) the encoder advertises to the LZMA chunk
+/// coder as the match-distance ceiling. Fixed at 4 MiB — the [`crate::xz`]
+/// default — so a default-config [`Decoder`] (also 4 MiB) round-trips.
+const ENC_DICT_SIZE: u32 = DEFAULT_DICT as u32;
+
+/// Default compression level (mirrors xz-utils' and [`crate::xz`]'s default).
+const ENC_DEFAULT_LEVEL: u8 = 6;
+
+/// Maximum uncompressed bytes buffered per LZMA2 chunk. Capped at 65_536 so
+/// both the uncompressed-chunk 16-bit size field and the compressed-chunk
+/// size fields stay in range, matching the [`crate::xz`] encoder's cap and
+/// bounding peak working-buffer memory.
+const ENC_CHUNK_MAX: usize = 65_536;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncPhase {
+    /// Buffering input; flushing a chunk when the buffer fills.
+    Body,
+    /// Draining a staged chunk from `pending`, then back to `Body`.
+    DrainPending,
+    /// (`finish` only) Flush any partial buffered chunk, then stage the
+    /// `0x00` end marker.
+    Finishing,
+    /// (`finish` only) Draining the `0x00` end marker from `pending`.
+    DrainEnd,
+    /// All chunks plus the `0x00` end marker have been drained.
+    Done,
+}
+
+/// Raw LZMA2 encoder.
 ///
-/// Lets the crate auto-derive the public [`Encoder`](crate::Encoder) trait
-/// while making encode attempts fail cleanly. LZMA2 output is produced via
-/// the [`crate::xz`] encoder.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Encoder;
+/// Emits the raw LZMA2 chunk stream consumed by [`Decoder`] — a sequence of
+/// full-reset chunks terminated by a single `0x00` end marker. There is **no**
+/// `.xz` container (no stream magic, block header, index, or CRC); for that,
+/// use [`crate::xz`]. Match distances are bounded by a fixed 4 MiB dictionary
+/// that the decoder must be told about out of band (see the
+/// [module docs](self#dictionary-size-contract)).
+///
+/// Each chunk is independently decodable: the encoder always full-resets
+/// (dict + props + state) at the chunk boundary, emitting a compressed chunk
+/// (control `0xE0`) when that shrinks the data and an uncompressed chunk
+/// (control `0x01`) otherwise.
+pub struct Encoder {
+    phase: EncPhase,
+    /// Staged bytes for the current chunk (or end marker), drained to the
+    /// caller from `pending[pending_idx..]`.
+    pending: Vec<u8>,
+    pending_idx: usize,
+    /// Input accumulated for the next chunk; flushed at `ENC_CHUNK_MAX` or on
+    /// `finish`.
+    in_buf: Vec<u8>,
+    /// Level-derived match-finder tuning; preserved across `reset`.
+    params: EncoderParams,
+}
+
+impl Default for Encoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Encoder {
+    /// Build an encoder at the default compression level (6).
+    pub fn new() -> Self {
+        Self {
+            phase: EncPhase::Body,
+            pending: Vec::new(),
+            pending_idx: 0,
+            in_buf: Vec::new(),
+            params: EncoderParams::from_level(ENC_DEFAULT_LEVEL),
+        }
+    }
+
+    /// Push staged bytes from `pending[pending_idx..]` into `output`. Returns
+    /// true once the buffer is fully drained.
+    fn drain_pending(&mut self, output: &mut [u8], written: &mut usize) -> bool {
+        while self.pending_idx < self.pending.len() && *written < output.len() {
+            output[*written] = self.pending[self.pending_idx];
+            *written += 1;
+            self.pending_idx += 1;
+        }
+        if self.pending_idx >= self.pending.len() {
+            self.pending.clear();
+            self.pending_idx = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Stage one LZMA2 chunk for `data` (`1..=ENC_CHUNK_MAX` bytes), choosing
+    /// a compressed chunk when it shrinks the data and an uncompressed
+    /// fallback otherwise.
+    fn stage_chunk(&mut self, data: &[u8]) {
+        debug_assert!(!data.is_empty() && data.len() <= ENC_CHUNK_MAX);
+        let compressed = encode_lzma_chunk(data, ENC_DICT_SIZE, self.params);
+        // A compressed chunk is only worth emitting when its range-coded body
+        // is both smaller than the input and fits the 16-bit (+1) comp-size
+        // field. Otherwise the uncompressed chunk is strictly smaller.
+        let use_compressed =
+            !compressed.is_empty() && compressed.len() <= 65_536 && compressed.len() < data.len();
+        if use_compressed {
+            self.stage_compressed_chunk(data, &compressed);
+        } else {
+            self.stage_uncompressed_chunk(data);
+        }
+    }
+
+    /// Stage a full-reset compressed chunk: control `0xE0` (compressed, with
+    /// dict, props, and state all reset; top 5 bits of `uncomp_size-1`), a
+    /// 2-byte `uncomp_size-1` BE remainder, a 2-byte `comp_size-1` BE, the
+    /// 1-byte LZMA props (present because we full-reset), then the
+    /// range-coded body.
+    fn stage_compressed_chunk(&mut self, data: &[u8], compressed: &[u8]) {
+        debug_assert!(!data.is_empty() && data.len() <= ENC_CHUNK_MAX);
+        debug_assert!(!compressed.is_empty() && compressed.len() <= 65_536);
+
+        let uncomp_m1 = (data.len() - 1) as u32; // 0..=65535 with our cap
+        // Top 5 bits of (uncomp_size - 1) live in the control byte; with a
+        // 65_536 cap they are always zero, yielding exactly 0xE0.
+        let control: u8 = 0xE0 | ((uncomp_m1 >> 16) & 0x1F) as u8;
+        let comp_m1 = (compressed.len() - 1) as u16;
+
+        self.pending.reserve(6 + compressed.len());
+        self.pending.push(control);
+        self.pending.push(((uncomp_m1 >> 8) & 0xFF) as u8);
+        self.pending.push((uncomp_m1 & 0xFF) as u8);
+        self.pending.push((comp_m1 >> 8) as u8);
+        self.pending.push((comp_m1 & 0xFF) as u8);
+        self.pending.push(LZMA2_PROPS_BYTE);
+        self.pending.extend_from_slice(compressed);
+        self.pending_idx = 0;
+    }
+
+    /// Stage an uncompressed chunk: control `0x01` (dict reset), 2-byte
+    /// `size-1` BE, then the raw bytes.
+    fn stage_uncompressed_chunk(&mut self, data: &[u8]) {
+        debug_assert!(!data.is_empty() && data.len() <= ENC_CHUNK_MAX);
+        let size_m1 = (data.len() - 1) as u16;
+        self.pending.reserve(3 + data.len());
+        self.pending.push(0x01);
+        self.pending.push((size_m1 >> 8) as u8);
+        self.pending.push((size_m1 & 0xFF) as u8);
+        self.pending.extend_from_slice(data);
+        self.pending_idx = 0;
+    }
+}
 
 impl RawEncoder for Encoder {
-    fn raw_encode(&mut self, _input: &[u8], _output: &mut [u8]) -> Result<RawProgress, Error> {
-        Err(Error::Unsupported)
+    fn raw_encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
+        let mut consumed = 0usize;
+        let mut written = 0usize;
+
+        loop {
+            match self.phase {
+                EncPhase::Body => {
+                    while consumed < input.len() && self.in_buf.len() < ENC_CHUNK_MAX {
+                        let take = (ENC_CHUNK_MAX - self.in_buf.len()).min(input.len() - consumed);
+                        self.in_buf
+                            .extend_from_slice(&input[consumed..consumed + take]);
+                        consumed += take;
+                    }
+                    if self.in_buf.len() == ENC_CHUNK_MAX {
+                        let data = core::mem::take(&mut self.in_buf);
+                        self.stage_chunk(&data);
+                        self.phase = EncPhase::DrainPending;
+                    } else {
+                        return Ok(RawProgress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                }
+                EncPhase::DrainPending => {
+                    if self.drain_pending(output, &mut written) {
+                        self.phase = EncPhase::Body;
+                    } else {
+                        return Ok(RawProgress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                }
+                // `encode` never advances into the finish-only phases.
+                EncPhase::Finishing | EncPhase::DrainEnd | EncPhase::Done => {
+                    return Ok(RawProgress {
+                        consumed,
+                        written,
+                        done: false,
+                    });
+                }
+            }
+        }
     }
-    fn raw_finish(&mut self, _output: &mut [u8]) -> Result<RawProgress, Error> {
-        Err(Error::Unsupported)
+
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
+        let mut written = 0usize;
+
+        // `encode` leaves the encoder in `Body`/`DrainPending`; the first
+        // `finish` call drives it through `Finishing` → `DrainEnd` → `Done`.
+        if self.phase == EncPhase::Body || self.phase == EncPhase::DrainPending {
+            // A `DrainPending` left over from `encode` still has chunk bytes
+            // staged; drain those before flushing the tail.
+            self.phase = EncPhase::Finishing;
+        }
+
+        loop {
+            match self.phase {
+                EncPhase::Finishing => {
+                    if !self.pending.is_empty() {
+                        // Drain a chunk staged during `encode` first.
+                        if !self.drain_pending(output, &mut written) {
+                            return Ok(RawProgress {
+                                consumed: 0,
+                                written,
+                                done: false,
+                            });
+                        }
+                    }
+                    if !self.in_buf.is_empty() {
+                        let data = core::mem::take(&mut self.in_buf);
+                        self.stage_chunk(&data);
+                        // Stay in `Finishing`; the loop drains this chunk then
+                        // re-checks the (now empty) buffer.
+                    } else {
+                        // Buffer empty and any staged chunk drained: emit the
+                        // single 0x00 end marker.
+                        self.pending.push(0x00);
+                        self.pending_idx = 0;
+                        self.phase = EncPhase::DrainEnd;
+                    }
+                }
+                EncPhase::DrainEnd => {
+                    if self.drain_pending(output, &mut written) {
+                        self.phase = EncPhase::Done;
+                        return Ok(RawProgress {
+                            consumed: 0,
+                            written,
+                            done: true,
+                        });
+                    }
+                    return Ok(RawProgress {
+                        consumed: 0,
+                        written,
+                        done: false,
+                    });
+                }
+                EncPhase::Done => {
+                    return Ok(RawProgress {
+                        consumed: 0,
+                        written,
+                        done: true,
+                    });
+                }
+                // Unreachable: normalized to `Finishing` above.
+                EncPhase::Body | EncPhase::DrainPending => {
+                    self.phase = EncPhase::Finishing;
+                }
+            }
+        }
     }
-    fn raw_reset(&mut self) {}
+
+    fn raw_reset(&mut self) {
+        let params = self.params;
+        self.phase = EncPhase::Body;
+        self.pending.clear();
+        self.pending_idx = 0;
+        self.in_buf.clear();
+        self.params = params;
+    }
 }
 
 // ─── decoder ───────────────────────────────────────────────────────────────
@@ -795,5 +1075,135 @@ mod tests {
         let (p2, st2) = dec.decode(&stream, &mut out).unwrap();
         assert_eq!(st2, Status::StreamEnd);
         assert_eq!(&out[..p2.written], &data[..]);
+    }
+
+    // ── encoder tests ─────────────────────────────────────────────────────
+
+    use crate::traits::Encoder as _;
+
+    /// Encode `data` with the raw LZMA2 [`Encoder`], driving the streaming
+    /// API with the given output-buffer size to stress phase boundaries.
+    fn encode_all(data: &[u8], out_chunk: usize) -> Vec<u8> {
+        let mut enc = Lzma2::encoder_with(());
+        let mut stream = Vec::new();
+        let mut obuf = vec![0u8; out_chunk];
+        let mut consumed = 0;
+        loop {
+            let (p, st) = enc.encode(&data[consumed..], &mut obuf).unwrap();
+            stream.extend_from_slice(&obuf[..p.written]);
+            consumed += p.consumed;
+            match st {
+                Status::InputEmpty => break,
+                Status::OutputFull => {}
+                Status::StreamEnd => unreachable!("encode never ends the stream"),
+            }
+        }
+        loop {
+            let (p, st) = enc.finish(&mut obuf).unwrap();
+            stream.extend_from_slice(&obuf[..p.written]);
+            if st == Status::StreamEnd {
+                break;
+            }
+        }
+        stream
+    }
+
+    /// Encode then decode `data`, asserting a byte-identical round-trip both
+    /// in bulk and one byte at a time.
+    fn enc_roundtrip(data: &[u8]) {
+        for out_chunk in [4usize, 64, 4096, 1 << 17] {
+            let stream = encode_all(data, out_chunk);
+            // Last byte of a valid stream is always the 0x00 end marker.
+            assert_eq!(stream.last().copied(), Some(0u8), "missing end marker");
+            let got = decode_all(&stream, data.len()).expect("decode_all");
+            assert_eq!(got, data, "bulk decode mismatch (out_chunk={out_chunk})");
+        }
+        // Stable framing → byte-streaming decode through every phase boundary.
+        let stream = encode_all(data, 1 << 17);
+        decode_byte_streaming(&stream, data);
+    }
+
+    #[test]
+    fn enc_empty() {
+        let stream = encode_all(&[], 16);
+        assert_eq!(stream, vec![0x00]);
+        assert!(decode_all(&stream, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn enc_one_byte() {
+        enc_roundtrip(b"Z");
+    }
+
+    #[test]
+    fn enc_small_text() {
+        enc_roundtrip(b"hello hello hello world the quick brown fox hello hello");
+    }
+
+    #[test]
+    fn enc_highly_compressible() {
+        // Zeros: forces the compressed-chunk path; ratio must be large.
+        let data = vec![0u8; 200 * 1024];
+        let stream = encode_all(&data, 1 << 17);
+        assert!(
+            stream.len() < data.len() / 4,
+            "zeros should compress hard, got {} from {}",
+            stream.len(),
+            data.len()
+        );
+        enc_roundtrip(&data);
+    }
+
+    #[test]
+    fn enc_multi_chunk() {
+        // > one 64 KiB chunk: several chunks plus the end marker.
+        let data: Vec<u8> = (0u32..200_000)
+            .map(|i| (i.wrapping_mul(31) >> 3) as u8)
+            .collect();
+        enc_roundtrip(&data);
+    }
+
+    #[test]
+    fn enc_incompressible_falls_back() {
+        // A pseudo-random, incompressible buffer forces uncompressed-chunk
+        // fallback (control 0x01). Verify at least one such chunk appears.
+        let mut data = vec![0u8; 4096];
+        let mut x = 0x1234_5678u32;
+        for b in data.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = (x >> 24) as u8;
+        }
+        let stream = encode_all(&data, 1 << 17);
+        assert_eq!(stream[0], 0x01, "expected uncompressed fallback chunk");
+        enc_roundtrip(&data);
+    }
+
+    #[test]
+    fn enc_reset_reuses_encoder() {
+        let data = b"reusable encoder content content content".to_vec();
+        let s1 = encode_all(&data, 1 << 17);
+        let mut enc = Lzma2::encoder_with(());
+        let mut obuf = vec![0u8; 1 << 17];
+        let mut produce = |enc: &mut Encoder| {
+            let mut out = Vec::new();
+            let (p, _) = enc.encode(&data, &mut obuf).unwrap();
+            out.extend_from_slice(&obuf[..p.written]);
+            loop {
+                let (p, st) = enc.finish(&mut obuf).unwrap();
+                out.extend_from_slice(&obuf[..p.written]);
+                if st == Status::StreamEnd {
+                    break;
+                }
+            }
+            out
+        };
+        let a = produce(&mut enc);
+        enc.reset();
+        let b = produce(&mut enc);
+        assert_eq!(a, b);
+        assert_eq!(a, s1, "reset output diverged from a fresh encoder");
+        assert_eq!(decode_all(&a, data.len()).unwrap(), data);
     }
 }
