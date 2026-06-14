@@ -140,6 +140,18 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
         crate::hpack::Http2Huffman::NAME => Some(Box::new(
             <crate::hpack::Http2Huffman as Algorithm>::encoder(),
         )),
+        #[cfg(feature = "huffman")]
+        crate::huffman_codec::Huffman::NAME => Some(Box::new(
+            <crate::huffman_codec::Huffman as Algorithm>::encoder(),
+        )),
+        #[cfg(feature = "rangecoder")]
+        crate::rangecoder::RangeCoder::NAME => Some(Box::new(
+            <crate::rangecoder::RangeCoder as Algorithm>::encoder(),
+        )),
+        #[cfg(feature = "mtf")]
+        crate::mtf::Mtf::NAME => Some(Box::new(<crate::mtf::Mtf as Algorithm>::encoder())),
+        #[cfg(feature = "bwt")]
+        crate::bwt::Bwt::NAME => Some(Box::new(<crate::bwt::Bwt as Algorithm>::encoder())),
         #[cfg(feature = "bcj")]
         crate::bcj::BcjX86::NAME => Some(Box::new(<crate::bcj::BcjX86 as Algorithm>::encoder())),
         #[cfg(feature = "bcj")]
@@ -378,6 +390,18 @@ pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
         crate::hpack::Http2Huffman::NAME => Some(Box::new(
             <crate::hpack::Http2Huffman as Algorithm>::decoder(),
         )),
+        #[cfg(feature = "huffman")]
+        crate::huffman_codec::Huffman::NAME => Some(Box::new(
+            <crate::huffman_codec::Huffman as Algorithm>::decoder(),
+        )),
+        #[cfg(feature = "rangecoder")]
+        crate::rangecoder::RangeCoder::NAME => Some(Box::new(
+            <crate::rangecoder::RangeCoder as Algorithm>::decoder(),
+        )),
+        #[cfg(feature = "mtf")]
+        crate::mtf::Mtf::NAME => Some(Box::new(<crate::mtf::Mtf as Algorithm>::decoder())),
+        #[cfg(feature = "bwt")]
+        crate::bwt::Bwt::NAME => Some(Box::new(<crate::bwt::Bwt as Algorithm>::decoder())),
         #[cfg(feature = "bcj")]
         crate::bcj::BcjX86::NAME => Some(Box::new(<crate::bcj::BcjX86 as Algorithm>::decoder())),
         #[cfg(feature = "bcj")]
@@ -758,6 +782,20 @@ pub const fn extension(name: &str) -> Option<&'static str> {
     if str_eq(name, "delta") && cfg!(feature = "delta") {
         return Some("delta");
     }
+    // Standalone primitives / transforms with no conventional file extension;
+    // the codec name doubles as the suffix the CLI appends.
+    if str_eq(name, "huffman") && cfg!(feature = "huffman") {
+        return Some("huff");
+    }
+    if str_eq(name, "range") && cfg!(feature = "rangecoder") {
+        return Some("range");
+    }
+    if str_eq(name, "mtf") && cfg!(feature = "mtf") {
+        return Some("mtf");
+    }
+    if str_eq(name, "bwt") && cfg!(feature = "bwt") {
+        return Some("bwt");
+    }
     if str_eq(name, "crunch") && cfg!(feature = "arc_crunch") {
         return Some("arc");
     }
@@ -887,6 +925,14 @@ pub const fn names() -> &'static [&'static str] {
         crate::lha::Lh7::NAME,
         #[cfg(feature = "hpack")]
         crate::hpack::Http2Huffman::NAME,
+        #[cfg(feature = "huffman")]
+        crate::huffman_codec::Huffman::NAME,
+        #[cfg(feature = "rangecoder")]
+        crate::rangecoder::RangeCoder::NAME,
+        #[cfg(feature = "mtf")]
+        crate::mtf::Mtf::NAME,
+        #[cfg(feature = "bwt")]
+        crate::bwt::Bwt::NAME,
         #[cfg(feature = "bcj")]
         crate::bcj::BcjX86::NAME,
         #[cfg(feature = "bcj")]

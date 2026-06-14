@@ -179,6 +179,21 @@ pub mod lha;
 #[cfg(feature = "hpack")]
 pub mod hpack;
 
+#[cfg(feature = "qpack")]
+pub mod qpack;
+
+#[cfg(feature = "huffman")]
+pub mod huffman_codec;
+
+#[cfg(feature = "rangecoder")]
+pub mod rangecoder;
+
+#[cfg(feature = "mtf")]
+pub mod mtf;
+
+#[cfg(feature = "bwt")]
+pub mod bwt;
+
 #[cfg(feature = "factory")]
 pub mod factory;
 
