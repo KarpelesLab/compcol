@@ -77,12 +77,20 @@ flag, and a `compcol` binary turns the library into a Unix-style filter.
 | RAR 3.x | `rar3` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + E8 filter; PPMd & VM filters refused | libarchive RAR3 fixtures |
 | RAR 5.x | `rar5` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + x86 filter; Delta/ARM refused | RARLAB-CLI fixtures |
 | HTTP/2 HPACK (RFC 7541) | `hpack` | — | full (header codec + `h2-huffman` string codec) | full (static+dynamic tables, integer/string coding) | RFC 7541 Appendix C vectors |
+| HTTP/3 QPACK (RFC 9204) | `qpack` | — | static-table + literal encoder; full decoder | full (static+dynamic tables via encoder stream, all field representations) | RFC 9204 Appendix B vectors |
+| Canonical Huffman (standalone) | `huffman` | `.huff` | full (length-limited, self-delimiting) | full | own round-trip |
+| Range coder (adaptive order-0) | `rangecoder` | `.range` | full | full | own round-trip |
+| Move-To-Front transform | `mtf` | `mtf` | full (reversible filter) | full | round-trip identity |
+| Burrows-Wheeler Transform (standalone) | `bwt` | `bwt` | full (block BWT + primary index) | full | round-trip identity |
 
-HPACK is HTTP/2's header-compression codec, not a byte-stream codec: it
-operates on `(name, value)` header lists with per-connection dynamic-table
-state, so it lives behind its own `compcol::hpack` API (`HpackEncoder` /
-`HpackDecoder`). The §5.2 string Huffman primitive is also exposed as the
-`Http2Huffman` codec (name `h2-huffman`) through the uniform trait surface.
+HPACK and QPACK are HTTP header-compression codecs, not byte-stream codecs:
+they operate on `(name, value)` header lists with per-connection dynamic-table
+state, so they live behind their own `compcol::hpack` / `compcol::qpack` APIs.
+The §5.2 string Huffman primitive is also exposed as the `Http2Huffman` codec
+(name `h2-huffman`) through the uniform trait surface; QPACK reuses it. The
+`huffman` / `rangecoder` / `mtf` / `bwt` features expose standalone
+building-block codecs (entropy coding and reversible transforms) that can be
+composed into a custom pipeline.
 
 The RAR encoders are permanently `Unsupported` per RARLAB's unRAR
 license terms (every clean-room RAR reader — libarchive, The

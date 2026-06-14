@@ -50,7 +50,8 @@ all = [
     "lha",
     "bcj", "bcj2", "delta",
     "arc_crunch", "arc_squeeze", "arc_squash",
-    "hpack",
+    "hpack", "qpack",
+    "huffman", "rangecoder", "mtf", "bwt",
 ]
 # Enables `alloc`-backed conveniences (e.g. the `factory` module, the
 # `compcol::vec` one-shot helpers). Pulled in automatically by features
@@ -246,6 +247,25 @@ arc_squash = ["alloc"]
 # (name `"h2-huffman"`). The full header codec lives behind its own
 # `compcol::hpack` API (it is stateful over header lists, not a byte stream).
 hpack   = ["alloc"]
+# HTTP/3 QPACK header compression (RFC 9204): static table (Appendix A),
+# dynamic table built from the encoder-stream instructions, and all field-line
+# representations. Reuses the HPACK string Huffman code, so it pulls `hpack`.
+# Lives behind its own `compcol::qpack` API (stateful header codec, not a byte
+# stream). Decoder is full; the encoder uses the static table + literals.
+qpack   = ["alloc", "hpack"]
+# Standalone canonical (length-limited) Huffman codec — `compcol::huffman_codec`
+# (name `"huffman"`). Self-delimiting order-0 Huffman over bytes.
+huffman = ["alloc"]
+# Standalone adaptive order-0 binary range coder — `compcol::rangecoder`
+# (name `"range"`). A self-contained entropy codec.
+rangecoder = ["alloc"]
+# Move-To-Front reversible transform — `compcol::mtf` (name `"mtf"`). A
+# length-preserving, streaming byte filter (as used inside bzip2).
+mtf     = ["alloc"]
+# Standalone block Burrows-Wheeler Transform — `compcol::bwt` (name `"bwt"`).
+# Reversible block transform with a per-block primary index; pairs with `mtf`
+# and an entropy coder.
+bwt     = ["alloc"]
 # `compcol::tokio_io` — async mirrors of compcol::io for the tokio
 # runtime. Pulls the tokio dependency for its AsyncRead/AsyncWrite
 # trait definitions; the rest of the crate stays dep-free.

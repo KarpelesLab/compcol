@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **HTTP/3 QPACK header compression** (RFC 9204) behind the new `qpack`
+  feature. `compcol::qpack::{QpackEncoder, QpackDecoder}` — full decoder
+  (static table, dynamic table built from the encoder-stream instructions, and
+  all field-line representations) validated byte-for-byte against the RFC 9204
+  Appendix B examples; the encoder uses the static table + literals (Required
+  Insert Count = 0). Reuses the HPACK string Huffman code and `HeaderField`.
+- **Standalone primitives / transforms**, each a first-class codec reachable
+  through the factory:
+  - `huffman` — a self-delimiting canonical (length-limited, order-0) Huffman
+    codec, `compcol::huffman_codec::Huffman` (name `"huffman"`).
+  - `rangecoder` — an adaptive order-0 binary range coder,
+    `compcol::rangecoder::RangeCoder` (name `"range"`).
+  - `mtf` — the Move-To-Front reversible transform, `compcol::mtf::Mtf`
+    (name `"mtf"`), a streaming length-preserving filter.
+  - `bwt` — a standalone block Burrows-Wheeler Transform, `compcol::bwt::Bwt`
+    (name `"bwt"`), with a per-block primary index. Pairs with `mtf` + an
+    entropy coder to build a bzip2-style pipeline from parts.
+
 ## [0.6.2](https://github.com/KarpelesLab/compcol/compare/v0.6.1...v0.6.2) - 2026-06-12
 
 ### Other
