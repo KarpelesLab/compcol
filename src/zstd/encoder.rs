@@ -43,7 +43,7 @@ use crate::zstd::encoder_fse::{
 };
 use crate::zstd::encoder_huffman::{
     HuffLengths, build_huff_encoder, build_huff_lengths, encode_huff_4streams, encode_huff_stream,
-    encode_huff_tree_direct, histogram, lengths_to_weights, predicted_bits,
+    encode_huff_tree_direct, encode_huff_tree_fse, histogram, lengths_to_weights, predicted_bits,
 };
 use crate::zstd::encoder_seq::{encode_sequence_count, ll_code, ml_code, of_code};
 use crate::zstd::matcher::{MIN_MATCH, MatchFinder};
@@ -990,12 +990,30 @@ fn try_build_huffman_literals_section_with(
     }
     let enc = build_huff_encoder(lengths);
     // Compute or skip the tree-description bytes depending on `fresh_tree`.
+    // When emitting a fresh tree we choose the smaller of two serialisations:
+    //   - direct nibble-packed weights (only valid for ≤ 128 weights), and
+    //   - FSE-compressed weights (mandatory above 128 weights, and often
+    //     smaller for large skewed alphabets even below the cap).
     let tree_bytes: Vec<u8> = if fresh_tree {
         let (weights, _max_num_bits) = lengths_to_weights(lengths);
-        if weights.len() > 128 {
-            return None; // Direct nibble encoding cap.
+        let direct: Option<Vec<u8>> = if weights.len() <= 128 {
+            Some(encode_huff_tree_direct(&weights))
+        } else {
+            None
+        };
+        let fse = encode_huff_tree_fse(&weights);
+        match (direct, fse) {
+            (Some(d), Some(f)) => {
+                if f.len() < d.len() {
+                    f
+                } else {
+                    d
+                }
+            }
+            (Some(d), None) => d,
+            (None, Some(f)) => f,
+            (None, None) => return None, // alphabet too large for either path
         }
-        encode_huff_tree_direct(&weights)
     } else {
         Vec::new()
     };

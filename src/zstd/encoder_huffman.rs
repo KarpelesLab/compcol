@@ -310,6 +310,121 @@ pub fn encode_huff_tree_direct(weights: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Encode a Huffman tree description using FSE-compressed weights
+/// (Header_Byte < 128: the byte value is the FSE payload length in bytes).
+///
+/// This is needed when the literal alphabet spans more than 128 byte values
+/// (e.g. UTF-8 text, whose multi-byte lead/continuation bytes push the
+/// highest-indexed present symbol past 127) — the direct nibble encoding caps
+/// at 128 weights, so without this path such blocks fall back to a
+/// Raw_Literals_Block and get no entropy coding at all.
+///
+/// The payload layout matches the decoder in
+/// [`crate::zstd::huffman::decode_fse_weights`]: an FSE table header
+/// (accuracy_log ≤ 6, weight alphabet 0..=11) followed by two interleaved FSE
+/// streams written backwards. Returns `None` if the weights can't be
+/// FSE-coded smaller than (or the structure doesn't fit) — caller falls back.
+pub fn encode_huff_tree_fse(weights: &[u8]) -> Option<Vec<u8>> {
+    use crate::zstd::encoder_fse::{FseEncoder, build_normalised_counts, encode_fse_table_header};
+
+    let n = weights.len();
+    // Need at least 2 weights to run the 2-state interleaved encoder, and the
+    // decoder also requires ≥ 2 symbols (it inits two states).
+    if n < 2 {
+        return None;
+    }
+
+    // Histogram of weight values (alphabet 0..=11).
+    const WALPHA: usize = 12; // weights are 0..=HUF_MAX_BITS(11)
+    let mut hist = [0u32; WALPHA];
+    let mut max_w = 0usize;
+    for &w in weights {
+        let w = w as usize;
+        if w >= WALPHA {
+            return None;
+        }
+        hist[w] += 1;
+        if w > max_w {
+            max_w = w;
+        }
+    }
+    let max_symbol = max_w; // highest present weight value
+
+    // Choose accuracy_log: weights use a small alphabet, RFC caps at 6.
+    // Pick the largest log (≤6) that still lets every present symbol get a
+    // slot; smaller tables save header bytes but a log of 6 keeps the streams
+    // tight, and the header is only a handful of bytes either way.
+    let mut accuracy_log: u8 = 6;
+    // accuracy_log must be ≥ 5 for the table-header encoder and large enough
+    // to hold the distinct present symbols.
+    let distinct = hist.iter().filter(|&&c| c > 0).count();
+    while accuracy_log > 5 && (1u32 << accuracy_log) > (n as u32).max(distinct as u32) * 4 {
+        accuracy_log -= 1;
+    }
+    if accuracy_log < 5 {
+        accuracy_log = 5;
+    }
+
+    let counts = build_normalised_counts(&hist[..=max_symbol], n as u32, accuracy_log)?;
+    let header = encode_fse_table_header(&counts, accuracy_log);
+    let enc = FseEncoder::from_normalized(&counts, accuracy_log);
+
+    // The decoder (`decode_fse_weights`) emits weights in index order, with
+    // even indices owned by state 1 and odd indices by state 2:
+    //   w0(s1) w1(s2) w2(s1) w3(s2) …
+    // It initialises s1 then s2 (each reads accuracy_log bits at the very end
+    // of the bitstream, so s1's init bits are read before s2's), then
+    // alternately emits+advances each state in increasing index order, and
+    // terminates by emitting the partner state's pending symbol.
+    //
+    // To replay `weights[0..n]` forward we run the two FSE state machines
+    // backwards: seed each state's `init_state` with the HIGHEST-index symbol
+    // it owns (the last symbol that state emits), then `encode_symbol` the
+    // remaining symbols from the highest index down to 0, picking the owning
+    // state by index parity. Each `encode_symbol(state, sym)` writes the bits
+    // the decoder consumes to land on `sym` while advancing — so forward
+    // decoding reproduces the original order.
+    let last_even = (n - 1).is_multiple_of(2);
+    let s1_high = if last_even { n - 1 } else { n - 2 };
+    let s2_high = if last_even { n - 2 } else { n - 1 };
+    let mut writer = RevBitWriter::new();
+    let mut s1 = enc.init_state(weights[s1_high] as usize);
+    let mut s2 = enc.init_state(weights[s2_high] as usize);
+    let mut i1: isize = s1_high as isize - 2;
+    let mut i2: isize = s2_high as isize - 2;
+    loop {
+        if i1 < 0 && i2 < 0 {
+            break;
+        }
+        // Emit in strictly decreasing index order (the mirror of the decoder's
+        // increasing reads).
+        if i1 >= i2 {
+            s1 = enc.encode_symbol(s1, weights[i1 as usize] as usize, &mut writer);
+            i1 -= 2;
+        } else {
+            s2 = enc.encode_symbol(s2, weights[i2 as usize] as usize, &mut writer);
+            i2 -= 2;
+        }
+    }
+    // Final states: the decoder reads s1's init before s2's, and the reverse
+    // writer's last-written bits are read first — so write s2 first, then s1.
+    enc.write_final_state(s2, &mut writer);
+    enc.write_final_state(s1, &mut writer);
+
+    let bitstream = writer.finish();
+    let mut payload = Vec::with_capacity(1 + header.len() + bitstream.len());
+    let fse_len = header.len() + bitstream.len();
+    if fse_len >= 128 {
+        // Header_Byte must be < 128 (it IS the payload length). Too big to
+        // address — bail (caller falls back to direct/raw).
+        return None;
+    }
+    payload.push(fse_len as u8);
+    payload.extend_from_slice(&header);
+    payload.extend_from_slice(&bitstream);
+    Some(payload)
+}
+
 // ─── Stream encoding ──────────────────────────────────────────────────────
 
 /// Encode a slice of bytes as a single Huffman bitstream using `enc`.
@@ -463,6 +578,43 @@ mod tests {
             }
         }
         assert_eq!(out, input);
+    }
+
+    #[test]
+    fn fse_weights_round_trip() {
+        use crate::zstd::huffman::decode_huffman_tree_weights_for_test;
+        // Build a literal alphabet that spans > 128 byte values so the direct
+        // nibble path would be rejected. UTF-8-ish: bytes scattered across the
+        // 0..=200 range with skewed frequencies.
+        let mut freq = [0u32; 256];
+        for b in 0u32..200 {
+            // Skewed: low bytes common, high bytes rare but present.
+            freq[b as usize] = 200 - b + 1;
+        }
+        let lengths = build_huff_lengths(&freq).unwrap();
+        let (weights, _max) = lengths_to_weights(&lengths);
+        assert!(weights.len() > 128, "test needs > 128 weights");
+        let payload = encode_huff_tree_fse(&weights).expect("fse weight encode");
+        let decoded = decode_huffman_tree_weights_for_test(&payload).unwrap();
+        assert_eq!(decoded, weights, "FSE weight round-trip mismatch");
+    }
+
+    #[test]
+    fn fse_weights_round_trip_small_alphabet() {
+        use crate::zstd::huffman::decode_huffman_tree_weights_for_test;
+        // Even a modest alphabet should round-trip (when it has ≥ 2 weights).
+        let text =
+            b"the quick brown fox jumps over the lazy dog. pack my box with five dozen liquor jugs.";
+        let mut freq = [0u32; 256];
+        for &b in text {
+            freq[b as usize] += 1;
+        }
+        let lengths = build_huff_lengths(&freq).unwrap();
+        let (weights, _max) = lengths_to_weights(&lengths);
+        if let Some(payload) = encode_huff_tree_fse(&weights) {
+            let decoded = decode_huffman_tree_weights_for_test(&payload).unwrap();
+            assert_eq!(decoded, weights);
+        }
     }
 
     #[test]
