@@ -50,6 +50,12 @@ pub(crate) struct FinderParams {
     pub max_chain: usize,
     /// Length at which the finder stops looking for a longer candidate.
     pub nice_match: usize,
+    /// When `true`, the encoder selects matches by [`find_match_cost`]
+    /// (maximise bit gain — prefer closer/cheaper distances) instead of
+    /// [`find_match`] (longest match). Distance coding dominates our
+    /// output, so cost-aware selection meaningfully cuts distance extra
+    /// bits at higher qualities.
+    pub cost_match: bool,
 }
 
 pub(crate) struct MatchFinder {
@@ -218,12 +224,192 @@ impl MatchFinder {
             None
         }
     }
+
+    /// Cost-aware variant of [`find_match`]. Instead of returning the
+    /// strictly longest match, it returns the match that maximises an
+    /// approximate bit *gain*:
+    ///
+    /// ```text
+    /// gain(len, dist) = len * VALUE_PER_BYTE - distance_cost(dist)
+    /// ```
+    ///
+    /// where `distance_cost ≈ floor(log2(dist))` charges far distances for
+    /// their extra bits. This makes the finder prefer a slightly shorter
+    /// but much closer match when the closer distance is cheaper to code —
+    /// the dominant cost in our output is distance extra bits, so trading a
+    /// byte of length for a far smaller distance is frequently a net win.
+    ///
+    /// `VALUE_PER_BYTE` is tuned so a one-byte length sacrifice is accepted
+    /// only when it saves at least that many distance bits.
+    pub(crate) fn find_match_cost(
+        &self,
+        buffer: &[u8],
+        pos: usize,
+        params: FinderParams,
+    ) -> Option<(usize, usize)> {
+        const VALUE_PER_BYTE: i64 = 3;
+        let buf_len = buffer.len();
+        if pos + MIN_MATCH > buf_len {
+            return None;
+        }
+        let h = hash4_at(buffer, pos);
+        let idx = (h as usize) & (HASH_SIZE - 1);
+
+        let max_dist = WINDOW_SIZE.min(pos);
+        let max_len = MAX_MATCH.min(buf_len - pos);
+        if max_len < MIN_MATCH {
+            return None;
+        }
+        let nice = params.nice_match.min(max_len);
+        let chain_cap = params.max_chain;
+        let target = &buffer[pos..pos + max_len];
+
+        let mut best_len: usize = 0;
+        let mut best_dist: usize = 0;
+        let mut best_gain: i64 = i64::MIN;
+
+        let prev = &self.prev[..];
+        let head = &self.head[..];
+        let mut cur = head[idx];
+        let mut steps = 0usize;
+        while cur != NIL && steps < chain_cap {
+            let cur_pos = cur as usize;
+            if cur_pos >= pos {
+                cur = prev[cur_pos];
+                steps += 1;
+                continue;
+            }
+            let dist = pos - cur_pos;
+            if dist > max_dist {
+                break;
+            }
+            // Cheap reject: this candidate can only beat the incumbent if
+            // it matches at least one byte past the current best length
+            // (a shorter match would need an implausibly tiny distance to
+            // win on gain; the explicit gain check below is the arbiter,
+            // but extending the compare to `best_len` first is wasted work
+            // when even a full-length match here would lose).
+            let cand = &buffer[cur_pos..cur_pos + max_len];
+            let mut len = 0usize;
+            while len + 8 <= max_len {
+                let a = u64::from_le_bytes([
+                    cand[len],
+                    cand[len + 1],
+                    cand[len + 2],
+                    cand[len + 3],
+                    cand[len + 4],
+                    cand[len + 5],
+                    cand[len + 6],
+                    cand[len + 7],
+                ]);
+                let b = u64::from_le_bytes([
+                    target[len],
+                    target[len + 1],
+                    target[len + 2],
+                    target[len + 3],
+                    target[len + 4],
+                    target[len + 5],
+                    target[len + 6],
+                    target[len + 7],
+                ]);
+                let diff = a ^ b;
+                if diff != 0 {
+                    len += (diff.trailing_zeros() / 8) as usize;
+                    break;
+                }
+                len += 8;
+            }
+            while len < max_len && cand[len] == target[len] {
+                len += 1;
+            }
+
+            if len >= MIN_MATCH {
+                let dist_cost = 32 - (dist as u32).leading_zeros(); // ≈ log2(dist)+1
+                let gain = len as i64 * VALUE_PER_BYTE - dist_cost as i64;
+                if gain > best_gain {
+                    best_gain = gain;
+                    best_len = len;
+                    best_dist = dist;
+                    // Stop once we have a long-enough match at this (closest
+                    // so far) distance; deeper chain entries are strictly
+                    // farther, so they can only win with extra length, which
+                    // is rare past `nice`.
+                    if len >= nice {
+                        break;
+                    }
+                }
+            }
+            cur = prev[cur_pos];
+            steps += 1;
+        }
+
+        if best_len >= MIN_MATCH {
+            Some((best_len, best_dist))
+        } else {
+            None
+        }
+    }
 }
 
 impl Default for MatchFinder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Compute the match length at a *specific* back-distance `dist` starting
+/// at `pos`. Returns the number of bytes that match (capped at
+/// [`MAX_MATCH`] and the slice tail), or 0 when `dist` is out of range.
+///
+/// Used by the encoder's repeat-distance preference: a match reachable at
+/// a recently-used distance costs only a 2–6 bit short code instead of a
+/// full distance symbol plus up to 24 extra bits, so even a somewhat
+/// shorter repeat-distance match can win on total bits.
+pub(crate) fn match_len_at(buffer: &[u8], pos: usize, dist: usize) -> usize {
+    if dist == 0 || dist > pos {
+        return 0;
+    }
+    let buf_len = buffer.len();
+    let max_len = MAX_MATCH.min(buf_len - pos);
+    if max_len == 0 {
+        return 0;
+    }
+    let src = pos - dist;
+    let cand = &buffer[src..src + max_len];
+    let target = &buffer[pos..pos + max_len];
+    let mut len = 0usize;
+    while len + 8 <= max_len {
+        let a = u64::from_le_bytes([
+            cand[len],
+            cand[len + 1],
+            cand[len + 2],
+            cand[len + 3],
+            cand[len + 4],
+            cand[len + 5],
+            cand[len + 6],
+            cand[len + 7],
+        ]);
+        let b = u64::from_le_bytes([
+            target[len],
+            target[len + 1],
+            target[len + 2],
+            target[len + 3],
+            target[len + 4],
+            target[len + 5],
+            target[len + 6],
+            target[len + 7],
+        ]);
+        let diff = a ^ b;
+        if diff != 0 {
+            len += (diff.trailing_zeros() / 8) as usize;
+            return len;
+        }
+        len += 8;
+    }
+    while len < max_len && cand[len] == target[len] {
+        len += 1;
+    }
+    len
 }
 
 /// Hash four bytes into a 15-bit bucket.
