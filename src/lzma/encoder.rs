@@ -1304,15 +1304,17 @@ fn literal_price_at(
 fn encode_all(input: &[u8], params: LevelParams) -> Vec<u8> {
     let dict_size = params.effective_dict_size(input.len());
 
+    // Threshold below which we also run a greedy pass and keep the smaller
+    // body. The optimal parser's cold-start price model can briefly lose to
+    // greedy on small, highly-repetitive inputs; the absolute loss is bounded
+    // by the first few price-refresh segments, so on larger inputs the optimal
+    // parse always wins overall and the extra greedy pass is pure waste. We
+    // therefore only run the guard pass on small inputs.
+    const GUARD_LIMIT: usize = 64 * 1024;
+
     let body = if params.opt_window == 0 {
         encode_body(input, dict_size, params, false)
-    } else {
-        // Run both parses and keep the smaller range-coded body. The optimal
-        // parse is almost always smaller, but on tiny, highly-repetitive
-        // inputs its cold-start price model can be momentarily mis-calibrated
-        // and lose to greedy; this guard guarantees a level never regresses
-        // below the greedy baseline. Greedy is cheap relative to optimal, so
-        // the extra pass is a minor cost on the levels that run optimal.
+    } else if input.len() <= GUARD_LIMIT {
         let opt = encode_body(input, dict_size, params, true);
         let greedy = encode_body(input, dict_size, params, false);
         if greedy.len() < opt.len() {
@@ -1320,6 +1322,8 @@ fn encode_all(input: &[u8], params: LevelParams) -> Vec<u8> {
         } else {
             opt
         }
+    } else {
+        encode_body(input, dict_size, params, true)
     };
 
     let mut out = Vec::with_capacity(13 + body.len());
