@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Encoder compression-ratio improvements** across the high-effort formats
+  (encoder-only; decoders unchanged, and every format's output still decodes
+  byte-for-byte with its reference tool — `xz`/`lzma`/`zstd`/`brotli`/`bzip2`/
+  `lz4 -d`). Measured on a 2.9 MB real-source corpus, our max level vs the
+  reference's max level (`ours/ref`, lower is better):
+  - **bzip2**: 1.07 → **1.00** — the encoder was building a single Huffman
+    table and pinning all selectors to 0; now does the reference's up-to-6
+    tables with 4 refinement passes (`sendMTFValues`) + depth-aware code
+    lengths + post-RLE1 block sizing. Output is byte-identical to `bzip2 -9`.
+  - **lzma**: 1.57 → **1.07** — cost-based optimal parse (LZMA-SDK-style
+    price model + DP over literals/matches/rep-matches) replacing the greedy
+    parse. `.lzma` is now near parity with `xz -9`.
+  - **lz4**: 1.53 → **1.18** — new HC (hash-chain + lazy) and price-based
+    optimal parse tiers wired to the level knob (`-l 9` does HC, `-l 12`
+    optimal); the fast low levels are unchanged. Also fixed a latent
+    conformance bug where a match could start in the final 12 bytes of a block
+    (rejected by strict `lz4 -d`).
+  - **zstd**: 1.49 → **1.40** — literals were always falling back to a raw
+    (un-entropy-coded) block because the Huffman-weight writer capped at 128
+    symbols; added FSE-compressed weights, plus a price-based optimal parse and
+    repeat-offset preference at high levels.
+  - **xz / lzma2**: 1.60 → **1.51** — benefits from the shared LZMA optimal
+    parse; the remaining gap is the 64 KiB per-chunk dictionary/model reset
+    framing, not the parse.
+  - **brotli**: 1.50 → **1.48** — literal context modeling (multi-tree context
+    map), cost-aware match selection, and repeat-distance preference.
+  - **deflate/zlib/gzip** (≈1.01 vs `gzip -9`) and **lzw** were already at
+    parity and are unchanged.
+
 ### Added
 
 - **Raw LZMA2 encoder** (`lzma2`): `compcol::lzma2::Lzma2` now encodes as well

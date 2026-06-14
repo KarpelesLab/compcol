@@ -220,9 +220,9 @@ pub fn encode_block(input: &[u8], out: &mut Vec<u8>) {
 ///
 /// `level` selects the parse strategy and search effort:
 ///
-/// * `level <` [`HC_LEVEL_THRESHOLD`] — delegate to the fast greedy
+/// * `level <` `HC_LEVEL_THRESHOLD` — delegate to the fast greedy
 ///   [`encode_block`] (LZ4's speed path).
-/// * `level >=` [`HC_LEVEL_THRESHOLD`] — the HC parse: a hash-chain match
+/// * `level >=` `HC_LEVEL_THRESHOLD` — the HC parse: a hash-chain match
 ///   finder that searches up to `nb_attempts` candidates per position for the
 ///   *longest* match, plus one-step lazy matching. `nb_attempts` grows with
 ///   the level, so higher levels trade speed for ratio.
