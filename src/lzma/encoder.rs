@@ -36,8 +36,8 @@ use super::{
     ALIGN_BITS, ALIGN_SIZE, DIST_MODEL_END, DIST_MODEL_START, DIST_SLOT_BITS, DIST_SLOTS,
     DIST_STATES, FULL_DISTANCES, LEN_HIGH_BITS, LEN_HIGH_SYMBOLS, LEN_LOW_BITS, LEN_LOW_SYMBOLS,
     LEN_MID_BITS, LEN_MID_SYMBOLS, LIT_STATES, MATCH_LEN_MIN, POS_STATES_MAX, PROB_INIT,
-    RC_BIT_MODEL_TOTAL_BITS, RC_MOVE_BITS, RC_TOP_VALUE, STATES, state_after_literal,
-    state_after_match, state_after_rep, state_after_short_rep,
+    RC_BIT_MODEL_TOTAL, RC_BIT_MODEL_TOTAL_BITS, RC_MOVE_BITS, RC_TOP_VALUE, STATES,
+    state_after_literal, state_after_match, state_after_rep, state_after_short_rep,
 };
 
 // ─── encoder parameters ──────────────────────────────────────────────────
@@ -98,65 +98,94 @@ struct LevelParams {
     max_chain: usize,
     /// Length at which the match finder stops looking for a longer candidate.
     nice_match: u32,
+    /// Length at which the optimal parser early-commits the current window
+    /// (a match this long is almost certainly taken, so there's no value in
+    /// extending the DP past it with increasingly stale prices). Keeping this
+    /// modest keeps committed segments short and prices fresh.
+    nice_len: u32,
+    /// Optimal-parser look-ahead window (number of optimum-buffer slots). When
+    /// `0` the parser falls back to a fast greedy/lazy parse.
+    opt_window: u32,
 }
 
 impl LevelParams {
     fn from_level(level: u8) -> Self {
         let level = level.min(9);
         // Mirrors xz's preset table for dictionary size, then a graduated
-        // chain budget / nice-match cutoff that grows with level. The
-        // numbers don't have to match xz precisely — what matters is that
-        // a higher level walks deeper chains and accepts longer matches.
+        // chain budget / nice-match cutoff and optimal-parse window that grow
+        // with level. The numbers don't have to match xz precisely — what
+        // matters is that a higher level walks deeper chains, accepts longer
+        // matches, and looks further ahead in the cost-based parse.
         match level {
             0 => Self {
                 dict_size: 1 << 16, // 64 KiB
                 max_chain: 8,
                 nice_match: 8,
+                nice_len: 8,
+                opt_window: 0,
             },
             1 => Self {
                 dict_size: 1 << 20, // 1 MiB
                 max_chain: 16,
                 nice_match: 16,
+                nice_len: 16,
+                opt_window: 0,
             },
             2 => Self {
                 dict_size: 1 << 21, // 2 MiB
                 max_chain: 24,
                 nice_match: 32,
+                nice_len: 32,
+                opt_window: 0,
             },
             3 => Self {
                 dict_size: 1 << 22, // 4 MiB
                 max_chain: 32,
-                nice_match: 48,
+                nice_match: 64,
+                nice_len: 16,
+                opt_window: 512,
             },
             4 => Self {
                 dict_size: 1 << 22, // 4 MiB
-                max_chain: 48,
-                nice_match: 64,
+                max_chain: 64,
+                nice_match: 128,
+                nice_len: 24,
+                opt_window: 1024,
             },
             5 => Self {
                 dict_size: 1 << 23, // 8 MiB
-                max_chain: 64,
-                nice_match: 96,
+                max_chain: 128,
+                nice_match: 192,
+                nice_len: 32,
+                opt_window: 2048,
             },
             6 => Self {
                 dict_size: 1 << 23, // 8 MiB
-                max_chain: 96,
-                nice_match: 128,
+                max_chain: 256,
+                nice_match: 273,
+                nice_len: 48,
+                opt_window: 4096,
             },
             7 => Self {
                 dict_size: 1 << 24, // 16 MiB
-                max_chain: 192,
-                nice_match: 192,
+                max_chain: 512,
+                nice_match: 273,
+                nice_len: 64,
+                opt_window: 4096,
             },
             8 => Self {
                 dict_size: 1 << 25, // 32 MiB
-                max_chain: 384,
-                nice_match: 256,
+                max_chain: 1024,
+                nice_match: 273,
+                nice_len: 96,
+                opt_window: 4096,
             },
             _ => Self {
                 dict_size: 1 << 26, // 64 MiB (level 9)
-                max_chain: 768,
+                max_chain: 2048,
                 nice_match: MAX_MATCH_LEN,
+                nice_len: 128,
+                opt_window: 4096,
             },
         }
     }
@@ -348,6 +377,96 @@ fn dist_special_encode(
     }
 }
 
+// ─── price model ──────────────────────────────────────────────────────────
+//
+// The optimal parser needs the *bit cost* of encoding a given symbol with the
+// current probability model. LZMA prices in 1/16-bit units: the cost of
+// coding a bit against probability `p` is a fixed-point `-log2` of the
+// matching probability. We replicate the SDK's `ProbPrices` table.
+
+const PRICE_SHIFT_BITS: u32 = 4;
+const PRICE_TABLE_SIZE: usize = (RC_BIT_MODEL_TOTAL >> PRICE_SHIFT_BITS) as usize;
+
+/// Precomputed price table: `prices[p >> 4]` is the cost in 1/16-bit units of
+/// coding a 0-bit against probability `p`. Generated the same way as the LZMA
+/// SDK's price table (a fixed-point `-log2` approximation).
+fn build_prob_prices() -> [u32; PRICE_TABLE_SIZE] {
+    let mut prices = [0u32; PRICE_TABLE_SIZE];
+    // `kCyclesBits` in the SDK: the squaring loop runs exactly this many times
+    // (it equals the price shift, 4 — NOT the model-bit count). Getting this
+    // wrong makes `bit_count` overflow the subtraction and yields garbage
+    // prices.
+    let cycles_bits = PRICE_SHIFT_BITS;
+    let mut i: usize = (1usize << PRICE_SHIFT_BITS) >> 1;
+    while i < (PRICE_TABLE_SIZE << PRICE_SHIFT_BITS) {
+        let mut w = i as u32;
+        let mut bit_count = 0u32;
+        let mut j = 0;
+        while j < cycles_bits {
+            w = w.wrapping_mul(w);
+            bit_count <<= 1;
+            while w >= (1u32 << 16) {
+                w >>= 1;
+                bit_count += 1;
+            }
+            j += 1;
+        }
+        let idx = i >> PRICE_SHIFT_BITS;
+        prices[idx] = (RC_BIT_MODEL_TOTAL_BITS << PRICE_SHIFT_BITS) - 15 - bit_count;
+        i += 1 << PRICE_SHIFT_BITS;
+    }
+    prices
+}
+
+#[inline]
+fn price_bit(prices: &[u32; PRICE_TABLE_SIZE], prob: u16, bit: u32) -> u32 {
+    let p = if bit == 0 {
+        prob as u32
+    } else {
+        RC_BIT_MODEL_TOTAL - prob as u32
+    };
+    prices[(p >> PRICE_SHIFT_BITS) as usize]
+}
+
+#[inline]
+fn price_bit0(prices: &[u32; PRICE_TABLE_SIZE], prob: u16) -> u32 {
+    prices[(prob as u32 >> PRICE_SHIFT_BITS) as usize]
+}
+
+#[inline]
+fn price_bit1(prices: &[u32; PRICE_TABLE_SIZE], prob: u16) -> u32 {
+    prices[((RC_BIT_MODEL_TOTAL - prob as u32) >> PRICE_SHIFT_BITS) as usize]
+}
+
+fn bittree_price(prices: &[u32; PRICE_TABLE_SIZE], probs: &[u16], bits: u32, symbol: u32) -> u32 {
+    let mut total = 0u32;
+    let mut idx: u32 = 1;
+    let mut i = bits;
+    while i > 0 {
+        i -= 1;
+        let bit = (symbol >> i) & 1;
+        total += price_bit(prices, probs[idx as usize], bit);
+        idx = (idx << 1) | bit;
+    }
+    total
+}
+
+fn bittree_reverse_price(
+    prices: &[u32; PRICE_TABLE_SIZE],
+    probs: &[u16],
+    bits: u32,
+    symbol: u32,
+) -> u32 {
+    let mut total = 0u32;
+    let mut idx: u32 = 1;
+    for i in 0..bits {
+        let bit = (symbol >> i) & 1;
+        total += price_bit(prices, probs[idx as usize], bit);
+        idx = (idx << 1) | bit;
+    }
+    total
+}
+
 // ─── length coder ────────────────────────────────────────────────────────
 
 struct LengthCoderEnc {
@@ -391,6 +510,39 @@ impl LengthCoderEnc {
                 LEN_HIGH_BITS,
                 length - (LEN_LOW_SYMBOLS + LEN_MID_SYMBOLS) as u32,
             );
+        }
+    }
+
+    /// Price of encoding length symbol `length` (0-based) at `pos_state`.
+    fn price(&self, prices: &[u32; PRICE_TABLE_SIZE], pos_state: u32, length: u32) -> u32 {
+        if length < LEN_LOW_SYMBOLS as u32 {
+            let base = (pos_state as usize) * LEN_LOW_SYMBOLS;
+            price_bit0(prices, self.choice)
+                + bittree_price(
+                    prices,
+                    &self.low[base..base + LEN_LOW_SYMBOLS],
+                    LEN_LOW_BITS,
+                    length,
+                )
+        } else if length < (LEN_LOW_SYMBOLS + LEN_MID_SYMBOLS) as u32 {
+            let base = (pos_state as usize) * LEN_MID_SYMBOLS;
+            price_bit1(prices, self.choice)
+                + price_bit0(prices, self.choice2)
+                + bittree_price(
+                    prices,
+                    &self.mid[base..base + LEN_MID_SYMBOLS],
+                    LEN_MID_BITS,
+                    length - LEN_LOW_SYMBOLS as u32,
+                )
+        } else {
+            price_bit1(prices, self.choice)
+                + price_bit1(prices, self.choice2)
+                + bittree_price(
+                    prices,
+                    &self.high,
+                    LEN_HIGH_BITS,
+                    length - (LEN_LOW_SYMBOLS + LEN_MID_SYMBOLS) as u32,
+                )
         }
     }
 }
@@ -509,6 +661,142 @@ impl LzmaEncCore {
                     symbol = (symbol << 1) | bit;
                 }
             }
+        }
+    }
+
+    /// Price of coding the literal `byte` at output offset `out_pos` with the
+    /// given previous byte, optional match byte (rep0 byte), and literal
+    /// state. Reads the live `lit` probabilities (snapshot at call time).
+    fn literal_price(
+        &self,
+        prices: &[u32; PRICE_TABLE_SIZE],
+        out_pos: u64,
+        byte: u8,
+        prev_byte: u8,
+        match_byte: Option<u8>,
+    ) -> u32 {
+        let lp_state = ((out_pos as u32) & self.lit_pos_mask) << self.lc;
+        let prev_high = (prev_byte as u32) >> (8 - self.lc);
+        let probs_idx = (lp_state + prev_high) as usize * 0x300;
+        let probs = &self.lit[probs_idx..probs_idx + 0x300];
+
+        let mut total = 0u32;
+        let mut symbol: u32 = 1;
+        let target = byte as u32;
+        match match_byte {
+            Some(mb) => {
+                let mut match_byte_w = mb as u32;
+                let mut mismatched = false;
+                let mut i: i32 = 8;
+                while symbol < 0x100 {
+                    i -= 1;
+                    let bit = (target >> i) & 1;
+                    match_byte_w <<= 1;
+                    let match_bit = match_byte_w & 0x100;
+                    if !mismatched {
+                        let idx = (0x100 + match_bit + symbol) as usize;
+                        total += price_bit(prices, probs[idx], bit);
+                        symbol = (symbol << 1) | bit;
+                        if (match_bit >> 8) != bit {
+                            mismatched = true;
+                        }
+                    } else {
+                        total += price_bit(prices, probs[symbol as usize], bit);
+                        symbol = (symbol << 1) | bit;
+                    }
+                }
+            }
+            None => {
+                let mut i: i32 = 8;
+                while symbol < 0x100 {
+                    i -= 1;
+                    let bit = (target >> i) & 1;
+                    total += price_bit(prices, probs[symbol as usize], bit);
+                    symbol = (symbol << 1) | bit;
+                }
+            }
+        }
+        total
+    }
+
+    /// Price of coding a new-match distance `distance` for a match of length
+    /// `length`. Reads the live distance probabilities.
+    fn distance_price(&self, prices: &[u32; PRICE_TABLE_SIZE], length: u32, distance: u32) -> u32 {
+        let dist_state_idx =
+            (length.min(DIST_STATES as u32 + MATCH_LEN_MIN - 1) - MATCH_LEN_MIN) as usize;
+        let slot = get_dist_slot(distance);
+        let slot_base = dist_state_idx * DIST_SLOTS;
+        let mut total = bittree_price(
+            prices,
+            &self.dist_slot[slot_base..slot_base + DIST_SLOTS],
+            DIST_SLOT_BITS,
+            slot,
+        );
+
+        if slot < DIST_MODEL_START {
+            return total;
+        }
+
+        let num_direct_bits = (slot >> 1) - 1;
+        let base = (2 | (slot & 1)) << num_direct_bits;
+        let extra = distance.wrapping_sub(base);
+
+        if slot < DIST_MODEL_END {
+            let base_idx = base as usize + 1;
+            let mut idx = base_idx;
+            let mut m: u32 = 1;
+            for i in 0..num_direct_bits {
+                let bit = (extra >> i) & 1;
+                total += price_bit(prices, self.dist_special[idx], bit);
+                if bit == 0 {
+                    idx += m as usize;
+                    m += m;
+                } else {
+                    m += m;
+                    idx += m as usize;
+                }
+            }
+        } else {
+            let direct_count = num_direct_bits - ALIGN_BITS;
+            // Direct (uniform) bits cost exactly 1 bit each.
+            total += direct_count << PRICE_SHIFT_BITS;
+            let align = extra & (ALIGN_SIZE as u32 - 1);
+            total += bittree_reverse_price(prices, &self.dist_align[..], ALIGN_BITS, align);
+        }
+        total
+    }
+
+    /// Snapshot the cheap per-flag bit prices used by the optimal parser.
+    fn price_snapshot(&self, prices: &[u32; PRICE_TABLE_SIZE]) -> PriceSnapshot {
+        let mut is_match = [[0u32; 2]; STATES * POS_STATES_MAX];
+        let mut is_rep0_long = [[0u32; 2]; STATES * POS_STATES_MAX];
+        for i in 0..STATES * POS_STATES_MAX {
+            is_match[i][0] = price_bit0(prices, self.is_match[i]);
+            is_match[i][1] = price_bit1(prices, self.is_match[i]);
+            is_rep0_long[i][0] = price_bit0(prices, self.is_rep0_long[i]);
+            is_rep0_long[i][1] = price_bit1(prices, self.is_rep0_long[i]);
+        }
+        let mut is_rep = [[0u32; 2]; STATES];
+        let mut is_rep0 = [[0u32; 2]; STATES];
+        let mut is_rep1 = [[0u32; 2]; STATES];
+        let mut is_rep2 = [[0u32; 2]; STATES];
+        for s in 0..STATES {
+            is_rep[s][0] = price_bit0(prices, self.is_rep[s]);
+            is_rep[s][1] = price_bit1(prices, self.is_rep[s]);
+            is_rep0[s][0] = price_bit0(prices, self.is_rep0[s]);
+            is_rep0[s][1] = price_bit1(prices, self.is_rep0[s]);
+            is_rep1[s][0] = price_bit0(prices, self.is_rep1[s]);
+            is_rep1[s][1] = price_bit1(prices, self.is_rep1[s]);
+            is_rep2[s][0] = price_bit0(prices, self.is_rep2[s]);
+            is_rep2[s][1] = price_bit1(prices, self.is_rep2[s]);
+        }
+        PriceSnapshot {
+            is_match,
+            is_rep,
+            is_rep0,
+            is_rep1,
+            is_rep2,
+            is_rep0_long,
         }
     }
 
@@ -812,6 +1100,71 @@ impl HashChain {
             None
         }
     }
+
+    /// Collect the candidate match set for the optimal parser: for each
+    /// achievable length `>= MATCH_LEN_MIN`, the *shortest* distance that
+    /// achieves it. `out` is filled with `(len, dist0based)` pairs in
+    /// strictly increasing length order. Returns the longest length found.
+    fn find_matches(
+        &self,
+        input: &[u8],
+        pos: usize,
+        dict_size: u32,
+        max_chain: usize,
+        nice_match: u32,
+        out: &mut Vec<(u32, u32)>,
+    ) -> u32 {
+        out.clear();
+        if pos + 3 > input.len() {
+            return 0;
+        }
+        let h = hash3(input[pos], input[pos + 1], input[pos + 2]) as usize;
+        let max_len = MAX_MATCH_LEN.min((input.len() - pos) as u32);
+        let max_dist = (dict_size as usize).min(pos);
+        let mut best_len: u32 = MATCH_LEN_MIN - 1;
+        let mut cur = self.head[h];
+        let mut steps = 0usize;
+        while cur != NIL && steps < max_chain {
+            let cur_pos = cur as usize;
+            if cur_pos >= pos {
+                cur = self.prev[cur_pos];
+                steps += 1;
+                continue;
+            }
+            let dist = pos - cur_pos;
+            if dist > max_dist {
+                break;
+            }
+            if best_len >= MATCH_LEN_MIN
+                && (best_len as usize) < (input.len() - pos)
+                && input[cur_pos + best_len as usize] != input[pos + best_len as usize]
+            {
+                cur = self.prev[cur_pos];
+                steps += 1;
+                continue;
+            }
+            let mut len = 0u32;
+            while len < max_len && input[cur_pos + len as usize] == input[pos + len as usize] {
+                len += 1;
+            }
+            if len >= MATCH_LEN_MIN && len > best_len {
+                // Chain is walked nearest-first, so this is the shortest
+                // distance achieving every length in (best_len, len].
+                out.push((len, (dist - 1) as u32));
+                best_len = len;
+                if len >= nice_match || len >= max_len {
+                    break;
+                }
+            }
+            cur = self.prev[cur_pos];
+            steps += 1;
+        }
+        if best_len >= MATCH_LEN_MIN {
+            best_len
+        } else {
+            0
+        }
+    }
 }
 
 // ─── rep-match helpers ───────────────────────────────────────────────────
@@ -833,16 +1186,175 @@ fn rep_match_len(input: &[u8], pos: usize, dist: u32) -> u32 {
     len as u32
 }
 
+// ─── price snapshot + optimal-parse scaffolding ───────────────────────────
+
+/// Cached bit prices for the cheap per-decision flags. Length/distance/literal
+/// prices are computed on demand from the core's live tables.
+struct PriceSnapshot {
+    is_match: [[u32; 2]; STATES * POS_STATES_MAX],
+    is_rep: [[u32; 2]; STATES],
+    is_rep0: [[u32; 2]; STATES],
+    is_rep1: [[u32; 2]; STATES],
+    is_rep2: [[u32; 2]; STATES],
+    is_rep0_long: [[u32; 2]; STATES * POS_STATES_MAX],
+}
+
+impl PriceSnapshot {
+    /// Price of the rep-flag prefix selecting rep index `rep_idx` from `state`
+    /// (the `is_rep`=1 bit plus the rep0/rep1/rep2 selector bits, but NOT the
+    /// length and NOT the is_rep0_long bit for rep0).
+    fn rep_choice_price(&self, state: usize, rep_idx: u32) -> u32 {
+        let mut p = self.is_rep[state][1];
+        match rep_idx {
+            0 => p += self.is_rep0[state][0],
+            1 => p += self.is_rep0[state][1] + self.is_rep1[state][0],
+            2 => p += self.is_rep0[state][1] + self.is_rep1[state][1] + self.is_rep2[state][0],
+            _ => p += self.is_rep0[state][1] + self.is_rep1[state][1] + self.is_rep2[state][1],
+        }
+        p
+    }
+}
+
+/// One parser decision, replayed through the real emit functions after the
+/// optimal parse has chosen it.
+#[derive(Clone, Copy)]
+enum Decision {
+    Literal,
+    /// New match: `(distance0based, length)`.
+    Match(u32, u32),
+    /// Long rep: `(rep_index, length)`.
+    Rep(u32, u32),
+    ShortRep,
+}
+
+/// A node in the optimum DP buffer.
+#[derive(Clone, Copy)]
+struct OptNode {
+    price: u32,
+    prev_pos: u32,
+    decision: Decision,
+    state: usize,
+    reps: [u32; 4],
+}
+
+const INFINITY_PRICE: u32 = u32::MAX;
+
+/// Scratch buffers for the optimal parser.
+struct Optimizer {
+    opt: Vec<OptNode>,
+    matches: Vec<(u32, u32)>,
+    decisions: Vec<Decision>,
+}
+
+impl Optimizer {
+    fn new(window: usize) -> Self {
+        let cap = window + MAX_MATCH_LEN as usize + 2;
+        Self {
+            opt: vec![
+                OptNode {
+                    price: INFINITY_PRICE,
+                    prev_pos: 0,
+                    decision: Decision::Literal,
+                    state: 0,
+                    reps: [0; 4],
+                };
+                cap
+            ],
+            matches: Vec::with_capacity(64),
+            decisions: Vec::with_capacity(window + 1),
+        }
+    }
+}
+
+fn reorder_reps(reps: [u32; 4], rep_idx: u32) -> [u32; 4] {
+    match rep_idx {
+        0 => reps,
+        1 => [reps[1], reps[0], reps[2], reps[3]],
+        2 => [reps[2], reps[0], reps[1], reps[3]],
+        _ => [reps[3], reps[0], reps[1], reps[2]],
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn literal_price_at(
+    core: &LzmaEncCore,
+    prices: &[u32; PRICE_TABLE_SIZE],
+    snap: &PriceSnapshot,
+    input: &[u8],
+    pos: usize,
+    out_pos: u64,
+    state: usize,
+    rep0: u32,
+) -> u32 {
+    let pos_state = (out_pos as u32) & core.pos_mask;
+    let im_idx = state * POS_STATES_MAX + pos_state as usize;
+    let prev_byte = if pos > 0 { input[pos - 1] } else { 0 };
+    let match_byte = if state < LIT_STATES {
+        None
+    } else {
+        let d = rep0 as usize + 1;
+        if d <= pos { Some(input[pos - d]) } else { None }
+    };
+    snap.is_match[im_idx][0]
+        + core.literal_price(prices, out_pos, input[pos], prev_byte, match_byte)
+}
+
 // ─── full encode pass ────────────────────────────────────────────────────
 
 fn encode_all(input: &[u8], params: LevelParams) -> Vec<u8> {
-    let mut core = LzmaEncCore::new();
-    let mut hc = HashChain::new(input.len());
     let dict_size = params.effective_dict_size(input.len());
 
+    let body = if params.opt_window == 0 {
+        encode_body(input, dict_size, params, false)
+    } else {
+        // Run both parses and keep the smaller range-coded body. The optimal
+        // parse is almost always smaller, but on tiny, highly-repetitive
+        // inputs its cold-start price model can be momentarily mis-calibrated
+        // and lose to greedy; this guard guarantees a level never regresses
+        // below the greedy baseline. Greedy is cheap relative to optimal, so
+        // the extra pass is a minor cost on the levels that run optimal.
+        let opt = encode_body(input, dict_size, params, true);
+        let greedy = encode_body(input, dict_size, params, false);
+        if greedy.len() < opt.len() {
+            greedy
+        } else {
+            opt
+        }
+    };
+
+    let mut out = Vec::with_capacity(13 + body.len());
+    out.push(ENC_PROPS_BYTE);
+    out.extend_from_slice(&dict_size.to_le_bytes());
+    out.extend_from_slice(&u64::MAX.to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Encode the range-coded body (with EOS marker + flush, no 13-byte header)
+/// using the greedy or optimal parse. Returns the raw body bytes.
+fn encode_body(input: &[u8], dict_size: u32, params: LevelParams, optimal: bool) -> Vec<u8> {
+    let mut core = LzmaEncCore::new();
+    let mut hc = HashChain::new(input.len());
+    if optimal {
+        encode_optimal(&mut core, &mut hc, input, dict_size, params);
+    } else {
+        encode_greedy(&mut core, &mut hc, input, dict_size, params);
+    }
+    core.emit_eos_marker();
+    core.rc.flush();
+    core.rc.out
+}
+
+/// Greedy/lazy parse — used by the lowest levels.
+fn encode_greedy(
+    core: &mut LzmaEncCore,
+    hc: &mut HashChain,
+    input: &[u8],
+    dict_size: u32,
+    params: LevelParams,
+) {
     let mut pos = 0usize;
     while pos < input.len() {
-        // Try rep matches first — they're the cheapest to encode.
         let rep_lens = [
             rep_match_len(input, pos, core.rep0),
             rep_match_len(input, pos, core.rep1),
@@ -850,10 +1362,8 @@ fn encode_all(input: &[u8], params: LevelParams) -> Vec<u8> {
             rep_match_len(input, pos, core.rep3),
         ];
 
-        // Best new match from the hash chain.
         let new_match = hc.find_longest(input, pos, dict_size, params.max_chain, params.nice_match);
 
-        // Decide what to emit.
         let best_rep_len = rep_lens.iter().copied().max().unwrap_or(0);
         let best_rep_idx = rep_lens
             .iter()
@@ -864,22 +1374,14 @@ fn encode_all(input: &[u8], params: LevelParams) -> Vec<u8> {
 
         let new_match_len = new_match.map(|(l, _)| l).unwrap_or(0);
 
-        // Heuristic: prefer rep if it's at least as long as a new match, or
-        // if rep[0] still matches at least one byte (SHORTREP is dirt-cheap
-        // when no longer match exists). New matches are emitted only when
-        // they strictly beat the best rep.
         let emit_new = new_match_len > best_rep_len && new_match_len >= MATCH_LEN_MIN;
         let emit_rep_long = !emit_new && best_rep_len >= MATCH_LEN_MIN;
         let emit_short_rep = !emit_new && !emit_rep_long && rep_lens[0] >= 1;
 
-        // Insert the current position into the hash chain so future positions
-        // can reference us. (We do this regardless of what we emit; the chain
-        // is the *input* index, not the output index.)
         hc.insert(input, pos);
 
         if emit_new {
             let (len, dist) = new_match.unwrap();
-            // Insert covered positions for higher-quality future matches.
             for j in 1..(len as usize) {
                 let p = pos + j;
                 if p + 3 <= input.len() {
@@ -905,16 +1407,312 @@ fn encode_all(input: &[u8], params: LevelParams) -> Vec<u8> {
             pos += 1;
         }
     }
+}
 
-    // End-of-stream marker + flush.
-    core.emit_eos_marker();
-    core.rc.flush();
-    let mut out = Vec::with_capacity(13 + core.rc.out.len());
-    out.push(ENC_PROPS_BYTE);
-    out.extend_from_slice(&dict_size.to_le_bytes());
-    out.extend_from_slice(&u64::MAX.to_le_bytes());
-    out.extend_from_slice(&core.rc.out);
-    out
+/// Cost-based optimal parse over a look-ahead window.
+fn encode_optimal(
+    core: &mut LzmaEncCore,
+    hc: &mut HashChain,
+    input: &[u8],
+    dict_size: u32,
+    params: LevelParams,
+) {
+    let prob_prices = build_prob_prices();
+    let window = params.opt_window as usize;
+    let mut opt = Optimizer::new(window);
+
+    let mut pos = 0usize;
+    while pos < input.len() {
+        let snap = core.price_snapshot(&prob_prices);
+        let parsed = parse_window(
+            core,
+            hc,
+            input,
+            pos,
+            dict_size,
+            params,
+            window,
+            &prob_prices,
+            &snap,
+            &mut opt,
+        );
+        debug_assert!(parsed > 0);
+        replay(core, hc, input, pos, &opt.decisions);
+        pos += parsed;
+    }
+}
+
+/// Parse one look-ahead window starting at `start`; fills `opt.decisions` and
+/// returns the number of input bytes the chosen decisions consume.
+#[allow(clippy::too_many_arguments)]
+fn parse_window(
+    core: &LzmaEncCore,
+    hc: &HashChain,
+    input: &[u8],
+    start: usize,
+    dict_size: u32,
+    params: LevelParams,
+    window: usize,
+    prices: &[u32; PRICE_TABLE_SIZE],
+    snap: &PriceSnapshot,
+    opt: &mut Optimizer,
+) -> usize {
+    let avail = input.len() - start;
+    let limit = window.min(avail);
+
+    opt.opt[0] = OptNode {
+        price: 0,
+        prev_pos: 0,
+        decision: Decision::Literal,
+        state: core.state,
+        reps: [core.rep0, core.rep1, core.rep2, core.rep3],
+    };
+    for node in opt.opt[1..=limit].iter_mut() {
+        node.price = INFINITY_PRICE;
+    }
+
+    // Hard commit cap: even without a long match we commit after this many
+    // bytes so the price snapshot is refreshed frequently against the live
+    // (adapting) model. Without this, a long literal run parsed under a single
+    // stale snapshot makes systematically worse rep-vs-match decisions.
+    const COMMIT_CAP: usize = 192;
+
+    let mut reached = 0usize;
+    let mut commit_end: Option<usize> = None;
+    let mut cur = 0usize;
+    while cur < limit {
+        if let Some(ce) = commit_end
+            && cur >= ce
+        {
+            break;
+        }
+        // Force a commit boundary once we've extended COMMIT_CAP bytes past the
+        // window start with no earlier long-match commit.
+        if commit_end.is_none() && cur >= COMMIT_CAP {
+            commit_end = Some(cur);
+            break;
+        }
+        let node = opt.opt[cur];
+        if node.price == INFINITY_PRICE {
+            cur += 1;
+            continue;
+        }
+        let pos = start + cur;
+        let out_pos = core.output_pos + cur as u64;
+        let state = node.state;
+        let reps = node.reps;
+        let pos_state = (out_pos as u32) & core.pos_mask;
+        let im_idx = state * POS_STATES_MAX + pos_state as usize;
+        let mut best_here: u32 = 0;
+
+        // ── literal ──────────────────────────────────────────────────────
+        {
+            let lp = literal_price_at(core, prices, snap, input, pos, out_pos, state, reps[0]);
+            let np = node.price.saturating_add(lp);
+            let to = cur + 1;
+            if to <= limit && np < opt.opt[to].price {
+                opt.opt[to] = OptNode {
+                    price: np,
+                    prev_pos: cur as u32,
+                    decision: Decision::Literal,
+                    state: state_after_literal(state),
+                    reps,
+                };
+                if to > reached {
+                    reached = to;
+                }
+            }
+        }
+
+        let match_flag = snap.is_match[im_idx][1];
+
+        // ── rep matches ──────────────────────────────────────────────────
+        for rep_idx in 0..4u32 {
+            let rlen = rep_match_len(input, pos, reps[rep_idx as usize]);
+            if rlen < 1 {
+                continue;
+            }
+            if rep_idx == 0 {
+                let sp = match_flag
+                    + snap.is_rep[state][1]
+                    + snap.is_rep0[state][0]
+                    + snap.is_rep0_long[im_idx][0];
+                let np = node.price.saturating_add(sp);
+                let to = cur + 1;
+                if to <= limit && np < opt.opt[to].price {
+                    opt.opt[to] = OptNode {
+                        price: np,
+                        prev_pos: cur as u32,
+                        decision: Decision::ShortRep,
+                        state: state_after_short_rep(state),
+                        reps,
+                    };
+                    if to > reached {
+                        reached = to;
+                    }
+                }
+            }
+            if rlen < MATCH_LEN_MIN {
+                continue;
+            }
+            if rlen > best_here {
+                best_here = rlen;
+            }
+            let rep_new_reps = reorder_reps(reps, rep_idx);
+            let choice = match_flag + snap.rep_choice_price(state, rep_idx);
+            let rep0_long = if rep_idx == 0 {
+                snap.is_rep0_long[im_idx][1]
+            } else {
+                0
+            };
+            let st_after = state_after_rep(state);
+            let maxr = rlen.min((limit - cur) as u32);
+            let mut l = MATCH_LEN_MIN;
+            while l <= maxr {
+                let len_price = core
+                    .rep_len_coder
+                    .price(prices, pos_state, l - MATCH_LEN_MIN);
+                let np = node.price.saturating_add(choice + rep0_long + len_price);
+                let to = cur + l as usize;
+                if np < opt.opt[to].price {
+                    opt.opt[to] = OptNode {
+                        price: np,
+                        prev_pos: cur as u32,
+                        decision: Decision::Rep(rep_idx, l),
+                        state: st_after,
+                        reps: rep_new_reps,
+                    };
+                    if to > reached {
+                        reached = to;
+                    }
+                }
+                l += 1;
+            }
+        }
+
+        // ── new matches ──────────────────────────────────────────────────
+        let longest = {
+            let opt_matches = &mut opt.matches;
+            hc.find_matches(
+                input,
+                pos,
+                dict_size,
+                params.max_chain,
+                params.nice_match,
+                opt_matches,
+            )
+        };
+        if longest >= MATCH_LEN_MIN {
+            if longest > best_here {
+                best_here = longest;
+            }
+            let match_choice = match_flag + snap.is_rep[state][0];
+            let st_after = state_after_match(state);
+            let cap = (limit - cur) as u32;
+            let mut prev_len = MATCH_LEN_MIN - 1;
+            let nmatches = opt.matches.len();
+            for mi in 0..nmatches {
+                let (mlen, mdist) = opt.matches[mi];
+                let band_end = mlen.min(cap);
+                let mut l = (prev_len + 1).max(MATCH_LEN_MIN);
+                while l <= band_end {
+                    let len_price = core.len_coder.price(prices, pos_state, l - MATCH_LEN_MIN);
+                    let dist_price = core.distance_price(prices, l, mdist);
+                    let np = node
+                        .price
+                        .saturating_add(match_choice + len_price + dist_price);
+                    let to = cur + l as usize;
+                    if np < opt.opt[to].price {
+                        let new_reps = [mdist, reps[0], reps[1], reps[2]];
+                        opt.opt[to] = OptNode {
+                            price: np,
+                            prev_pos: cur as u32,
+                            decision: Decision::Match(mdist, l),
+                            state: st_after,
+                            reps: new_reps,
+                        };
+                        if to > reached {
+                            reached = to;
+                        }
+                    }
+                    l += 1;
+                }
+                prev_len = mlen;
+            }
+        }
+
+        // Early-commit once a long match is reachable: commit up to its end so
+        // the price snapshot stays close to the live model. Mirrors the SDK's
+        // `nice_len` cut-off in GetOptimum.
+        if commit_end.is_none() && best_here >= params.nice_len {
+            commit_end = Some((cur + best_here as usize).min(limit));
+        }
+
+        cur += 1;
+    }
+
+    let end = match commit_end {
+        Some(ce) => ce.max(1).min(reached.max(1)),
+        None => reached.max(1),
+    }
+    .min(avail);
+    trace_back(opt, end);
+    end
+}
+
+fn trace_back(opt: &mut Optimizer, end: usize) {
+    opt.decisions.clear();
+    let mut cur = end;
+    while cur > 0 {
+        let node = opt.opt[cur];
+        opt.decisions.push(node.decision);
+        cur = node.prev_pos as usize;
+    }
+    opt.decisions.reverse();
+}
+
+fn replay(
+    core: &mut LzmaEncCore,
+    hc: &mut HashChain,
+    input: &[u8],
+    start: usize,
+    decisions: &[Decision],
+) {
+    let mut pos = start;
+    for &d in decisions {
+        match d {
+            Decision::Literal => {
+                hc.insert(input, pos);
+                core.emit_literal(input, pos);
+                pos += 1;
+            }
+            Decision::ShortRep => {
+                hc.insert(input, pos);
+                core.emit_short_rep();
+                pos += 1;
+            }
+            Decision::Match(dist, len) => {
+                for j in 0..(len as usize) {
+                    let p = pos + j;
+                    if p + 3 <= input.len() {
+                        hc.insert(input, p);
+                    }
+                }
+                core.emit_match(dist, len);
+                pos += len as usize;
+            }
+            Decision::Rep(idx, len) => {
+                for j in 0..(len as usize) {
+                    let p = pos + j;
+                    if p + 3 <= input.len() {
+                        hc.insert(input, p);
+                    }
+                }
+                core.emit_long_rep(idx, len);
+                pos += len as usize;
+            }
+        }
+    }
 }
 
 // ─── public streaming Encoder ────────────────────────────────────────────
