@@ -93,6 +93,112 @@ impl MatchFinder {
         self.head[idx] = pos as u32;
     }
 
+    /// Collect distinct match candidates at `pos` for the optimal parse.
+    ///
+    /// Walks the hash chain and records every candidate that is *strictly
+    /// longer* than all previous ones, pushing `(length, distance)` into
+    /// `out`. The result is therefore a set of length/distance pairs with
+    /// strictly increasing length; for any target length the shortest
+    /// (hence usually closest) sufficient distance among them can be
+    /// recovered by the caller. Returns the number of candidates written
+    /// (capped at `out.len()`).
+    ///
+    /// Unlike [`find_match`] this keeps the chain entries that a
+    /// longest-only search would discard — exactly the closer, cheaper
+    /// distances the DP wants to price against the cost model.
+    pub(crate) fn find_matches(
+        &self,
+        buffer: &[u8],
+        pos: usize,
+        params: FinderParams,
+        out: &mut [(u32, u32)],
+    ) -> usize {
+        if out.is_empty() {
+            return 0;
+        }
+        let buf_len = buffer.len();
+        if pos + MIN_MATCH > buf_len {
+            return 0;
+        }
+        let h = hash4_at(buffer, pos);
+        let idx = (h as usize) & (HASH_SIZE - 1);
+        let max_dist = WINDOW_SIZE.min(pos);
+        let max_len = MAX_MATCH.min(buf_len - pos);
+        if max_len < MIN_MATCH {
+            return 0;
+        }
+        let nice = params.nice_match.min(max_len);
+        let chain_cap = params.max_chain;
+        let target = &buffer[pos..pos + max_len];
+
+        let mut best_len: usize = MIN_MATCH - 1;
+        let mut count = 0usize;
+
+        let prev = &self.prev[..];
+        let head = &self.head[..];
+        let mut cur = head[idx];
+        let mut steps = 0usize;
+        while cur != NIL && steps < chain_cap {
+            let cur_pos = cur as usize;
+            if cur_pos >= pos {
+                cur = prev[cur_pos];
+                steps += 1;
+                continue;
+            }
+            let dist = pos - cur_pos;
+            if dist > max_dist {
+                break;
+            }
+            // Only bother if this candidate could extend past best_len.
+            if buffer[cur_pos + best_len] == target[best_len] {
+                let cand = &buffer[cur_pos..cur_pos + max_len];
+                let mut len = 0usize;
+                while len + 8 <= max_len {
+                    let a = u64::from_le_bytes([
+                        cand[len],
+                        cand[len + 1],
+                        cand[len + 2],
+                        cand[len + 3],
+                        cand[len + 4],
+                        cand[len + 5],
+                        cand[len + 6],
+                        cand[len + 7],
+                    ]);
+                    let b = u64::from_le_bytes([
+                        target[len],
+                        target[len + 1],
+                        target[len + 2],
+                        target[len + 3],
+                        target[len + 4],
+                        target[len + 5],
+                        target[len + 6],
+                        target[len + 7],
+                    ]);
+                    let diff = a ^ b;
+                    if diff != 0 {
+                        len += (diff.trailing_zeros() / 8) as usize;
+                        break;
+                    }
+                    len += 8;
+                }
+                while len < max_len && cand[len] == target[len] {
+                    len += 1;
+                }
+                if len > best_len {
+                    best_len = len;
+                    out[count] = (len as u32, dist as u32);
+                    count += 1;
+                    if count == out.len() || len >= nice {
+                        break;
+                    }
+                }
+            }
+            cur = prev[cur_pos];
+            steps += 1;
+        }
+        count
+    }
+
     /// Find the longest prior occurrence of the bytes starting at `pos`.
     /// Returns Some((length, distance)) with length ≥ MIN_MATCH, or None.
     pub(crate) fn find_match(

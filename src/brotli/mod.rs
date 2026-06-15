@@ -63,6 +63,7 @@ mod encoder_dict;
 mod encoder_huffman;
 mod encoder_iac;
 mod encoder_lz77;
+mod encoder_optimal;
 mod huffman;
 mod transforms;
 
@@ -108,6 +109,12 @@ struct LevelParams {
     /// entirely (saves ~80 KiB of working memory + per-position probe
     /// cost on the lowest quality settings).
     use_dict: bool,
+    /// Number of iterative optimal-parse passes (zopfli-style). `0`
+    /// selects the single-pass greedy parser; `≥1` runs the forward DP in
+    /// [`encoder_optimal`], rebuilding the cost model from the previous
+    /// pass's histograms each round. Only enabled at the top quality
+    /// tiers where the extra parse time is worth the ratio.
+    opt_passes: u32,
 }
 
 impl LevelParams {
@@ -135,6 +142,13 @@ impl LevelParams {
             // 11 (and clamp-from-above)
             _ => (1024, 1024, true, true),
         };
+        // Iterative optimal parse on the slowest tiers, where the extra
+        // DP passes buy meaningful ratio over greedy.
+        let opt_passes = match q {
+            10 => 2,
+            11 => 3,
+            _ => 0,
+        };
         Self {
             finder: encoder_lz77::FinderParams {
                 max_chain,
@@ -142,6 +156,7 @@ impl LevelParams {
                 cost_match,
             },
             use_dict,
+            opt_passes,
         }
     }
 }
@@ -1371,19 +1386,52 @@ fn encode_meta_block(
     // Window size = 1 << WBITS = 1 << 16 (the encoder always picks WBITS=16).
     const WINDOW_SIZE: u32 = 1 << 16;
 
-    // 1. Run LZ77 + command construction in a single fused pass. The
-    //    match finder is given a copy of the block-start distance ring so
-    //    its repeat-distance preference matches what `plan_commands`/the
-    //    decoder will see; `plan_commands` then advances the real ring.
-    lz77_to_commands(
-        payload,
-        dict_index,
-        id_transforms,
-        prev_total_out,
-        level.finder,
-        *ring,
-        scratch,
-    );
+    // 1. Run LZ77 + command construction. On the top quality tiers we use
+    //    the iterative optimal (zopfli-style) forward DP; otherwise the
+    //    single-pass greedy parser. Both produce the same `Command`
+    //    stream that `plan_commands` consumes. The match finder is given a
+    //    copy of the block-start distance ring so its repeat-distance
+    //    preference matches what `plan_commands`/the decoder will see;
+    //    `plan_commands` then advances the real ring.
+    let mut used_optimal = false;
+    if level.opt_passes > 0 {
+        let EncScratch {
+            mf,
+            cmds,
+            insert_pool,
+            ..
+        } = scratch;
+        cmds.clear();
+        let dp_finder = encoder_lz77::FinderParams {
+            max_chain: level.finder.max_chain,
+            nice_match: level.finder.nice_match.max(258),
+            cost_match: false,
+        };
+        encoder_optimal::optimal_parse(
+            payload,
+            mf,
+            dict_index,
+            id_transforms,
+            prev_total_out,
+            *ring,
+            level.opt_passes,
+            dp_finder,
+            cmds,
+            insert_pool,
+        );
+        used_optimal = !cmds.is_empty();
+    }
+    if !used_optimal {
+        lz77_to_commands(
+            payload,
+            dict_index,
+            id_transforms,
+            prev_total_out,
+            level.finder,
+            *ring,
+            scratch,
+        );
+    }
     // 2. Plan + tally frequencies in a single pass.
     plan_commands(mlen, ring, prev_total_out, WINDOW_SIZE, scratch);
 
