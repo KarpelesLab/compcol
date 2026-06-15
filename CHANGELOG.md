@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **docs.rs build**: add the crate-root `#![cfg_attr(docsrs, feature(doc_cfg))]`
+  that the crate's per-module `#[cfg_attr(docsrs, doc(cfg(...)))]` labels
+  require. Without it the docs.rs build (nightly + `--cfg docsrs`) failed with
+  E0658, even though the plain stable `cargo doc` CI job — where `docsrs` is
+  unset and the attributes are inert — passed. A new CI job (`docsrs`) now
+  builds the docs the way docs.rs does (nightly + `--cfg docsrs`, warnings
+  denied) so this gap is caught before publishing.
+
+### Fixed
+
 - *(cli)* `compcol -d` no longer truncates highly-compressible large inputs.
   The streaming decode loop stopped once the compressed input was consumed,
   leaving output a block-buffering decoder (notably bzip2) still held

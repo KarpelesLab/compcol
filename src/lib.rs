@@ -11,6 +11,15 @@
 
 #![no_std]
 #![forbid(unsafe_code)]
+// Enable the nightly `doc_cfg` feature when building the docs.rs doc set
+// (docs.rs passes `--cfg docsrs`). Modules across the crate carry
+// `#![cfg_attr(docsrs, doc(cfg(feature = "...")))]` to label which feature
+// each item needs; those `#[doc(cfg(...))]` attributes are experimental and
+// require this crate-level `feature(doc_cfg)`. Without it, the docs.rs build
+// (nightly + `--cfg docsrs`) fails with E0658 even though a plain stable
+// `cargo doc` — where `docsrs` is unset and the attributes are inert —
+// succeeds. Gated on `docsrs` so stable builds never see the nightly feature.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
