@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Round 2 of encoder ratio + codec speed work** (encoder-only for ratio;
+  decoders unchanged and every format still decodes byte-for-byte with its
+  reference tool). Ratios on a 2.9 MB real-source corpus, our max level vs the
+  reference's max (`ours/ref`, lower is better):
+  - **xz / lzma2**: 1.51 → **1.10** — the LZMA2 chunk encoder now keeps the LZ
+    dictionary **continuous across chunks** (emits `0xC0` continue-dict control
+    bytes after the first `0xE0`, with a single match-finder spanning the whole
+    input) instead of resetting every 64 KiB. Closes nearly all of the gap to
+    the `.lzma` path (1.07). Also fixes the raw-LZMA2 decoder to feed
+    uncompressed (stored) chunks into the dictionary.
+  - **zstd**: 1.40 → **1.04 vs `zstd -19`** at max level (now beats `zstd -12`)
+    — cross-block matching over a retained sliding window (≤8 MiB, within the
+    advertised window) plus a two-pass, statistics-driven optimal parse
+    (btultra2-style repricing) and repeat-offset-aware DP pricing.
+  - **lz4**: 1.18 → **1.02** (frame, `-l 12` beats `lz4 -9`) — implemented LZ4
+    frame **block-linked** mode so matches reference up to 64 KiB of prior
+    blocks' output, not just the current block.
+- **Standalone-codec encode throughput** (output byte-identical):
+  - **bwt** encode ~3× faster — replaced the prefix-doubling rotation sort with
+    linear-time SA-IS suffix-array construction.
+  - **mtf** encode ~2.3× faster (single-pass scan-and-shift); **rangecoder**
+    encode/decode ~+15% (tightened hot loops).
+
+  Note: the xz/lzma2 and zstd encoders now buffer the whole input to drive a
+  single continuous match-finder (same memory profile the `.lzma` path already
+  had); higher levels trade encode time for ratio, decode speed is unchanged.
+
 ## [0.6.3](https://github.com/KarpelesLab/compcol/compare/v0.6.2...v0.6.3) - 2026-06-15
 
 ### Added
