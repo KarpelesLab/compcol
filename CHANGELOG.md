@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3](https://github.com/KarpelesLab/compcol/compare/v0.6.2...v0.6.3) - 2026-06-15
+
+### Added
+
+- add QPACK (RFC 9204) + standalone Huffman / range-coder / MTF / BWT codecs
+
+### Fixed
+
+- *(lzma2)* restore Debug/Clone on Encoder; document the stub→struct break
+
+### Other
+
+- changelog for encoder compression-ratio improvements
+- *(enc)* literal context modeling + cost-aware match selection
+- enable optimal parse from level 13
+- price-based optimal parse at high levels (btopt-style)
+- distance-aware repeat-offset preference in match selection
+- FSE-compressed Huffman weights for >128-symbol literal alphabets
+- skip redundant greedy guard pass on large inputs
+- cost-based optimal parse for compression ratio
+- price-based optimal parse for top levels + fix EOB conformance
+- HC hash-chain match finder + lazy parse, wire level knob
+- size blocks by post-RLE-1 length, like reference bzip2
+- multi-table Huffman optimization (sendMTFValues)
+- port reference BZ2_hbMakeCodeLengths (depth-aware, 17-bit cap)
+- README + CHANGELOG for lzma2 encoder, lzfse bvx2, lz5 rationale
+- document why Huff0 sub-streams stay Unsupported (no functional change)
+- general FSE table construction (k/k-1 split) for bvx2
+- implement bvx2 (LZFSE v2) block decoder
+- implement raw LZMA2 encoder (replace Unsupported stub)
+
 ### Performance
 
 - **Encoder compression-ratio improvements** across the high-effort formats
