@@ -103,3 +103,26 @@ jobs:
 
       - name: cargo doc --no-deps --all-features
         run: cargo doc --no-deps --all-features
+
+  docsrs:
+    name: Docs build (docs.rs config)
+    runs-on: ubuntu-latest
+    env:
+      # Mirror the docs.rs build environment so a docs.rs-only failure is
+      # caught here rather than only after publishing. docs.rs builds on
+      # nightly and passes `--cfg docsrs` (see [package.metadata.docs.rs] in
+      # Cargo.toml); the plain `docs` job above runs on stable without
+      # `--cfg docsrs`, so the `#[cfg_attr(docsrs, doc(cfg(...)))]` labels are
+      # inert there and a missing crate-root `feature(doc_cfg)` slips through.
+      RUSTDOCFLAGS: --cfg docsrs -D warnings -D rustdoc::broken-intra-doc-links
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust (nightly, as docs.rs uses)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo doc --no-deps --all-features (docs.rs config)
+        run: cargo doc --no-deps --all-features
