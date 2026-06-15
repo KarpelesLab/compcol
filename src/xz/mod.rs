@@ -58,7 +58,9 @@ use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
 // decoder exposed under the `lzma2` feature without pulling in this xz
 // container. See `lib.rs`.
 use crate::lzma2_internal::lzma2_decoder::{Lzma2Props, LzmaCore, lzma2_dict_size};
-use crate::lzma2_internal::lzma2_encoder::{EncoderParams, LZMA2_PROPS_BYTE, encode_lzma2_stream};
+use crate::lzma2_internal::lzma2_encoder::{
+    EncoderParams, LZMA2_PROPS_BYTE, Lzma2Chunk, Lzma2StreamEncoder,
+};
 
 // ─── constants ─────────────────────────────────────────────────────────────
 
@@ -394,9 +396,19 @@ pub struct Encoder {
     // the caller's `output`. We push from `pending[pending_idx..]`.
     pending: Vec<u8>,
     pending_idx: usize,
-    // Input buffer for the next LZMA2 chunk; flushed at LZMA2_CHUNK_MAX or
-    // on finish().
-    in_buf: Vec<u8>,
+    // Bounded-memory continuous-dictionary LZMA2 chunk encoder. Fed input
+    // incrementally; emits framed chunks as they become fully buffered, so the
+    // whole input is never accumulated. `None` until the Body phase starts.
+    stream: Option<Lzma2StreamEncoder>,
+    // Raw input bytes pushed into `stream` but not yet consumed by an emitted
+    // chunk. Bounded by one chunk's worth (`stream` emits as soon as a full
+    // chunk is buffered), so this stays `O(LZMA2_CHUNK_MAX)`. Used to frame
+    // uncompressed-fallback chunks (raw bytes copied verbatim) and to feed the
+    // Block Check CRC32 in encode order.
+    staged_input: Vec<u8>,
+    // Set once `stream.finish()` has been called, so a multi-call `raw_finish`
+    // (draining across several small output buffers) doesn't re-finish.
+    stream_finished: bool,
     // CRC32 of all uncompressed input bytes — becomes the Block Check.
     check: Crc32,
     // Bookkeeping for the Index Record.
@@ -427,7 +439,9 @@ impl Encoder {
             phase: EncPhase::StreamHeader,
             pending,
             pending_idx: 0,
-            in_buf: Vec::new(),
+            stream: None,
+            staged_input: Vec::new(),
+            stream_finished: false,
             check: Crc32::new(),
             uncompressed_total: 0,
             compressed_payload_bytes: 0,
@@ -453,30 +467,36 @@ impl Encoder {
         }
     }
 
-    /// Stage the whole block's LZMA2 payload from the fully-buffered input.
+    /// Frame each produced LZMA2 chunk into `pending`, consuming the matching
+    /// raw bytes from `staged_input` (for CRC + the uncompressed fallback).
     ///
-    /// The LZMA2 chunks are produced by a single continuous match-finder
-    /// ([`encode_lzma2_stream`]): the first chunk resets the dictionary
-    /// (`0xE0` compressed / `0x01` uncompressed) and every later chunk
-    /// *continues* it (`0xC0` compressed / `0x02` uncompressed), so a match in
-    /// a later chunk can reference data from any earlier chunk (up to the
-    /// dictionary size). The range coder still resets per chunk, but the
-    /// dictionary/history is continuous — this is what brings the ratio in
-    /// line with the single-stream `.lzma` path.
-    ///
-    /// `input` is the entire block (`uncompressed_total` bytes). Each framed
-    /// chunk is appended to `pending`; the caller drains it before the block
-    /// trailer.
-    fn stage_payload(&mut self, input: &[u8]) {
-        let chunks = encode_lzma2_stream(input, LZMA2_DICT_SIZE, self.enc_params);
-        let mut pos = 0usize;
+    /// The chunks come from a single continuous, **bounded-memory** match-finder
+    /// ([`Lzma2StreamEncoder`]): the first chunk resets the dictionary (`0xE0`
+    /// compressed / `0x01` uncompressed) and every later chunk *continues* it
+    /// (`0xC0` compressed / `0x02` uncompressed), so a match in a later chunk
+    /// can reference data from any earlier chunk up to the dictionary size. The
+    /// range coder still resets per chunk, but the dictionary/history is
+    /// continuous — this is what brings the ratio in line with the single-stream
+    /// `.lzma` path, while peak memory stays `O(dict_size)`.
+    /// Lazily create the bounded-memory LZMA2 stream encoder on first use.
+    fn stream(&mut self) -> &mut Lzma2StreamEncoder {
+        self.stream
+            .get_or_insert_with(|| Lzma2StreamEncoder::new(LZMA2_DICT_SIZE, self.enc_params))
+    }
+
+    fn stage_chunks(&mut self, chunks: Vec<Lzma2Chunk>) {
         for chunk in chunks {
-            let data = &input[pos..pos + chunk.uncomp_len];
+            let n = chunk.uncomp_len;
+            debug_assert!(self.staged_input.len() >= n);
+            // The bytes belonging to this chunk are the front `n` of the staged
+            // buffer (chunks are produced in encode order).
+            let data: Vec<u8> = self.staged_input.drain(..n).collect();
+            self.check.update(&data);
+            self.uncompressed_total += n as u64;
             match chunk.body {
-                Some(ref body) => self.stage_compressed_chunk(data, body, chunk.reset_dict),
-                None => self.stage_uncompressed_chunk(data, chunk.reset_dict),
+                Some(ref body) => self.stage_compressed_chunk(&data, body, chunk.reset_dict),
+                None => self.stage_uncompressed_chunk(&data, chunk.reset_dict),
             }
-            pos += chunk.uncomp_len;
         }
     }
 
@@ -602,20 +622,35 @@ impl RawEncoder for Encoder {
                     }
                 }
                 EncPhase::Body => {
-                    // Buffer the entire block's input so the LZMA2 payload can
-                    // be produced by a single continuous match-finder at
-                    // `finish` (the dictionary spans the whole input rather
-                    // than resetting per chunk). We never flush mid-stream;
-                    // chunking happens only at the output-framing level.
-                    if consumed < input.len() {
-                        self.in_buf.extend_from_slice(&input[consumed..]);
-                        consumed = input.len();
+                    // Feed input into the bounded-memory streaming LZMA2 encoder
+                    // and frame any chunks it emits, draining them to the caller
+                    // as we go. The whole input is never accumulated — the
+                    // dictionary is a sliding `~dict_size` window inside the
+                    // stream encoder. If a previous pass staged chunk bytes,
+                    // drain those first.
+                    if self.pending_idx < self.pending.len() {
+                        self.phase = EncPhase::DrainPending;
+                    } else if consumed < input.len() {
+                        // Push a bounded slice so `staged_input` stays small.
+                        let take = (input.len() - consumed).min(LZMA2_CHUNK_MAX);
+                        let slice = &input[consumed..consumed + take];
+                        self.staged_input.extend_from_slice(slice);
+                        let chunks = self.stream().push(slice);
+                        consumed += take;
+                        if !chunks.is_empty() {
+                            self.stage_chunks(chunks);
+                        }
+                        // Drain whatever was staged before consuming more input.
+                        if self.pending_idx < self.pending.len() {
+                            self.phase = EncPhase::DrainPending;
+                        }
+                    } else {
+                        return Ok(RawProgress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
                     }
-                    return Ok(RawProgress {
-                        consumed,
-                        written,
-                        done: false,
-                    });
                 }
                 EncPhase::DrainPending => {
                     if self.drain_pending(output, &mut written) {
@@ -684,19 +719,27 @@ impl RawEncoder for Encoder {
                     }
                 }
                 EncPhase::Body => {
-                    if !self.in_buf.is_empty() {
-                        // Produce the whole block's LZMA2 payload at once from
-                        // the fully-buffered input, using a single continuous
-                        // match-finder so the dictionary spans every chunk.
-                        let data = core::mem::take(&mut self.in_buf);
-                        self.check.update(&data);
-                        self.uncompressed_total += data.len() as u64;
-                        self.stage_payload(&data);
+                    if self.pending_idx < self.pending.len() {
+                        // Drain bytes staged in a prior pass first.
                         self.phase = EncPhase::DrainPending;
                     } else {
-                        // No pending input. Move to block trailer.
-                        self.stage_block_trailer();
-                        self.phase = EncPhase::BlockTrailer;
+                        // Flush the remaining buffered bytes as the final
+                        // chunk(s) from the bounded-memory stream encoder (once),
+                        // then frame them. Memory stays `O(dict_size)`.
+                        if self.stream.is_some() && !self.stream_finished {
+                            let chunks = self.stream().finish();
+                            self.stream_finished = true;
+                            self.stage_chunks(chunks);
+                        }
+                        if self.pending_idx < self.pending.len() {
+                            self.phase = EncPhase::DrainPending;
+                        } else {
+                            // No more chunk bytes. Move to the block trailer in
+                            // this same iteration so the loop makes progress
+                            // even when `finish` produced nothing.
+                            self.stage_block_trailer();
+                            self.phase = EncPhase::BlockTrailer;
+                        }
                     }
                 }
                 EncPhase::DrainPending => {
@@ -787,7 +830,9 @@ impl RawEncoder for Encoder {
             phase: EncPhase::StreamHeader,
             pending,
             pending_idx: 0,
-            in_buf: Vec::new(),
+            stream: None,
+            staged_input: Vec::new(),
+            stream_finished: false,
             check: Crc32::new(),
             uncompressed_total: 0,
             compressed_payload_bytes: 0,
