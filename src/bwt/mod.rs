@@ -36,15 +36,19 @@
 //!
 //! ## Forward transform
 //!
-//! For each block we build the order of its cyclic rotations with a
-//! prefix-doubling (Manber–Myers) sort — `O(n log n)` ranking rounds, each an
-//! `O(n)` counting sort on the `(rank[i], rank[i + k])` pairs. From the sorted
-//! rotation order `sa` (where `sa[r]` is the starting offset of the rotation
-//! ranked `r`) the BWT last column is `L[r] = block[(sa[r] + n - 1) mod n]`,
-//! and the primary index is the rank of the rotation that starts at offset 0.
+//! For each block we build the order of its cyclic rotations by suffix-sorting
+//! the doubled block `T + T + $` (sentinel `$` smaller than any byte) with
+//! **SA-IS** (Suffix Array by Induced Sorting; Nong, Zhang & Chan, 2009), a
+//! linear-time `O(n)` construction. From the sorted rotation order `sa` (where
+//! `sa[r]` is the starting offset of the rotation ranked `r`) the BWT last
+//! column is `L[r] = block[(sa[r] + n - 1) mod n]`, and the primary index is
+//! the rank of the rotation that starts at offset 0.
 //!
-//! The prefix-doubling sort is `O(n log n)` and handles the pathological cases
-//! (all-equal bytes, long repeats) without degrading to `O(n² log n)`.
+//! SA-IS is `O(n)` and handles the pathological cases (all-equal bytes, long
+//! repeats) without degrading. A small KMP-based tie-break pass reorders any
+//! run of *equal* cyclic rotations (only possible for fully periodic blocks)
+//! by ascending offset, so the emitted `(L, primary)` pair is identical to
+//! that of a stable cyclic-rotation sort.
 //!
 //! ## Inverse transform
 //!
@@ -64,8 +68,9 @@
 //! ## Licensing
 //!
 //! Clean-room from the published BWT algorithm description (Burrows & Wheeler,
-//! 1994) and the textbook prefix-doubling rotation sort. No code was copied
-//! from `src/bzip2/` or any third-party source.
+//! 1994) and the published SA-IS suffix-array construction (Nong, Zhang &
+//! Chan, 2009). Implemented independently within this module; no code was
+//! copied from `src/bzip2/` or any third-party source.
 
 #![cfg_attr(docsrs, doc(cfg(feature = "bwt")))]
 
