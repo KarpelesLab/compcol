@@ -174,7 +174,12 @@ fn pipe_decode_drains_internal_block_buffer() {
         let (encoded, _err, code) = run_with_stdin(&["-t", codec], &input);
         assert_eq!(code, 0, "{codec} encode failed");
         let (decoded, err, code) = run_with_stdin(&["-t", codec, "-d"], &encoded);
-        assert_eq!(code, 0, "{codec} decode failed: {}", String::from_utf8_lossy(&err));
+        assert_eq!(
+            code,
+            0,
+            "{codec} decode failed: {}",
+            String::from_utf8_lossy(&err)
+        );
         assert_eq!(
             decoded.len(),
             input.len(),
