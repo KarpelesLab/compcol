@@ -34,10 +34,15 @@
 //! When `block_independence = false` (the LZ4 CLI default and ours), the
 //! decoder must keep up to 64 KiB of the previously-decoded payload
 //! available so the next block's back-references can address it. Our
-//! encoder respects this in the same direction: the matcher only ever
-//! looks within the current block (i.e. it produces blocks that decode
-//! correctly under either mode), but the decoder honours linked-block
-//! semantics on input from any conforming encoder.
+//! encoder produces such references: it carries a sliding 64 KiB window of
+//! the most recently emitted raw output and offers it to the block match
+//! finder as a dictionary (see [`block::encode_block_level_dict`]), so a
+//! match in one block can reference bytes that were emitted by previous
+//! blocks. This is what gives linked mode its ratio edge over independent
+//! blocks, whose match window is just the block's own ≤ 64 KiB.
+//!
+//! When `block_independence = true`, the window is never populated and each
+//! block is compressed in isolation, decoding correctly on its own.
 
 use alloc::vec::Vec;
 
@@ -362,6 +367,10 @@ pub struct Encoder {
     /// xxHash32 over the entire raw content. Only used when
     /// `cfg.content_checksum`.
     content_hash: XxHash32,
+    /// Sliding 64 KiB window of the most recently emitted *raw* output, used
+    /// as a back-reference dictionary for the next block in linked-block mode
+    /// (`cfg.block_independence == false`). Empty in independent mode.
+    window: Vec<u8>,
 }
 
 impl Encoder {
@@ -373,6 +382,11 @@ impl Encoder {
     /// Construct with an explicit config.
     pub fn with_config(cfg: EncoderConfig) -> Self {
         let bs = cfg.block_max_size.bytes();
+        let window_cap = if cfg.block_independence {
+            0
+        } else {
+            WINDOW_SIZE
+        };
         let mut enc = Self {
             cfg,
             block_size: bs,
@@ -381,9 +395,30 @@ impl Encoder {
             staged_idx: 0,
             phase: EncPhase::Header,
             content_hash: XxHash32::new(),
+            window: Vec::with_capacity(window_cap),
         };
         enc.build_header();
         enc
+    }
+
+    /// Append `bytes` (a block's raw payload) to the sliding back-reference
+    /// window, keeping only the trailing [`WINDOW_SIZE`] bytes. No-op in
+    /// independent mode.
+    fn push_window(&mut self, bytes: &[u8]) {
+        if self.cfg.block_independence {
+            return;
+        }
+        if bytes.len() >= WINDOW_SIZE {
+            self.window.clear();
+            self.window
+                .extend_from_slice(&bytes[bytes.len() - WINDOW_SIZE..]);
+            return;
+        }
+        let combined = self.window.len() + bytes.len();
+        if combined > WINDOW_SIZE {
+            self.window.drain(..combined - WINDOW_SIZE);
+        }
+        self.window.extend_from_slice(bytes);
     }
 
     /// Stage the frame header (magic + FLG + BD + HC) in `staged`.
@@ -426,9 +461,20 @@ impl Encoder {
             self.content_hash.update(&self.raw);
         }
 
-        // Compress into a scratch buffer.
+        // Compress into a scratch buffer. In linked-block mode the previous
+        // blocks' trailing output (`self.window`, ≤ 64 KiB) is offered as a
+        // back-reference dictionary so matches can cross the block boundary.
         let mut compressed = Vec::with_capacity(block::compress_bound(self.raw.len()));
-        block::encode_block_level(&self.raw, &mut compressed, self.cfg.level);
+        block::encode_block_level_dict(&self.window, &self.raw, &mut compressed, self.cfg.level);
+
+        // Slide the window forward with this block's raw payload, regardless of
+        // whether we end up emitting it compressed or raw — the decoder's
+        // window tracks decoded output either way.
+        if !self.cfg.block_independence {
+            let raw = core::mem::take(&mut self.raw);
+            self.push_window(&raw);
+            self.raw = raw;
+        }
 
         self.staged.clear();
         // Choose the smaller of compressed / raw. The LZ4 Frame spec
@@ -626,6 +672,7 @@ impl RawEncoder for Encoder {
         self.staged.clear();
         self.staged_idx = 0;
         self.content_hash = XxHash32::new();
+        self.window.clear();
         self.phase = EncPhase::Header;
         self.build_header();
     }
