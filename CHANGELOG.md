@@ -84,10 +84,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     linear-time SA-IS suffix-array construction.
   - **mtf** encode ~2.3× faster (single-pass scan-and-shift); **rangecoder**
     encode/decode ~+15% (tightened hot loops).
-
-  Note: the xz/lzma2 and zstd encoders now buffer the whole input to drive a
-  single continuous match-finder (same memory profile the `.lzma` path already
-  had); higher levels trade encode time for ratio, decode speed is unchanged.
+- **Bounded-memory LZMA encoders.** The `xz`, raw `lzma2`, and `.lzma`
+  encoders now stream with a sliding window whose match finder, history, and
+  hash chains are all `O(dict_size)` (default 4 MiB) instead of buffering the
+  whole input — peak memory is now independent of input length (≈45 MB RSS
+  encoding a 600 MB file; previously O(input) and OOM-prone). The continuous
+  dictionary, and therefore the ratio, is unchanged (matches already could not
+  reach past `dict_size`): `xz`/`.lzma` on the 2.9 MB corpus stay within 0.03%.
+  Output continues to decode byte-for-byte with system `xz`. (`zstd` already
+  streamed within its bounded window.)
 
 ## [0.6.3](https://github.com/KarpelesLab/compcol/compare/v0.6.2...v0.6.3) - 2026-06-15
 
