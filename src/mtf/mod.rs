@@ -106,16 +106,31 @@ impl Table {
     }
 
     /// Encode one byte: return its current rank and move it to the front.
+    ///
+    /// Combines the find-rank scan and the move-to-front shift into a single
+    /// pass: as we walk the table looking for `b` we slide each scanned entry
+    /// back one slot (carrying the previous value forward), so each element is
+    /// touched exactly once. This replaces the previous scan-then-`copy_within`
+    /// (two passes over the prefix) and is what makes the encode hot loop fast
+    /// on the small-rank-dominated streams MTF is built for.
     fn encode_byte(&mut self, b: u8) -> u8 {
-        // Linear scan of 256 entries — `b` is guaranteed present (the table
-        // is always a permutation of all byte values), so the loop always
-        // finds it.
-        let mut rank = 0usize;
-        while self.table[rank] != b {
+        // `b` is always present (the table is a permutation of all 256 byte
+        // values), so the loop always terminates before running off the end.
+        let mut carry = self.table[0];
+        if carry == b {
+            return 0;
+        }
+        self.table[0] = b;
+        let mut rank = 1usize;
+        loop {
+            let next = self.table[rank];
+            self.table[rank] = carry;
+            if next == b {
+                return rank as u8;
+            }
+            carry = next;
             rank += 1;
         }
-        self.move_to_front(rank);
-        rank as u8
     }
 
     /// Decode one byte: return the symbol at `rank` and move it to the front.
