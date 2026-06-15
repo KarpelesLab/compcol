@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(brotli enc)* iterative, statistics-driven optimal LZ77 parse
+  (zopfli-style forward DP) at quality 9–11. The cost model is rebuilt from
+  the previous pass's command/literal/distance histograms each round;
+  candidate matches are precomputed once and shared across passes. Improves
+  the max-quality ratio on the 2.9 MB corpus from 707558 to 669632 bytes
+  (1.473 → 1.394 vs `brotli -q 11`) and q9 from 709198 to 680156, with
+  reference cross-decode verified.
+
 ### Performance
 
 - **Round 2 of encoder ratio + codec speed work** (encoder-only for ratio;
