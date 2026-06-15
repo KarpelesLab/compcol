@@ -1990,7 +1990,7 @@ fn replay(
 
 /// Streaming `.lzma` (alone) encoder with **bounded memory**.
 ///
-/// Drives a [`LzmaStreamEncoder`] whose match finder, sliding window, and LZ
+/// Drives an `LzmaStreamEncoder` whose match finder, sliding window, and LZ
 /// history are all `O(dict_size)` — so peak memory is independent of the input
 /// length. `encode` feeds input incrementally and emits range-coded output as
 /// it is produced (the header up front, then body bytes); `finish` emits the
