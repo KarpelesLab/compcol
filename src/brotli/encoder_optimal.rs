@@ -102,11 +102,7 @@ impl CostModel {
     }
 
     /// Build a model from the histograms of a previous pass's commands.
-    fn from_hist(
-        lit_hist: &[u32; 256],
-        cmd_hist: &[u32; 704],
-        dist_hist: &[u32; 64],
-    ) -> Self {
+    fn from_hist(lit_hist: &[u32; 256], cmd_hist: &[u32; 704], dist_hist: &[u32; 64]) -> Self {
         Self {
             lit: SymCost::from_hist(lit_hist),
             cmd: SymCost::from_hist(cmd_hist),
@@ -424,7 +420,11 @@ fn forward_dp(
         // The running literal-run length entering position `p` is the
         // accumulated insert for the *next* command. A copy-end node
         // restarts the run at 0; a literal-step node carries its count.
-        let run_in = if here.copy_len == 0 { here.insert_len } else { 0 };
+        let run_in = if here.copy_len == 0 {
+            here.insert_len
+        } else {
+            0
+        };
 
         // (a) Literal step: extend the running insert run by one byte. The
         //     per-literal cost is added incrementally so a copy starting
@@ -460,11 +460,7 @@ fn forward_dp(
                     ring4[k]
                 } else {
                     let v = seed.nth_last((k + 1) as u32);
-                    if v > 0 {
-                        v as u32
-                    } else {
-                        0
-                    }
+                    if v > 0 { v as u32 } else { 0 }
                 }
             };
 
@@ -484,8 +480,8 @@ fn forward_dp(
                 let maxl = rl.min(MAX_MATCH).min(n - p);
                 let mut len = MIN_MATCH;
                 while len <= maxl {
-                    let cost =
-                        copy_start_cost + repeat_command_cost(model, insert_len, len as u32, k as u32);
+                    let cost = copy_start_cost
+                        + repeat_command_cost(model, insert_len, len as u32, k as u32);
                     relax(nodes, p + len, cost, insert_len, len as u32, d, None);
                     len += 1;
                 }
@@ -530,7 +526,13 @@ fn forward_dp(
         if let Some(dc) = cache.dict[p] {
             let dest = p + dc.emit_len as usize;
             let cost = copy_start_cost
-                + command_cost(model, insert_len, dc.word_len as u32, dc.dcode, dc.dextra_bits);
+                + command_cost(
+                    model,
+                    insert_len,
+                    dc.word_len as u32,
+                    dc.dcode,
+                    dc.dextra_bits,
+                );
             relax(
                 nodes,
                 dest,
@@ -781,7 +783,9 @@ fn emit_path(
             cmds.push(Command {
                 insert: buf,
                 copy_len: node.copy_len,
-                kind: CopyKind::Backref { distance: node.dist },
+                kind: CopyKind::Backref {
+                    distance: node.dist,
+                },
             });
         }
     }
