@@ -99,6 +99,9 @@ impl Default for EncoderConfig {
 /// walk deeper chains and accept longer matches before bailing out.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LevelParams {
+    /// Clamped compression level (1..=22). Retained so the parser can gate
+    /// behaviour (e.g. the statistics-driven repricing passes) on it.
+    pub level: u8,
     /// Maximum number of hash-chain links the match finder walks per probe.
     pub max_chain: usize,
     /// Length at which the match finder stops looking for a longer candidate.
@@ -117,12 +120,20 @@ pub(crate) struct LevelParams {
 /// Lowest level at which the optimal parser is used.
 const OPTIMAL_LEVEL: u8 = 13;
 
-/// Per-position hash-chain depth cap for the optimal parser. The DP visits
-/// every position, so an uncapped chain (up to 16384 at level 22) makes each
-/// block quadratic; this bound keeps encode time reasonable while preserving
-/// nearly all of the ratio (the DP's win comes from length/repeat pricing,
-/// not from exhaustive chain walks).
-const OPTIMAL_MAX_CHAIN: usize = 4096;
+/// Per-position hash-chain depth cap for the optimal parser, by level. The DP
+/// visits every position, so an uncapped chain (up to 16384 at level 22) makes
+/// each block quadratic; this bound keeps encode time in the single-digit
+/// seconds while preserving nearly all of the ratio (the DP's win comes mostly
+/// from cross-block matching and length/repeat pricing, not from exhaustive
+/// chain walks — beyond ~256 links the marginal ratio is < 1%).
+fn optimal_chain_cap(level: u8) -> usize {
+    match level {
+        0..=15 => 128,
+        16..=19 => 256,
+        // 20..=22: spend more chain budget for the top presets.
+        _ => 384,
+    }
+}
 
 impl LevelParams {
     /// Clamp `level` to `1..=22` and expand to match-finder tuning. The
@@ -163,6 +174,7 @@ impl LevelParams {
             _ => (16384, super::matcher::MAX_MATCH),
         };
         Self {
+            level,
             max_chain,
             nice_match,
             lazy_search,
@@ -171,16 +183,31 @@ impl LevelParams {
     }
 }
 
+/// Window the encoder retains as match context across blocks. The frame
+/// advertises a 16 MiB window (`WD = 0x70`), so back-references up to this many
+/// bytes are spec-legal and `zstd -d` will accept them. We cap the *retained*
+/// history at 8 MiB to bound encoder memory and the per-block re-index cost;
+/// real inputs rarely benefit from references beyond a few MiB and the cap
+/// keeps total work near-linear.
+const MATCH_WINDOW: usize = 8 * 1024 * 1024;
+
 /// Streaming Zstandard encoder.
 pub struct Encoder {
     state: State,
+    /// Match context retained from already-emitted blocks (the sliding window).
+    /// Back-references in the current block may point anywhere in here, giving
+    /// cross-block matching up to [`MATCH_WINDOW`] bytes. Trimmed from the front
+    /// once it exceeds the window.
+    history: Vec<u8>,
     /// Input buffer pending block emission.
     pending: Vec<u8>,
     /// Output bytes ready to drain into the caller's buffer.
     out_buf: Vec<u8>,
     /// Cursor into `out_buf`.
     out_idx: usize,
-    /// Reusable matcher.
+    /// Reusable matcher. Re-indexed per block over `history ++ pending` so that
+    /// back-references in the current block can reach into earlier blocks
+    /// (cross-block matching within the advertised window).
     matcher: MatchFinder,
     /// Have we written the frame header yet?
     header_written: bool,
@@ -219,6 +246,7 @@ impl Encoder {
     pub fn with_config(config: EncoderConfig) -> Self {
         Self {
             state: State::Accepting,
+            history: Vec::new(),
             pending: Vec::with_capacity(BLOCK_SIZE),
             out_buf: Vec::new(),
             out_idx: 0,
@@ -266,156 +294,147 @@ impl Encoder {
             // Too small to bother — the framing overhead eats any savings.
             return None;
         }
-        let buffer = self.pending.as_slice();
-        self.matcher.resize_for(buffer.len());
 
-        // Run LZ77 with repeat-offset awareness. We track a per-block ring
-        // copy of `prev_offsets` and rewrite each emitted match's offset
-        // through `assign_offset` so equal distances collapse to codes 1..=3.
-        //
-        // Two strategies depending on level:
-        //   - level ≤ 3: greedy. Take the best match at the current position.
-        //   - level ≥ 4: lazy. After finding a match at pos, also probe at
-        //     pos+1; if it gives a meaningfully longer match, emit a literal
-        //     and use that one instead.
-        //
-        // Independent of level, we always check the three repeat offsets at
-        // each position first — a repeat-offset match costs 1 bit in the
-        // offset stream vs. ~log2(distance) bits for a fresh offset, so even
-        // short repeats are cheap wins.
-        let lazy = self.params.lazy_search;
+        // Cross-block matching: build a buffer of retained history followed by
+        // the current block, and compress only the `[start, end)` tail.
+        // Back-references in this block may point anywhere in `history`, up to
+        // the advertised 16 MiB window — `zstd -d` accepts them. `history` is
+        // already trimmed to `MATCH_WINDOW`, so every distance is in range.
+        let start = self.history.len();
+        let mut buffer: Vec<u8> = Vec::with_capacity(start + self.pending.len());
+        buffer.extend_from_slice(&self.history);
+        buffer.extend_from_slice(&self.pending);
+        let buffer = buffer.as_slice();
         let buf_len = buffer.len();
+
+        // Rebuild the chains for this buffer and pre-index only the retained
+        // history (`[0, start)`). Each parser then splices in the *current
+        // block's* positions lazily as it advances, so the hash chains never
+        // contain positions ahead of the probe — the standard LZ invariant that
+        // keeps match finding correct and the depth budget meaningful. Indexing
+        // history up front is what enables cross-block back-references.
+        self.matcher.resize_for(buf_len);
+        for i in 0..start.min(buf_len.saturating_sub(3)) {
+            self.matcher.insert(buffer, i);
+        }
+
+        let lazy = self.params.lazy_search;
         let max_chain = self.params.max_chain;
         let nice_match = self.params.nice_match;
 
-        // High levels: price-based optimal parse over the whole block. The DP
-        // probes a match candidate at every input position, so we cap the
-        // per-position chain depth to keep the per-block cost bounded — the DP
-        // recovers most of the ratio from trying lengths and repeat offsets
-        // rather than from exhaustive chain walks.
-        if self.params.optimal {
-            let opt_chain = max_chain.min(OPTIMAL_MAX_CHAIN);
-            let (sequences, new_offsets) = optimal_parse(
-                &mut self.matcher,
-                buffer,
-                self.prev_offsets,
-                opt_chain,
+        // High levels: price-based optimal parse over the block. The DP probes a
+        // match candidate at every input position, so we cap the per-position
+        // chain depth to keep the per-block cost bounded.
+        let body = if self.params.optimal {
+            let opt_chain = max_chain.min(optimal_chain_cap(self.params.level));
+            // Statistics-driven repricing at high levels (btultra2-style).
+            let reprice_passes = if self.params.level >= REPRICE_LEVEL {
+                2
+            } else {
+                0
+            };
+            let cfg = ParseConfig {
+                start,
+                init_offsets: self.prev_offsets,
+                max_chain: opt_chain,
                 nice_match,
-            );
+            };
+            let (sequences, new_offsets) =
+                optimal_parse_2pass(&mut self.matcher, buffer, &cfg, reprice_passes);
             if sequences.is_empty() {
                 return None;
             }
-            return finish_compressed_block(
+            finish_compressed_block(
                 buffer,
+                start,
                 &sequences,
                 new_offsets,
                 self.prev_huff_lengths.as_ref(),
             )
-            .map(|(body, new_lengths, committed_offsets)| {
-                self.prev_offsets = committed_offsets;
-                if let Some(lengths) = new_lengths {
-                    self.prev_huff_lengths = Some(lengths);
+        } else {
+            // Greedy / lazy parse with repeat-offset awareness. Positions in the
+            // current block are spliced into the chain lazily up to `pos`.
+            let mut sequences: Vec<Seq> = Vec::new();
+            let mut lit_start: usize = start;
+            let mut pos: usize = start;
+            let mut block_offsets = self.prev_offsets;
+            let mut next_insert = start;
+
+            while pos + MIN_MATCH < buf_len {
+                while next_insert <= pos {
+                    self.matcher.insert(buffer, next_insert);
+                    next_insert += 1;
                 }
-                body
-            });
-        }
 
-        let mut sequences: Vec<Seq> = Vec::new();
-        let mut lit_start: usize = 0;
-        let mut pos: usize = 0;
-        let mut block_offsets = self.prev_offsets;
+                let (m_dist, m_len, m_is_rep1) = best_at(
+                    &self.matcher,
+                    buffer,
+                    pos,
+                    &block_offsets,
+                    max_chain,
+                    nice_match,
+                );
 
-        // Invariant: positions in [0, next_insert) have already been spliced
-        // into the matcher's hash chain. We advance `next_insert` lazily.
-        let mut next_insert: usize = 0;
-        while pos + MIN_MATCH < buf_len {
-            // Make sure `pos` is in the chain.
-            while next_insert <= pos {
-                self.matcher.insert(buffer, next_insert);
-                next_insert += 1;
-            }
+                if m_len == 0 {
+                    pos += 1;
+                    continue;
+                }
 
-            // Step 1: best-match selection at `pos`.
-            let (m_dist, m_len, m_is_rep1) = best_at(
-                &self.matcher,
-                buffer,
-                pos,
-                &block_offsets,
-                max_chain,
-                nice_match,
-            );
-
-            if m_len == 0 {
-                pos += 1;
-                continue;
-            }
-
-            // Step 2 (lazy only): probe pos+1 for a meaningfully better match.
-            // "Meaningfully better" = strictly longer by at least 1 byte when
-            // the current isn't already long. We skip the probe when the
-            // current match is already at least `nice_match` — there's no
-            // plausible win at that point.
-            let (best_pos, best_dist, best_len) =
-                if lazy && m_len < nice_match && pos + 1 + MIN_MATCH < buf_len {
-                    // Insert pos+1 into the chain so its hash bucket includes it.
-                    while next_insert <= pos + 1 {
-                        self.matcher.insert(buffer, next_insert);
-                        next_insert += 1;
-                    }
-                    let (n_dist, n_len, _) = best_at(
-                        &self.matcher,
-                        buffer,
-                        pos + 1,
-                        &block_offsets,
-                        max_chain,
-                        nice_match,
-                    );
-                    // Score: prefer longer-match. A repeat-offset hit at pos
-                    // saves bits in the offset stream — bias slightly in its
-                    // favour by requiring the lazy match to beat by ≥2.
-                    let margin = if m_is_rep1 { 2 } else { 1 };
-                    if n_len >= m_len + margin {
-                        (pos + 1, n_dist, n_len)
+                let (best_pos, best_dist, best_len) =
+                    if lazy && m_len < nice_match && pos + 1 + MIN_MATCH < buf_len {
+                        while next_insert <= pos + 1 {
+                            self.matcher.insert(buffer, next_insert);
+                            next_insert += 1;
+                        }
+                        let (n_dist, n_len, _) = best_at(
+                            &self.matcher,
+                            buffer,
+                            pos + 1,
+                            &block_offsets,
+                            max_chain,
+                            nice_match,
+                        );
+                        let margin = if m_is_rep1 { 2 } else { 1 };
+                        if n_len >= m_len + margin {
+                            (pos + 1, n_dist, n_len)
+                        } else {
+                            (pos, m_dist, m_len)
+                        }
                     } else {
                         (pos, m_dist, m_len)
-                    }
-                } else {
-                    (pos, m_dist, m_len)
-                };
+                    };
 
-            // Emit the literals run up to `best_pos`, then the chosen match.
-            let literal_run = best_pos - lit_start;
-            let offset_value =
-                assign_offset(best_dist as u32, literal_run as u32, &mut block_offsets);
-            sequences.push(Seq {
-                literal_length: literal_run as u32,
-                match_length: best_len as u32,
-                offset_value,
-            });
-            // Splice the interior positions of the match into the chain so
-            // later positions can match against them. We only insert
-            // positions that aren't already in.
-            let match_end = best_pos + best_len;
-            while next_insert < match_end {
-                self.matcher.insert(buffer, next_insert);
-                next_insert += 1;
+                let literal_run = best_pos - lit_start;
+                let offset_value =
+                    assign_offset(best_dist as u32, literal_run as u32, &mut block_offsets);
+                sequences.push(Seq {
+                    literal_length: literal_run as u32,
+                    match_length: best_len as u32,
+                    offset_value,
+                });
+                let match_end = best_pos + best_len;
+                while next_insert < match_end {
+                    self.matcher.insert(buffer, next_insert);
+                    next_insert += 1;
+                }
+                pos = match_end;
+                lit_start = pos;
             }
-            pos = match_end;
-            lit_start = pos;
-        }
 
-        let _ = lit_start;
-        if sequences.is_empty() {
-            return None;
-        }
+            let _ = lit_start;
+            if sequences.is_empty() {
+                return None;
+            }
+            finish_compressed_block(
+                buffer,
+                start,
+                &sequences,
+                block_offsets,
+                self.prev_huff_lengths.as_ref(),
+            )
+        };
 
-        finish_compressed_block(
-            buffer,
-            &sequences,
-            block_offsets,
-            self.prev_huff_lengths.as_ref(),
-        )
-        .map(|(body, new_lengths, committed_offsets)| {
+        body.map(|(body, new_lengths, committed_offsets)| {
             self.prev_offsets = committed_offsets;
             if let Some(lengths) = new_lengths {
                 self.prev_huff_lengths = Some(lengths);
@@ -433,16 +452,20 @@ impl Encoder {
 /// `self.pending` (which `buffer` borrows) against `&mut self`.
 fn finish_compressed_block(
     buffer: &[u8],
+    start: usize,
     sequences: &[Seq],
     block_offsets: [u32; 3],
     prev_huff_lengths: Option<&HuffLengths>,
 ) -> Option<(Vec<u8>, Option<HuffLengths>, [u32; 3])> {
-    // Reconstruct all literal bytes by replaying the sequences: each sequence
-    // emits `literal_length` literals from the cursor, then skips
-    // `match_length` matched bytes. Trailing bytes after the last sequence are
-    // literals too.
-    let mut all_literals: Vec<u8> = Vec::with_capacity(buffer.len());
-    let mut cursor = 0usize;
+    // Reconstruct the current block's literal bytes by replaying the sequences:
+    // each sequence emits `literal_length` literals from the cursor, then skips
+    // `match_length` matched bytes. The cursor starts at `start` (the first byte
+    // of this block within `buffer`; earlier bytes are retained history that
+    // matches reference but that this block does not re-emit). Trailing bytes
+    // after the last sequence are literals too.
+    let block_len = buffer.len() - start;
+    let mut all_literals: Vec<u8> = Vec::with_capacity(block_len);
+    let mut cursor = start;
     for s in sequences {
         let ll = s.literal_length as usize;
         all_literals.extend_from_slice(&buffer[cursor..cursor + ll]);
@@ -454,7 +477,7 @@ fn finish_compressed_block(
     let seq_section = build_sequences_section(sequences);
 
     let total = lit_section.len() + seq_section.len();
-    if total >= buffer.len() {
+    if total >= block_len {
         return None; // Not worth compressing.
     }
 
@@ -642,7 +665,7 @@ impl Encoder {
             let body_size = self.pending.len() as u32;
             Self::push_block_header(&mut self.out_buf, body_size, 1, last);
             self.out_buf.push(self.pending[0]);
-            self.pending.clear();
+            self.roll_history_from_pending();
             return;
         }
         if let Some(body) = self.try_compress_block() {
@@ -654,7 +677,27 @@ impl Encoder {
             Self::append_raw_block(&mut self.out_buf, &pending_snapshot, last);
             self.pending = pending_snapshot;
         }
-        self.pending.clear();
+        self.roll_history_from_pending();
+    }
+
+    /// Move the just-emitted `pending` bytes into the cross-block match window
+    /// (`history`) and trim the window to [`MATCH_WINDOW`]. Every emitted block —
+    /// RLE, compressed, or raw — extends the decoder's window, so back-references
+    /// in later blocks may reference these bytes. Keeping `history` ≤ the window
+    /// guarantees every offset we emit stays within the advertised window.
+    fn roll_history_from_pending(&mut self) {
+        if !self.pending.is_empty() {
+            self.history.extend_from_slice(&self.pending);
+            self.pending.clear();
+        }
+        if self.history.len() > MATCH_WINDOW {
+            let drop = self.history.len() - MATCH_WINDOW;
+            self.history.drain(0..drop);
+            // Front of the buffer shifted, so every absolute index recorded in
+            // the matcher is now stale. Drop the chains; the next block rebuilds
+            // them. Trimming only happens past the 8 MiB window, so this is rare.
+            self.matcher.resize_for(self.history.len().max(1));
+        }
     }
 
     /// Copy as much of `out_buf[out_idx..]` into `output[*written..]` as fits.
@@ -679,37 +722,160 @@ impl Encoder {
 
 // ─── price-based optimal parser ───────────────────────────────────────────
 
-/// Estimated bit cost of a literal byte (~Huffman-coded text/code literal).
-/// Only the literal-vs-match trade-off depends on it, not correctness.
-const LIT_PRICE: u32 = 9;
+/// Fixed-point fractional-bit scale. Prices are carried as `bits << PRICE_SHIFT`
+/// so the DP can weigh sub-bit differences (an FSE code can cost a fractional
+/// number of bits). 8 fractional bits is ample precision and keeps every block
+/// price well inside `u32` (128 KiB × ~16 bits × 256 ≈ 2^31).
+const PRICE_SHIFT: u32 = 8;
+const PRICE_ONE: u32 = 1 << PRICE_SHIFT;
 
-/// Estimated bit cost of the offset part of a match: the FSE offset code plus
-/// its extra bits, with a distance matching one of the active repeat offsets
-/// priced near-free (repeats emit a tiny FSE code and NO offset extra bits).
-fn offset_price(distance: u32, reps: &[u32; 3], ll: u32) -> u32 {
-    let is_rep = if ll > 0 {
-        distance == reps[0] || distance == reps[1] || distance == reps[2]
-    } else {
-        distance == reps[1] || distance == reps[2] || (reps[0] > 1 && distance == reps[0] - 1)
-    };
-    if is_rep {
-        return 4;
+/// `round(log2(x) * 256)` for `x ≥ 1`, via the integer part plus a mantissa
+/// interpolation. Converts FSE normalized counts into per-code bit prices
+/// without floating point (the crate is `no_std`).
+fn log2_fp(x: u32) -> u32 {
+    if x <= 1 {
+        return 0;
     }
-    // Fresh offset: `code` extra bits (the literal low bits of the distance)
-    // plus the FSE-coded offset code itself (~5 bits amortised). The FSE code
-    // adapts to the block, so it is NOT another `log2(D)` — charging that would
-    // double-count and push the DP away from good long-distance matches.
-    let val = distance + 3;
-    let code = 31 - val.leading_zeros();
-    code + 5
+    let i = 31 - x.leading_zeros(); // floor(log2(x))
+    // Fractional part: the top PRICE_SHIFT mantissa bits below the leading 1.
+    let frac = if i >= PRICE_SHIFT {
+        (x >> (i - PRICE_SHIFT)) & (PRICE_ONE - 1)
+    } else {
+        (x << (PRICE_SHIFT - i)) & (PRICE_ONE - 1)
+    };
+    // Linear approximation log2(1 + f) ≈ f over the mantissa (max error
+    // < 0.09 bit) — plenty accurate for pricing decisions.
+    i * PRICE_ONE + frac
 }
 
-/// Estimated bit cost of the literal-length / match-length FSE codes plus
-/// their extra bits for a sequence with the given run/length.
-fn ll_ml_price(literal_length: u32, match_length: u32) -> u32 {
-    let (_lc, lb, _lv) = ll_code(literal_length);
-    let (_mc, mb, _mv) = ml_code(match_length);
-    10 + lb + mb
+/// Per-code fractional-bit price model for one FSE-coded symbol stream.
+///
+/// Derived from the *actual* normalized counts the encoder will emit (after a
+/// first parse), so the DP prices each LL/ML/OF code at its real FSE cost
+/// instead of a flat constant. The cost of a symbol whose normalized count is
+/// `c` under accuracy log `al` is `al - log2(c)` bits (a state covering more of
+/// the table reads fewer bits) — the standard FSE entropy estimate zstd's
+/// optimal parser uses.
+struct CodePrices {
+    /// `bits << PRICE_SHIFT` per code index. Empty → always use `fallback`.
+    cost: Vec<u32>,
+    /// Price for a code absent from `cost` (or with count 0).
+    fallback: u32,
+}
+
+impl CodePrices {
+    /// Build from a normalized FSE count table (`counts[c]` may be -1 for the
+    /// "less than one" probability rows, which read `accuracy_log` bits).
+    fn from_counts(counts: &[i16], accuracy_log: u8) -> Self {
+        let al_fp = (accuracy_log as u32) * PRICE_ONE;
+        let mut cost = Vec::with_capacity(counts.len());
+        for &c in counts {
+            let bits = if c <= 0 {
+                // count -1 (and the degenerate 0) → one state, reads `al` bits.
+                al_fp
+            } else {
+                al_fp.saturating_sub(log2_fp(c as u32))
+            };
+            cost.push(bits);
+        }
+        Self {
+            cost,
+            fallback: al_fp,
+        }
+    }
+
+    #[inline]
+    fn code_cost(&self, code: u8) -> u32 {
+        self.cost
+            .get(code as usize)
+            .copied()
+            .unwrap_or(self.fallback)
+    }
+}
+
+/// Full fractional-bit price model used by the optimal parser.
+struct PriceModel {
+    ll: CodePrices,
+    ml: CodePrices,
+    of: CodePrices,
+    /// Average literal-byte cost (`bits << PRICE_SHIFT`) under the block's
+    /// Huffman tree. A single average is enough for the literal-vs-match
+    /// trade-off; per-byte pricing barely moves the parse.
+    lit: u32,
+}
+
+impl PriceModel {
+    /// Heuristic model for the first pass (no statistics yet). Mirrors the
+    /// original flat constants so pass 1 behaves like the previous encoder.
+    fn heuristic() -> Self {
+        Self {
+            ll: CodePrices {
+                cost: Vec::new(),
+                fallback: 6 * PRICE_ONE,
+            },
+            ml: CodePrices {
+                cost: Vec::new(),
+                fallback: 6 * PRICE_ONE,
+            },
+            of: CodePrices {
+                cost: Vec::new(),
+                fallback: 5 * PRICE_ONE,
+            },
+            lit: 9 * PRICE_ONE,
+        }
+    }
+
+    /// Price the offset part of a match: FSE code cost + extra bits. A distance
+    /// hitting one of the active repeat offsets uses code 0..=2 (cheap, no extra
+    /// bits); a fresh offset uses code `log2(distance+3)` with that many extras.
+    #[inline]
+    fn offset_price(&self, distance: u32, reps: &[u32; 3], ll: u32) -> u32 {
+        if let Some(code) = rep_match_code(distance, reps, ll) {
+            return self.of.code_cost(code);
+        }
+        let val = distance + 3;
+        let code = 31 - val.leading_zeros();
+        self.of.code_cost(code as u8) + code * PRICE_ONE
+    }
+
+    /// Price the literal-length + match-length FSE codes plus their extra bits.
+    #[inline]
+    fn ll_ml_price(&self, literal_length: u32, match_length: u32) -> u32 {
+        let (lc, lb, _) = ll_code(literal_length);
+        let (mc, mb, _) = ml_code(match_length);
+        self.ll.code_cost(lc) + self.ml.code_cost(mc) + (lb + mb) * PRICE_ONE
+    }
+
+    #[inline]
+    fn lit_run_price(&self, run: u32) -> u32 {
+        self.lit.saturating_mul(run)
+    }
+}
+
+/// If `distance` matches an active repeat offset, return the FSE *offset code*
+/// it encodes to (0, 1, or 2 → offset_value 1, 2, 3). Mirrors the aliasing
+/// rules in [`assign_offset`]: the `literal_length == 0` case shifts the codes.
+#[inline]
+fn rep_match_code(distance: u32, reps: &[u32; 3], ll: u32) -> Option<u8> {
+    if ll > 0 {
+        if distance == reps[0] {
+            Some(0)
+        } else if distance == reps[1] {
+            Some(1)
+        } else if distance == reps[2] {
+            Some(2)
+        } else {
+            None
+        }
+    } else if distance == reps[1] {
+        Some(0)
+    } else if distance == reps[2] {
+        Some(1)
+    } else if reps[0] > 1 && distance == reps[0] - 1 {
+        Some(2)
+    } else {
+        None
+    }
 }
 
 /// Update the repeat-offset ring after a match (mirrors `assign_offset`'s
@@ -733,31 +899,58 @@ fn advance_reps(distance: u32, literal_length: u32, reps: &[u32; 3]) -> [u32; 3]
 /// greedy/lazy parsing comes from (their offset extra bits dominate output).
 ///
 /// Returns the chosen sequences (in order) and the final repeat-offset ring.
+///
+/// Invariant block-level inputs (where the block starts, the incoming repeat
+/// ring, and the match-finder knobs) are grouped in [`ParseConfig`] so the same
+/// settings flow through every repricing pass without a long argument list.
+struct ParseConfig {
+    /// First byte of the block within `buffer`; earlier bytes are retained
+    /// history that matches may reference but the block does not re-emit.
+    start: usize,
+    /// Repeat-offset ring entering the block (carried across blocks).
+    init_offsets: [u32; 3],
+    /// Hash-chain depth cap and "good enough" match length for the finder.
+    max_chain: usize,
+    nice_match: usize,
+}
+
 fn optimal_parse(
     matcher: &mut MatchFinder,
     buffer: &[u8],
-    init_offsets: [u32; 3],
-    max_chain: usize,
-    nice_match: usize,
+    cfg: &ParseConfig,
+    model: &PriceModel,
+    block_indexed: bool,
 ) -> (Vec<Seq>, [u32; 3]) {
+    let ParseConfig {
+        start,
+        init_offsets,
+        max_chain,
+        nice_match,
+    } = *cfg;
     let n = buffer.len();
-    if n < MIN_MATCH + 1 {
+    if n < start + MIN_MATCH + 1 {
         return (Vec::new(), init_offsets);
     }
 
-    // Insert every hashable position up front so chain walks see the whole
-    // block (back-references only look earlier, so insertion order within the
-    // block doesn't affect correctness).
-    matcher.resize_for(n);
-    for i in 0..n.saturating_sub(3) {
-        matcher.insert(buffer, i);
-    }
+    // The caller has already indexed the retained history (`[0, start)`). On the
+    // first parse pass we splice in this block's positions lazily as the DP
+    // advances, so the chains never contain positions ahead of the probe (the
+    // standard LZ invariant). Repricing passes reuse the now-complete index.
+    let hash_end = n.saturating_sub(3);
+    let mut next_insert = start;
 
+    // DP arrays are block-relative: index `j` maps to absolute position
+    // `start + j`, so memory stays proportional to the block (not the window).
+    let m = n - start;
     const INF: u32 = u32::MAX;
-    let mut price: Vec<u32> = vec![INF; n + 1];
-    // Back-pointer: (prev_pos, match_len, match_dist). match_len == 0 → literal.
-    let mut back: Vec<(u32, u32, u32)> = vec![(0, 0, 0); n + 1];
-    let mut reps_at: Vec<[u32; 3]> = vec![init_offsets; n + 1];
+    let mut price: Vec<u32> = vec![INF; m + 1];
+    // Back-pointer: (prev_abs_pos, match_len, match_dist). match_len == 0 → literal.
+    let mut back: Vec<(u32, u32, u32)> = vec![(0, 0, 0); m + 1];
+    let mut reps_at: Vec<[u32; 3]> = vec![init_offsets; m + 1];
+    // Length of the literal run ending at each node on its cheapest path. Used
+    // to (a) price the literal-length FSE code at the following match and (b)
+    // resolve repeat-offset aliasing (the LL==0 case shifts the rep codes).
+    let mut runlen_at: Vec<u32> = vec![0; m + 1];
     price[0] = 0;
 
     // Step length sparsely for long matches to bound DP work. Dense up to 128
@@ -774,46 +967,68 @@ fn optimal_parse(
 
     let mut cands: Vec<crate::zstd::matcher::Match> = Vec::new();
 
-    for i in 0..n {
-        let base = price[i];
+    for j in 0..m {
+        let i = start + j; // absolute input position
+
+        // Splice this position into the hash chain before it is probed (first
+        // pass only). Done unconditionally — even for unreachable nodes — so the
+        // chain stays complete and ordered; the match finder only ever looks at
+        // positions strictly before the probe.
+        if !block_indexed {
+            while next_insert <= i {
+                if next_insert < hash_end {
+                    matcher.insert(buffer, next_insert);
+                }
+                next_insert += 1;
+            }
+        }
+
+        let base = price[j];
         if base == INF {
             continue;
         }
-        let cur_reps = reps_at[i];
+        let cur_reps = reps_at[j];
 
-        // Option A: emit a literal.
-        let lit_cand = base.saturating_add(LIT_PRICE);
-        if lit_cand < price[i + 1] {
-            price[i + 1] = lit_cand;
-            back[i + 1] = (i as u32, 0, 0);
-            reps_at[i + 1] = cur_reps;
+        // Option A: emit a literal. Carries the running literal-run length so
+        // the next match can price its literal-length FSE code correctly.
+        let lit_cand = base.saturating_add(model.lit_run_price(1));
+        if lit_cand < price[j + 1] {
+            price[j + 1] = lit_cand;
+            back[j + 1] = (i as u32, 0, 0);
+            reps_at[j + 1] = cur_reps;
+            runlen_at[j + 1] = runlen_at[j] + 1;
         }
 
         if i + MIN_MATCH > n {
             continue;
         }
-        // Proxy literal-length for offset rep-aliasing: the common case is a
-        // sequence following some literals (LL>0, reps map to codes 1..=3).
-        let ll_proxy = 1u32;
+        // Actual literal-run length on the cheapest path to `i`. Drives both the
+        // repeat-offset aliasing (LL==0 shifts the rep codes) and the LL FSE
+        // code charged on the emitted sequence.
+        let ll = runlen_at[j];
+        // ML code + ML extra bits + LL code + LL extra bits for this sequence.
+        // The literal *bytes* are already priced step-by-step above, so only the
+        // length codes are charged here.
+        let ll_ml = |l: u32| model.ll_ml_price(ll, l);
 
         // Option B1: repeat-offset matches at the three active distances.
         for &d in &cur_reps {
             if d == 0 || (d as usize) > i {
                 continue;
             }
-            let m = matcher.check_repeat_offset(buffer, i, d as usize);
-            if m >= MIN_MATCH {
-                let max_l = m.min(n - i);
-                let off = offset_price(d, &cur_reps, ll_proxy);
+            let mm = matcher.check_repeat_offset(buffer, i, d as usize);
+            if mm >= MIN_MATCH {
+                let max_l = mm.min(n - i);
+                let off = model.offset_price(d, &cur_reps, ll);
+                let next_reps = advance_reps(d, ll, &cur_reps);
                 let mut l = MIN_MATCH;
                 while l <= max_l {
-                    let cost = base
-                        .saturating_add(off)
-                        .saturating_add(ll_ml_price(0, l as u32));
-                    if cost < price[i + l] {
-                        price[i + l] = cost;
-                        back[i + l] = (i as u32, l as u32, d);
-                        reps_at[i + l] = advance_reps(d, ll_proxy, &cur_reps);
+                    let cost = base.saturating_add(off).saturating_add(ll_ml(l as u32));
+                    if cost < price[j + l] {
+                        price[j + l] = cost;
+                        back[j + l] = (i as u32, l as u32, d);
+                        reps_at[j + l] = next_reps;
+                        runlen_at[j + l] = 0;
                     }
                     if l == max_l {
                         break;
@@ -827,17 +1042,22 @@ fn optimal_parse(
         matcher.collect_matches(buffer, i, n, max_chain, nice_match, &mut cands);
         for c in &cands {
             let d = c.distance as u32;
+            // Skip candidates that coincide with a repeat offset — already
+            // priced (more cheaply) in B1.
+            if rep_match_code(d, &cur_reps, ll).is_some() {
+                continue;
+            }
             let max_l = c.length.min(n - i);
-            let off = offset_price(d, &cur_reps, ll_proxy);
+            let off = model.offset_price(d, &cur_reps, ll);
+            let next_reps = advance_reps(d, ll, &cur_reps);
             let mut l = MIN_MATCH;
             while l <= max_l {
-                let cost = base
-                    .saturating_add(off)
-                    .saturating_add(ll_ml_price(0, l as u32));
-                if cost < price[i + l] {
-                    price[i + l] = cost;
-                    back[i + l] = (i as u32, l as u32, d);
-                    reps_at[i + l] = advance_reps(d, ll_proxy, &cur_reps);
+                let cost = base.saturating_add(off).saturating_add(ll_ml(l as u32));
+                if cost < price[j + l] {
+                    price[j + l] = cost;
+                    back[j + l] = (i as u32, l as u32, d);
+                    reps_at[j + l] = next_reps;
+                    runlen_at[j + l] = 0;
                 }
                 if l == max_l {
                     break;
@@ -849,11 +1069,11 @@ fn optimal_parse(
 
     // Backtrack to recover the chosen steps, then emit sequences forward.
     let mut steps: Vec<(u32, u32)> = Vec::new(); // (match_len, match_dist); 0 = literal
-    let mut i = n;
-    while i > 0 {
-        let (prev, mlen, mdist) = back[i];
+    let mut j = m;
+    while j > 0 {
+        let (prev_abs, mlen, mdist) = back[j];
         steps.push((mlen, mdist));
-        i = prev as usize;
+        j = (prev_abs as usize) - start;
     }
     steps.reverse();
 
@@ -877,6 +1097,180 @@ fn optimal_parse(
     let _ = pending_literals;
 
     (sequences, block_offsets)
+}
+
+/// Lowest level at which the optimal parser runs a second, statistics-driven
+/// repricing pass over the block. The first pass uses a flat heuristic model;
+/// the second rebuilds the price model from the actual LL/ML/OF code and
+/// literal-byte statistics and reparses, so prices reflect the entropy coding
+/// the block will actually use. Mirrors zstd's `btultra2` two-pass parse.
+const REPRICE_LEVEL: u8 = 15;
+
+/// Build a statistics-driven [`PriceModel`] from a completed parse's sequences
+/// and the block's literal bytes. The FSE code prices come from the same
+/// normalized-count tables [`build_sequences_section`] / [`pick_table`] would
+/// pick; the literal price is the Huffman entropy of the literal bytes.
+fn build_price_model(buffer: &[u8], start: usize, sequences: &[Seq]) -> PriceModel {
+    // Histogram the LL/ML/OF codes exactly as the sequence section will.
+    let mut ll_hist = [0u32; 36];
+    let mut ml_hist = [0u32; 53];
+    let mut of_hist = [0u32; 32];
+    for s in sequences {
+        let (lc, _, _) = ll_code(s.literal_length);
+        let (mc, _, _) = ml_code(s.match_length);
+        let (oc, _, _) = of_code(s.offset_value);
+        ll_hist[lc as usize] += 1;
+        ml_hist[mc as usize] += 1;
+        of_hist[(oc as usize).min(31)] += 1;
+    }
+    let n = sequences.len() as u32;
+
+    let ll = code_prices_for(&ll_hist, &DEFAULT_LL_COUNTS, DEFAULT_LL_ACCURACY_LOG, 9, n);
+    let of = code_prices_for(&of_hist, &DEFAULT_OF_COUNTS, DEFAULT_OF_ACCURACY_LOG, 8, n);
+    let ml = code_prices_for(&ml_hist, &DEFAULT_ML_COUNTS, DEFAULT_ML_ACCURACY_LOG, 9, n);
+
+    // Literal-byte price: average Huffman code length over the actual literal
+    // bytes of this block (the `[start, end)` tail). Reconstruct the literal
+    // stream from the sequences, build the same tree the literals section would,
+    // and average its code lengths.
+    let all_literals = reconstruct_literals(buffer, start, sequences);
+    let lit = literal_price(&all_literals);
+
+    PriceModel { ll, ml, of, lit }
+}
+
+/// Replay `sequences` over `buffer[start..]` to recover the block's literal
+/// bytes (the bytes not covered by any match). Shared by the price model and
+/// the cost predictor so they always agree with [`finish_compressed_block`].
+fn reconstruct_literals(buffer: &[u8], start: usize, sequences: &[Seq]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(buffer.len() - start);
+    let mut cursor = start;
+    for s in sequences {
+        let ll = s.literal_length as usize;
+        out.extend_from_slice(&buffer[cursor..cursor + ll]);
+        cursor += ll + s.match_length as usize;
+    }
+    out.extend_from_slice(&buffer[cursor..]);
+    out
+}
+
+/// Pick the normalized FSE counts the encoder would actually emit for a code
+/// stream (custom if it beats predefined, else predefined) and turn them into a
+/// [`CodePrices`]. `al_cap` bounds the custom accuracy log; `n` is the sequence
+/// count (used to size the custom table the way [`pick_table`] does).
+fn code_prices_for(
+    hist: &[u32],
+    default_counts: &[i16],
+    default_al: u8,
+    al_cap: u8,
+    n: u32,
+) -> CodePrices {
+    if n == 0 {
+        return CodePrices::from_counts(default_counts, default_al);
+    }
+    // Mirror pick_table's accuracy-log selection for the custom table.
+    let mut al = al_cap;
+    while al > 5 && (1u32 << al) > n * 4 {
+        al -= 1;
+    }
+    if al < 5 {
+        al = 5;
+    }
+    if let Some(counts) = build_normalised_counts(hist, n, al) {
+        // Compare predicted bitstream cost the way pick_table does; only use the
+        // custom table's prices when it is the one that would be emitted.
+        let pred_custom = predict_fse_bits(&counts, hist, al);
+        let pred_default = predict_fse_bits(default_counts, hist, default_al);
+        let header = encode_fse_table_header(&counts, al);
+        let custom_bytes = (pred_custom / 8 + 1) as usize + header.len();
+        let default_bytes = (pred_default / 8 + 1) as usize;
+        if custom_bytes + 2 < default_bytes {
+            return CodePrices::from_counts(&counts, al);
+        }
+    }
+    CodePrices::from_counts(default_counts, default_al)
+}
+
+/// Average Huffman code length (as `bits << PRICE_SHIFT`) over `literals`,
+/// using the same canonical tree the literals section builds. Falls back to a
+/// flat 8 bits when the alphabet can't be Huffman-coded (tiny/degenerate input).
+fn literal_price(literals: &[u8]) -> u32 {
+    if literals.is_empty() {
+        return 8 * PRICE_ONE;
+    }
+    let freq = histogram(literals);
+    if let Some(lengths) = build_huff_lengths(&freq) {
+        let mut total_bits: u64 = 0;
+        let mut total_syms: u64 = 0;
+        for (b, &f) in freq.iter().enumerate() {
+            if f == 0 {
+                continue;
+            }
+            let len = lengths[b] as u64;
+            total_bits += (f as u64) * len.max(1);
+            total_syms += f as u64;
+        }
+        // Average bits/symbol in fixed point. Clamp to ≥1 bit so the DP never
+        // treats literals as free.
+        if let Some(avg) = (total_bits * PRICE_ONE as u64).checked_div(total_syms) {
+            return (avg as u32).max(PRICE_ONE);
+        }
+    }
+    8 * PRICE_ONE
+}
+
+/// Drive the optimal parser: a first heuristic-priced pass, then (at high
+/// levels) one or more statistics-driven repricing passes. Each repricing pass
+/// rebuilds the price model from the previous pass's sequences and reparses;
+/// the best (smallest predicted body) result wins. Returns the chosen sequences
+/// and final repeat-offset ring.
+fn optimal_parse_2pass(
+    matcher: &mut MatchFinder,
+    buffer: &[u8],
+    cfg: &ParseConfig,
+    reprice_passes: u32,
+) -> (Vec<Seq>, [u32; 3]) {
+    let start = cfg.start;
+    // Pass 1: flat heuristic prices. Splices the current block into the chains
+    // lazily (history was pre-indexed by the caller); later passes reuse them.
+    let mut model = PriceModel::heuristic();
+    let (mut best_seqs, mut best_offsets) = optimal_parse(matcher, buffer, cfg, &model, false);
+    if best_seqs.is_empty() {
+        return (best_seqs, best_offsets);
+    }
+    let mut best_cost = predicted_block_cost(buffer, start, &best_seqs);
+
+    // Repricing passes: rebuild the model from the current best parse and
+    // reparse. Keep iterating while it strictly improves the predicted cost.
+    for _ in 0..reprice_passes {
+        model = build_price_model(buffer, start, &best_seqs);
+        let (seqs, offsets) = optimal_parse(
+            matcher, buffer, cfg, &model, true, // chains already populated by pass 1
+        );
+        if seqs.is_empty() {
+            break;
+        }
+        let cost = predicted_block_cost(buffer, start, &seqs);
+        if cost < best_cost {
+            best_cost = cost;
+            best_seqs = seqs;
+            best_offsets = offsets;
+        } else {
+            break; // no further improvement
+        }
+    }
+
+    (best_seqs, best_offsets)
+}
+
+/// Predict the total compressed body size (in bytes) for a parse, used to pick
+/// the better of two repricing passes. Sums the literals section and sequences
+/// section the encoder would actually emit. Cheap relative to the parse itself.
+fn predicted_block_cost(buffer: &[u8], start: usize, sequences: &[Seq]) -> usize {
+    let all_literals = reconstruct_literals(buffer, start, sequences);
+    let (lit_section, _) = build_literals_section(&all_literals, None);
+    let seq_section = build_sequences_section(sequences);
+    lit_section.len() + seq_section.len()
 }
 
 /// Find the best (distance, length) match at `pos`, mixing repeat-offset
@@ -1518,6 +1912,7 @@ impl RawEncoder for Encoder {
 
     fn raw_reset(&mut self) {
         self.state = State::Accepting;
+        self.history.clear();
         self.pending.clear();
         self.out_buf.clear();
         self.out_idx = 0;
