@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- *(cli)* `compcol -d` no longer truncates highly-compressible large inputs.
+  The streaming decode loop stopped once the compressed input was consumed,
+  leaving output a block-buffering decoder (notably bzip2) still held
+  internally — `finish` does not flush it, so `compcol -t bzip2 -d` cut output
+  at 64 KiB. A drain loop now pulls the decoder's buffered output before
+  finishing. (Library decoders were already correct; this was CLI-only.)
+
 ### Added
 
 - *(brotli enc)* iterative, statistics-driven optimal LZ77 parse
