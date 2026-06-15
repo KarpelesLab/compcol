@@ -418,6 +418,75 @@ fn linked_blocks_back_reference_across_boundary() {
     round_trip_with(cfg, &v);
 }
 
+/// Linked blocks must compress strictly better than independent blocks when
+/// the payload's second block repeats data from the first block's tail —
+/// because only linked mode can back-reference across the boundary.
+#[test]
+fn linked_beats_independent_across_boundary() {
+    // First 64 KiB: pseudo-random (so it is not itself very compressible).
+    // Second block: a verbatim copy of the first block's last stretch, which
+    // only a cross-block reference can exploit.
+    let mut first = Vec::with_capacity(64 * 1024);
+    let mut state: u32 = 0x1357_9BDF;
+    for _ in 0..(64 * 1024) {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        first.push((state >> 16) as u8);
+    }
+    let mut payload = first.clone();
+    // Second block reuses the tail of the first block verbatim.
+    payload.extend_from_slice(&first[16 * 1024..]);
+
+    let linked = EncoderConfig {
+        block_max_size: BlockMaxSize::Max64KB,
+        block_independence: false,
+        level: 9,
+        ..Default::default()
+    };
+    let independent = EncoderConfig {
+        block_independence: true,
+        ..linked
+    };
+
+    let enc_linked = encode_with_cfg_chunked(linked, &payload, 8192, 8192);
+    let enc_indep = encode_with_cfg_chunked(independent, &payload, 8192, 8192);
+
+    // Both must round-trip.
+    round_trip_with(linked, &payload);
+    round_trip_with(independent, &payload);
+
+    assert!(
+        enc_linked.len() < enc_indep.len(),
+        "linked {} should be smaller than independent {}",
+        enc_linked.len(),
+        enc_indep.len()
+    );
+}
+
+/// Our linked-block (default) encoder output must decode byte-for-byte through
+/// the system `lz4` tool across multiple blocks — the core cross-block
+/// reference path.
+#[test]
+fn cross_tool_linked_multiblock_our_encode_system_decode() {
+    if !system_lz4_available() {
+        eprintln!("skipping cross-tool test: `lz4` not on PATH");
+        return;
+    }
+    // ~200 KiB so it spans several 64 KiB blocks, with long-range repetition
+    // that the linked window exploits across boundaries.
+    let unit = b"the quick brown fox jumps over the lazy dog. ".repeat(64);
+    let mut payload = Vec::new();
+    while payload.len() < 200 * 1024 {
+        payload.extend_from_slice(&unit);
+    }
+    let cfg = EncoderConfig {
+        level: 9,
+        ..Default::default()
+    };
+    let encoded = encode_with_cfg_chunked(cfg, &payload, 4096, 4096);
+    let decoded = system_decompress(&encoded).expect("system lz4 -dc failed");
+    assert_eq!(decoded, payload);
+}
+
 // ─── Cross-tool: system `lz4 -dc` ────────────────────────────────────────
 
 fn system_lz4_available() -> bool {
