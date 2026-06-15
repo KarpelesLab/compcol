@@ -127,14 +127,13 @@ impl Model {
     }
 }
 
-#[inline]
-fn adapt(prob: &mut u16, bit: u32) {
-    if bit == 0 {
-        *prob += ((1u16 << PROB_BITS) - *prob) >> MOVE_BITS;
-    } else {
-        *prob -= *prob >> MOVE_BITS;
-    }
-}
+// The probability counter update (`adapt`) is inlined directly into the
+// `encode_bytes` / `decode_bytes` hot loops:
+//
+// * bit 0: `prob += (2048 - prob) >> MOVE_BITS`
+// * bit 1: `prob -= prob >> MOVE_BITS`
+//
+// Both directions run the identical update so the models stay in lock-step.
 
 // ─── encoder ──────────────────────────────────────────────────────────────
 
@@ -180,16 +179,11 @@ impl Encoder {
         // Take the input out so we can borrow `self.out` mutably while
         // reading the bytes; swap a placeholder in to avoid cloning.
         let input = core::mem::take(&mut self.input);
-        for &byte in &input {
-            // Bit-tree walk, MSB first.
-            let mut node = 1usize;
-            for i in (0..8).rev() {
-                let bit = ((byte >> i) & 1) as u32;
-                let prob = &mut model.probs[node];
-                rc.encode_bit(&mut self.out, prob, bit);
-                node = (node << 1) | (bit as usize);
-            }
-        }
+        // A range-coded payload is never larger than the input by more than a
+        // few flush bytes; reserve up front so the per-byte `push`es in the
+        // renormalization loop don't re-check capacity / reallocate.
+        self.out.reserve(input.len() + 16);
+        rc.encode_bytes(&mut self.out, &mut model.probs, &input);
         rc.flush(&mut self.out);
         self.input = input;
     }
@@ -263,30 +257,54 @@ impl RangeEncoder {
         }
     }
 
+    /// Encode every byte of `input` as an 8-bit bit-tree walk against the
+    /// shared `probs` model. Hoists `range`/`low` into locals so they live in
+    /// registers across the inner loop and indexes `probs` with `node & 0xFF`
+    /// (the walk only reads nodes `1..=255`, so the mask is a no-op that lets
+    /// the compiler drop the bounds check on the fixed 256-entry array).
     #[inline]
-    fn encode_bit(&mut self, out: &mut Vec<u8>, prob: &mut u16, bit: u32) {
-        // bound = (range >> 11) * prob  — the size of the "bit 0" subrange.
-        let bound = (self.range >> PROB_BITS) * (*prob as u32);
-        if bit == 0 {
-            self.range = bound;
-        } else {
-            self.low += bound as u64;
-            self.range -= bound;
+    fn encode_bytes(&mut self, out: &mut Vec<u8>, probs: &mut [u16; TREE_NODES], input: &[u8]) {
+        let mut range = self.range;
+        let mut low = self.low;
+        for &byte in input {
+            let mut node = 1usize;
+            // MSB-first: unrolled over the 8 bits of `byte`.
+            let mut b = byte;
+            for _ in 0..8 {
+                let bit = (b >> 7) as u32; // top bit
+                b <<= 1;
+                let slot = node & (TREE_NODES - 1);
+                let p = probs[slot];
+                let bound = (range >> PROB_BITS) * (p as u32);
+                if bit == 0 {
+                    range = bound;
+                    probs[slot] = p + (((1u16 << PROB_BITS) - p) >> MOVE_BITS);
+                } else {
+                    low += bound as u64;
+                    range -= bound;
+                    probs[slot] = p - (p >> MOVE_BITS);
+                }
+                node = (node << 1) | (bit as usize);
+                while range < TOP {
+                    range <<= 8;
+                    self.shift_low(out, &mut low);
+                }
+            }
         }
-        adapt(prob, bit);
-        while self.range < TOP {
-            self.range <<= 8;
-            self.shift_low(out);
-        }
+        self.range = range;
+        self.low = low;
     }
 
+    /// Renormalize one byte out of the `low` accumulator. `low` is passed by
+    /// reference so the encode loop can keep it in a register rather than
+    /// bouncing through `self` on every renormalization.
     #[inline]
-    fn shift_low(&mut self, out: &mut Vec<u8>) {
+    fn shift_low(&mut self, out: &mut Vec<u8>, low: &mut u64) {
         // If the top byte of low is not 0xFF (or a carry is pending),
         // flush the cached byte plus any staged 0xFF run, adjusted by the
         // carry bit (low >> 32).
-        if self.low < 0xFF00_0000 || self.low > 0xFFFF_FFFF {
-            let carry = (self.low >> 32) as u8;
+        if *low < 0xFF00_0000 || *low > 0xFFFF_FFFF {
+            let carry = (*low >> 32) as u8;
             let mut temp = self.cache;
             loop {
                 out.push(temp.wrapping_add(carry));
@@ -296,18 +314,20 @@ impl RangeEncoder {
                     break;
                 }
             }
-            self.cache = (self.low >> 24) as u8;
+            self.cache = (*low >> 24) as u8;
         }
         self.cache_size += 1;
-        self.low = (self.low << 8) & 0xFFFF_FFFF;
+        *low = (*low << 8) & 0xFFFF_FFFF;
     }
 
     fn flush(&mut self, out: &mut Vec<u8>) {
         // Drain the 32-bit low accumulator: 5 shift_low calls move every
         // byte (plus the cache) out to the stream.
+        let mut low = self.low;
         for _ in 0..5 {
-            self.shift_low(out);
+            self.shift_low(out, &mut low);
         }
+        self.low = low;
     }
 }
 
@@ -376,17 +396,7 @@ impl Decoder {
         let result = (|| {
             let mut rc = RangeDecoder::new(&payload[8..])?;
             let mut model = Model::new();
-            for _ in 0..out_len {
-                let mut node = 1usize;
-                for _ in 0..8 {
-                    let prob = &mut model.probs[node];
-                    let bit = rc.decode_bit(prob)?;
-                    node = (node << 1) | (bit as usize);
-                }
-                // node now holds 256 + byte.
-                self.out.push((node & 0xFF) as u8);
-            }
-            Ok(())
+            rc.decode_bytes(&mut model.probs, out_len, &mut self.out)
         })();
         self.input = payload;
         result
@@ -495,27 +505,68 @@ impl<'a> RangeDecoder<'a> {
         }
     }
 
-    #[inline]
-    fn decode_bit(&mut self, prob: &mut u16) -> Result<u32, Error> {
-        let bound = (self.range >> PROB_BITS) * (*prob as u32);
-        let bit;
-        if self.code < bound {
-            self.range = bound;
-            bit = 0;
-        } else {
-            self.code -= bound;
-            self.range -= bound;
-            bit = 1;
+    /// Decode `out_len` bytes into `out`, each an 8-bit bit-tree walk against
+    /// `probs`. Mirrors [`RangeEncoder::encode_bytes`]: hoists `range`/`code`
+    /// /`pos` into locals so they stay in registers across the inner loop, and
+    /// indexes `probs` with `node & 0xFF` (the walk only reads nodes
+    /// `1..=255`, a no-op mask that elides the bounds check). The over-read
+    /// flag is consulted once per byte — a complete stream never sets it, and
+    /// a truncated one is reported as soon as the first short byte is decoded.
+    fn decode_bytes(
+        &mut self,
+        probs: &mut [u16; TREE_NODES],
+        out_len: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Error> {
+        let mut range = self.range;
+        let mut code = self.code;
+        let mut pos = self.pos;
+        let payload = self.payload;
+        out.reserve(out_len);
+        for _ in 0..out_len {
+            let mut node = 1usize;
+            for _ in 0..8 {
+                let slot = node & (TREE_NODES - 1);
+                let p = probs[slot];
+                let bound = (range >> PROB_BITS) * (p as u32);
+                let bit;
+                if code < bound {
+                    range = bound;
+                    probs[slot] = p + (((1u16 << PROB_BITS) - p) >> MOVE_BITS);
+                    bit = 0usize;
+                } else {
+                    code -= bound;
+                    range -= bound;
+                    probs[slot] = p - (p >> MOVE_BITS);
+                    bit = 1usize;
+                }
+                node = (node << 1) | bit;
+                while range < TOP {
+                    range <<= 8;
+                    // Inline of next_byte with the hoisted `pos`.
+                    let b = match payload.get(pos) {
+                        Some(&b) => b,
+                        None => {
+                            self.overran = true;
+                            0
+                        }
+                    };
+                    pos += 1;
+                    code = (code << 8) | b as u32;
+                }
+            }
+            if self.overran {
+                self.range = range;
+                self.code = code;
+                self.pos = pos;
+                return Err(Error::UnexpectedEnd);
+            }
+            out.push((node & 0xFF) as u8);
         }
-        adapt(prob, bit);
-        while self.range < TOP {
-            self.range <<= 8;
-            self.code = (self.code << 8) | self.next_byte() as u32;
-        }
-        if self.overran {
-            return Err(Error::UnexpectedEnd);
-        }
-        Ok(bit)
+        self.range = range;
+        self.code = code;
+        self.pos = pos;
+        Ok(())
     }
 }
 
