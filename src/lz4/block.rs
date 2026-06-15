@@ -230,15 +230,46 @@ pub fn encode_block(input: &[u8], out: &mut Vec<u8>) {
 /// The emitted bitstream is byte-for-byte a valid LZ4 block in every case —
 /// only the parse changes, so the reference `lz4` decoder reads it unchanged.
 pub fn encode_block_level(input: &[u8], out: &mut Vec<u8>, level: u8) {
-    if level < HC_LEVEL_THRESHOLD {
-        encode_block(input, out);
+    encode_block_level_dict(&[], input, out, level);
+}
+
+/// Encode `input` as a single LZ4 block, allowing back-references into a
+/// `dict` prefix (the tail of previously emitted output, up to 64 KiB).
+///
+/// This is the LZ4 frame **linked-block** match finder: matches in the
+/// current block may point back into `dict`, giving a sliding window that
+/// crosses block boundaries. The emitted bitstream is an ordinary LZ4 block —
+/// the offsets simply reach further back than the block's own length, which
+/// the reference decoder resolves against the previously decoded output.
+///
+/// `dict` should be at most [`MAX_DISTANCE`]` + 1` bytes (the caller carries a
+/// 64 KiB sliding window so this holds); any byte of `dict` further than
+/// [`MAX_DISTANCE`] from a match start is simply never referenced. Passing an
+/// empty `dict` reproduces [`encode_block_level`] exactly.
+///
+/// The end-of-block rules (last 5 bytes literal, last match starts ≥ 12 bytes
+/// before the block end) apply to the **current block** boundary only — the
+/// dict prefix never affects them.
+pub fn encode_block_level_dict(dict: &[u8], input: &[u8], out: &mut Vec<u8>, level: u8) {
+    if dict.is_empty() {
+        if level < HC_LEVEL_THRESHOLD {
+            encode_block(input, out);
+        } else if level < OPT_LEVEL_THRESHOLD {
+            encode_block_hc_dict(&[], input, out, level);
+        } else {
+            encode_block_optimal_dict(&[], input, out, level);
+        }
         return;
     }
+    // With a dictionary we always use a match finder that understands the
+    // prefix. The fast greedy path would ignore the dict, so low levels fall
+    // through to the HC finder (at its shallowest depth) to still cross block
+    // boundaries while staying cheap.
     if level < OPT_LEVEL_THRESHOLD {
-        encode_block_hc(input, out, level);
-        return;
+        encode_block_hc_dict(dict, input, out, level);
+    } else {
+        encode_block_optimal_dict(dict, input, out, level);
     }
-    encode_block_optimal(input, out, level);
 }
 
 /// Map a compression level to a hash-chain search depth (`nb_attempts`).
@@ -361,15 +392,39 @@ fn hc_resolve(
 /// candidate start it walks the chain up to `nb_attempts` links and keeps the
 /// longest match inside the 64 KiB window. A one-step lazy heuristic defers a
 /// match when the next position offers a strictly longer one.
-fn encode_block_hc(input: &[u8], out: &mut Vec<u8>, level: u8) {
+///
+/// `dict` is an optional prefix of previously emitted output that matches may
+/// reference (LZ4 linked-block mode). Internally `dict` and `input` are parsed
+/// over one combined buffer; only positions inside `input` may *start* a
+/// sequence, but their back-references may reach into the `dict` region.
+fn encode_block_hc_dict(dict: &[u8], input: &[u8], out: &mut Vec<u8>, level: u8) {
     out.clear();
     if input.is_empty() {
         return;
     }
+    // The current block is too small to host any match under the end-of-block
+    // rules; emit it as literals regardless of the dictionary.
     if input.len() < MFLIMIT + 1 {
         emit_last_literals(input, out);
         return;
     }
+
+    let dict_len = dict.len();
+    // Combined view: dict bytes occupy [0, dict_len), the current block occupies
+    // [dict_len, n). Matches can point anywhere behind a start position (subject
+    // to MAX_DISTANCE), so a match starting in the block can reach into dict.
+    // One contiguous allocation lets the existing finder address dict and block
+    // uniformly with plain offsets.
+    let buf: Vec<u8>;
+    let input: &[u8] = if dict_len == 0 {
+        input
+    } else {
+        let mut v = Vec::with_capacity(dict_len + input.len());
+        v.extend_from_slice(dict);
+        v.extend_from_slice(input);
+        buf = v;
+        &buf
+    };
 
     let n = input.len();
     let nb_attempts = nb_attempts_for_level(level);
@@ -377,6 +432,9 @@ fn encode_block_hc(input: &[u8], out: &mut Vec<u8>, level: u8) {
     let mut head = alloc::vec![HASH_EMPTY; HC_HASH_TABLE_SIZE];
     let mut chain = alloc::vec![HASH_EMPTY; n];
 
+    // End-of-block limits are measured against the combined length `n`; since
+    // the current block sits at the tail, this keeps the last 5 / 12 bytes of
+    // the *block* literal exactly as the single-block path does.
     let match_limit = n - MFLIMIT; // last position a match may start at
     let hash_limit = n - MIN_MATCH - LAST_LITERALS; // last hashable position
     let forward_limit = n - LAST_LITERALS; // last 5 bytes stay literal
@@ -386,8 +444,9 @@ fn encode_block_hc(input: &[u8], out: &mut Vec<u8>, level: u8) {
     // each position is inserted exactly once and the chain stays strictly
     // ordered newest-first.
     let mut inserted_through: usize = 0;
-    let mut anchor: usize = 0;
-    let mut ip: usize = 0;
+    // Sequences may only start inside the current block.
+    let mut anchor: usize = dict_len;
+    let mut ip: usize = dict_len;
 
     // Insert all hashable positions in [inserted_through, up_to).
     macro_rules! insert_up_to {
@@ -399,6 +458,9 @@ fn encode_block_hc(input: &[u8], out: &mut Vec<u8>, level: u8) {
             }
         }};
     }
+
+    // Seed the chain with every dict position so block matches can find them.
+    insert_up_to!(dict_len);
 
     while ip <= match_limit && ip <= hash_limit {
         // Ensure positions up to and including `ip` are in the chain.
@@ -528,7 +590,11 @@ struct OptStep {
 /// the hash-chain finder (sequence overhead + the literal run it terminates).
 /// Backtracking recovers the cheapest path, which is then emitted with the
 /// shared sequence emitter — so the bitstream stays a valid LZ4 block.
-fn encode_block_optimal(input: &[u8], out: &mut Vec<u8>, level: u8) {
+///
+/// `dict` is an optional prefix of previously emitted output that matches may
+/// reference (LZ4 linked-block mode). The DP only traverses positions inside
+/// the current block; matches found may point back into the `dict` region.
+fn encode_block_optimal_dict(dict: &[u8], input: &[u8], out: &mut Vec<u8>, level: u8) {
     out.clear();
     if input.is_empty() {
         return;
@@ -537,6 +603,20 @@ fn encode_block_optimal(input: &[u8], out: &mut Vec<u8>, level: u8) {
         emit_last_literals(input, out);
         return;
     }
+
+    let dict_len = dict.len();
+    // Combined buffer: dict at [0, dict_len), block at [dict_len, n). See
+    // `encode_block_hc_dict` for the rationale.
+    let buf: Vec<u8>;
+    let input: &[u8] = if dict_len == 0 {
+        input
+    } else {
+        let mut v = Vec::with_capacity(dict_len + input.len());
+        v.extend_from_slice(dict);
+        v.extend_from_slice(input);
+        buf = v;
+        &buf
+    };
 
     let n = input.len();
     let nb_attempts = nb_attempts_for_level(level);
@@ -562,7 +642,9 @@ fn encode_block_optimal(input: &[u8], out: &mut Vec<u8>, level: u8) {
         };
         n + 1
     ];
-    price[0] = 0;
+    // The DP origin is the start of the current block, not byte 0: the dict
+    // region is never traversed, only referenced.
+    price[dict_len] = 0;
 
     // Insert all positions up to `up_to` (exclusive) that are hashable.
     let mut inserted_through = 0usize;
@@ -576,7 +658,10 @@ fn encode_block_optimal(input: &[u8], out: &mut Vec<u8>, level: u8) {
         }};
     }
 
-    let mut i = 0usize;
+    // Seed the chain with every dict position so block matches can find them.
+    insert_up_to!(dict_len);
+
+    let mut i = dict_len;
     while i < n {
         if price[i] == usize::MAX {
             i += 1;
@@ -666,10 +751,11 @@ fn encode_block_optimal(input: &[u8], out: &mut Vec<u8>, level: u8) {
         i += 1;
     }
 
-    // Backtrack from n to 0, collecting the path edges in reverse.
+    // Backtrack from n to the block origin, collecting the path edges in
+    // reverse.
     let mut path: Vec<OptStep> = Vec::new();
     let mut pos = n;
-    while pos > 0 {
+    while pos > dict_len {
         let s = step[pos];
         if s.match_pos == usize::MAX {
             // Literal edge: step back one byte. Collapse a contiguous literal
@@ -683,7 +769,7 @@ fn encode_block_optimal(input: &[u8], out: &mut Vec<u8>, level: u8) {
     path.reverse();
 
     // Replay forward, emitting literals then each match.
-    let mut anchor = 0usize;
+    let mut anchor = dict_len;
     for s in &path {
         let match_start = {
             // The match's start position is the end-of-literal-run point. We
