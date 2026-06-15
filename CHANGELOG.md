@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.4](https://github.com/KarpelesLab/compcol/compare/v0.6.3...v0.6.4) - 2026-06-15
+
+### Fixed
+
+- *(cli)* drain decoder's internal block buffer before finish
+
+### Other
+
+- changelog for CLI decode-drain fix
+- changelog for iterative optimal brotli parse
+- *(enc)* enable optimal parse at q9 (2 passes)
+- *(enc)* cargo fmt encoder_optimal
+- *(enc)* price ring-reuse short codes for explicit DP matches
+- *(enc)* iterative zopfli-style optimal parse at q10/q11
+- changelog for round-2 ratio + speed work
+- *(enc)* cross-block matching + two-pass statistics-driven optimal parse
+- *(enc)* single-pass scan-and-shift move-to-front
+- tighten encode/decode hot loops
+- *(enc)* replace prefix-doubling rotation sort with SA-IS
+- test linked-block cross-boundary references and cross-tool decode
+- implement frame linked-block mode (cross-block match window)
+- emit continue-dict chunks; feed uncompressed chunks to the dict
+- continuous cross-chunk dictionary in the shared chunk encoder
+
 ### Fixed
 
 - **docs.rs build**: add the crate-root `#![cfg_attr(docsrs, feature(doc_cfg))]`
