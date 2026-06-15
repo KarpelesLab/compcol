@@ -189,26 +189,6 @@ impl LevelParams {
             },
         }
     }
-
-    /// Compute the dict size actually written into the header for an input of
-    /// `input_len` bytes. We never claim more than what could possibly be
-    /// referenced, so a 1 KiB input doesn't force the decoder to allocate a
-    /// 64 MiB window. The advertised size is also clamped to the decoder's
-    /// minimum of 4 KiB.
-    fn effective_dict_size(&self, input_len: usize) -> u32 {
-        // Round `input_len` up to a power of two (clamped at u32::MAX). Empty
-        // input gets the minimum dict; `next_power_of_two` would panic on 0.
-        let needed = if input_len == 0 {
-            MIN_DICT_SIZE
-        } else {
-            let np2 = (input_len as u64)
-                .checked_next_power_of_two()
-                .unwrap_or(u32::MAX as u64);
-            np2.min(u32::MAX as u64) as u32
-        };
-        let needed = needed.max(MIN_DICT_SIZE);
-        needed.min(self.dict_size)
-    }
 }
 
 fn hash3(b0: u8, b1: u8, b2: u8) -> u32 {
@@ -841,28 +821,30 @@ impl LzmaEncCore {
         }
     }
 
-    /// Emit a literal packet for the byte at index `pos` in the input.
-    fn emit_literal(&mut self, input: &[u8], pos: usize) {
+    /// Emit a literal packet for the byte at absolute position `pos`, reading
+    /// from the sliding window `win` (whose first byte is absolute `base`).
+    fn emit_literal(&mut self, win: &[u8], base: usize, pos: usize) {
         let pos_state = self.pos_state();
         let idx = self.state * POS_STATES_MAX + pos_state as usize;
         rc_encode_bit(&mut self.rc, &mut self.is_match[idx], 0);
 
-        let prev_byte = if pos > 0 { input[pos - 1] } else { 0 };
+        let i = pos - base;
+        let prev_byte = if pos > 0 { win[i - 1] } else { 0 };
         let match_byte = if self.state < LIT_STATES {
             None
         } else {
-            // The byte at distance rep0; we always have it available in the
-            // input buffer because the encoder buffered everything.
+            // The byte at distance rep0; always retained in the sliding window
+            // (distance ≤ dict_size ≤ retained history).
             let d = self.rep0 as usize + 1;
             if d <= pos {
-                Some(input[pos - d])
+                Some(win[i - d])
             } else {
                 // Shouldn't happen at a literal-after-match state, but be
                 // safe — fall back to plain literal coding.
                 None
             }
         };
-        self.encode_literal_full(input[pos], prev_byte, match_byte);
+        self.encode_literal_full(win[i], prev_byte, match_byte);
 
         self.state = state_after_literal(self.state);
         self.output_pos += 1;
@@ -1014,46 +996,67 @@ fn get_dist_slot(distance: u32) -> u32 {
 // all input before encoding, there's no sliding window to maintain; the head
 // array and prev links cover the whole buffer in one shot.
 
+/// Sliding-window 3-byte hash-chain match finder.
+///
+/// Positions in `head`/`prev` are **absolute** input offsets; `prev` is a ring
+/// of `prev.len()` slots indexed `pos & prev_mask`, sized larger than
+/// `dict_size + MAX_MATCH_LEN` so every legally-reachable link (distance ≤
+/// `dict_size`) is still intact. Byte reads go through the sliding window `win`
+/// whose first byte is absolute `base` (absolute `p` reads `win[p - base]`).
+/// This keeps peak memory `O(dict_size)` regardless of input length.
 struct HashChain {
     head: Box<[u32; HASH_SIZE]>,
     prev: Vec<u32>,
+    prev_mask: usize,
 }
 
 impl HashChain {
-    fn new(buf_len: usize) -> Self {
+    /// Build a finder whose `prev` ring covers at least `dict_size +
+    /// MAX_MATCH_LEN` positions (rounded up to a power of two), capped by
+    /// `cap_hint` when the total input is known smaller.
+    fn new(dict_size: u32, cap_hint: usize) -> Self {
+        let needed = (dict_size as usize)
+            .saturating_add(MAX_MATCH_LEN as usize)
+            .saturating_add(2);
+        let want = needed.min(cap_hint.max(1));
+        let cap = want.max(1).next_power_of_two();
         Self {
             head: Box::new([NIL; HASH_SIZE]),
-            prev: vec![NIL; buf_len],
+            prev: vec![NIL; cap],
+            prev_mask: cap - 1,
         }
     }
 
-    /// Splice position `pos` into the hash chain. No-op if there aren't
-    /// three bytes available.
-    fn insert(&mut self, input: &[u8], pos: usize) {
-        if pos + 3 > input.len() {
+    /// Splice absolute position `pos` into the hash chain. No-op if fewer than
+    /// three bytes follow in the window.
+    fn insert(&mut self, win: &[u8], base: usize, pos: usize) {
+        let i = pos - base;
+        if i + 3 > win.len() {
             return;
         }
-        let h = hash3(input[pos], input[pos + 1], input[pos + 2]) as usize;
-        self.prev[pos] = self.head[h];
+        let h = hash3(win[i], win[i + 1], win[i + 2]) as usize;
+        self.prev[pos & self.prev_mask] = self.head[h];
         self.head[h] = pos as u32;
     }
 
-    /// Find the longest match for `input[pos..]` against earlier positions,
-    /// bounded by `MAX_MATCH_LEN`, the per-level chain budget, and the
-    /// per-level "nice match" early-exit.
+    /// Find the longest match for the window position at absolute `pos` against
+    /// earlier positions, bounded by `MAX_MATCH_LEN`, the per-level chain
+    /// budget, and the per-level "nice match" early-exit.
     fn find_longest(
         &self,
-        input: &[u8],
+        win: &[u8],
+        base: usize,
         pos: usize,
         dict_size: u32,
         max_chain: usize,
         nice_match: u32,
     ) -> Option<(u32, u32)> {
-        if pos + 3 > input.len() {
+        let pi = pos - base;
+        if pi + 3 > win.len() {
             return None;
         }
-        let h = hash3(input[pos], input[pos + 1], input[pos + 2]) as usize;
-        let max_len = MAX_MATCH_LEN.min((input.len() - pos) as u32);
+        let h = hash3(win[pi], win[pi + 1], win[pi + 2]) as usize;
+        let max_len = MAX_MATCH_LEN.min((win.len() - pi) as u32);
         let max_dist = (dict_size as usize).min(pos);
         let mut best_len: u32 = 0;
         let mut best_dist: u32 = 0;
@@ -1062,7 +1065,7 @@ impl HashChain {
         while cur != NIL && steps < max_chain {
             let cur_pos = cur as usize;
             if cur_pos >= pos {
-                cur = self.prev[cur_pos];
+                cur = self.prev[cur_pos & self.prev_mask];
                 steps += 1;
                 continue;
             }
@@ -1070,17 +1073,18 @@ impl HashChain {
             if dist > max_dist {
                 break;
             }
+            let ci = cur_pos - base;
             // Cheap rejection by the (best_len)-th byte.
             if best_len > 2
-                && (best_len as usize) < (input.len() - pos)
-                && input[cur_pos + best_len as usize] != input[pos + best_len as usize]
+                && (best_len as usize) < (win.len() - pi)
+                && win[ci + best_len as usize] != win[pi + best_len as usize]
             {
-                cur = self.prev[cur_pos];
+                cur = self.prev[cur_pos & self.prev_mask];
                 steps += 1;
                 continue;
             }
             let mut len = 0u32;
-            while len < max_len && input[cur_pos + len as usize] == input[pos + len as usize] {
+            while len < max_len && win[ci + len as usize] == win[pi + len as usize] {
                 len += 1;
             }
             if len >= MATCH_LEN_MIN && len > best_len {
@@ -1091,7 +1095,7 @@ impl HashChain {
                     break;
                 }
             }
-            cur = self.prev[cur_pos];
+            cur = self.prev[cur_pos & self.prev_mask];
             steps += 1;
         }
         if best_len >= MATCH_LEN_MIN {
@@ -1105,9 +1109,11 @@ impl HashChain {
     /// achievable length `>= MATCH_LEN_MIN`, the *shortest* distance that
     /// achieves it. `out` is filled with `(len, dist0based)` pairs in
     /// strictly increasing length order. Returns the longest length found.
+    #[allow(clippy::too_many_arguments)]
     fn find_matches(
         &self,
-        input: &[u8],
+        win: &[u8],
+        base: usize,
         pos: usize,
         dict_size: u32,
         max_chain: usize,
@@ -1115,11 +1121,12 @@ impl HashChain {
         out: &mut Vec<(u32, u32)>,
     ) -> u32 {
         out.clear();
-        if pos + 3 > input.len() {
+        let pi = pos - base;
+        if pi + 3 > win.len() {
             return 0;
         }
-        let h = hash3(input[pos], input[pos + 1], input[pos + 2]) as usize;
-        let max_len = MAX_MATCH_LEN.min((input.len() - pos) as u32);
+        let h = hash3(win[pi], win[pi + 1], win[pi + 2]) as usize;
+        let max_len = MAX_MATCH_LEN.min((win.len() - pi) as u32);
         let max_dist = (dict_size as usize).min(pos);
         let mut best_len: u32 = MATCH_LEN_MIN - 1;
         let mut cur = self.head[h];
@@ -1127,7 +1134,7 @@ impl HashChain {
         while cur != NIL && steps < max_chain {
             let cur_pos = cur as usize;
             if cur_pos >= pos {
-                cur = self.prev[cur_pos];
+                cur = self.prev[cur_pos & self.prev_mask];
                 steps += 1;
                 continue;
             }
@@ -1135,16 +1142,17 @@ impl HashChain {
             if dist > max_dist {
                 break;
             }
+            let ci = cur_pos - base;
             if best_len >= MATCH_LEN_MIN
-                && (best_len as usize) < (input.len() - pos)
-                && input[cur_pos + best_len as usize] != input[pos + best_len as usize]
+                && (best_len as usize) < (win.len() - pi)
+                && win[ci + best_len as usize] != win[pi + best_len as usize]
             {
-                cur = self.prev[cur_pos];
+                cur = self.prev[cur_pos & self.prev_mask];
                 steps += 1;
                 continue;
             }
             let mut len = 0u32;
-            while len < max_len && input[cur_pos + len as usize] == input[pos + len as usize] {
+            while len < max_len && win[ci + len as usize] == win[pi + len as usize] {
                 len += 1;
             }
             if len >= MATCH_LEN_MIN && len > best_len {
@@ -1156,7 +1164,7 @@ impl HashChain {
                     break;
                 }
             }
-            cur = self.prev[cur_pos];
+            cur = self.prev[cur_pos & self.prev_mask];
             steps += 1;
         }
         if best_len >= MATCH_LEN_MIN {
@@ -1169,18 +1177,18 @@ impl HashChain {
 
 // ─── rep-match helpers ───────────────────────────────────────────────────
 
-/// Try to extend a match starting at `pos` using a 0-based LZ distance
-/// `dist`. Returns the match length (0 if not even 1 byte matches), capped
-/// at `MAX_MATCH_LEN`. The byte at index `pos - dist - 1` is the first
-/// candidate.
-fn rep_match_len(input: &[u8], pos: usize, dist: u32) -> u32 {
+/// Length of a repeat match at absolute `pos` against 0-based LZ distance
+/// `dist`, reading from the sliding window `win` (first byte = absolute `base`).
+/// Capped at `MAX_MATCH_LEN`.
+fn rep_match_len(win: &[u8], base: usize, pos: usize, dist: u32) -> u32 {
     let d = dist as usize + 1;
     if d > pos {
         return 0;
     }
-    let max_len = MAX_MATCH_LEN.min((input.len() - pos) as u32) as usize;
+    let pi = pos - base;
+    let max_len = MAX_MATCH_LEN.min((win.len() - pi) as u32) as usize;
     let mut len = 0usize;
-    while len < max_len && input[pos - d + len] == input[pos + len] {
+    while len < max_len && win[pi - d + len] == win[pi + len] {
         len += 1;
     }
     len as u32
@@ -1280,7 +1288,8 @@ fn literal_price_at(
     core: &LzmaEncCore,
     prices: &[u32; PRICE_TABLE_SIZE],
     snap: &PriceSnapshot,
-    input: &[u8],
+    win: &[u8],
+    base: usize,
     pos: usize,
     out_pos: u64,
     state: usize,
@@ -1288,85 +1297,322 @@ fn literal_price_at(
 ) -> u32 {
     let pos_state = (out_pos as u32) & core.pos_mask;
     let im_idx = state * POS_STATES_MAX + pos_state as usize;
-    let prev_byte = if pos > 0 { input[pos - 1] } else { 0 };
+    let i = pos - base;
+    let prev_byte = if pos > 0 { win[i - 1] } else { 0 };
     let match_byte = if state < LIT_STATES {
         None
     } else {
         let d = rep0 as usize + 1;
-        if d <= pos { Some(input[pos - d]) } else { None }
+        if d <= pos { Some(win[i - d]) } else { None }
     };
-    snap.is_match[im_idx][0]
-        + core.literal_price(prices, out_pos, input[pos], prev_byte, match_byte)
+    snap.is_match[im_idx][0] + core.literal_price(prices, out_pos, win[i], prev_byte, match_byte)
 }
 
 // ─── full encode pass ────────────────────────────────────────────────────
 
-fn encode_all(input: &[u8], params: LevelParams) -> Vec<u8> {
-    let dict_size = params.effective_dict_size(input.len());
+/// Extra window history retained behind the current parse position, on top of
+/// `dict_size`, so an insertion never overwrites a still-reachable older ring
+/// slot and the longest match / literal look-back can always be read.
+const WINDOW_SLOP: usize = MAX_MATCH_LEN as usize + 16;
 
-    // Threshold below which we also run a greedy pass and keep the smaller
-    // body. The optimal parser's cold-start price model can briefly lose to
-    // greedy on small, highly-repetitive inputs; the absolute loss is bounded
-    // by the first few price-refresh segments, so on larger inputs the optimal
-    // parse always wins overall and the extra greedy pass is pure waste. We
-    // therefore only run the guard pass on small inputs.
-    const GUARD_LIMIT: usize = 64 * 1024;
+/// How many bytes of forward lookahead must be buffered past the parse position
+/// before a streaming `push` will encode them, so the optimal parser always has
+/// its full look-ahead window plus a longest-match's worth of context. On
+/// `finish` the remaining tail is encoded without this margin.
+fn lookahead_margin(params: LevelParams) -> usize {
+    params.opt_window as usize + MAX_MATCH_LEN as usize + 1
+}
 
-    let body = if params.opt_window == 0 {
-        encode_body(input, dict_size, params, false)
-    } else if input.len() <= GUARD_LIMIT {
-        let opt = encode_body(input, dict_size, params, true);
-        let greedy = encode_body(input, dict_size, params, false);
-        if greedy.len() < opt.len() {
-            greedy
-        } else {
-            opt
+/// Streaming `.lzma` body encoder with **bounded memory**.
+///
+/// The `.lzma` range coder is a single continuous stream (no per-chunk reset);
+/// this struct drives the parse incrementally over a sliding `~dict_size`
+/// window and forwards range-coded output bytes as they are produced. Peak
+/// memory is `O(dict_size)`:
+///
+/// - the match finder's `prev` ring is `O(dict_size)` (see [`HashChain`]);
+/// - only `dict_size + WINDOW_SLOP` history plus one lookahead margin of bytes
+///   is retained in `win` — older bytes are dropped once the parse position has
+///   moved past them.
+///
+/// The 13-byte header (props + dict size + `u64::MAX` length) is emitted before
+/// the first body bytes; the EOS marker + range-coder flush are appended by
+/// [`finish`](Self::finish).
+struct LzmaStreamEncoder {
+    core: LzmaEncCore,
+    hc: HashChain,
+    params: LevelParams,
+    dict_size: u32,
+    /// Reusable optimal-parser scratch (only used at levels with `opt_window`).
+    opt: Optimizer,
+    prob_prices: [u32; PRICE_TABLE_SIZE],
+    /// Retained window bytes; `win[0]` is absolute offset `win_base`.
+    win: Vec<u8>,
+    win_base: usize,
+    /// Absolute offset of the next byte to encode.
+    pos: usize,
+    /// Absolute count of bytes appended so far.
+    appended: usize,
+    /// Range-coder output bytes already forwarded to the caller.
+    drained: usize,
+    /// Set once the header has been emitted (prepended to the first push).
+    header_done: bool,
+    /// Set once the EOS marker + flush have been emitted.
+    finished: bool,
+    /// `true` until we commit to true incremental streaming. While `false` and
+    /// the total stays `<= GUARD_LIMIT`, input is only buffered (no output) so
+    /// `finish` can run the greedy-vs-optimal guard pass over the whole small
+    /// input and keep the smaller body — matching the old one-shot behaviour and
+    /// preventing the optimal parser's cold start from ever losing to greedy on
+    /// small inputs. Once the total exceeds `GUARD_LIMIT` we commit and stream.
+    committed: bool,
+}
+
+/// Inputs at or below this size run the greedy-vs-optimal guard pass at
+/// `finish` (and are therefore buffered whole — bounded, since this is far
+/// below `dict_size`). Larger inputs stream incrementally with the optimal
+/// parse only. Mirrors the old `encode_all` GUARD_LIMIT.
+const GUARD_LIMIT: usize = 64 * 1024;
+
+impl LzmaStreamEncoder {
+    fn new(params: LevelParams) -> Self {
+        // Advertise (and cap matches at) the level's dictionary size, clamped to
+        // the decoder's 4 KiB minimum. Independent of input length so the header
+        // can be emitted up front without buffering the whole stream.
+        let dict_size = params.dict_size.max(MIN_DICT_SIZE);
+        let cap_hint = (dict_size as usize)
+            .saturating_add(MAX_MATCH_LEN as usize)
+            .saturating_add(WINDOW_SLOP + lookahead_margin(params));
+        Self {
+            core: LzmaEncCore::new(),
+            hc: HashChain::new(dict_size, cap_hint),
+            params,
+            dict_size,
+            opt: Optimizer::new(params.opt_window as usize),
+            prob_prices: build_prob_prices(),
+            win: Vec::new(),
+            win_base: 0,
+            pos: 0,
+            appended: 0,
+            drained: 0,
+            header_done: false,
+            finished: false,
+            // Greedy-only levels (`opt_window == 0`) have no cold-start
+            // regression, so they commit to streaming immediately and skip the
+            // guard buffering.
+            committed: params.opt_window == 0,
         }
-    } else {
-        encode_body(input, dict_size, params, true)
-    };
-
-    let mut out = Vec::with_capacity(13 + body.len());
-    out.push(ENC_PROPS_BYTE);
-    out.extend_from_slice(&dict_size.to_le_bytes());
-    out.extend_from_slice(&u64::MAX.to_le_bytes());
-    out.extend_from_slice(&body);
-    out
-}
-
-/// Encode the range-coded body (with EOS marker + flush, no 13-byte header)
-/// using the greedy or optimal parse. Returns the raw body bytes.
-fn encode_body(input: &[u8], dict_size: u32, params: LevelParams, optimal: bool) -> Vec<u8> {
-    let mut core = LzmaEncCore::new();
-    let mut hc = HashChain::new(input.len());
-    if optimal {
-        encode_optimal(&mut core, &mut hc, input, dict_size, params);
-    } else {
-        encode_greedy(&mut core, &mut hc, input, dict_size, params);
     }
-    core.emit_eos_marker();
-    core.rc.flush();
-    core.rc.out
+
+    /// Append `data`, encode any bytes now safely buffered (keeping a forward
+    /// lookahead margin), and return all output produced so far (header on the
+    /// first commit, then range-coded body bytes).
+    fn push(&mut self, data: &[u8]) -> Vec<u8> {
+        self.win.extend_from_slice(data);
+        self.appended += data.len();
+        // While still small and uncommitted, only buffer — `finish` will run the
+        // greedy-vs-optimal guard. Commit (and start streaming) once the total
+        // crosses GUARD_LIMIT.
+        if !self.committed {
+            if self.appended <= GUARD_LIMIT {
+                return Vec::new();
+            }
+            self.committed = true;
+        }
+        let margin = lookahead_margin(self.params);
+        // Only encode up to `appended - margin` so the parser keeps full
+        // forward context; the tail is encoded at `finish`.
+        let encode_to = self.appended.saturating_sub(margin);
+        if encode_to > self.pos {
+            self.encode_range(encode_to);
+            self.trim_window();
+        }
+        self.take_output()
+    }
+
+    /// Encode the remaining tail, emit the EOS marker + flush, and return all
+    /// remaining output bytes.
+    fn finish(&mut self) -> Vec<u8> {
+        if !self.finished {
+            if !self.committed {
+                // Small input: run the greedy-vs-optimal guard over the whole
+                // buffered window and keep the smaller body, exactly as the old
+                // one-shot encoder did. `win` holds the entire input (≤ GUARD).
+                return self.finish_small();
+            }
+            if self.pos < self.appended {
+                self.encode_range(self.appended);
+            }
+            self.core.emit_eos_marker();
+            self.core.rc.flush();
+            self.finished = true;
+        }
+        self.take_output()
+    }
+
+    /// Guard path for small inputs: encode the whole buffered `win` twice
+    /// (greedy + optimal) from a fresh core and keep the smaller body, then
+    /// emit header + body. Memory is bounded (input ≤ GUARD_LIMIT).
+    fn finish_small(&mut self) -> Vec<u8> {
+        let input = &self.win;
+        let dict_size = self.dict_size;
+        let params = self.params;
+
+        let opt_body = {
+            let mut core = LzmaEncCore::new();
+            let mut hc = HashChain::new(dict_size, input.len().max(1));
+            let mut opt = Optimizer::new(params.opt_window as usize);
+            let prices = build_prob_prices();
+            encode_optimal(
+                &mut core,
+                &mut hc,
+                input,
+                0,
+                0,
+                input.len(),
+                dict_size,
+                params,
+                &prices,
+                &mut opt,
+            );
+            core.emit_eos_marker();
+            core.rc.flush();
+            core.rc.out
+        };
+        let greedy_body = {
+            let mut core = LzmaEncCore::new();
+            let mut hc = HashChain::new(dict_size, input.len().max(1));
+            encode_greedy(
+                &mut core,
+                &mut hc,
+                input,
+                0,
+                0,
+                input.len(),
+                dict_size,
+                params,
+            );
+            core.emit_eos_marker();
+            core.rc.flush();
+            core.rc.out
+        };
+        let body = if greedy_body.len() < opt_body.len() {
+            greedy_body
+        } else {
+            opt_body
+        };
+
+        self.finished = true;
+        let mut out = Vec::with_capacity(13 + body.len());
+        out.push(ENC_PROPS_BYTE);
+        out.extend_from_slice(&self.dict_size.to_le_bytes());
+        out.extend_from_slice(&u64::MAX.to_le_bytes());
+        out.extend_from_slice(&body);
+        self.header_done = true;
+        out
+    }
+
+    /// Encode absolute positions `[self.pos, end)` into the continuous range
+    /// coder, advancing `self.pos`.
+    fn encode_range(&mut self, end: usize) {
+        let base = self.win_base;
+        let start = self.pos;
+        if self.params.opt_window == 0 {
+            encode_greedy(
+                &mut self.core,
+                &mut self.hc,
+                &self.win,
+                base,
+                start,
+                end,
+                self.dict_size,
+                self.params,
+            );
+        } else {
+            encode_optimal(
+                &mut self.core,
+                &mut self.hc,
+                &self.win,
+                base,
+                start,
+                end,
+                self.dict_size,
+                self.params,
+                &self.prob_prices,
+                &mut self.opt,
+            );
+        }
+        self.pos = end;
+    }
+
+    /// Drop window history older than `dict_size + WINDOW_SLOP` before `pos`.
+    /// Only shifts once the droppable prefix exceeds a whole `dict_size +
+    /// WINDOW_SLOP`, amortising the `drain` memmove to `O(1)` per input byte.
+    fn trim_window(&mut self) {
+        let keep_from = self
+            .pos
+            .saturating_sub(self.dict_size as usize + WINDOW_SLOP);
+        let droppable = keep_from.saturating_sub(self.win_base);
+        if droppable >= self.dict_size as usize + WINDOW_SLOP {
+            self.win.drain(..droppable);
+            self.win_base = keep_from;
+        }
+    }
+
+    /// Pull any newly-produced output: the 13-byte header on first call, then
+    /// the range coder's freshly-flushed bytes.
+    fn take_output(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if !self.header_done {
+            out.push(ENC_PROPS_BYTE);
+            out.extend_from_slice(&self.dict_size.to_le_bytes());
+            out.extend_from_slice(&u64::MAX.to_le_bytes());
+            self.header_done = true;
+        }
+        let body = &self.core.rc.out;
+        if self.drained < body.len() {
+            out.extend_from_slice(&body[self.drained..]);
+            self.drained = body.len();
+        }
+        out
+    }
 }
 
-/// Greedy/lazy parse — used by the lowest levels.
+/// Greedy/lazy parse over the sliding window. Encodes absolute positions
+/// `[pos_start, pos_end)`; match lengths are clamped to `pos_end` so a streaming
+/// driver can stop at a lookahead boundary without crossing it.
+#[allow(clippy::too_many_arguments)]
 fn encode_greedy(
     core: &mut LzmaEncCore,
     hc: &mut HashChain,
-    input: &[u8],
+    win: &[u8],
+    base: usize,
+    pos_start: usize,
+    pos_end: usize,
     dict_size: u32,
     params: LevelParams,
 ) {
-    let mut pos = 0usize;
-    while pos < input.len() {
+    let win_end = base + win.len();
+    let mut pos = pos_start;
+    while pos < pos_end {
+        let cap = (pos_end - pos) as u32;
         let rep_lens = [
-            rep_match_len(input, pos, core.rep0),
-            rep_match_len(input, pos, core.rep1),
-            rep_match_len(input, pos, core.rep2),
-            rep_match_len(input, pos, core.rep3),
+            rep_match_len(win, base, pos, core.rep0).min(cap),
+            rep_match_len(win, base, pos, core.rep1).min(cap),
+            rep_match_len(win, base, pos, core.rep2).min(cap),
+            rep_match_len(win, base, pos, core.rep3).min(cap),
         ];
 
-        let new_match = hc.find_longest(input, pos, dict_size, params.max_chain, params.nice_match);
+        let new_match = hc
+            .find_longest(
+                win,
+                base,
+                pos,
+                dict_size,
+                params.max_chain,
+                params.nice_match,
+            )
+            .map(|(l, d)| (l.min(cap), d));
 
         let best_rep_len = rep_lens.iter().copied().max().unwrap_or(0);
         let best_rep_idx = rep_lens
@@ -1382,14 +1628,14 @@ fn encode_greedy(
         let emit_rep_long = !emit_new && best_rep_len >= MATCH_LEN_MIN;
         let emit_short_rep = !emit_new && !emit_rep_long && rep_lens[0] >= 1;
 
-        hc.insert(input, pos);
+        hc.insert(win, base, pos);
 
         if emit_new {
             let (len, dist) = new_match.unwrap();
             for j in 1..(len as usize) {
                 let p = pos + j;
-                if p + 3 <= input.len() {
-                    hc.insert(input, p);
+                if p + 3 <= win_end {
+                    hc.insert(win, base, p);
                 }
             }
             core.emit_match(dist, len);
@@ -1397,8 +1643,8 @@ fn encode_greedy(
         } else if emit_rep_long {
             for j in 1..(best_rep_len as usize) {
                 let p = pos + j;
-                if p + 3 <= input.len() {
-                    hc.insert(input, p);
+                if p + 3 <= win_end {
+                    hc.insert(win, base, p);
                 }
             }
             core.emit_long_rep(best_rep_idx, best_rep_len);
@@ -1407,41 +1653,48 @@ fn encode_greedy(
             core.emit_short_rep();
             pos += 1;
         } else {
-            core.emit_literal(input, pos);
+            core.emit_literal(win, base, pos);
             pos += 1;
         }
     }
 }
 
-/// Cost-based optimal parse over a look-ahead window.
+/// Cost-based optimal parse over a look-ahead window, encoding absolute
+/// positions `[pos_start, pos_end)`.
+#[allow(clippy::too_many_arguments)]
 fn encode_optimal(
     core: &mut LzmaEncCore,
     hc: &mut HashChain,
-    input: &[u8],
+    win: &[u8],
+    base: usize,
+    pos_start: usize,
+    pos_end: usize,
     dict_size: u32,
     params: LevelParams,
+    prob_prices: &[u32; PRICE_TABLE_SIZE],
+    opt: &mut Optimizer,
 ) {
-    let prob_prices = build_prob_prices();
     let window = params.opt_window as usize;
-    let mut opt = Optimizer::new(window);
 
-    let mut pos = 0usize;
-    while pos < input.len() {
-        let snap = core.price_snapshot(&prob_prices);
+    let mut pos = pos_start;
+    while pos < pos_end {
+        let snap = core.price_snapshot(prob_prices);
         let parsed = parse_window(
             core,
             hc,
-            input,
+            win,
+            base,
             pos,
+            pos_end,
             dict_size,
             params,
             window,
-            &prob_prices,
+            prob_prices,
             &snap,
-            &mut opt,
+            opt,
         );
         debug_assert!(parsed > 0);
-        replay(core, hc, input, pos, &opt.decisions);
+        replay(core, hc, win, base, pos, &opt.decisions);
         pos += parsed;
     }
 }
@@ -1452,8 +1705,10 @@ fn encode_optimal(
 fn parse_window(
     core: &LzmaEncCore,
     hc: &HashChain,
-    input: &[u8],
+    win: &[u8],
+    base: usize,
     start: usize,
+    pos_end: usize,
     dict_size: u32,
     params: LevelParams,
     window: usize,
@@ -1461,7 +1716,9 @@ fn parse_window(
     snap: &PriceSnapshot,
     opt: &mut Optimizer,
 ) -> usize {
-    let avail = input.len() - start;
+    // `avail` is bounded by the encode boundary `pos_end`, not the end of the
+    // window, so the DP never produces a decision that carries past `pos_end`.
+    let avail = pos_end - start;
     let limit = window.min(avail);
 
     opt.opt[0] = OptNode {
@@ -1511,7 +1768,7 @@ fn parse_window(
 
         // ── literal ──────────────────────────────────────────────────────
         {
-            let lp = literal_price_at(core, prices, snap, input, pos, out_pos, state, reps[0]);
+            let lp = literal_price_at(core, prices, snap, win, base, pos, out_pos, state, reps[0]);
             let np = node.price.saturating_add(lp);
             let to = cur + 1;
             if to <= limit && np < opt.opt[to].price {
@@ -1532,7 +1789,7 @@ fn parse_window(
 
         // ── rep matches ──────────────────────────────────────────────────
         for rep_idx in 0..4u32 {
-            let rlen = rep_match_len(input, pos, reps[rep_idx as usize]);
+            let rlen = rep_match_len(win, base, pos, reps[rep_idx as usize]);
             if rlen < 1 {
                 continue;
             }
@@ -1598,7 +1855,8 @@ fn parse_window(
         let longest = {
             let opt_matches = &mut opt.matches;
             hc.find_matches(
-                input,
+                win,
+                base,
                 pos,
                 dict_size,
                 params.max_chain,
@@ -1678,28 +1936,30 @@ fn trace_back(opt: &mut Optimizer, end: usize) {
 fn replay(
     core: &mut LzmaEncCore,
     hc: &mut HashChain,
-    input: &[u8],
+    win: &[u8],
+    base: usize,
     start: usize,
     decisions: &[Decision],
 ) {
+    let win_end = base + win.len();
     let mut pos = start;
     for &d in decisions {
         match d {
             Decision::Literal => {
-                hc.insert(input, pos);
-                core.emit_literal(input, pos);
+                hc.insert(win, base, pos);
+                core.emit_literal(win, base, pos);
                 pos += 1;
             }
             Decision::ShortRep => {
-                hc.insert(input, pos);
+                hc.insert(win, base, pos);
                 core.emit_short_rep();
                 pos += 1;
             }
             Decision::Match(dist, len) => {
                 for j in 0..(len as usize) {
                     let p = pos + j;
-                    if p + 3 <= input.len() {
-                        hc.insert(input, p);
+                    if p + 3 <= win_end {
+                        hc.insert(win, base, p);
                     }
                 }
                 core.emit_match(dist, len);
@@ -1708,8 +1968,8 @@ fn replay(
             Decision::Rep(idx, len) => {
                 for j in 0..(len as usize) {
                     let p = pos + j;
-                    if p + 3 <= input.len() {
-                        hc.insert(input, p);
+                    if p + 3 <= win_end {
+                        hc.insert(win, base, p);
                     }
                 }
                 core.emit_long_rep(idx, len);
@@ -1721,19 +1981,21 @@ fn replay(
 
 // ─── public streaming Encoder ────────────────────────────────────────────
 
-/// Streaming `.lzma` (alone) encoder.
+/// Streaming `.lzma` (alone) encoder with **bounded memory**.
 ///
-/// Implementation note: LZMA's range coder operates on the entire stream, so
-/// the simplest correct approach is to accumulate input into a `Vec<u8>` and
-/// produce the compressed output in one shot on `finish`. The streaming
-/// `encode` calls append to the buffer and never write output; `finish`
-/// builds the full output and then drains it across however many calls the
-/// caller's output buffer requires.
+/// Drives a [`LzmaStreamEncoder`] whose match finder, sliding window, and LZ
+/// history are all `O(dict_size)` — so peak memory is independent of the input
+/// length. `encode` feeds input incrementally and emits range-coded output as
+/// it is produced (the header up front, then body bytes); `finish` emits the
+/// EOS marker + flush. Output the codec produces faster than the caller drains
+/// it is held in a small `pending` buffer (bounded by one push's worth).
 pub struct Encoder {
-    input_buf: Vec<u8>,
-    output_buf: Vec<u8>,
-    output_pos: usize,
-    finished: bool,
+    stream: Option<LzmaStreamEncoder>,
+    /// Produced output bytes not yet handed to the caller.
+    pending: Vec<u8>,
+    pending_idx: usize,
+    /// Set once `stream.finish()` has run.
+    stream_finished: bool,
     /// Match-finder tuning derived from [`EncoderConfig::level`]. Persisted
     /// across `reset` since configuration is meant to survive resets.
     params: LevelParams,
@@ -1756,52 +2018,118 @@ impl Encoder {
     /// the nearest valid level rather than rejected.
     pub fn with_config(config: EncoderConfig) -> Self {
         Self {
-            input_buf: Vec::new(),
-            output_buf: Vec::new(),
-            output_pos: 0,
-            finished: false,
+            stream: None,
+            pending: Vec::new(),
+            pending_idx: 0,
+            stream_finished: false,
             params: LevelParams::from_level(config.level),
+        }
+    }
+
+    fn stream(&mut self) -> &mut LzmaStreamEncoder {
+        let params = self.params;
+        self.stream
+            .get_or_insert_with(|| LzmaStreamEncoder::new(params))
+    }
+
+    /// Push staged output bytes from `pending[pending_idx..]` into `output`.
+    /// Returns true once the buffer is fully drained.
+    fn drain_pending(&mut self, output: &mut [u8], written: &mut usize) -> bool {
+        while self.pending_idx < self.pending.len() && *written < output.len() {
+            output[*written] = self.pending[self.pending_idx];
+            *written += 1;
+            self.pending_idx += 1;
+        }
+        if self.pending_idx >= self.pending.len() {
+            self.pending.clear();
+            self.pending_idx = 0;
+            true
+        } else {
+            false
         }
     }
 }
 
+/// Bytes of input pulled into the stream encoder per `raw_encode` step, so
+/// `pending` (produced output) stays bounded between drains.
+const ENC_PUSH_MAX: usize = 1 << 16;
+
 impl RawEncoder for Encoder {
-    fn raw_encode(&mut self, input: &[u8], _output: &mut [u8]) -> Result<RawProgress, Error> {
-        if self.finished {
+    fn raw_encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
+        if self.stream_finished {
             return Err(Error::Corrupt);
         }
-        self.input_buf.extend_from_slice(input);
-        Ok(RawProgress {
-            consumed: input.len(),
-            written: 0,
-            done: false,
-        })
+        let mut consumed = 0usize;
+        let mut written = 0usize;
+        loop {
+            // Drain any output we already produced first.
+            if self.pending_idx < self.pending.len() {
+                if !self.drain_pending(output, &mut written) {
+                    return Ok(RawProgress {
+                        consumed,
+                        written,
+                        done: false,
+                    });
+                }
+                continue;
+            }
+            if consumed < input.len() {
+                let take = (input.len() - consumed).min(ENC_PUSH_MAX);
+                let slice = &input[consumed..consumed + take];
+                let produced = self.stream().push(slice);
+                consumed += take;
+                if !produced.is_empty() {
+                    self.pending = produced;
+                    self.pending_idx = 0;
+                }
+            } else {
+                return Ok(RawProgress {
+                    consumed,
+                    written,
+                    done: false,
+                });
+            }
+        }
     }
 
     fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
-        if !self.finished {
-            // One-shot encode of everything we've buffered.
-            self.output_buf = encode_all(&self.input_buf, self.params);
-            self.output_pos = 0;
-            self.finished = true;
+        let mut written = 0usize;
+        loop {
+            if self.pending_idx < self.pending.len() {
+                if !self.drain_pending(output, &mut written) {
+                    return Ok(RawProgress {
+                        consumed: 0,
+                        written,
+                        done: false,
+                    });
+                }
+                continue;
+            }
+            if !self.stream_finished {
+                // Finish the stream (emit EOS + flush) and stage its remaining
+                // output. An encoder that never saw input still emits a valid
+                // empty stream (header + EOS).
+                let produced = self.stream().finish();
+                self.stream_finished = true;
+                if !produced.is_empty() {
+                    self.pending = produced;
+                    self.pending_idx = 0;
+                }
+            } else {
+                return Ok(RawProgress {
+                    consumed: 0,
+                    written,
+                    done: true,
+                });
+            }
         }
-        let remaining = self.output_buf.len() - self.output_pos;
-        let n = remaining.min(output.len());
-        output[..n].copy_from_slice(&self.output_buf[self.output_pos..self.output_pos + n]);
-        self.output_pos += n;
-        let done = self.output_pos >= self.output_buf.len();
-        Ok(RawProgress {
-            consumed: 0,
-            written: n,
-            done,
-        })
     }
 
     fn raw_reset(&mut self) {
-        self.input_buf.clear();
-        self.output_buf.clear();
-        self.output_pos = 0;
-        self.finished = false;
+        self.stream = None;
+        self.pending.clear();
+        self.pending_idx = 0;
+        self.stream_finished = false;
         // Note: params is preserved per the trait contract.
     }
 }

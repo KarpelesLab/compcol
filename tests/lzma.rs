@@ -235,27 +235,28 @@ fn encode_at_level(payload: &[u8], level: u8) -> Vec<u8> {
 }
 
 fn encode_with(enc: &mut Encoder, payload: &[u8]) -> Vec<u8> {
-    // The encoder buffers all input internally and emits nothing until
-    // `finish`, so a small scratch buffer is fine for the `encode` calls.
+    // The `.lzma` encoder is now a bounded-memory streaming encoder: it emits
+    // range-coded output during `encode` as the sliding-window parse produces
+    // it (header up front, then body), so we must drain `output` while feeding
+    // input. A small scratch buffer exercises the `OutputFull` path.
+    let mut out = Vec::new();
     let mut scratch = [0u8; 64];
     let mut consumed = 0;
     while consumed < payload.len() {
         let (p, status) = enc.encode(&payload[consumed..], &mut scratch).unwrap();
+        out.extend_from_slice(&scratch[..p.written]);
         consumed += p.consumed;
-        // Output should always be empty from encode() for LZMA.
-        assert_eq!(p.written, 0);
         match status {
             Status::InputEmpty | Status::StreamEnd => break,
             Status::OutputFull => {
-                // Shouldn't happen — encode() doesn't write anything.
-                if p.consumed == 0 {
+                // Drain and retry; making no progress at all is a real stall.
+                if p.consumed == 0 && p.written == 0 {
                     panic!("encoder stalled mid-input");
                 }
             }
         }
     }
 
-    let mut out = Vec::new();
     let mut buf = vec![0u8; 4096];
     loop {
         let (p, status) = enc.finish(&mut buf).unwrap();
@@ -350,14 +351,23 @@ fn encode_streaming_one_byte_chunks_round_trip() {
 
     let mut enc = Encoder::new();
     let mut scratch = [0u8; 4];
-    for byte in payload {
-        let (p, _status) = enc
-            .encode(core::slice::from_ref(byte), &mut scratch)
-            .unwrap();
-        assert_eq!(p.consumed, 1);
-        assert_eq!(p.written, 0);
-    }
     let mut compressed = Vec::new();
+    // Streaming `.lzma` may emit header/body bytes during `encode`; drain them
+    // and re-offer a byte until it is consumed. Feed exactly one input byte at
+    // a time.
+    for byte in payload {
+        let mut consumed = 0;
+        while consumed == 0 {
+            let (p, _status) = enc
+                .encode(core::slice::from_ref(byte), &mut scratch)
+                .unwrap();
+            compressed.extend_from_slice(&scratch[..p.written]);
+            consumed += p.consumed;
+            if p.consumed == 0 && p.written == 0 {
+                panic!("encoder stalled feeding a single byte");
+            }
+        }
+    }
     let mut buf = [0u8; 1];
     loop {
         let (p, status) = enc.finish(&mut buf).unwrap();
