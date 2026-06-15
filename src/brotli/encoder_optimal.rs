@@ -496,6 +496,11 @@ fn forward_dp(
             // achieving that length. For candidate `j` spanning lengths
             // `(prev_len, len_j]`, that distance is the cheapest available
             // for every length in the band, so we relax all of them.
+            //
+            // If an explicit distance coincides with a recent ring
+            // distance it can be coded as a cheap short code instead of a
+            // full distance symbol + extra bits — price it as the cheaper
+            // of the two so the DP prefers ring-reusing matches.
             let (cands, dcodes) = cache.explicit(p);
             let mut prev_len = MIN_MATCH - 1;
             for (&(clen, cdist), &(dcode, ndb)) in cands.iter().zip(dcodes.iter()) {
@@ -503,10 +508,17 @@ fn forward_dp(
                 if maxl <= prev_len {
                     continue;
                 }
+                let short = ring_short_code(&ring4, &seed, cdist);
                 let mut l = prev_len + 1;
                 while l <= maxl {
-                    let cost =
-                        copy_start_cost + command_cost(model, insert_len, l as u32, dcode, ndb);
+                    let full = command_cost(model, insert_len, l as u32, dcode, ndb);
+                    let cost = match short {
+                        Some(sc) => {
+                            let rep = repeat_command_cost(model, insert_len, l as u32, sc);
+                            copy_start_cost + full.min(rep)
+                        }
+                        None => copy_start_cost + full,
+                    };
                     relax(nodes, p + l, cost, insert_len, l as u32, cdist, None);
                     l += 1;
                 }
@@ -530,6 +542,75 @@ fn forward_dp(
             );
         }
     }
+}
+
+/// Return the short distance code (0..=15) for `dist` given the recent
+/// ring (reconstructed `ring4`, falling back to the block-start `seed`),
+/// or `None` if `dist` needs a full distance symbol. Mirrors the subset
+/// of `DistRing::try_short_code` the DP relies on.
+#[inline]
+fn ring_short_code(ring4: &[u32; 4], seed: &DistRing, dist: u32) -> Option<u32> {
+    let slot = |k: usize| -> i32 {
+        if ring4[k] != 0 {
+            ring4[k] as i32
+        } else {
+            seed.nth_last((k + 1) as u32)
+        }
+    };
+    let d = dist as i32;
+    let last = slot(0);
+    let last2 = slot(1);
+    if d == last {
+        return Some(0);
+    }
+    if d == last2 {
+        return Some(1);
+    }
+    if d == slot(2) {
+        return Some(2);
+    }
+    if d == slot(3) {
+        return Some(3);
+    }
+    if d > 0 {
+        if d == last - 1 {
+            return Some(4);
+        }
+        if d == last + 1 {
+            return Some(5);
+        }
+        if d == last - 2 {
+            return Some(6);
+        }
+        if d == last + 2 {
+            return Some(7);
+        }
+        if d == last - 3 {
+            return Some(8);
+        }
+        if d == last + 3 {
+            return Some(9);
+        }
+        if d == last2 - 1 {
+            return Some(10);
+        }
+        if d == last2 + 1 {
+            return Some(11);
+        }
+        if d == last2 - 2 {
+            return Some(12);
+        }
+        if d == last2 + 2 {
+            return Some(13);
+        }
+        if d == last2 - 3 {
+            return Some(14);
+        }
+        if d == last2 + 3 {
+            return Some(15);
+        }
+    }
+    None
 }
 
 /// Relax a copy transition landing at `dest`.
