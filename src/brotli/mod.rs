@@ -145,6 +145,7 @@ impl LevelParams {
         // Iterative optimal parse on the slowest tiers, where the extra
         // DP passes buy meaningful ratio over greedy.
         let opt_passes = match q {
+            9 => 2,
             10 => 2,
             11 => 3,
             _ => 0,
