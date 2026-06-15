@@ -242,9 +242,9 @@ pub fn encode_block_level(input: &[u8], out: &mut Vec<u8>, level: u8) {
 /// the offsets simply reach further back than the block's own length, which
 /// the reference decoder resolves against the previously decoded output.
 ///
-/// `dict` should be at most [`MAX_DISTANCE`]` + 1` bytes (the caller carries a
+/// `dict` should be at most `MAX_DISTANCE + 1` bytes (the caller carries a
 /// 64 KiB sliding window so this holds); any byte of `dict` further than
-/// [`MAX_DISTANCE`] from a match start is simply never referenced. Passing an
+/// `MAX_DISTANCE` from a match start is simply never referenced. Passing an
 /// empty `dict` reproduces [`encode_block_level`] exactly.
 ///
 /// The end-of-block rules (last 5 bytes literal, last match starts ≥ 12 bytes
