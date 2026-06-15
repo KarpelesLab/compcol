@@ -1908,6 +1908,13 @@ fn parse_window(
         // `nice_len` cut-off in GetOptimum.
         if commit_end.is_none() && best_here >= params.nice_len {
             commit_end = Some((cur + best_here as usize).min(limit));
+            // The long match from this node already records the cheapest arrival
+            // at the commit boundary; stop extending the DP rather than grinding
+            // through every position the match spans (otherwise the band fill is
+            // O(nice..273) per covered byte and the parse goes quadratic on
+            // highly-repetitive input). Matches the SDK's greedy `nice_len`
+            // acceptance and leaves ratio essentially unchanged.
+            break;
         }
 
         cur += 1;

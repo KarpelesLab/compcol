@@ -1879,6 +1879,15 @@ fn parse_window(
         if commit_end.is_none() && best_here >= params.nice_len {
             let bounded = (cur + best_here as usize).min(limit);
             commit_end = Some(bounded);
+            // The long match from this node already writes the cheapest known
+            // arrival at `bounded` (a single match decision). Stop extending the
+            // DP now instead of grinding through every position the match spans
+            // — on long-match runs (highly repetitive input) that band would
+            // otherwise cost O(nice..273) work per covered byte, turning the
+            // parse quadratic. Committing the match here matches the SDK's
+            // greedy `nice_len` acceptance and leaves ratio essentially
+            // unchanged.
+            break;
         }
 
         cur += 1;
