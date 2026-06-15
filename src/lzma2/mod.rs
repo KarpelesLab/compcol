@@ -181,7 +181,7 @@ fn resolve_dict_size(cfg: &DecoderConfig) -> Result<usize, Error> {
 
 // ─── encoder ──────────────────────────────────────────────────────────────
 
-use crate::lzma2_internal::lzma2_encoder::{EncoderParams, LZMA2_PROPS_BYTE, encode_lzma_chunk};
+use crate::lzma2_internal::lzma2_encoder::{EncoderParams, LZMA2_PROPS_BYTE, encode_lzma2_stream};
 
 /// Dictionary size (in bytes) the encoder advertises to the LZMA chunk
 /// coder as the match-distance ceiling. Fixed at 4 MiB — the [`crate::xz`]
@@ -278,37 +278,41 @@ impl Encoder {
         }
     }
 
-    /// Stage one LZMA2 chunk for `data` (`1..=ENC_CHUNK_MAX` bytes), choosing
-    /// a compressed chunk when it shrinks the data and an uncompressed
-    /// fallback otherwise.
-    fn stage_chunk(&mut self, data: &[u8]) {
-        debug_assert!(!data.is_empty() && data.len() <= ENC_CHUNK_MAX);
-        let compressed = encode_lzma_chunk(data, ENC_DICT_SIZE, self.params);
-        // A compressed chunk is only worth emitting when its range-coded body
-        // is both smaller than the input and fits the 16-bit (+1) comp-size
-        // field. Otherwise the uncompressed chunk is strictly smaller.
-        let use_compressed =
-            !compressed.is_empty() && compressed.len() <= 65_536 && compressed.len() < data.len();
-        if use_compressed {
-            self.stage_compressed_chunk(data, &compressed);
-        } else {
-            self.stage_uncompressed_chunk(data);
+    /// Stage the whole stream's LZMA2 chunks from the fully-buffered `input`.
+    ///
+    /// The chunks come from a single continuous match-finder
+    /// ([`encode_lzma2_stream`]): the first chunk resets the dictionary
+    /// (`0xE0` compressed / `0x01` uncompressed) and every later chunk
+    /// continues it (`0xC0` compressed / `0x02` uncompressed), so cross-chunk
+    /// matches (up to the 4 MiB dictionary) are found. The caller appends the
+    /// `0x00` end marker afterwards.
+    fn stage_payload(&mut self, input: &[u8]) {
+        let chunks = encode_lzma2_stream(input, ENC_DICT_SIZE, self.params);
+        let mut pos = 0usize;
+        for chunk in chunks {
+            let data = &input[pos..pos + chunk.uncomp_len];
+            match chunk.body {
+                Some(ref body) => self.stage_compressed_chunk(data, body, chunk.reset_dict),
+                None => self.stage_uncompressed_chunk(data, chunk.reset_dict),
+            }
+            pos += chunk.uncomp_len;
         }
     }
 
-    /// Stage a full-reset compressed chunk: control `0xE0` (compressed, with
-    /// dict, props, and state all reset; top 5 bits of `uncomp_size-1`), a
+    /// Stage a compressed chunk: control `0xE0` (dict reset) for the first
+    /// chunk or `0xC0` (dictionary continues) otherwise — both carry the top 5
+    /// bits of `uncomp_size-1` and set bit 6 (props present). Followed by a
     /// 2-byte `uncomp_size-1` BE remainder, a 2-byte `comp_size-1` BE, the
-    /// 1-byte LZMA props (present because we full-reset), then the
-    /// range-coded body.
-    fn stage_compressed_chunk(&mut self, data: &[u8], compressed: &[u8]) {
+    /// 1-byte LZMA props, then the range-coded body.
+    fn stage_compressed_chunk(&mut self, data: &[u8], compressed: &[u8], reset_dict: bool) {
         debug_assert!(!data.is_empty() && data.len() <= ENC_CHUNK_MAX);
         debug_assert!(!compressed.is_empty() && compressed.len() <= 65_536);
 
         let uncomp_m1 = (data.len() - 1) as u32; // 0..=65535 with our cap
         // Top 5 bits of (uncomp_size - 1) live in the control byte; with a
-        // 65_536 cap they are always zero, yielding exactly 0xE0.
-        let control: u8 = 0xE0 | ((uncomp_m1 >> 16) & 0x1F) as u8;
+        // 65_536 cap they are always zero, yielding exactly 0xE0 / 0xC0.
+        let base: u8 = if reset_dict { 0xE0 } else { 0xC0 };
+        let control: u8 = base | ((uncomp_m1 >> 16) & 0x1F) as u8;
         let comp_m1 = (compressed.len() - 1) as u16;
 
         self.pending.reserve(6 + compressed.len());
@@ -322,13 +326,15 @@ impl Encoder {
         self.pending_idx = 0;
     }
 
-    /// Stage an uncompressed chunk: control `0x01` (dict reset), 2-byte
-    /// `size-1` BE, then the raw bytes.
-    fn stage_uncompressed_chunk(&mut self, data: &[u8]) {
+    /// Stage an uncompressed chunk: control `0x01` (dict reset) for the first
+    /// chunk or `0x02` (dictionary continues) otherwise, a 2-byte `size-1` BE,
+    /// then the raw bytes.
+    fn stage_uncompressed_chunk(&mut self, data: &[u8], reset_dict: bool) {
         debug_assert!(!data.is_empty() && data.len() <= ENC_CHUNK_MAX);
+        let control: u8 = if reset_dict { 0x01 } else { 0x02 };
         let size_m1 = (data.len() - 1) as u16;
         self.pending.reserve(3 + data.len());
-        self.pending.push(0x01);
+        self.pending.push(control);
         self.pending.push((size_m1 >> 8) as u8);
         self.pending.push((size_m1 & 0xFF) as u8);
         self.pending.extend_from_slice(data);
@@ -344,23 +350,19 @@ impl RawEncoder for Encoder {
         loop {
             match self.phase {
                 EncPhase::Body => {
-                    while consumed < input.len() && self.in_buf.len() < ENC_CHUNK_MAX {
-                        let take = (ENC_CHUNK_MAX - self.in_buf.len()).min(input.len() - consumed);
-                        self.in_buf
-                            .extend_from_slice(&input[consumed..consumed + take]);
-                        consumed += take;
+                    // Buffer the entire input so the chunk stream can be
+                    // produced by a single continuous match-finder at `finish`
+                    // — the dictionary then spans every chunk instead of
+                    // resetting per chunk. No mid-stream flush.
+                    if consumed < input.len() {
+                        self.in_buf.extend_from_slice(&input[consumed..]);
+                        consumed = input.len();
                     }
-                    if self.in_buf.len() == ENC_CHUNK_MAX {
-                        let data = core::mem::take(&mut self.in_buf);
-                        self.stage_chunk(&data);
-                        self.phase = EncPhase::DrainPending;
-                    } else {
-                        return Ok(RawProgress {
-                            consumed,
-                            written,
-                            done: false,
-                        });
-                    }
+                    return Ok(RawProgress {
+                        consumed,
+                        written,
+                        done: false,
+                    });
                 }
                 EncPhase::DrainPending => {
                     if self.drain_pending(output, &mut written) {
@@ -411,9 +413,9 @@ impl RawEncoder for Encoder {
                     }
                     if !self.in_buf.is_empty() {
                         let data = core::mem::take(&mut self.in_buf);
-                        self.stage_chunk(&data);
-                        // Stay in `Finishing`; the loop drains this chunk then
-                        // re-checks the (now empty) buffer.
+                        self.stage_payload(&data);
+                        // Stay in `Finishing`; the loop drains the staged
+                        // chunks then re-checks the (now empty) buffer.
                     } else {
                         // Buffer empty and any staged chunk drained: emit the
                         // single 0x00 end marker.
@@ -546,6 +548,24 @@ impl Decoder {
         e
     }
 
+    /// Feed raw uncompressed-chunk bytes into the LZMA2 dictionary so a later
+    /// dictionary-continuing compressed chunk (`0xC0`) can reference them.
+    /// Lazily creates `lzma_core` (canonical default props, sized to the
+    /// configured dictionary) when the stream opens with an uncompressed chunk.
+    fn feed_uncompressed_dict(&mut self, src: &[u8]) {
+        if self.lzma_core.is_none() {
+            let props = Lzma2Props::parse(LZMA2_PROPS_BYTE).unwrap_or(Lzma2Props {
+                lc: 3,
+                lp: 0,
+                pb: 2,
+            });
+            self.lzma_core = Some(Box::new(LzmaCore::new(props, self.dict_size)));
+        }
+        if let Some(core) = self.lzma_core.as_mut() {
+            core.append_literals(src);
+        }
+    }
+
     /// Pull bytes from `input` (advancing `consumed`) into `scratch` until it
     /// holds `scratch_want` bytes. Returns true once full.
     fn fill_scratch(&mut self, input: &[u8], consumed: &mut usize) -> bool {
@@ -640,11 +660,13 @@ impl RawDecoder for Decoder {
                         let src = &input[consumed..consumed + take];
                         output[written..written + take].copy_from_slice(src);
                         // Feed the bytes into the LZ window so a later
-                        // compressed chunk (without a dict reset) can
-                        // back-reference them.
-                        if let Some(core) = self.lzma_core.as_mut() {
-                            core.append_literals(src);
-                        }
+                        // dictionary-continuing compressed chunk (`0xC0`) can
+                        // back-reference them. Lazily create the core (canonical
+                        // default props — irrelevant for plain dict population,
+                        // and replaced by the next compressed chunk's reset
+                        // bits) when none exists yet, e.g. when the stream opens
+                        // with an uncompressed chunk.
+                        self.feed_uncompressed_dict(src);
                         self.chunk_remaining -= take;
                         consumed += take;
                         written += take;

@@ -58,7 +58,7 @@ use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
 // decoder exposed under the `lzma2` feature without pulling in this xz
 // container. See `lib.rs`.
 use crate::lzma2_internal::lzma2_decoder::{Lzma2Props, LzmaCore, lzma2_dict_size};
-use crate::lzma2_internal::lzma2_encoder::{EncoderParams, LZMA2_PROPS_BYTE, encode_lzma_chunk};
+use crate::lzma2_internal::lzma2_encoder::{EncoderParams, LZMA2_PROPS_BYTE, encode_lzma2_stream};
 
 // ─── constants ─────────────────────────────────────────────────────────────
 
@@ -453,55 +453,51 @@ impl Encoder {
         }
     }
 
-    /// Stage an LZMA2 chunk for emission, choosing between a compressed
-    /// chunk and an uncompressed fallback.
+    /// Stage the whole block's LZMA2 payload from the fully-buffered input.
     ///
-    /// We always use the "full reset" form of the chunk's control byte
-    /// (`0xE0` for compressed, `0x01` for uncompressed), so every chunk is
-    /// independently decodable. This is slightly less efficient than
-    /// reusing state across chunks but keeps the chunk header shape
-    /// uniform and matches xz-utils' default emission pattern when each
-    /// chunk straddles a dictionary reset.
+    /// The LZMA2 chunks are produced by a single continuous match-finder
+    /// ([`encode_lzma2_stream`]): the first chunk resets the dictionary
+    /// (`0xE0` compressed / `0x01` uncompressed) and every later chunk
+    /// *continues* it (`0xC0` compressed / `0x02` uncompressed), so a match in
+    /// a later chunk can reference data from any earlier chunk (up to the
+    /// dictionary size). The range coder still resets per chunk, but the
+    /// dictionary/history is continuous — this is what brings the ratio in
+    /// line with the single-stream `.lzma` path.
     ///
-    /// `data.len()` must be in `1..=LZMA2_CHUNK_MAX`. The compressed-chunk
-    /// path additionally requires the compressed payload to fit in
-    /// 65_536 bytes (the 16-bit + 1 size field); if it overflows or the
-    /// compressor's output isn't smaller than the input, we fall back to
-    /// emitting the uncompressed chunk.
-    fn stage_chunk(&mut self, data: &[u8]) {
-        debug_assert!(!data.is_empty() && data.len() <= LZMA2_CHUNK_MAX);
-        // Try LZMA-compressed first. Compressed size is bounded by both
-        // the chunk's 16-bit size field (max 65_536) and our heuristic:
-        // if the compressor expanded the data, we'd save nothing by
-        // emitting a compressed chunk — uncompressed is smaller.
-        let compressed = encode_lzma_chunk(data, LZMA2_DICT_SIZE, self.enc_params);
-        let use_compressed =
-            !compressed.is_empty() && compressed.len() <= 65_536 && compressed.len() < data.len();
-
-        if use_compressed {
-            self.stage_compressed_chunk(data, &compressed);
-        } else {
-            self.stage_uncompressed_chunk(data);
+    /// `input` is the entire block (`uncompressed_total` bytes). Each framed
+    /// chunk is appended to `pending`; the caller drains it before the block
+    /// trailer.
+    fn stage_payload(&mut self, input: &[u8]) {
+        let chunks = encode_lzma2_stream(input, LZMA2_DICT_SIZE, self.enc_params);
+        let mut pos = 0usize;
+        for chunk in chunks {
+            let data = &input[pos..pos + chunk.uncomp_len];
+            match chunk.body {
+                Some(ref body) => self.stage_compressed_chunk(data, body, chunk.reset_dict),
+                None => self.stage_uncompressed_chunk(data, chunk.reset_dict),
+            }
+            pos += chunk.uncomp_len;
         }
     }
 
-    /// Stage a compressed LZMA2 chunk: control byte `0xE0`-style header
-    /// with the uncompressed-size's top 5 bits embedded into bits 0..=4
-    /// of the control byte, followed by two big-endian uncompressed-size
-    /// continuation bytes, two big-endian compressed-size bytes, a
-    /// 1-byte LZMA properties byte (because we full-reset every chunk),
-    /// and the range-coded payload.
-    fn stage_compressed_chunk(&mut self, data: &[u8], compressed: &[u8]) {
+    /// Stage one compressed LZMA2 chunk: a control byte (`0xE0` for the first
+    /// dict-resetting chunk, `0xC0` for a dict-continuing chunk — both carry
+    /// the top 5 bits of `uncomp_size-1` in bits 0..=4), two big-endian
+    /// `uncomp_size-1` continuation bytes, two big-endian `comp_size-1` bytes,
+    /// a 1-byte LZMA properties byte (bit 6 of both control values is set, so
+    /// properties are always present), then the range-coded payload.
+    fn stage_compressed_chunk(&mut self, data: &[u8], compressed: &[u8], reset_dict: bool) {
         debug_assert!(!data.is_empty() && data.len() <= LZMA2_CHUNK_MAX);
         debug_assert!(!compressed.is_empty() && compressed.len() <= 65_536);
 
         let uncomp_size_minus_1 = (data.len() - 1) as u32; // 0..=65535
         let uncomp_top = ((uncomp_size_minus_1 >> 16) & 0x1F) as u8; // 0 here
-        // Control byte: `111x_xxxx` = compressed + dict reset + props reset
-        // + state reset (full reset). The low 5 bits carry the top 5 bits
-        // of (uncomp_size - 1). With our 65_536 cap those top 5 bits are
-        // always zero, yielding the exact value 0xE0.
-        let control: u8 = 0xE0 | uncomp_top;
+        // Control base: `111x_xxxx` (0xE0) = compressed + dict reset + props
+        // reset + state reset; `110x_xxxx` (0xC0) = compressed + props reset +
+        // state reset, dictionary CONTINUES. The low 5 bits carry the top 5
+        // bits of (uncomp_size - 1); with our 65_536 cap those are zero.
+        let base: u8 = if reset_dict { 0xE0 } else { 0xC0 };
+        let control: u8 = base | uncomp_top;
 
         let uncomp_mid = ((uncomp_size_minus_1 >> 8) & 0xFF) as u8;
         let uncomp_lo = (uncomp_size_minus_1 & 0xFF) as u8;
@@ -524,11 +520,12 @@ impl Encoder {
         self.compressed_payload_bytes += (header_len + compressed.len()) as u64;
     }
 
-    /// Stage an LZMA2 uncompressed chunk (control byte 0x01 — dict reset,
-    /// for the simple case where compression wouldn't help).
-    fn stage_uncompressed_chunk(&mut self, data: &[u8]) {
+    /// Stage an LZMA2 uncompressed chunk: control `0x01` (dict reset) for the
+    /// first chunk, `0x02` (no reset, dictionary continues) otherwise. Used as
+    /// the fallback when compression would expand a chunk.
+    fn stage_uncompressed_chunk(&mut self, data: &[u8], reset_dict: bool) {
         debug_assert!(!data.is_empty() && data.len() <= LZMA2_CHUNK_MAX);
-        let control: u8 = 0x01; // full dict reset; safe for any position
+        let control: u8 = if reset_dict { 0x01 } else { 0x02 };
         let size_minus_1 = (data.len() - 1) as u16;
         self.pending.reserve(3 + data.len());
         self.pending.push(control);
@@ -605,29 +602,20 @@ impl RawEncoder for Encoder {
                     }
                 }
                 EncPhase::Body => {
-                    // Consume input into the buffer.
-                    while consumed < input.len() && self.in_buf.len() < LZMA2_CHUNK_MAX {
-                        let take =
-                            (LZMA2_CHUNK_MAX - self.in_buf.len()).min(input.len() - consumed);
-                        self.in_buf
-                            .extend_from_slice(&input[consumed..consumed + take]);
-                        consumed += take;
+                    // Buffer the entire block's input so the LZMA2 payload can
+                    // be produced by a single continuous match-finder at
+                    // `finish` (the dictionary spans the whole input rather
+                    // than resetting per chunk). We never flush mid-stream;
+                    // chunking happens only at the output-framing level.
+                    if consumed < input.len() {
+                        self.in_buf.extend_from_slice(&input[consumed..]);
+                        consumed = input.len();
                     }
-                    if self.in_buf.len() == LZMA2_CHUNK_MAX {
-                        // Flush a full chunk.
-                        let data = core::mem::take(&mut self.in_buf);
-                        self.check.update(&data);
-                        self.uncompressed_total += data.len() as u64;
-                        self.stage_chunk(&data);
-                        self.phase = EncPhase::DrainPending;
-                    } else {
-                        // Need more input; come back via another call.
-                        return Ok(RawProgress {
-                            consumed,
-                            written,
-                            done: false,
-                        });
-                    }
+                    return Ok(RawProgress {
+                        consumed,
+                        written,
+                        done: false,
+                    });
                 }
                 EncPhase::DrainPending => {
                     if self.drain_pending(output, &mut written) {
@@ -697,11 +685,13 @@ impl RawEncoder for Encoder {
                 }
                 EncPhase::Body => {
                     if !self.in_buf.is_empty() {
-                        // Flush a partial chunk.
+                        // Produce the whole block's LZMA2 payload at once from
+                        // the fully-buffered input, using a single continuous
+                        // match-finder so the dictionary spans every chunk.
                         let data = core::mem::take(&mut self.in_buf);
                         self.check.update(&data);
                         self.uncompressed_total += data.len() as u64;
-                        self.stage_chunk(&data);
+                        self.stage_payload(&data);
                         self.phase = EncPhase::DrainPending;
                     } else {
                         // No pending input. Move to block trailer.
@@ -942,6 +932,28 @@ impl Decoder {
             comp_decoded_pos: 0,
             last_props: 0,
             poisoned: false,
+        }
+    }
+
+    /// Feed raw uncompressed-chunk bytes into the LZMA2 dictionary so a later
+    /// dictionary-continuing compressed chunk can reference them. Creates the
+    /// `lzma_core` on first use (canonical default props; the next compressed
+    /// chunk's reset bits replace them) sized to the block's dictionary.
+    fn feed_uncompressed_dict(&mut self, src: &[u8]) {
+        if self.lzma_core.is_none() {
+            // Props are irrelevant for plain dict population; use the canonical
+            // default (lc=3, lp=0, pb=2). `parse` cannot fail for this byte.
+            let props = Lzma2Props::parse(LZMA2_PROPS_BYTE).unwrap_or(Lzma2Props {
+                lc: 3,
+                lp: 0,
+                pb: 2,
+            });
+            let dict_size = (self.lzma2_dict_size as usize).clamp(4096, 128 * 1024 * 1024);
+            self.lzma_core = Some(Box::new(LzmaCore::new(props, dict_size)));
+            self.last_props = LZMA2_PROPS_BYTE;
+        }
+        if let Some(core) = self.lzma_core.as_mut() {
+            core.append_literals(src);
         }
     }
 
@@ -1432,6 +1444,15 @@ impl RawDecoder for Decoder {
                         let src = &input[consumed..consumed + take];
                         output[written..written + take].copy_from_slice(src);
                         self.check.update(src);
+                        // Feed the raw bytes into the LZ dictionary so a later
+                        // dictionary-continuing compressed chunk (`0xC0`) can
+                        // back-reference them. Lazily create the core (with the
+                        // block's dict size and the canonical default props —
+                        // props don't affect plain dict population, and the
+                        // next compressed chunk resets them) when none exists
+                        // yet, e.g. when the block opens with an uncompressed
+                        // chunk.
+                        self.feed_uncompressed_dict(src);
                         self.block_compressed_seen += take as u64;
                         self.block_uncompressed_seen += take as u64;
                         self.chunk_remaining -= take;
