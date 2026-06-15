@@ -260,6 +260,21 @@ fn stream_decode(
         }
     }
 
+    // Drain any decoded output the decoder still holds internally before
+    // declaring end-of-input. Some codecs (notably bzip2) decode a whole block
+    // into an internal buffer that can exceed the caller's output buffer; once
+    // the compressed input is fully consumed, the decode loop above stops
+    // (its `consumed < n` guard is false) with that buffer still pending. Pull
+    // the rest out with empty-input `decode` calls until nothing more is
+    // produced — mirroring the streaming contract the library exercises.
+    loop {
+        let (p, _status) = dec.decode(&[], &mut out_buf).map_err(codec_err)?;
+        writer.write_all(&out_buf[..p.written])?;
+        if p.written == 0 {
+            break;
+        }
+    }
+
     loop {
         let (p, status) = dec.finish(&mut out_buf).map_err(codec_err)?;
         writer.write_all(&out_buf[..p.written])?;

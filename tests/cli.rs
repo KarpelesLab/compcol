@@ -163,6 +163,30 @@ fn pipe_round_trip_gzip() {
 }
 
 #[test]
+fn pipe_decode_drains_internal_block_buffer() {
+    // Regression: a highly-compressible large input decodes to far more than
+    // one output-buffer's worth. Block-buffering decoders (notably bzip2)
+    // decode an entire block internally; the CLI must drain that buffer after
+    // the compressed input is consumed instead of stopping at the first
+    // buffer-full (which previously truncated bzip2 output at 64 KiB).
+    let input = b"the quick brown fox jumps over the lazy dog 0123456789\n".repeat(100_000);
+    for codec in ["bzip2", "gzip", "xz", "zstd", "lzma", "lz4", "brotli"] {
+        let (encoded, _err, code) = run_with_stdin(&["-t", codec], &input);
+        assert_eq!(code, 0, "{codec} encode failed");
+        let (decoded, err, code) = run_with_stdin(&["-t", codec, "-d"], &encoded);
+        assert_eq!(code, 0, "{codec} decode failed: {}", String::from_utf8_lossy(&err));
+        assert_eq!(
+            decoded.len(),
+            input.len(),
+            "{codec} decode truncated: got {} of {} bytes",
+            decoded.len(),
+            input.len()
+        );
+        assert_eq!(decoded, input, "{codec} decode mismatch");
+    }
+}
+
+#[test]
 fn auto_detect_decompress_gzip_via_pipe() {
     // Compress with an explicit -t, then decompress with NO -t: the binary
     // must auto-detect gzip from the 1F 8B magic.
