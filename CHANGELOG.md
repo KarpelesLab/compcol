@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.6](https://github.com/KarpelesLab/compcol/compare/v0.6.5...v0.6.6) - 2026-06-27
+
+### Added
+
+- *(qpack)* dynamic-table encoder driving the encoder stream
+
 ### Added
 
 - *(qpack)* dynamic-table encoder: `QpackEncoder::with_dynamic_table` + `encode`
