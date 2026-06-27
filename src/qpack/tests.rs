@@ -272,6 +272,185 @@ fn sensitive_field_sets_never_index_bit() {
     assert!(out2[0].sensitive);
 }
 
+// ─── dynamic-table encoder ───────────────────────────────────────────────
+
+/// Round-trip a dynamic [`Encoded`] pair through `dec`: feed the encoder stream
+/// first (the contract), then decode the field section.
+fn rt(dec: &mut QpackDecoder, e: &Encoded) -> Vec<HeaderField> {
+    dec.feed_encoder_stream(&e.encoder_stream).unwrap();
+    dec.decode_field_section(&e.field_section).unwrap()
+}
+
+#[test]
+fn encode_static_only_matches_encode_field_section() {
+    // encode() on a static-only encoder emits no encoder stream and a field
+    // section byte-identical to encode_field_section().
+    let fields = vec![
+        f(b":path", b"/"),
+        f(b":method", b"GET"),
+        f(b"custom", b"value"),
+    ];
+    let mut a = QpackEncoder::new();
+    let mut b = QpackEncoder::new();
+    let e = a.encode(&fields);
+    assert!(e.encoder_stream.is_empty());
+    assert_eq!(e.field_section, b.encode_field_section(&fields));
+}
+
+#[test]
+fn dynamic_inserts_literal_name_and_round_trips() {
+    let mut enc = QpackEncoder::with_dynamic_table(4096);
+    let mut dec = QpackDecoder::with_max_table_capacity(4096);
+
+    let fields = vec![f(b"custom-key", b"custom-value")];
+    let e = enc.encode(&fields);
+    // An insert happened (Set Capacity + Insert with Literal Name), and the
+    // field section carries a non-zero Required Insert Count.
+    assert!(!e.encoder_stream.is_empty());
+    assert_eq!(enc.insert_count(), 1);
+    assert_ne!(e.field_section[0], 0x00); // RIC prefix byte != 0
+    assert_eq!(rt(&mut dec, &e), fields);
+    assert_eq!(dec.insert_count(), 1);
+}
+
+#[test]
+fn dynamic_reuses_entry_without_new_inserts() {
+    let mut enc = QpackEncoder::with_dynamic_table(4096);
+    let mut dec = QpackDecoder::with_max_table_capacity(4096);
+
+    let fields = vec![f(b"x-custom", b"hello")];
+    let first = enc.encode(&fields);
+    assert!(!first.encoder_stream.is_empty());
+    assert_eq!(rt(&mut dec, &first), fields);
+
+    // Second section references the existing entry — no new encoder-stream
+    // bytes, but still a dynamic (indexed) reference with non-zero RIC.
+    let second = enc.encode(&fields);
+    assert!(second.encoder_stream.is_empty());
+    assert_eq!(enc.insert_count(), 1);
+    assert_eq!(rt(&mut dec, &second), fields);
+}
+
+#[test]
+fn dynamic_static_name_reference_insert() {
+    // :authority has a static name (index 0) but no value match → the insert
+    // uses a static Insert with Name Reference.
+    let mut enc = QpackEncoder::with_dynamic_table(4096);
+    let mut dec = QpackDecoder::with_max_table_capacity(4096);
+
+    let fields = vec![f(b":authority", b"www.example.com")];
+    let e = enc.encode(&fields);
+    assert_eq!(enc.insert_count(), 1);
+    assert_eq!(rt(&mut dec, &e), fields);
+}
+
+#[test]
+fn dynamic_name_reference_reuse_for_new_value() {
+    // First insert custom-key=v1 (literal name); a later field with the same
+    // name but a new value inserts via a *dynamic* name reference.
+    let mut enc = QpackEncoder::with_dynamic_table(4096);
+    let mut dec = QpackDecoder::with_max_table_capacity(4096);
+
+    let e1 = enc.encode(&[f(b"custom-key", b"v1")]);
+    assert_eq!(rt(&mut dec, &e1), vec![f(b"custom-key", b"v1")]);
+
+    let e2 = enc.encode(&[f(b"custom-key", b"v2")]);
+    assert!(!e2.encoder_stream.is_empty());
+    assert_eq!(enc.insert_count(), 2);
+    assert_eq!(rt(&mut dec, &e2), vec![f(b"custom-key", b"v2")]);
+}
+
+#[test]
+fn dynamic_mixed_static_dynamic_literal_round_trip() {
+    let mut enc = QpackEncoder::with_dynamic_table(4096);
+    let mut dec = QpackDecoder::with_max_table_capacity(4096);
+
+    let fields = vec![
+        f(b":method", b"GET"),            // static full match
+        f(b":authority", b"example.org"), // static name → insert
+        f(b"x-app-id", b"42"),            // literal name → insert
+        f(b"accept", b"*/*"),             // static full match
+        f(b"x-app-id", b"42"),            // dynamic full match (reuse)
+    ];
+    let e = enc.encode(&fields);
+    assert_eq!(rt(&mut dec, &e), fields);
+}
+
+#[test]
+fn dynamic_huffman_round_trip_many_fields() {
+    let mut enc = QpackEncoder::with_dynamic_table(8192); // Huffman on
+    let mut dec = QpackDecoder::with_max_table_capacity(8192);
+
+    let mut fields: Vec<HeaderField> = (0..30)
+        .map(|i| {
+            let name = alloc::format!("x-header-{i}");
+            let val = alloc::format!("value-{i}-{}", "data".repeat(i % 4));
+            f(name.as_bytes(), val.as_bytes())
+        })
+        .collect();
+    // Repeat some fields so the second occurrences reuse dynamic entries.
+    fields.extend_from_slice(&fields.clone()[..10]);
+    let e = enc.encode(&fields);
+    assert_eq!(rt(&mut dec, &e), fields);
+}
+
+#[test]
+fn dynamic_eviction_safety_within_section() {
+    // Capacity fits only ~2 of these entries. Entries referenced by the field
+    // section must never be evicted by a later insert in the same batch, so the
+    // encoder falls back to literals once the table is full — and the section
+    // still round-trips exactly.
+    let mut enc = QpackEncoder::with_dynamic_table(128);
+    let mut dec = QpackDecoder::with_max_table_capacity(128);
+
+    let fields = vec![
+        f(b"aaaaaaaaaa", b"00000000000000000000"), // size 10+20+32 = 62
+        f(b"bbbbbbbbbb", b"11111111111111111111"), // 62  → table now full
+        f(b"cccccccccc", b"22222222222222222222"), // cannot insert → literal
+        f(b"dddddddddd", b"33333333333333333333"), // literal
+    ];
+    let e = enc.encode(&fields);
+    assert_eq!(rt(&mut dec, &e), fields);
+    // At most two entries ever inserted (the rest fell back to literals).
+    assert!(enc.insert_count() <= 2, "inserted {}", enc.insert_count());
+}
+
+#[test]
+fn dynamic_sensitive_field_not_inserted() {
+    let mut enc = QpackEncoder::with_dynamic_table(4096);
+    let mut dec = QpackDecoder::with_max_table_capacity(4096);
+
+    let fields = vec![
+        HeaderField::sensitive(b"authorization", b"Bearer secret"), // static name
+        HeaderField::sensitive(b"x-token", b"abc123"),              // literal name
+    ];
+    let e = enc.encode(&fields);
+    // Nothing inserted; both coded never-indexed.
+    assert!(e.encoder_stream.is_empty());
+    assert_eq!(enc.insert_count(), 0);
+    let out = rt(&mut dec, &e);
+    assert_eq!(out, fields);
+    assert!(out[0].sensitive);
+    assert!(out[1].sensitive);
+}
+
+#[test]
+fn dynamic_cross_section_reference_with_eviction() {
+    // Encode three sections; the third reuses an entry inserted in the first
+    // while later inserts have advanced (and possibly evicted) the table.
+    let mut enc = QpackEncoder::with_dynamic_table(256);
+    let mut dec = QpackDecoder::with_max_table_capacity(256);
+
+    let a = vec![f(b"k1", b"reusable-value")];
+    let ea = enc.encode(&a);
+    assert_eq!(rt(&mut dec, &ea), a);
+
+    // Reference k1 again immediately (still present).
+    let eb = enc.encode(&a);
+    assert!(eb.encoder_stream.is_empty());
+    assert_eq!(rt(&mut dec, &eb), a);
+}
+
 // ─── error handling ──────────────────────────────────────────────────────
 
 #[test]
