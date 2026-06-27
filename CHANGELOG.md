@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(qpack)* dynamic-table encoder: `QpackEncoder::with_dynamic_table` + `encode`
+  drive the encoder stream (Set Dynamic Table Capacity, Insert with
+  Name Reference against static/dynamic names, Insert with Literal Name) and
+  emit field sections with dynamic indexed / name-reference representations and
+  a non-zero Required Insert Count. Entries referenced by a field section are
+  never evicted by inserts in the same batch; sensitive fields stay out of the
+  table (never-indexed). The previous static-only `encode_field_section` path is
+  unchanged. QPACK is now fully bidirectional (encode + decode, static +
+  dynamic), matching HPACK.
+
 ## [0.6.5](https://github.com/KarpelesLab/compcol/compare/v0.6.4...v0.6.5) - 2026-06-15
 
 ### Fixed

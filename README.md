@@ -77,7 +77,7 @@ flag, and a `compcol` binary turns the library into a Unix-style filter.
 | RAR 3.x | `rar3` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + E8 filter; PPMd & VM filters refused | libarchive RAR3 fixtures |
 | RAR 5.x | `rar5` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + x86 filter; Delta/ARM refused | RARLAB-CLI fixtures |
 | HTTP/2 HPACK (RFC 7541) | `hpack` | — | full (header codec + `h2-huffman` string codec) | full (static+dynamic tables, integer/string coding) | RFC 7541 Appendix C vectors |
-| HTTP/3 QPACK (RFC 9204) | `qpack` | — | static-table + literal encoder; full decoder | full (static+dynamic tables via encoder stream, all field representations) | RFC 9204 Appendix B vectors |
+| HTTP/3 QPACK (RFC 9204) | `qpack` | — | full (static + dynamic-table encoder driving the encoder stream; eviction-safe) | full (static+dynamic tables via encoder stream, all field representations) | RFC 9204 Appendix B vectors |
 | Canonical Huffman (standalone) | `huffman` | `.huff` | full (length-limited, self-delimiting) | full | own round-trip |
 | Range coder (adaptive order-0) | `rangecoder` | `.range` | full | full | own round-trip |
 | Move-To-Front transform | `mtf` | `mtf` | full (reversible filter) | full | round-trip identity |

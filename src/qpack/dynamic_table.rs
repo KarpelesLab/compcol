@@ -120,6 +120,49 @@ impl DynamicTable {
         Some(abs)
     }
 
+    /// Find the best live entry for `(name, value)`, used by the encoder mirror
+    /// to reference existing insertions. Prefers a full name+value match
+    /// (returning `value_matched = true`), else the most recent name-only match.
+    /// Returns the **absolute** index. Newest matches are preferred so the
+    /// reference is least likely to be evicted soon.
+    pub(crate) fn find(&self, name: &[u8], value: &[u8]) -> Option<(usize, bool)> {
+        let mut name_only: Option<usize> = None;
+        for (i, (n, v)) in self.entries.iter().enumerate().rev() {
+            if n.as_slice() == name {
+                let abs = self.dropped + i;
+                if v.as_slice() == value {
+                    return Some((abs, true));
+                }
+                if name_only.is_none() {
+                    name_only = Some(abs);
+                }
+            }
+        }
+        name_only.map(|abs| (abs, false))
+    }
+
+    /// The absolute index of the oldest entry that would survive inserting an
+    /// entry of `incoming` bytes (i.e. the post-insert `dropped`). Every live
+    /// entry with absolute index `< evict_floor(incoming)` would be evicted to
+    /// make room. Pure — does not mutate. The encoder uses this to avoid
+    /// evicting entries it still references in the field section being built.
+    pub(crate) fn evict_floor(&self, incoming: usize) -> usize {
+        let mut size = self.size;
+        let mut dropped = self.dropped;
+        let mut i = 0;
+        while size + incoming > self.capacity {
+            match self.entries.get(i) {
+                Some((n, v)) => {
+                    size -= Self::entry_size(n, v);
+                    dropped += 1;
+                    i += 1;
+                }
+                None => break,
+            }
+        }
+        dropped
+    }
+
     /// Look up an entry by **absolute** index. Returns `None` if the index has
     /// been evicted or never inserted.
     pub(crate) fn get_absolute(&self, abs: usize) -> Option<(&[u8], &[u8])> {
