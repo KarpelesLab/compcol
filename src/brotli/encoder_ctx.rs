@@ -159,22 +159,49 @@ pub(crate) fn cluster(
         }
     }
 
+    // Agglomerative clustering. The naive form recomputes every pair's merge
+    // delta — including each cluster's own `histogram_bits` — on every iteration,
+    // which is O(active³ · 256) and blows up on dense histograms (e.g. random
+    // input, where every context spans all 256 symbols). Instead cache each
+    // cluster's self-cost and the pairwise deltas, keyed by stable cluster id,
+    // and after each merge recompute only the merged cluster's row. The merge
+    // sequence — and therefore the resulting model and compressed output — is
+    // byte-for-byte identical to the naive version; only redundant work is cut.
+    let mut self_bits = alloc::vec![0u64; NUM_CONTEXTS];
+    for &c in &active {
+        self_bits[c] = histogram_bits(&histograms[c], totals[c]);
+    }
+    // `delta[ci][cj]` for `ci < cj`; valid only for currently-active pairs.
+    let mut delta = alloc::vec![alloc::vec![0i64; NUM_CONTEXTS]; NUM_CONTEXTS];
+    let pair_delta = |ci: usize, cj: usize, sb: &[u64], hs: &[[u32; 256]], ts: &[u32]| -> i64 {
+        let bm = merged_bits(&hs[ci], ts[ci], &hs[cj], ts[cj]);
+        bm as i64 - sb[ci] as i64 - sb[cj] as i64 - HEADER_COST_BITS as i64
+    };
+    for ai in 0..active.len() {
+        for aj in (ai + 1)..active.len() {
+            let (ci, cj) = (active[ai], active[aj]);
+            delta[ci][cj] = pair_delta(ci, cj, &self_bits, &histograms, &totals);
+        }
+    }
+
     while active.len() > 1 {
         let force = active.len() > max_trees;
         let mut best_i = 0usize;
         let mut best_j = 0usize;
         let mut best_delta: i64 = i64::MAX;
+        // Same scan order and strict `<` tie-break as the naive loop, so the
+        // chosen pair is identical — but now a cheap matrix lookup, not a
+        // 256-symbol recomputation.
         for ai in 0..active.len() {
             for aj in (ai + 1)..active.len() {
-                let ci = active[ai];
-                let cj = active[aj];
-                let bi = histogram_bits(&histograms[ci], totals[ci]);
-                let bj = histogram_bits(&histograms[cj], totals[cj]);
-                let bm = merged_bits(&histograms[ci], totals[ci], &histograms[cj], totals[cj]);
-                // Merging trades a header allowance against extra data bits.
-                let delta = bm as i64 - bi as i64 - bj as i64 - HEADER_COST_BITS as i64;
-                if delta < best_delta {
-                    best_delta = delta;
+                let (ci, cj) = (active[ai], active[aj]);
+                let d = if ci < cj {
+                    delta[ci][cj]
+                } else {
+                    delta[cj][ci]
+                };
+                if d < best_delta {
+                    best_delta = d;
                     best_i = ai;
                     best_j = aj;
                 }
@@ -197,6 +224,15 @@ pub(crate) fn cluster(
             }
         }
         active.swap_remove(best_j);
+        // Only the merged cluster `ci`'s costs changed; refresh its self-cost
+        // and its delta against every other surviving cluster.
+        self_bits[ci] = histogram_bits(&histograms[ci], totals[ci]);
+        for &ck in &active {
+            if ck != ci {
+                let (lo, hi) = if ci < ck { (ci, ck) } else { (ck, ci) };
+                delta[lo][hi] = pair_delta(lo, hi, &self_bits, &histograms, &totals);
+            }
+        }
     }
 
     // Compress cluster ids to a dense 0..num_trees range.
