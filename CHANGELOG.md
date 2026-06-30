@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.7](https://github.com/KarpelesLab/compcol/compare/v0.6.6...v0.6.7) - 2026-06-30
+
+### Added
+
+- *(zstd)* validate Content_Checksum frames (XXH64)
+
+### Fixed
+
+- *(decoder)* report OutputFull when the output buffer is full
+
+### Other
+
+- *(lzma2/xz)* linear-time match finder + faster optimal parse
+
 ### Added
 
 - *(zstd)* decode and validate frames carrying a `Content_Checksum` (the `zstd`
