@@ -307,14 +307,22 @@ impl Encoder {
         let buffer = buffer.as_slice();
         let buf_len = buffer.len();
 
-        // Rebuild the chains for this buffer and pre-index only the retained
-        // history (`[0, start)`). Each parser then splices in the *current
-        // block's* positions lazily as it advances, so the hash chains never
-        // contain positions ahead of the probe — the standard LZ invariant that
-        // keeps match finding correct and the depth budget meaningful. Indexing
-        // history up front is what enables cross-block back-references.
-        self.matcher.resize_for(buf_len);
-        for i in 0..start.min(buf_len.saturating_sub(3)) {
+        // Pre-index the retained history (`[0, start)`) so cross-block
+        // back-references are findable; each parser then splices in the
+        // *current block's* positions lazily as it advances, preserving the LZ
+        // invariant that the chains never contain positions ahead of the probe.
+        //
+        // The chains persist across blocks (the history prefix is byte-stable
+        // until the window is trimmed), so we only index the positions not
+        // already indexed by earlier blocks — `[inserted_upto, start)`. The old
+        // code re-indexed all of history every block, which is O(history) per
+        // block and quadratic over a stream; this makes it amortised O(input).
+        // `prepare_incremental` keeps the existing chains (rebuilding only on a
+        // head-size change); window trims call `resize_for`, which resets the
+        // high-water so the next block re-indexes from scratch.
+        self.matcher.prepare_incremental(buf_len);
+        let index_to = start.min(buf_len.saturating_sub(3));
+        for i in self.matcher.inserted_upto()..index_to {
             self.matcher.insert(buffer, i);
         }
 

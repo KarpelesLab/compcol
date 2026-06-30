@@ -29,6 +29,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   streaming XXH64 implementation; the decompressed output is hashed and checked
   against the 4-byte frame trailer, reporting `ChecksumMismatch` on corruption.
 
+### Changed
+
+- *(brotli)* much faster encode on low-redundancy input. The literal-context
+  histogram clustering was O(contexts³ · 256) — it rescanned every cluster pair
+  and recomputed each cluster's cost from scratch on every merge — which blew up
+  on dense histograms (e.g. random/incompressible data: ~37k instructions per
+  byte). It now caches per-cluster costs and the pairwise-delta matrix and
+  updates only the merged cluster each round. The merge sequence, and therefore
+  the compressed output, is byte-for-byte identical; encode of incompressible
+  input is ~8× faster.
+- *(zstd)* faster encode, especially on low-match input, with equal-or-better
+  ratio. The match finder's hash table was a fixed 64 Ki buckets over an up-to
+  8 MiB window (load factor in the hundreds), so every probe walked a full chain
+  of useless far links; it is now sized to the window. The per-block match index
+  is also built incrementally — the chains persist across blocks instead of
+  re-indexing all of history every block (which was O(history) per block, i.e.
+  quadratic over a stream). Output is unchanged on single-block inputs and
+  equal-or-smaller on multi-block inputs (no ratio regression observed).
+
 ### Fixed
 
 - *(decoder bridge)* a decoder that buffers a whole block internally (notably
