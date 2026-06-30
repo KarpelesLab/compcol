@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(decoder bridge)* a decoder that buffers a whole block internally (notably
+  `bzip2`) could fail a naive decode loop with `UnexpectedEnd`. When the
+  caller's `output` buffer filled mid-block, the `RawDecoder`→`Decoder` bridge
+  reported `InputEmpty` (because the decoder had already absorbed all the input)
+  instead of `OutputFull`; a loop that stops on `InputEmpty` then called
+  `finish` on a half-drained stream and got `UnexpectedEnd`. The bridge now
+  returns `OutputFull` whenever the output buffer is full, which is always the
+  correct "drain and call again" signal. Affected `bzip2` round-trips whenever a
+  decoded block was larger than the output buffer.
 - *(lzma2/xz)* eliminated quadratic encode time on incompressible/low-match
   input. The match finder's hash head table was a fixed 64 Ki buckets, so as the
   input grew the per-bucket chains lengthened and every probe walked work that
