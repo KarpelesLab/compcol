@@ -50,12 +50,13 @@
 //!   RLE_Mode for sequence FSE tables, multi-frame output, content checksum,
 //!   or dictionaries.
 //!
-//! # What does NOT work
+//! # Content checksum
 //!
-//! - **Content_Checksum_Flag** in the Frame_Header. The 4-byte trailer is the
-//!   low 32 bits of XXH64 over the decompressed data; we do not ship an
-//!   XXH64 implementation, so any frame that advertises a content checksum
-//!   is refused with [`crate::Error::Unsupported`].
+//! Frames with `Content_Checksum_Flag` set (the `zstd` CLI writes one by
+//! default) are decoded and the 4-byte trailer — the low 32 bits of XXH64 over
+//! the decompressed data — is validated; a mismatch is reported as
+//! [`crate::Error::ChecksumMismatch`]. Our encoder does not yet emit a content
+//! checksum.
 //!
 //! - **Skippable_Frame** magic numbers (`0x184D2A50..=0x184D2A5F`) are
 //!   detected and rejected as unsupported rather than silently skipped.
@@ -80,6 +81,7 @@ mod huffman;
 mod literals;
 mod matcher;
 mod sequences;
+mod xxhash;
 
 pub use decoder::Decoder;
 pub use encoder::{Encoder, EncoderConfig};
