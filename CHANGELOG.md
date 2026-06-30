@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(zstd)* decode and validate frames carrying a `Content_Checksum` (the `zstd`
+  CLI writes one by default). Previously any such frame was refused with
+  `Unsupported`, so default `zstd` output only decoded with `--no-check`. Adds a
+  streaming XXH64 implementation; the decompressed output is hashed and checked
+  against the 4-byte frame trailer, reporting `ChecksumMismatch` on corruption.
+
 ### Fixed
 
 - *(decoder bridge)* a decoder that buffers a whole block internally (notably

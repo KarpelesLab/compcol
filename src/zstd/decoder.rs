@@ -4,9 +4,9 @@
 //! `Compressed_Block` (Block_Type=2). See the module-level `mod.rs` docs for
 //! a full list of supported literal / sequence sub-modes.
 //!
-//! The decoder also refuses frames whose Frame_Header sets the
-//! `Content_Checksum_Flag` — we do not implement XXH64 in this crate, so we
-//! cannot validate the trailing 4-byte checksum.
+//! Frames whose Frame_Header sets the `Content_Checksum_Flag` are decoded and
+//! the trailing 4-byte XXH64 checksum is validated against the decompressed
+//! output (see [`crate::zstd`]).
 
 use alloc::vec::Vec;
 
@@ -14,6 +14,7 @@ use crate::error::Error;
 use crate::traits::{RawDecoder, RawProgress};
 use crate::zstd::literals::{LiteralsState, decode_literals};
 use crate::zstd::sequences::{SequencesState, decode_sequences, execute_sequences};
+use crate::zstd::xxhash::Xxh64;
 
 const MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
@@ -52,9 +53,8 @@ enum DecPhase {
     /// Emitting the bytes decoded out of a Compressed_Block (held in
     /// `emit_buf`).
     CompressedEmit,
-    /// Reading 4-byte Content_Checksum trailer (only entered if we somehow
-    /// allowed a checksummed frame — currently we refuse such frames in
-    /// `Fhd`).
+    /// Reading and validating the 4-byte Content_Checksum trailer (entered
+    /// after the last block when the Frame_Header set `Content_Checksum_Flag`).
     ContentChecksum,
     /// Frame fully consumed; subsequent input is ignored (we do not handle
     /// concatenated frames).
@@ -116,6 +116,11 @@ pub struct Decoder {
     /// Carry-over state for sequence FSE tables (Repeat_Mode) and the
     /// previous-offsets stack.
     seq_state: SequencesState,
+
+    /// Running XXH64 over the decompressed output, fed at every emit site.
+    /// Only consulted (and the per-byte update only performed) when
+    /// `has_content_checksum` is set; finalized against the frame trailer.
+    content_hash: Xxh64,
 }
 
 impl Decoder {
@@ -142,6 +147,7 @@ impl Decoder {
             history_emitted: 0,
             lit_state: LiteralsState::default(),
             seq_state: SequencesState::new(),
+            content_hash: Xxh64::new(),
         }
     }
 
@@ -181,12 +187,6 @@ impl Decoder {
 
         self.single_segment = ss_flag != 0;
         self.has_content_checksum = cchk_flag != 0;
-
-        // We don't implement XXH64 in this build, so checksummed frames are
-        // unsupported (per task spec).
-        if self.has_content_checksum {
-            return Err(self.poison(Error::Unsupported));
-        }
 
         self.dict_id_field_size = match dict_id_flag {
             0 => 0,
@@ -490,6 +490,9 @@ impl RawDecoder for Decoder {
                         });
                     }
                     output[written..written + n].copy_from_slice(&input[consumed..consumed + n]);
+                    if self.has_content_checksum {
+                        self.content_hash.update(&output[written..written + n]);
+                    }
                     // Mirror into history so subsequent Compressed_Blocks can
                     // back-reference these bytes.
                     self.history
@@ -525,6 +528,9 @@ impl RawDecoder for Decoder {
                     let n = core::cmp::min(self.rle_remaining as usize, out_avail);
                     for slot in &mut output[written..written + n] {
                         *slot = self.rle_byte;
+                    }
+                    if self.has_content_checksum {
+                        self.content_hash.update(&output[written..written + n]);
                     }
                     // Mirror into history.
                     for _ in 0..n {
@@ -582,6 +588,9 @@ impl RawDecoder for Decoder {
                     output[written..written + n].copy_from_slice(
                         &self.history[self.history_emitted..self.history_emitted + n],
                     );
+                    if self.has_content_checksum {
+                        self.content_hash.update(&output[written..written + n]);
+                    }
                     self.history_emitted += n;
                     written += n;
                     if self.history_emitted == self.history.len() {
@@ -589,14 +598,20 @@ impl RawDecoder for Decoder {
                     }
                 }
                 DecPhase::ContentChecksum => {
-                    // Currently unreachable — we reject checksummed frames
-                    // in `parse_fhd`. Kept as a state for future XXH64 work.
+                    // The 4-byte trailer is the low 32 bits of XXH64 over the
+                    // decompressed content (little-endian). Validate it against
+                    // the running hash we fed at every emit site.
                     if !self.fill_scratch(input, &mut consumed) {
                         return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
                         });
+                    }
+                    let expected = u32::from_le_bytes(self.scratch[..4].try_into().unwrap());
+                    let actual = self.content_hash.digest() as u32;
+                    if expected != actual {
+                        return Err(self.poison(Error::ChecksumMismatch));
                     }
                     self.phase = DecPhase::Done;
                 }

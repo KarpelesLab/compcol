@@ -443,18 +443,47 @@ fn decode_rejects_bad_magic() {
     assert_eq!(err, Error::BadHeader);
 }
 
-#[test]
-fn decode_rejects_checksum_flag() {
-    // Build a frame with Content_Checksum_Flag set (bit 2). We can't actually
-    // verify the checksum (no XXH64), so the decoder must refuse.
+/// A minimal valid frame carrying `Content_Checksum_Flag`: magic, FHD with the
+/// checksum bit set, a Window_Descriptor, one Last Raw_Block of `payload`, then
+/// the 4-byte trailer (caller supplies it so tests can corrupt it).
+fn checksummed_raw_frame(payload: &[u8], trailer: [u8; 4]) -> Vec<u8> {
     let mut f = Vec::new();
     f.extend_from_slice(&[0x28, 0xB5, 0x2F, 0xFD]);
-    f.push(0x04); // FHD: Content_Checksum_Flag = 1
-    f.push(0x50);
+    f.push(0x04); // FHD: Content_Checksum_Flag = 1, SS = 0, no dict, no FCS
+    f.push(0x00); // Window_Descriptor (minimal)
+    // Block_Header: Last_Block = 1, Block_Type = 0 (Raw), Block_Size = len.
+    let bh: u32 = 1 | ((payload.len() as u32) << 3);
+    f.push((bh & 0xFF) as u8);
+    f.push(((bh >> 8) & 0xFF) as u8);
+    f.push(((bh >> 16) & 0xFF) as u8);
+    f.extend_from_slice(payload);
+    f.extend_from_slice(&trailer);
+    f
+}
+
+#[test]
+fn decode_validates_correct_checksum() {
+    // Trailer = low 32 bits of XXH64("hello", seed 0), little-endian.
+    let frame = checksummed_raw_frame(b"hello", [0xA3, 0x6D, 0x9F, 0x88]);
     let mut dec = Decoder::new();
     let mut out = [0u8; 16];
-    let err = dec.decode(&f, &mut out).unwrap_err();
-    assert_eq!(err, Error::Unsupported);
+    let (p, _st) = dec.decode(&frame, &mut out).unwrap();
+    let (pf, _stf) = dec.finish(&mut out[p.written..]).unwrap();
+    assert_eq!(&out[..p.written + pf.written], b"hello");
+}
+
+#[test]
+fn decode_rejects_bad_checksum() {
+    // Same frame with the trailer corrupted: must be rejected, not ignored.
+    let frame = checksummed_raw_frame(b"hello", [0xA3, 0x6D, 0x9F, 0x00]);
+    let mut dec = Decoder::new();
+    let mut out = [0u8; 16];
+    // The mismatch surfaces once the trailer is read (here, in one shot).
+    let err = dec
+        .decode(&frame, &mut out)
+        .and_then(|p| dec.finish(&mut out[p.0.written..]))
+        .unwrap_err();
+    assert_eq!(err, Error::ChecksumMismatch);
 }
 
 #[test]
