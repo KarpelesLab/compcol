@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- *(lzma2/xz)* eliminated quadratic encode time on incompressible/low-match
+  input. The match finder's hash head table was a fixed 64 Ki buckets, so as the
+  input grew the per-bucket chains lengthened and every probe walked work that
+  scaled with the input — `xz` encode of 4 MiB of random data took ~6.7 s and
+  kept worsening. The head table is now sized to the match-finder window (like
+  liblzma sizes its hash to the dictionary), so chains stay O(1) and encode is
+  linear. Output is byte-for-byte unchanged.
+
+### Changed
+
+- *(lzma2/xz)* faster optimal-parse encoder, output unchanged: length-symbol
+  prices are cached per `pos_state` and refreshed periodically (instead of an
+  8-bit bittree walk per length per position), the new-match distance price is
+  computed once per dist-state band rather than per length, and match-length
+  comparison runs eight bytes at a time. Net: ~3× fewer instructions on
+  natural-language text, ~4× on long-run data, ~1.6× on mixed source code, with
+  identical compressed output.
+
 ## [0.6.6](https://github.com/KarpelesLab/compcol/compare/v0.6.5...v0.6.6) - 2026-06-27
 
 ### Added

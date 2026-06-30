@@ -51,6 +51,8 @@ const LEN_MID_BITS: u32 = 3;
 const LEN_MID_SYMBOLS: usize = 1 << LEN_MID_BITS;
 const LEN_HIGH_BITS: u32 = 8;
 const LEN_HIGH_SYMBOLS: usize = 1 << LEN_HIGH_BITS;
+/// Total number of length symbols (0-based): low ⊕ mid ⊕ high = 8 + 8 + 256.
+const LEN_SYMBOLS: usize = LEN_LOW_SYMBOLS + LEN_MID_SYMBOLS + LEN_HIGH_SYMBOLS;
 
 const MATCH_LEN_MIN: u32 = 2;
 
@@ -108,8 +110,19 @@ pub(crate) const LZMA2_PROPS_BYTE: u8 = (ENC_PB * 5 + ENC_LP) as u8 * 9 + ENC_LC
 const MAX_MATCH_LEN: u32 = 273; // 2 + 8 + 8 + 255 (LEN_LOW + LEN_MID + LEN_HIGH)
 
 // Hash chain match finder configuration.
-const HASH_BITS: u32 = 16;
-const HASH_SIZE: usize = 1 << HASH_BITS;
+//
+// The head table is sized at construction time to the match-finder window
+// (≈ `dict_size`, see `HashChain::new`) so that for incompressible input the
+// per-bucket chains stay short (load factor ≈ 1). A small *fixed* table would
+// make distinct 3-byte prefixes collide into the same bucket as the input
+// grows, so every probe walks a chain whose length scales with the input —
+// turning the parse O(n²/table) until the `max_chain` cap finally engages.
+// liblzma sizes its hash tables to the dictionary for the same reason.
+//
+// `HASH_MIN_BITS` floors the table for tiny inputs; the upper bound comes from
+// the window. `hash3` returns a full 32-bit mix that each probe reduces with
+// the runtime `head_mask`.
+const HASH_MIN_BITS: u32 = 14;
 const NIL: u32 = u32::MAX;
 
 /// Match-finder + optimal-parser tuning expanded from the user-facing `level`
@@ -206,11 +219,38 @@ impl EncoderParams {
     }
 }
 
+/// Full-width 3-byte hash mix. The caller reduces this to a bucket index with
+/// the finder's runtime `head_mask`; mixing all three bytes across the high
+/// bits keeps distinct prefixes well separated for any mask width.
 fn hash3(b0: u8, b1: u8, b2: u8) -> u32 {
-    ((b0 as u32).wrapping_mul(2654435761)
-        ^ ((b1 as u32).wrapping_shl(8))
-        ^ ((b2 as u32).wrapping_shl(16)))
-        & (HASH_SIZE as u32 - 1)
+    (b0 as u32).wrapping_mul(2654435761)
+        ^ (b1 as u32).wrapping_mul(2246822519)
+        ^ (b2 as u32).wrapping_mul(3266489917)
+}
+
+/// Length of the common prefix of `win[ci..]` and `win[pi..]`, up to `max_len`
+/// bytes. Compares eight bytes at a time via little-endian word loads — the
+/// first differing byte is the lowest set byte of the XOR, found with
+/// `trailing_zeros`. Callers must guarantee `ci < pi`, `pi + max_len <=
+/// win.len()` (so both word reads stay in bounds). On highly repetitive input
+/// the match-extension loop ran to 273 bytes one-at-a-time and dominated the
+/// match finder; the word stride cuts that ~8×.
+#[inline]
+fn match_len_at(win: &[u8], ci: usize, pi: usize, max_len: usize) -> u32 {
+    let mut i = 0usize;
+    while i + 8 <= max_len {
+        let x = u64::from_le_bytes(win[ci + i..ci + i + 8].try_into().unwrap());
+        let y = u64::from_le_bytes(win[pi + i..pi + i + 8].try_into().unwrap());
+        let d = x ^ y;
+        if d != 0 {
+            return (i + (d.trailing_zeros() >> 3) as usize) as u32;
+        }
+        i += 8;
+    }
+    while i < max_len && win[ci + i] == win[pi + i] {
+        i += 1;
+    }
+    i as u32
 }
 
 // ─── range encoder ───────────────────────────────────────────────────────
@@ -484,39 +524,6 @@ impl LengthCoderEnc {
                 LEN_HIGH_BITS,
                 length - (LEN_LOW_SYMBOLS + LEN_MID_SYMBOLS) as u32,
             );
-        }
-    }
-
-    /// Price of encoding length symbol `length` (0-based) at `pos_state`.
-    fn price(&self, prices: &[u32; PRICE_TABLE_SIZE], pos_state: u32, length: u32) -> u32 {
-        if length < LEN_LOW_SYMBOLS as u32 {
-            let base = (pos_state as usize) * LEN_LOW_SYMBOLS;
-            price_bit0(prices, self.choice)
-                + bittree_price(
-                    prices,
-                    &self.low[base..base + LEN_LOW_SYMBOLS],
-                    LEN_LOW_BITS,
-                    length,
-                )
-        } else if length < (LEN_LOW_SYMBOLS + LEN_MID_SYMBOLS) as u32 {
-            let base = (pos_state as usize) * LEN_MID_SYMBOLS;
-            price_bit1(prices, self.choice)
-                + price_bit0(prices, self.choice2)
-                + bittree_price(
-                    prices,
-                    &self.mid[base..base + LEN_MID_SYMBOLS],
-                    LEN_MID_BITS,
-                    length - LEN_LOW_SYMBOLS as u32,
-                )
-        } else {
-            price_bit1(prices, self.choice)
-                + price_bit1(prices, self.choice2)
-                + bittree_price(
-                    prices,
-                    &self.high,
-                    LEN_HIGH_BITS,
-                    length - (LEN_LOW_SYMBOLS + LEN_MID_SYMBOLS) as u32,
-                )
         }
     }
 }
@@ -998,7 +1005,8 @@ fn get_dist_slot(distance: u32) -> u32 {
 /// All byte reads go through the sliding window `win`, whose first byte is the
 /// absolute offset `base`; an absolute position `p` reads `win[p - base]`.
 struct HashChain {
-    head: Box<[u32; HASH_SIZE]>,
+    head: Vec<u32>,
+    head_mask: usize,
     prev: Vec<u32>,
     prev_mask: usize,
 }
@@ -1008,14 +1016,21 @@ impl HashChain {
     /// MAX_MATCH_LEN` positions (rounded up to a power of two). `cap_hint`
     /// caps the ring when the total input is known to be smaller, so small
     /// inputs (and the unit tests) don't over-allocate.
+    ///
+    /// The bucket `head` table is sized to the same window so that the average
+    /// chain length stays O(1) as the input grows (load factor ≈ 1); see the
+    /// note on `HASH_MIN_BITS`. It is floored at `1 << HASH_MIN_BITS` so tiny
+    /// inputs still get a usable spread.
     fn new(dict_size: u32, cap_hint: usize) -> Self {
         let needed = (dict_size as usize)
             .saturating_add(MAX_MATCH_LEN as usize)
             .saturating_add(2);
         let want = needed.min(cap_hint.max(1));
         let cap = want.max(1).next_power_of_two();
+        let head_cap = cap.max(1 << HASH_MIN_BITS);
         Self {
-            head: Box::new([NIL; HASH_SIZE]),
+            head: vec![NIL; head_cap],
+            head_mask: head_cap - 1,
             prev: vec![NIL; cap],
             prev_mask: cap - 1,
         }
@@ -1028,7 +1043,7 @@ impl HashChain {
         if i + 3 > win.len() {
             return;
         }
-        let h = hash3(win[i], win[i + 1], win[i + 2]) as usize;
+        let h = hash3(win[i], win[i + 1], win[i + 2]) as usize & self.head_mask;
         self.prev[pos & self.prev_mask] = self.head[h];
         self.head[h] = pos as u32;
     }
@@ -1046,7 +1061,7 @@ impl HashChain {
         if pi + 3 > win.len() {
             return None;
         }
-        let h = hash3(win[pi], win[pi + 1], win[pi + 2]) as usize;
+        let h = hash3(win[pi], win[pi + 1], win[pi + 2]) as usize & self.head_mask;
         let max_len = MAX_MATCH_LEN.min((win.len() - pi) as u32);
         let max_dist = (dict_size as usize).min(pos);
         let mut best_len: u32 = 0;
@@ -1073,10 +1088,7 @@ impl HashChain {
                 steps += 1;
                 continue;
             }
-            let mut len = 0u32;
-            while len < max_len && win[ci + len as usize] == win[pi + len as usize] {
-                len += 1;
-            }
+            let len = match_len_at(win, ci, pi, max_len as usize);
             if len >= MATCH_LEN_MIN && len > best_len {
                 best_len = len;
                 best_dist = (dist - 1) as u32;
@@ -1112,7 +1124,7 @@ impl HashChain {
         if pi + 3 > win.len() {
             return 0;
         }
-        let h = hash3(win[pi], win[pi + 1], win[pi + 2]) as usize;
+        let h = hash3(win[pi], win[pi + 1], win[pi + 2]) as usize & self.head_mask;
         let max_len = MAX_MATCH_LEN.min((win.len() - pi) as u32);
         let max_dist = (dict_size as usize).min(pos);
         let mut best_len: u32 = MATCH_LEN_MIN - 1;
@@ -1138,10 +1150,7 @@ impl HashChain {
                 steps += 1;
                 continue;
             }
-            let mut len = 0u32;
-            while len < max_len && win[ci + len as usize] == win[pi + len as usize] {
-                len += 1;
-            }
+            let len = match_len_at(win, ci, pi, max_len as usize);
             if len >= MATCH_LEN_MIN && len > best_len {
                 // Chain is walked nearest-first, so this is the shortest
                 // distance achieving every length in (best_len, len]. Record
@@ -1174,11 +1183,7 @@ fn rep_match_len(win: &[u8], base: usize, pos: usize, dist: u32) -> u32 {
     }
     let pi = pos - base;
     let max_len = MAX_MATCH_LEN.min((win.len() - pi) as u32) as usize;
-    let mut len = 0usize;
-    while len < max_len && win[pi - d + len] == win[pi + len] {
-        len += 1;
-    }
-    len as u32
+    match_len_at(win, pi - d, pi, max_len)
 }
 
 // ─── parse decision replay ────────────────────────────────────────────────
@@ -1239,6 +1244,112 @@ impl Optimizer {
             matches: Vec::with_capacity(64),
             decisions: Vec::with_capacity(window + 1),
         }
+    }
+}
+
+/// Fill `row[len_sym]` with the price of every length symbol `0..LEN_SYMBOLS`
+/// for the given length coder and `pos_state`. Mirrors [`LengthCoderEnc::price`]
+/// exactly but amortises the per-symbol choice/bittree work across the whole
+/// row — the optimal parser indexes the same `(pos_state, len)` cell many times
+/// per window, so one row build replaces hundreds of repeated bittree walks.
+fn fill_len_row(
+    row: &mut [u32; LEN_SYMBOLS],
+    lc: &LengthCoderEnc,
+    prices: &[u32; PRICE_TABLE_SIZE],
+    pos_state: u32,
+) {
+    let c0 = price_bit0(prices, lc.choice);
+    let c1 = price_bit1(prices, lc.choice);
+    let c2_0 = price_bit0(prices, lc.choice2);
+    let c2_1 = price_bit1(prices, lc.choice2);
+
+    let low_base = pos_state as usize * LEN_LOW_SYMBOLS;
+    let low = &lc.low[low_base..low_base + LEN_LOW_SYMBOLS];
+    for (l, cell) in row[..LEN_LOW_SYMBOLS].iter_mut().enumerate() {
+        *cell = c0 + bittree_price(prices, low, LEN_LOW_BITS, l as u32);
+    }
+
+    let mid_base = pos_state as usize * LEN_MID_SYMBOLS;
+    let mid = &lc.mid[mid_base..mid_base + LEN_MID_SYMBOLS];
+    let mid_pref = c1 + c2_0;
+    for (l, cell) in row[LEN_LOW_SYMBOLS..LEN_LOW_SYMBOLS + LEN_MID_SYMBOLS]
+        .iter_mut()
+        .enumerate()
+    {
+        *cell = mid_pref + bittree_price(prices, mid, LEN_MID_BITS, l as u32);
+    }
+
+    let hi_pref = c1 + c2_1;
+    for (l, cell) in row[LEN_LOW_SYMBOLS + LEN_MID_SYMBOLS..]
+        .iter_mut()
+        .enumerate()
+    {
+        *cell = hi_pref + bittree_price(prices, &lc.high, LEN_HIGH_BITS, l as u32);
+    }
+}
+
+/// Per-window cache of length-symbol prices, one row per `pos_state`, built
+/// lazily on first use. Valid only while the live length-coder probabilities
+/// are frozen — i.e. within a single `parse_window`, where `core` is borrowed
+/// immutably. `reset` invalidates every row at the start of each window.
+struct LenPriceCache {
+    match_len: Box<[[u32; LEN_SYMBOLS]; POS_STATES_MAX]>,
+    rep_len: Box<[[u32; LEN_SYMBOLS]; POS_STATES_MAX]>,
+    match_valid: [bool; POS_STATES_MAX],
+    rep_valid: [bool; POS_STATES_MAX],
+}
+
+impl LenPriceCache {
+    fn new() -> Self {
+        Self {
+            match_len: Box::new([[0u32; LEN_SYMBOLS]; POS_STATES_MAX]),
+            rep_len: Box::new([[0u32; LEN_SYMBOLS]; POS_STATES_MAX]),
+            match_valid: [false; POS_STATES_MAX],
+            rep_valid: [false; POS_STATES_MAX],
+        }
+    }
+
+    /// Invalidate all rows; call once per `parse_window` before reuse.
+    fn reset(&mut self) {
+        self.match_valid = [false; POS_STATES_MAX];
+        self.rep_valid = [false; POS_STATES_MAX];
+    }
+
+    #[inline]
+    fn match_price(
+        &mut self,
+        core: &LzmaEncCore,
+        prices: &[u32; PRICE_TABLE_SIZE],
+        pos_state: u32,
+        len_sym: u32,
+    ) -> u32 {
+        let ps = pos_state as usize;
+        if !self.match_valid[ps] {
+            fill_len_row(&mut self.match_len[ps], &core.len_coder, prices, pos_state);
+            self.match_valid[ps] = true;
+        }
+        self.match_len[ps][len_sym as usize]
+    }
+
+    #[inline]
+    fn rep_price(
+        &mut self,
+        core: &LzmaEncCore,
+        prices: &[u32; PRICE_TABLE_SIZE],
+        pos_state: u32,
+        len_sym: u32,
+    ) -> u32 {
+        let ps = pos_state as usize;
+        if !self.rep_valid[ps] {
+            fill_len_row(
+                &mut self.rep_len[ps],
+                &core.rep_len_coder,
+                prices,
+                pos_state,
+            );
+            self.rep_valid[ps] = true;
+        }
+        self.rep_len[ps][len_sym as usize]
     }
 }
 
@@ -1634,12 +1745,27 @@ fn encode_optimal(
     let prob_prices = build_prob_prices();
     let window = params.opt_window as usize;
     let mut opt = Optimizer::new(window);
+    let mut lpc = LenPriceCache::new();
 
     let mut pos = pos_start;
+    // The length-price rows in `lpc` are recomputed from the live model only
+    // every `LEN_PRICE_REFRESH` committed *decisions*, not every window:
+    // early-commit on long matches makes windows as short as a single (long)
+    // match decision, so a per-window rebuild of the 272-entry rows never
+    // amortises (it dominated the profile). Counting decisions — as the LZMA SDK
+    // counts length encodes — makes the refresh interval span many windows on
+    // match-heavy input while staying frequent on literal-heavy input, and
+    // leaves prices close enough to the live model that the ratio is unchanged.
+    const LEN_PRICE_REFRESH: usize = 128;
+    let mut since_refresh = LEN_PRICE_REFRESH; // force a build before the first window
     // Refresh the price snapshot once per committed window. Prices drift as
     // the model adapts; refreshing each window keeps them close to the live
     // model without recomputing per byte.
     while pos < pos_end {
+        if since_refresh >= LEN_PRICE_REFRESH {
+            lpc.reset();
+            since_refresh = 0;
+        }
         let snap = core.price_snapshot(&prob_prices);
         let parsed = parse_window(
             core,
@@ -1654,12 +1780,14 @@ fn encode_optimal(
             &prob_prices,
             &snap,
             &mut opt,
+            &mut lpc,
         );
         debug_assert!(parsed > 0);
         // Replay the chosen decisions through the real emit path. `pos`
         // advances by exactly `parsed` bytes.
         replay(core, hc, win, base, pos, &opt.decisions);
         pos += parsed;
+        since_refresh += opt.decisions.len();
     }
 }
 
@@ -1682,6 +1810,7 @@ fn parse_window(
     prices: &[u32; PRICE_TABLE_SIZE],
     snap: &PriceSnapshot,
     opt: &mut Optimizer,
+    lpc: &mut LenPriceCache,
 ) -> usize {
     // `avail` is bounded by the chunk boundary, not the end of input, so the
     // DP never produces a decision that would carry past `pos_end`.
@@ -1807,9 +1936,7 @@ fn parse_window(
             let maxr = rlen.min(cap);
             let mut l = MATCH_LEN_MIN;
             while l <= maxr {
-                let len_price = core
-                    .rep_len_coder
-                    .price(prices, pos_state, l - MATCH_LEN_MIN);
+                let len_price = lpc.rep_price(core, prices, pos_state, l - MATCH_LEN_MIN);
                 let np = node.price.saturating_add(choice + rep0_long + len_price);
                 let to = cur + l as usize;
                 if np < opt.opt[to].price {
@@ -1845,10 +1972,24 @@ fn parse_window(
             for mi in 0..nmatches {
                 let (mlen, mdist) = opt.matches[mi];
                 let band_end = mlen.min(cap);
+                // The distance price depends on length only through the
+                // length→dist-state bucket, which is non-decreasing in length and
+                // saturates at `DIST_STATES - 1` (every length ≥ `DIST_STATES +
+                // MATCH_LEN_MIN - 1` shares one price). Recompute it only when that
+                // bucket actually changes — a band starting at length ≥ 5 (the
+                // common case) needs a single dist-slot bittree walk instead of
+                // one per length. This recompute was ~20% of the realistic-input
+                // profile.
                 let mut l = (prev_len + 1).max(MATCH_LEN_MIN);
+                let mut dist_state = usize::MAX;
+                let mut dist_price = 0u32;
                 while l <= band_end {
-                    let len_price = core.len_coder.price(prices, pos_state, l - MATCH_LEN_MIN);
-                    let dist_price = core.distance_price(prices, l, mdist);
+                    let len_price = lpc.match_price(core, prices, pos_state, l - MATCH_LEN_MIN);
+                    let ds = ((l - MATCH_LEN_MIN) as usize).min(DIST_STATES - 1);
+                    if ds != dist_state {
+                        dist_price = core.distance_price(prices, l, mdist);
+                        dist_state = ds;
+                    }
                     let np = node
                         .price
                         .saturating_add(match_choice + len_price + dist_price);
