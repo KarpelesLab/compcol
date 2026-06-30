@@ -364,6 +364,17 @@ impl<T: RawDecoder> Decoder for T {
         let p = self.raw_decode(input, output)?;
         let status = if p.done {
             Status::StreamEnd
+        } else if p.written == output.len() && !output.is_empty() {
+            // Output buffer is full. A decoder that buffers input internally
+            // (e.g. bzip2 absorbs a whole block before draining it) reports
+            // `consumed == input.len()` here even though it still has decoded
+            // bytes pending — so keying the status off `consumed` alone would
+            // wrongly say `InputEmpty` and a standard loop would stop early
+            // (then `finish` sees a half-drained stream → `UnexpectedEnd`).
+            // A filled output always means "drain and call again", which is
+            // exactly `OutputFull`'s contract; calling again with no remaining
+            // input simply yields `InputEmpty` once the pending bytes are out.
+            Status::OutputFull
         } else if p.consumed >= input.len() {
             Status::InputEmpty
         } else {

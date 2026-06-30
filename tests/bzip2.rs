@@ -268,6 +268,57 @@ fn round_trip_streaming_one_byte() {
     assert_eq!(decoded, input);
 }
 
+/// Decode following the *exact* streaming loop documented on the `Decoder`
+/// trait — no defensive "drain after InputEmpty" workaround like
+/// [`decode_chunked`] has. A naive caller breaks out of the decode loop on
+/// `InputEmpty` and then calls `finish`. This is the pattern that regressed:
+/// the decoder buffers a whole block internally, so when the small `output`
+/// fills mid-block it used to report `InputEmpty` (instead of `OutputFull`),
+/// the loop stopped with the block half-drained, and `finish` then failed with
+/// `UnexpectedEnd`.
+fn decode_documented_loop(encoded: &[u8], out_chunk: usize) -> Result<Vec<u8>, Error> {
+    let mut dec = Decoder::new();
+    let mut buf = vec![0u8; out_chunk];
+    let mut out = Vec::new();
+    let mut consumed = 0;
+    loop {
+        let (p, status) = dec.decode(&encoded[consumed..], &mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        consumed += p.consumed;
+        match status {
+            Status::OutputFull => continue,
+            Status::InputEmpty => break,
+            Status::StreamEnd => return Ok(out),
+        }
+    }
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        if matches!(status, Status::StreamEnd) {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+#[test]
+fn round_trip_small_output_buffer_naive_loop() {
+    // Inputs larger than the output buffer force the decoder to drain a single
+    // decoded block across several `decode` calls. Before the fix this failed
+    // with `UnexpectedEnd` for any block bigger than `out_chunk`.
+    for &n in &[100_000usize, 600_000, 1_000_000] {
+        let input: Vec<u8> = (0..n)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let encoded = encode_all(&input);
+        for &out_chunk in &[1usize, 64, 4096, 65536] {
+            let decoded = decode_documented_loop(&encoded, out_chunk)
+                .unwrap_or_else(|e| panic!("n={n} out_chunk={out_chunk}: {e:?}"));
+            assert_eq!(decoded, input, "n={n} out_chunk={out_chunk}");
+        }
+    }
+}
+
 // ─── reset / reuse ─────────────────────────────────────────────────────
 
 #[test]
