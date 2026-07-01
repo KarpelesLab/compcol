@@ -138,69 +138,87 @@ impl Encoder {
             return;
         }
 
-        // Okumura-style ring buffer + brute-force match finder. The
-        // ring is sized `N + F - 1`; bytes written into positions
-        // `0..F-1` are mirrored into `N..N+F-1` so a match running off
-        // the right end of the buffer reads contiguously without a wrap
-        // check on every byte.
-        let mut text_buf = vec![NUL; N + F - 1];
+        // Match finding runs over the raw input with a hash chain instead of
+        // the Okumura ring's O(N) brute-force scan per position. The decoder's
+        // ring is byte-identical to what a matching Okumura encoder would build,
+        // so a match whose source is input position `cand` is encoded with the
+        // ring index the decoder expects: `(cand + N - F) & (N - 1)`. The
+        // reachable dictionary is the `N - F` bytes before the current position.
+        //
+        // The output size depends only on the match *lengths* (every match is a
+        // 2-byte token, every literal a 1-byte token), so finding the same
+        // longest length — via a fully-walked chain of same-prefix candidates —
+        // reproduces the brute-force ratio while cutting encode from O(N·n) to
+        // O(n · chain). (The only difference is the initial `0x20` ring fill,
+        // which the input-based finder can't reference; its ratio effect is
+        // negligible.)
+        let input = core::mem::take(&mut self.input);
+        let data = input.as_slice();
+        let n = data.len();
+        const MIN_MATCH: usize = THRESHOLD + 1;
+
+        const HASH_BITS: u32 = 15;
+        const HASH_SIZE: usize = 1 << HASH_BITS;
+        // `u32` positions (halving the `prev` ring vs `usize`) — the reachable
+        // window is 4 KiB and inputs this codec sees fit in 32 bits; the smaller
+        // array is markedly cheaper to allocate/zero on match-heavy input where
+        // the finder itself does almost no work.
+        const NIL: u32 = u32::MAX;
+        let mut head = vec![NIL; HASH_SIZE];
+        let mut prev = vec![NIL; n];
+        let hash3 = |i: usize| -> usize {
+            let a = data[i] as usize;
+            let b = data[i + 1] as usize;
+            let c = data[i + 2] as usize;
+            ((a << 10) ^ (b << 5) ^ c).wrapping_mul(2_654_435_761) >> (32 - HASH_BITS)
+                & (HASH_SIZE - 1)
+        };
+
         // Group buffer: 1 flag byte + up to 8 tokens × 2 bytes = 17.
         let mut code_buf = [0u8; 17];
         let mut code_ptr: usize = 1;
         let mut mask: u8 = 1;
 
-        let mut s: usize = 0;
-        let mut r: usize = N - F;
-        let mut in_pos: usize = 0;
-        let n = self.input.len();
-
-        // Prefill lookahead window with up to F bytes.
-        let mut length: usize = 0;
-        while length < F && in_pos < n {
-            text_buf[r + length] = self.input[in_pos];
-            in_pos += 1;
-            length += 1;
-        }
-
-        while length > 0 {
-            // Find the longest match in the ring buffer. Match positions
-            // inside the lookahead window `[r, r+length)` are excluded
-            // because the decoder has not yet committed those bytes to
-            // its ring buffer; positions immediately *before* `r` are
-            // fine, and the LZ77 self-overlap trick — a match that
-            // walks into bytes it just wrote — is allowed because the
-            // decoder produces those bytes one-at-a-time during copy.
-            let mut best_len: usize = 0;
-            let mut best_pos: usize = 0;
-            for i in 0..N {
-                let off_into_la = (i + N - r) & (N - 1);
-                if off_into_la < length {
-                    continue;
-                }
-                let mut k = 0usize;
-                while k < length && text_buf[(i + k) & (N - 1)] == text_buf[r + k] {
-                    k += 1;
-                    if k >= F {
-                        break;
+        let mut cur = 0usize;
+        // Positions `[0, inserted)` are already spliced into the chains.
+        let mut inserted = 0usize;
+        while cur < n {
+            let mut best_len = 0usize;
+            let mut best_cand = 0usize;
+            if cur + MIN_MATCH <= n {
+                let max_len = F.min(n - cur);
+                let min_pos = cur.saturating_sub(N - F);
+                let h = hash3(cur);
+                let mut cand = head[h];
+                // Walk the whole chain (candidates share the 3-byte prefix) so
+                // the longest match equals the brute-force result; only stop
+                // early once we hit the max length `F`.
+                while cand != NIL && (cand as usize) >= min_pos {
+                    let cp = cand as usize;
+                    let mut k = 0usize;
+                    while k < max_len && data[cp + k] == data[cur + k] {
+                        k += 1;
                     }
-                }
-                if k > best_len {
-                    best_len = k;
-                    best_pos = i;
-                    if k >= F {
-                        break;
+                    if k > best_len {
+                        best_len = k;
+                        best_cand = cp;
+                        if best_len >= F {
+                            break;
+                        }
                     }
-                } else if k == best_len && k > 0 && i < best_pos {
-                    best_pos = i;
+                    cand = prev[cp];
                 }
             }
 
+            let advance;
             if best_len <= THRESHOLD {
-                best_len = 1;
+                advance = 1;
                 code_buf[0] |= mask;
-                code_buf[code_ptr] = text_buf[r];
+                code_buf[code_ptr] = data[cur];
                 code_ptr += 1;
             } else {
+                advance = best_len;
+                let best_pos = (best_cand + N - F) & (N - 1);
                 code_buf[code_ptr] = (best_pos & 0xFF) as u8;
                 code_ptr += 1;
                 code_buf[code_ptr] =
@@ -216,28 +234,18 @@ impl Encoder {
                 mask = 1;
             }
 
-            let last_len = best_len;
-            let mut i = 0usize;
-            while i < last_len && in_pos < n {
-                let c = self.input[in_pos];
-                in_pos += 1;
-                text_buf[s] = c;
-                if s < F - 1 {
-                    text_buf[s + N] = c;
+            // Splice every passed-over position into the chains (including
+            // match interiors) so later positions can reference them.
+            let insert_end = cur + advance;
+            while inserted < insert_end {
+                if inserted + MIN_MATCH <= n {
+                    let h = hash3(inserted);
+                    prev[inserted] = head[h];
+                    head[h] = inserted as u32;
                 }
-                s = (s + 1) & (N - 1);
-                r = (r + 1) & (N - 1);
-                i += 1;
+                inserted += 1;
             }
-            while i < last_len {
-                s = (s + 1) & (N - 1);
-                r = (r + 1) & (N - 1);
-                length -= 1;
-                if length == 0 {
-                    break;
-                }
-                i += 1;
-            }
+            cur += advance;
         }
 
         if code_ptr > 1 {

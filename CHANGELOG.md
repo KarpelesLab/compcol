@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- *(lzss)* replaced the encoder's O(N·n) brute-force ring-buffer match scan
+  (every position compared against all 4096 ring slots) with a hash-chain
+  finder over the raw input, translating each match source to the ring index
+  the decoder expects. Encode of low-redundancy input is dramatically faster —
+  ~9× on natural-language text and ~700× on incompressible input (which had
+  collapsed to ~0.3 MB/s) — with the compressed size unchanged (match *lengths*,
+  which determine output size, are preserved; only the tie-broken source
+  position can differ).
+- *(huffman)* the standalone canonical-Huffman decoder now decodes via a single
+  peek-and-lookup table (indexed by the next `max_length` bits) instead of
+  walking each code one bit at a time, roughly halving decode instruction count
+  (~1.9–2.1× fewer) across text and high-entropy input. Output is unchanged and
+  corrupt/truncated streams are still rejected without panicking.
+
 ## [0.6.7](https://github.com/KarpelesLab/compcol/compare/v0.6.6...v0.6.7) - 2026-06-30
 
 ### Added
