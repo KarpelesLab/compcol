@@ -158,6 +158,31 @@ fn hash2(a: u8, b: u8) -> usize {
 
 /// Encode `input` as an LZS bitstream (no end marker, no padding) into
 /// `bw`.
+/// Count bytes matching at `input[a..]` and `input[b..]`, advancing the `a`
+/// cursor up to (not reaching) `a_limit`. `b` is always behind `a`, so `b+len`
+/// stays in bounds whenever `a+len` does. Compares 8 bytes per step via an LE
+/// `u64` load + XOR + `trailing_zeros`; identical result to the scalar loop, so
+/// the emitted match length (and the wire bytes) are unchanged.
+#[inline]
+fn match_forward(input: &[u8], a: usize, b: usize, a_limit: usize) -> usize {
+    let mut len = 0usize;
+    while a + len + 8 <= a_limit {
+        let mut xa = [0u8; 8];
+        let mut xb = [0u8; 8];
+        xa.copy_from_slice(&input[a + len..a + len + 8]);
+        xb.copy_from_slice(&input[b + len..b + len + 8]);
+        let x = u64::from_le_bytes(xa) ^ u64::from_le_bytes(xb);
+        if x != 0 {
+            return len + (x.trailing_zeros() as usize >> 3);
+        }
+        len += 8;
+    }
+    while a + len < a_limit && input[a + len] == input[b + len] {
+        len += 1;
+    }
+    len
+}
+
 fn encode_payload(input: &[u8], bw: &mut BitWriter) {
     if input.is_empty() {
         return;
@@ -180,12 +205,8 @@ fn encode_payload(input: &[u8], bw: &mut BitWriter) {
                 if p < i {
                     let dist = i - p;
                     if (1..=MAX_DISTANCE).contains(&dist) {
-                        // Verify and extend.
-                        let max_len = remaining;
-                        let mut len = 0usize;
-                        while len < max_len && input[p + len] == input[i + len] {
-                            len += 1;
-                        }
+                        // Verify and extend, 8 bytes at a time.
+                        let len = match_forward(input, i, p, i + remaining);
                         if len >= MIN_MATCH {
                             best_len = len;
                             best_dist = dist;

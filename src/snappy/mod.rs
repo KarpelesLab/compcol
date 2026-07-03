@@ -172,6 +172,31 @@ impl RawEncoder for Encoder {
 /// Layout:
 /// * Varint-encoded `input.len()`.
 /// * A literal+copy tag stream covering every byte of `input`.
+/// Count bytes matching at `input[a..]` and `input[b..]`, advancing the `a`
+/// cursor up to (not reaching) `a_limit`. `b` is always behind `a`, so `b+len`
+/// stays in bounds whenever `a+len` does. Compares 8 bytes per step via an LE
+/// `u64` load + XOR + `trailing_zeros`; identical result to the scalar loop, so
+/// the emitted match length (and the wire bytes) are unchanged.
+#[inline]
+fn match_forward(input: &[u8], a: usize, b: usize, a_limit: usize) -> usize {
+    let mut len = 0usize;
+    while a + len + 8 <= a_limit {
+        let mut xa = [0u8; 8];
+        let mut xb = [0u8; 8];
+        xa.copy_from_slice(&input[a + len..a + len + 8]);
+        xb.copy_from_slice(&input[b + len..b + len + 8]);
+        let x = u64::from_le_bytes(xa) ^ u64::from_le_bytes(xb);
+        if x != 0 {
+            return len + (x.trailing_zeros() as usize >> 3);
+        }
+        len += 8;
+    }
+    while a + len < a_limit && input[a + len] == input[b + len] {
+        len += 1;
+    }
+    len
+}
+
 fn compress_block(input: &[u8], out: &mut Vec<u8>) {
     out.clear();
     write_varint_u32(input.len() as u32, out);
@@ -249,14 +274,8 @@ fn compress_block(input: &[u8], out: &mut Vec<u8>) {
             emit_literal(&input[next_emit..ip], out);
         }
 
-        // Extend the match as far as it'll go.
-        let mut m_end = ip + 4;
-        let mut c_end = candidate + 4;
-        while m_end < input_end && input[m_end] == input[c_end] {
-            m_end += 1;
-            c_end += 1;
-        }
-        let mut match_len = m_end - ip;
+        // Extend the match as far as it'll go, 8 bytes at a time.
+        let mut match_len = 4 + match_forward(input, ip + 4, candidate + 4, input_end);
         let offset = (ip - candidate) as u32;
 
         // Emit one or more copy tags (max 64 bytes per tag).

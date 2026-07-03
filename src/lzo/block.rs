@@ -86,6 +86,31 @@ fn hash4(bytes: [u8; 4]) -> usize {
     ((v.wrapping_mul(2_654_435_761)) >> (32 - HASH_LOG)) as usize
 }
 
+/// Count bytes matching at `input[a..]` and `input[b..]`, advancing the `a`
+/// cursor up to (not reaching) `a_limit`. `b` is always behind `a`, so `b+len`
+/// stays in bounds whenever `a+len` does. Compares 8 bytes per step via an LE
+/// `u64` load + XOR + `trailing_zeros`; identical result to the scalar loop, so
+/// the emitted match length (and the wire bytes) are unchanged.
+#[inline]
+fn match_forward(input: &[u8], a: usize, b: usize, a_limit: usize) -> usize {
+    let mut len = 0usize;
+    while a + len + 8 <= a_limit {
+        let mut xa = [0u8; 8];
+        let mut xb = [0u8; 8];
+        xa.copy_from_slice(&input[a + len..a + len + 8]);
+        xb.copy_from_slice(&input[b + len..b + len + 8]);
+        let x = u64::from_le_bytes(xa) ^ u64::from_le_bytes(xb);
+        if x != 0 {
+            return len + (x.trailing_zeros() as usize >> 3);
+        }
+        len += 8;
+    }
+    while a + len < a_limit && input[a + len] == input[b + len] {
+        len += 1;
+    }
+    len
+}
+
 /// Worst-case encoded length for `input_len` bytes of input.
 ///
 /// `LZO_COMPRESS_BOUND` for LZO1X family is `n + n/16 + 64 + 3`.
@@ -165,11 +190,8 @@ pub fn encode_block(input: &[u8], out: &mut Vec<u8>) {
         }
         search_match_nb = 1 << 6;
 
-        // Extend the match forward as far as possible.
-        let mut match_len = 4usize;
-        while ip + match_len < in_len && input[match_pos + match_len] == input[ip + match_len] {
-            match_len += 1;
-        }
+        // Extend the match forward as far as possible, 8 bytes at a time.
+        let match_len = 4 + match_forward(input, ip + 4, match_pos + 4, in_len);
 
         let literal_len = ip - anchor;
         let distance = ip - match_pos;

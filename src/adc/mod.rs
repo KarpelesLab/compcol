@@ -95,6 +95,31 @@ fn hash3(b0: u8, b1: u8, b2: u8) -> usize {
     ((v.wrapping_mul(2_654_435_761)) >> (32 - HASH_LOG)) as usize
 }
 
+/// Count bytes matching at `input[a..]` and `input[b..]`, advancing the `a`
+/// cursor up to (not reaching) `a_limit`. `b` is always behind `a`, so `b+len`
+/// stays in bounds whenever `a+len` does. Compares 8 bytes per step via an LE
+/// `u64` load + XOR + `trailing_zeros`; identical result to the scalar loop, so
+/// the emitted match length (and the wire bytes) are unchanged.
+#[inline]
+fn match_forward(input: &[u8], a: usize, b: usize, a_limit: usize) -> usize {
+    let mut len = 0usize;
+    while a + len + 8 <= a_limit {
+        let mut xa = [0u8; 8];
+        let mut xb = [0u8; 8];
+        xa.copy_from_slice(&input[a + len..a + len + 8]);
+        xb.copy_from_slice(&input[b + len..b + len + 8]);
+        let x = u64::from_le_bytes(xa) ^ u64::from_le_bytes(xb);
+        if x != 0 {
+            return len + (x.trailing_zeros() as usize >> 3);
+        }
+        len += 8;
+    }
+    while a + len < a_limit && input[a + len] == input[b + len] {
+        len += 1;
+    }
+    len
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EncPhase {
     /// Accepting raw input bytes into `input`; nothing has been encoded yet.
@@ -184,11 +209,8 @@ impl Encoder {
                         // (long form caps at 67; short form caps at 18, but
                         // we may still want the long form for offset ≤ 1024
                         // if length > 18).
-                        let mut len = 3usize;
                         let limit = (n - i).min(MAX_LONG_MATCH);
-                        while len < limit && input[prev_pos + len] == input[i + len] {
-                            len += 1;
-                        }
+                        let len = 3 + match_forward(input, i + 3, prev_pos + 3, i + limit);
                         // Reject matches we cannot encode: short form needs
                         // 3+ and short offset; long form needs 4+.
                         if dist <= MAX_SHORT_OFFSET {
