@@ -295,3 +295,8 @@ required-features = ["factory"]
 name             = "bench"
 path             = "examples/bench.rs"
 required-features = ["factory"]
+
+[[example]]
+name             = "micro"
+path             = "examples/micro.rs"
+required-features = ["factory"]
