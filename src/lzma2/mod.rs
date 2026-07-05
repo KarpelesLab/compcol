@@ -339,12 +339,15 @@ impl Encoder {
         reset_dict: bool,
         reset_state: bool,
     ) {
-        debug_assert!(!data.is_empty() && data.len() <= ENC_CHUNK_MAX);
+        // A compressed chunk's uncompressed span uses the 21-bit size field
+        // (≤ 2 MiB); the compressed body must fit the 16-bit comp field.
+        debug_assert!(!data.is_empty() && data.len() <= 1 << 21);
         debug_assert!(!compressed.is_empty() && compressed.len() <= 65_536);
 
-        let uncomp_m1 = (data.len() - 1) as u32; // 0..=65535 with our cap
-        // Top 5 bits of (uncomp_size - 1) live in the control byte; with a
-        // 65_536 cap they are always zero, yielding exactly 0xE0 / 0xC0 / 0x80.
+        let uncomp_m1 = (data.len() - 1) as u32; // 0..=2^21-1
+        // The top 5 bits of (uncomp_size - 1) live in the low bits of the
+        // control byte (nonzero once a chunk exceeds 64 KiB); the reset mode is
+        // the high 3 bits: 0xE0 / 0xC0 / 0x80.
         let base: u8 = if reset_dict {
             0xE0
         } else if reset_state {

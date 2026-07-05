@@ -523,11 +523,13 @@ impl Encoder {
         reset_dict: bool,
         reset_state: bool,
     ) {
-        debug_assert!(!data.is_empty() && data.len() <= LZMA2_CHUNK_MAX);
+        // A compressed chunk's uncompressed span uses the 21-bit size field
+        // (≤ 2 MiB); the compressed body must fit the 16-bit comp field.
+        debug_assert!(!data.is_empty() && data.len() <= 1 << 21);
         debug_assert!(!compressed.is_empty() && compressed.len() <= 65_536);
 
-        let uncomp_size_minus_1 = (data.len() - 1) as u32; // 0..=65535
-        let uncomp_top = ((uncomp_size_minus_1 >> 16) & 0x1F) as u8; // 0 here
+        let uncomp_size_minus_1 = (data.len() - 1) as u32; // 0..=2^21-1
+        let uncomp_top = ((uncomp_size_minus_1 >> 16) & 0x1F) as u8;
         let base: u8 = if reset_dict {
             0xE0
         } else if reset_state {
