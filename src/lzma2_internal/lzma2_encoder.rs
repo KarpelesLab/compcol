@@ -623,6 +623,16 @@ impl LzmaEncCore {
         self.rc = RangeEncoder::new();
     }
 
+    /// Reset **only** the range coder for a continued chunk (LZMA2 `0x80`):
+    /// the probability model, LZMA `state`, and the four rep distances all
+    /// carry over, so the adaptive model keeps warming across chunk boundaries
+    /// exactly as native `xz` does. Each LZMA2 chunk is still an independently
+    /// range-coded blob (its own 5-byte init + flush), so the range coder alone
+    /// must start fresh; `output_pos` is likewise left running.
+    fn reset_range_coder(&mut self) {
+        self.rc = RangeEncoder::new();
+    }
+
     fn encode_literal_full(&mut self, byte: u8, prev_byte: u8, match_byte: Option<u8>) {
         let lp_state = ((self.output_pos as u32) & self.lit_pos_mask) << self.lc;
         let prev_high = (prev_byte as u32) >> (8 - self.lc);
@@ -1436,9 +1446,16 @@ pub(crate) struct Lzma2Chunk {
     pub uncomp_len: usize,
     /// `true` when this is the first chunk of the stream and therefore must
     /// reset the dictionary (`0xE0` compressed / `0x01` uncompressed); `false`
-    /// for every later chunk, which continues the dictionary (`0xC0`
-    /// compressed / `0x02` uncompressed).
+    /// for every later chunk, which continues the dictionary.
     pub reset_dict: bool,
+    /// For a compressed chunk (`body.is_some()`): `true` when the LZMA state +
+    /// probability model are reset for this chunk (control `0xE0` on the first
+    /// chunk, `0xC0` otherwise — both carry a props byte); `false` when the
+    /// model is *continued* from the previous chunk (control `0x80`, no props
+    /// byte), which is the common case on compressible data and what lets the
+    /// adaptive model warm across chunk boundaries. Ignored for uncompressed
+    /// chunks (their control is `0x01`/`0x02`, chosen from `reset_dict`).
+    pub reset_state: bool,
     /// `Some(range-coded body)` for a compressed chunk; `None` for an
     /// uncompressed-fallback chunk (the caller copies the raw input slice).
     pub body: Option<Vec<u8>>,
@@ -1483,6 +1500,13 @@ pub(crate) struct Lzma2StreamEncoder {
     appended: usize,
     /// `true` until the first chunk is emitted.
     first: bool,
+    /// `true` when the next compressed chunk must reset the LZMA state +
+    /// probability model rather than continue it. Set on the first chunk and
+    /// after any uncompressed-fallback chunk: an uncompressed chunk is not run
+    /// through the model on decode, and the discarded compressed attempt has
+    /// already mutated our model, so the two would desync unless the next
+    /// compressed chunk resets both sides back to a known state.
+    need_state_reset: bool,
 }
 
 impl Lzma2StreamEncoder {
@@ -1502,6 +1526,7 @@ impl Lzma2StreamEncoder {
             pos: 0,
             appended: 0,
             first: true,
+            need_state_reset: true,
         }
     }
 
@@ -1535,22 +1560,40 @@ impl Lzma2StreamEncoder {
     /// Encode the chunk `[self.pos, chunk_end)` and advance `self.pos`.
     fn encode_one_chunk(&mut self, chunk_end: usize) -> Lzma2Chunk {
         let uncomp_len = chunk_end - self.pos;
-        let body = self.encode_chunk_body(chunk_end);
+        // Reset the model on the first chunk and after any uncompressed chunk;
+        // otherwise continue it (control `0x80`) so the adaptive model warms
+        // across chunk boundaries.
+        let reset_state = self.first || self.need_state_reset;
+        let body = self.encode_chunk_body(chunk_end, reset_state);
         let use_compressed = !body.is_empty() && body.len() <= 65_536 && body.len() < uncomp_len;
         let chunk = Lzma2Chunk {
             uncomp_len,
             reset_dict: self.first,
+            reset_state,
             body: if use_compressed { Some(body) } else { None },
         };
         self.pos = chunk_end;
         self.first = false;
+        // A compressed chunk leaves the model in a state the decoder will
+        // reproduce, so the next chunk may continue it. An uncompressed
+        // fallback does not: the decoder never runs the model over it, and this
+        // chunk's discarded compressed attempt already mutated our copy — force
+        // the next compressed chunk to reset both sides back into sync.
+        self.need_state_reset = !use_compressed;
         chunk
     }
 
-    /// Range-code `[self.pos, chunk_end)` through the shared core/hash chain,
-    /// resetting LZMA state first (keeping `output_pos` and the LZ history).
-    fn encode_chunk_body(&mut self, chunk_end: usize) -> Vec<u8> {
-        self.core.reset_state_keep_pos();
+    /// Range-code `[self.pos, chunk_end)` through the shared core/hash chain.
+    /// When `reset_state` is set, re-initialise the LZMA state + probability
+    /// model first (control `0xC0`/`0xE0` semantics); otherwise keep the model
+    /// running and reset only the per-chunk range coder (control `0x80`). Either
+    /// way `output_pos` and the LZ history are preserved.
+    fn encode_chunk_body(&mut self, chunk_end: usize, reset_state: bool) -> Vec<u8> {
+        if reset_state {
+            self.core.reset_state_keep_pos();
+        } else {
+            self.core.reset_range_coder();
+        }
         let base = self.win_base;
         let start = self.pos;
         if self.params.opt_window == 0 {

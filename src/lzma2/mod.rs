@@ -309,35 +309,65 @@ impl Encoder {
             debug_assert!(self.staged_input.len() >= n);
             let data: Vec<u8> = self.staged_input.drain(..n).collect();
             match chunk.body {
-                Some(ref body) => self.stage_compressed_chunk(&data, body, chunk.reset_dict),
+                Some(ref body) => {
+                    self.stage_compressed_chunk(&data, body, chunk.reset_dict, chunk.reset_state)
+                }
                 None => self.stage_uncompressed_chunk(&data, chunk.reset_dict),
             }
         }
     }
 
-    /// Stage a compressed chunk: control `0xE0` (dict reset) for the first
-    /// chunk or `0xC0` (dictionary continues) otherwise — both carry the top 5
-    /// bits of `uncomp_size-1` and set bit 6 (props present). Followed by a
-    /// 2-byte `uncomp_size-1` BE remainder, a 2-byte `comp_size-1` BE, the
-    /// 1-byte LZMA props, then the range-coded body.
-    fn stage_compressed_chunk(&mut self, data: &[u8], compressed: &[u8], reset_dict: bool) {
+    /// Stage a compressed chunk. The control byte selects the reset mode:
+    ///
+    /// * `0xE0` — first chunk: reset dictionary + props + state (props byte
+    ///   follows).
+    /// * `0xC0` — `reset_state` set, dictionary continues: reset props + state
+    ///   (props byte follows). Used after an uncompressed chunk.
+    /// * `0x80` — continuation: no reset, the model carries over from the
+    ///   previous chunk. **No props byte.** This is the common case on
+    ///   compressible data and is what keeps the adaptive model warm across
+    ///   64 KiB chunk boundaries (native `xz` does the same).
+    ///
+    /// All three carry the top 5 bits of `uncomp_size-1` in the low bits, then
+    /// a 2-byte `uncomp_size-1` BE remainder, a 2-byte `comp_size-1` BE, the
+    /// 1-byte LZMA props (only when the control byte sets bit 6), then the
+    /// range-coded body.
+    fn stage_compressed_chunk(
+        &mut self,
+        data: &[u8],
+        compressed: &[u8],
+        reset_dict: bool,
+        reset_state: bool,
+    ) {
         debug_assert!(!data.is_empty() && data.len() <= ENC_CHUNK_MAX);
         debug_assert!(!compressed.is_empty() && compressed.len() <= 65_536);
 
         let uncomp_m1 = (data.len() - 1) as u32; // 0..=65535 with our cap
         // Top 5 bits of (uncomp_size - 1) live in the control byte; with a
-        // 65_536 cap they are always zero, yielding exactly 0xE0 / 0xC0.
-        let base: u8 = if reset_dict { 0xE0 } else { 0xC0 };
+        // 65_536 cap they are always zero, yielding exactly 0xE0 / 0xC0 / 0x80.
+        let base: u8 = if reset_dict {
+            0xE0
+        } else if reset_state {
+            0xC0
+        } else {
+            0x80
+        };
         let control: u8 = base | ((uncomp_m1 >> 16) & 0x1F) as u8;
+        // Bit 6 (0x40) set ⇒ new props follow (0xE0/0xC0); a `0x80`
+        // continuation reuses the props established by an earlier chunk.
+        let has_props = control & 0x40 != 0;
         let comp_m1 = (compressed.len() - 1) as u16;
 
-        self.pending.reserve(6 + compressed.len());
+        self.pending
+            .reserve(5 + has_props as usize + compressed.len());
         self.pending.push(control);
         self.pending.push(((uncomp_m1 >> 8) & 0xFF) as u8);
         self.pending.push((uncomp_m1 & 0xFF) as u8);
         self.pending.push((comp_m1 >> 8) as u8);
         self.pending.push((comp_m1 & 0xFF) as u8);
-        self.pending.push(LZMA2_PROPS_BYTE);
+        if has_props {
+            self.pending.push(LZMA2_PROPS_BYTE);
+        }
         self.pending.extend_from_slice(compressed);
         self.pending_idx = 0;
     }

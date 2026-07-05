@@ -494,30 +494,50 @@ impl Encoder {
             self.check.update(&data);
             self.uncompressed_total += n as u64;
             match chunk.body {
-                Some(ref body) => self.stage_compressed_chunk(&data, body, chunk.reset_dict),
+                Some(ref body) => {
+                    self.stage_compressed_chunk(&data, body, chunk.reset_dict, chunk.reset_state)
+                }
                 None => self.stage_uncompressed_chunk(&data, chunk.reset_dict),
             }
         }
     }
 
-    /// Stage one compressed LZMA2 chunk: a control byte (`0xE0` for the first
-    /// dict-resetting chunk, `0xC0` for a dict-continuing chunk — both carry
-    /// the top 5 bits of `uncomp_size-1` in bits 0..=4), two big-endian
-    /// `uncomp_size-1` continuation bytes, two big-endian `comp_size-1` bytes,
-    /// a 1-byte LZMA properties byte (bit 6 of both control values is set, so
-    /// properties are always present), then the range-coded payload.
-    fn stage_compressed_chunk(&mut self, data: &[u8], compressed: &[u8], reset_dict: bool) {
+    /// Stage one compressed LZMA2 chunk. The control byte selects the reset
+    /// mode: `0xE0` (first chunk — reset dict + props + state), `0xC0`
+    /// (`reset_state`, dict continues — reset props + state), or `0x80`
+    /// (continuation — no reset, the model carries over from the previous
+    /// chunk). `0xE0`/`0xC0` set bit 6 and are followed by a 1-byte props
+    /// field; `0x80` has no props byte. The low 5 bits of the control carry the
+    /// top 5 bits of `uncomp_size-1`; then two big-endian `uncomp_size-1`
+    /// continuation bytes, two big-endian `comp_size-1` bytes, the optional
+    /// props byte, then the range-coded payload.
+    ///
+    /// Continuation (`0x80`) is what keeps the adaptive LZMA model warm across
+    /// 64 KiB chunk boundaries, matching native `xz`; a mid-stream props/state
+    /// reset every chunk would otherwise re-warm the model from scratch and
+    /// bloat highly compressible output.
+    fn stage_compressed_chunk(
+        &mut self,
+        data: &[u8],
+        compressed: &[u8],
+        reset_dict: bool,
+        reset_state: bool,
+    ) {
         debug_assert!(!data.is_empty() && data.len() <= LZMA2_CHUNK_MAX);
         debug_assert!(!compressed.is_empty() && compressed.len() <= 65_536);
 
         let uncomp_size_minus_1 = (data.len() - 1) as u32; // 0..=65535
         let uncomp_top = ((uncomp_size_minus_1 >> 16) & 0x1F) as u8; // 0 here
-        // Control base: `111x_xxxx` (0xE0) = compressed + dict reset + props
-        // reset + state reset; `110x_xxxx` (0xC0) = compressed + props reset +
-        // state reset, dictionary CONTINUES. The low 5 bits carry the top 5
-        // bits of (uncomp_size - 1); with our 65_536 cap those are zero.
-        let base: u8 = if reset_dict { 0xE0 } else { 0xC0 };
+        let base: u8 = if reset_dict {
+            0xE0
+        } else if reset_state {
+            0xC0
+        } else {
+            0x80
+        };
         let control: u8 = base | uncomp_top;
+        // Bit 6 (0x40) set ⇒ a props byte follows (0xE0/0xC0).
+        let has_props = control & 0x40 != 0;
 
         let uncomp_mid = ((uncomp_size_minus_1 >> 8) & 0xFF) as u8;
         let uncomp_lo = (uncomp_size_minus_1 & 0xFF) as u8;
@@ -525,16 +545,17 @@ impl Encoder {
         let comp_hi = (comp_size_minus_1 >> 8) as u8;
         let comp_lo = (comp_size_minus_1 & 0xFF) as u8;
 
-        // Header: 6 bytes (control + 2 uncomp + 2 comp + 1 props), then
-        // the compressed payload.
-        let header_len = 6usize;
+        // Header: control + 2 uncomp + 2 comp + optional props, then payload.
+        let header_len = 5 + has_props as usize;
         self.pending.reserve(header_len + compressed.len());
         self.pending.push(control);
         self.pending.push(uncomp_mid);
         self.pending.push(uncomp_lo);
         self.pending.push(comp_hi);
         self.pending.push(comp_lo);
-        self.pending.push(LZMA2_PROPS_BYTE);
+        if has_props {
+            self.pending.push(LZMA2_PROPS_BYTE);
+        }
         self.pending.extend_from_slice(compressed);
         self.pending_idx = 0;
         self.compressed_payload_bytes += (header_len + compressed.len()) as u64;
