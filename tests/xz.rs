@@ -520,8 +520,17 @@ fn pipe_through(cmd: &str, args: &[&str], stdin_data: &[u8]) -> std::io::Result<
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    child.stdin.as_mut().unwrap().write_all(stdin_data)?;
+    // Feed stdin from a dedicated thread while the parent drains stdout, so a
+    // payload larger than the OS pipe buffer (~64 KiB) can't deadlock both ends
+    // — the same pattern the bench harness uses.
+    let mut stdin = child.stdin.take().unwrap();
+    let data = stdin_data.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&data);
+        // Drop `stdin` to send EOF.
+    });
     let out = child.wait_with_output()?;
+    let _ = writer.join();
     if !out.status.success() {
         return Err(std::io::Error::other(format!(
             "{} {:?} exited {:?}: {}",
@@ -545,6 +554,25 @@ fn our_encode_then_system_xz_decode() {
         ("short", b"hello xz world".to_vec()),
         ("medium", b"Lorem ipsum dolor sit amet. ".repeat(200)),
         ("two_chunks", vec![0xCDu8; 70_000]),
+        // Highly compressible input spanning many 64 KiB chunks: every
+        // continuation chunk is a `0x80` (no state/props reset), so the
+        // adaptive model carries across all of them. Native `xz` must accept
+        // that continuation framing.
+        (
+            "many_chunks_compressible",
+            b"Lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(40_000),
+        ),
+        // Many chunks of incompressible data: forces uncompressed-fallback
+        // chunks interleaved with state-reset (`0xC0`) compressed chunks.
+        ("many_chunks_random", {
+            let mut v = Vec::with_capacity(600_000);
+            let mut s: u32 = 0x1234_5678;
+            while v.len() < 600_000 {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                v.push((s >> 16) as u8);
+            }
+            v
+        }),
     ] {
         let encoded = encode_all(&input);
         match pipe_through("xz", &["-d", "-c"], &encoded) {

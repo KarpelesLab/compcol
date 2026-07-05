@@ -556,54 +556,6 @@ impl BitWriter {
     }
 }
 
-/// MSB-first bit reader over a borrowed slice.
-struct BitReader<'a> {
-    buf: &'a [u8],
-    byte: usize,
-    bit: u8, // 0..=7, counts from MSB
-}
-
-impl<'a> BitReader<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Self {
-            buf,
-            byte: 0,
-            bit: 0,
-        }
-    }
-
-    /// Bits remaining from the current position to the end of the buffer.
-    #[inline]
-    fn remaining(&self) -> usize {
-        (self.buf.len() - self.byte) * 8 - self.bit as usize
-    }
-
-    /// Peek the next `n` bits (`1..=15`), MSB-first, right-aligned, zero-padded
-    /// past end-of-buffer. Does not advance. Used to index the decode table.
-    #[inline]
-    fn peek(&self, n: u32) -> u32 {
-        // Assemble the current byte and the next few into a 64-bit big-endian
-        // accumulator, then slice out the `n` bits at offset `self.bit`.
-        let mut acc: u64 = 0;
-        for i in 0..8 {
-            acc <<= 8;
-            if self.byte + i < self.buf.len() {
-                acc |= self.buf[self.byte + i] as u64;
-            }
-        }
-        let shift = 64 - self.bit as u32 - n;
-        ((acc >> shift) & ((1u64 << n) - 1)) as u32
-    }
-
-    /// Advance the cursor by `n` bits.
-    #[inline]
-    fn consume(&mut self, n: u32) {
-        let total = self.bit as usize + n as usize;
-        self.byte += total >> 3;
-        self.bit = (total & 7) as u8;
-    }
-}
-
 // ─── core transforms ──────────────────────────────────────────────────────
 
 /// Encode `input` into a complete self-delimiting Huffman stream.
@@ -658,17 +610,18 @@ fn decode_stream(input: &[u8]) -> Result<Vec<u8>, Error> {
         return Ok(out);
     }
 
-    let mut reader = BitReader::new(rest);
     let max = table.max_length as u32;
 
     // Build a single-level decode table indexed by the next `max` bits: each
     // canonical code of length `L` owns the `2^(max-L)` slots whose top `L`
     // bits equal the code, so one peek + lookup decodes a symbol in O(1)
-    // instead of walking the code bit-by-bit. `len_tbl[i] == 0` marks an
-    // index no complete code reaches (never happens for a valid table).
+    // instead of walking the code bit-by-bit. Each entry packs the code length
+    // in the high byte and the symbol in the low byte, so a symbol lookup
+    // touches a single `u16` (one cache line) rather than two parallel arrays.
+    // A zero entry (`len == 0`) marks an index no complete code reaches (never
+    // happens for a valid table).
     let tsize = 1usize << max;
-    let mut sym_tbl = alloc::vec![0u8; tsize];
-    let mut len_tbl = alloc::vec![0u8; tsize];
+    let mut dec_tbl = alloc::vec![0u16; tsize];
     for length in 1..=max as usize {
         let count = table.counts[length] as u32;
         if count == 0 {
@@ -678,30 +631,45 @@ fn decode_stream(input: &[u8]) -> Result<Vec<u8>, Error> {
         let fidx = table.first_idx[length] as u32;
         let shift = max - length as u32;
         for j in 0..count {
-            let sym = table.symbols[(fidx + j) as usize] as u8;
+            let sym = table.symbols[(fidx + j) as usize];
+            let entry = ((length as u16) << 8) | sym;
             let base = ((first + j) as usize) << shift;
-            for slot in &mut sym_tbl[base..base + (1usize << shift)] {
-                *slot = sym;
-            }
-            for slot in &mut len_tbl[base..base + (1usize << shift)] {
-                *slot = length as u8;
+            for slot in &mut dec_tbl[base..base + (1usize << shift)] {
+                *slot = entry;
             }
         }
     }
 
+    // Decode with a left-aligned 64-bit bit accumulator refilled 8 bytes at a
+    // time. `acc` holds `have` valid bits at the top (MSB-first); everything
+    // below is zero, so a short tail reads as zero-padded — matching the old
+    // per-symbol window assembly but without rebuilding it every symbol.
+    let data = rest;
+    let mut acc: u64 = 0;
+    let mut have: u32 = 0;
+    let mut pos = 0usize; // next byte in `data` to load
+    let shift0 = 64 - max;
     while out.len() < orig_len {
-        let idx = reader.peek(max) as usize;
-        let len = len_tbl[idx];
+        while have <= 56 && pos < data.len() {
+            acc |= (data[pos] as u64) << (56 - have);
+            have += 8;
+            pos += 1;
+        }
+        let entry = dec_tbl[(acc >> shift0) as usize];
+        let len = (entry >> 8) as u32;
         // A valid complete tree fills every slot, so `len == 0` only occurs on a
         // corrupt table; a code longer than the bits left means truncation.
         if len == 0 {
             return Err(Error::Corrupt);
         }
-        if len as usize > reader.remaining() {
+        // Bits remaining from the current cursor to the end of the stream.
+        let remaining = have as usize + (data.len() - pos) * 8;
+        if len as usize > remaining {
             return Err(Error::UnexpectedEnd);
         }
-        out.push(sym_tbl[idx]);
-        reader.consume(len as u32);
+        out.push(entry as u8);
+        acc <<= len;
+        have -= len;
     }
 
     Ok(out)

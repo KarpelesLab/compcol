@@ -60,6 +60,40 @@ const HC_LEVEL_THRESHOLD: u8 = 3;
 /// encoded byte cost.
 const OPT_LEVEL_THRESHOLD: u8 = 10;
 
+/// Count bytes that match at `input[a..]` and `input[b..]`, advancing the `a`
+/// cursor up to (but not reaching) `a_limit`. The `b` cursor is always behind
+/// `a` (it points at an older match position), so `b + len` stays in bounds
+/// whenever `a + len` does.
+///
+/// Compares 8 bytes per step via a little-endian `u64` load + XOR, using
+/// `trailing_zeros` to locate the first mismatching byte — the standard LZ4
+/// speedup over a byte-at-a-time loop. The result is identical to the scalar
+/// loop, so the emitted match length (and thus the bitstream) is unchanged.
+#[inline]
+fn match_forward(input: &[u8], a: usize, b: usize, a_limit: usize) -> usize {
+    let mut len = 0usize;
+    while a + len + 8 <= a_limit {
+        let x = read_u64(input, a + len) ^ read_u64(input, b + len);
+        if x != 0 {
+            return len + (x.trailing_zeros() as usize >> 3);
+        }
+        len += 8;
+    }
+    while a + len < a_limit && input[a + len] == input[b + len] {
+        len += 1;
+    }
+    len
+}
+
+/// Little-endian `u64` load from `input[at..at + 8]`. Caller guarantees
+/// `at + 8 <= input.len()`.
+#[inline]
+fn read_u64(input: &[u8], at: usize) -> u64 {
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&input[at..at + 8]);
+    u64::from_le_bytes(buf)
+}
+
 /// Hash 4 bytes down to `HASH_LOG` bits.
 ///
 /// Uses the classic LZ4 multiply-and-shift hash. `2654435761` is Knuth's
@@ -176,12 +210,8 @@ pub fn encode_block(input: &[u8], out: &mut Vec<u8>) {
         // Extend the match forward. The forward limit is `input.len() -
         // LAST_LITERALS` because the last 5 bytes must be literals.
         let forward_limit = input.len() - LAST_LITERALS;
-        let mut match_len = MIN_MATCH;
-        while ip + match_len < forward_limit
-            && input[match_pos + match_len] == input[ip + match_len]
-        {
-            match_len += 1;
-        }
+        let match_len =
+            MIN_MATCH + match_forward(input, ip + MIN_MATCH, match_pos + MIN_MATCH, forward_limit);
 
         // Emit the sequence: literals from anchor..ip, then offset, then
         // match-length excess.
@@ -342,10 +372,7 @@ fn hc_longest_match(
             && input[c + best_len] == input[pos + best_len]
             && input[c] == input[pos]
         {
-            let mut l = 0usize;
-            while pos + l < forward_limit && input[c + l] == input[pos + l] {
-                l += 1;
-            }
+            let l = match_forward(input, pos, c, forward_limit);
             if l > best_len {
                 best_len = l;
                 best_pos = c;

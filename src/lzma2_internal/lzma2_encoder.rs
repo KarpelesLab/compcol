@@ -623,6 +623,16 @@ impl LzmaEncCore {
         self.rc = RangeEncoder::new();
     }
 
+    /// Reset **only** the range coder for a continued chunk (LZMA2 `0x80`):
+    /// the probability model, LZMA `state`, and the four rep distances all
+    /// carry over, so the adaptive model keeps warming across chunk boundaries
+    /// exactly as native `xz` does. Each LZMA2 chunk is still an independently
+    /// range-coded blob (its own 5-byte init + flush), so the range coder alone
+    /// must start fresh; `output_pos` is likewise left running.
+    fn reset_range_coder(&mut self) {
+        self.rc = RangeEncoder::new();
+    }
+
     fn encode_literal_full(&mut self, byte: u8, prev_byte: u8, match_byte: Option<u8>) {
         let lp_state = ((self.output_pos as u32) & self.lit_pos_mask) << self.lc;
         let prev_high = (prev_byte as u32) >> (8 - self.lc);
@@ -1436,21 +1446,37 @@ pub(crate) struct Lzma2Chunk {
     pub uncomp_len: usize,
     /// `true` when this is the first chunk of the stream and therefore must
     /// reset the dictionary (`0xE0` compressed / `0x01` uncompressed); `false`
-    /// for every later chunk, which continues the dictionary (`0xC0`
-    /// compressed / `0x02` uncompressed).
+    /// for every later chunk, which continues the dictionary.
     pub reset_dict: bool,
+    /// For a compressed chunk (`body.is_some()`): `true` when the LZMA state +
+    /// probability model are reset for this chunk (control `0xE0` on the first
+    /// chunk, `0xC0` otherwise — both carry a props byte); `false` when the
+    /// model is *continued* from the previous chunk (control `0x80`, no props
+    /// byte), which is the common case on compressible data and what lets the
+    /// adaptive model warm across chunk boundaries. Ignored for uncompressed
+    /// chunks (their control is `0x01`/`0x02`, chosen from `reset_dict`).
+    pub reset_state: bool,
     /// `Some(range-coded body)` for a compressed chunk; `None` for an
     /// uncompressed-fallback chunk (the caller copies the raw input slice).
     pub body: Option<Vec<u8>>,
 }
 
 /// Largest uncompressed payload a single compressed chunk may carry. The
-/// compressed-chunk uncompressed-size field is 21 bits (+1 ⇒ 2 MiB), but we
-/// cap at 64 KiB so the *compressed* size always fits the 16-bit (+1) comp
-/// field and the chunk header shape stays uniform with the uncompressed
-/// fallback. The dictionary still spans the whole input regardless of this
-/// slice size — only the output framing is chunked.
-const STREAM_CHUNK_UNCOMP_MAX: usize = 65_536;
+/// compressed-chunk uncompressed-size field is 21 bits (+1 ⇒ 2 MiB); we cap at
+/// 1 MiB to bound the streaming buffer while still packing a large span into
+/// one chunk when the data compresses well. Packing more uncompressed bytes per
+/// chunk amortises the per-chunk framing header + 5-byte range-coder flush
+/// (~10 bytes/chunk), which is what closes most of the compressible-ratio gap
+/// vs native `xz`; on incompressible data the compressed body hits
+/// [`CHUNK_COMP_CAP`] long before this and the chunk is cut short. The
+/// dictionary still spans the whole input regardless of this slice size.
+const CHUNK_UNCOMP_MAX: usize = 1 << 20;
+
+/// Cut a chunk (at a committed packet/window boundary) once its compressed
+/// body reaches this many bytes, so the body always fits the 16-bit (+1)
+/// `comp_size` field (≤ 65 536). The margin below 65 536 covers the final
+/// committed window (≤ `opt_window` ≈ 4 KiB of output) plus the 5-byte flush.
+const CHUNK_COMP_CAP: usize = 58_000;
 
 /// Streaming continuous-dictionary LZMA2 chunk encoder with **bounded memory**.
 ///
@@ -1461,8 +1487,16 @@ const STREAM_CHUNK_UNCOMP_MAX: usize = 65_536;
 ///
 /// - The match finder's `prev` ring is sized `O(dict_size)` (see [`HashChain`]).
 /// - Only a sliding window of roughly `dict_size + WINDOW_SLOP` history plus one
-///   pending chunk of lookahead is retained in `win`; older bytes are dropped
-///   once the parse position has moved `> dict_size + WINDOW_SLOP` past them.
+///   pending chunk of lookahead (up to `CHUNK_UNCOMP_MAX`) is retained in `win`;
+///   older bytes are dropped once the parse position has moved
+///   `> dict_size + WINDOW_SLOP` past them.
+///
+/// The pending-chunk lookahead is `CHUNK_UNCOMP_MAX` (1 MiB) rather than a
+/// single 64 KiB chunk: packing more uncompressed bytes into each compressed
+/// chunk amortises the per-chunk framing + range-coder-flush overhead, which is
+/// what brings compressible output close to native `xz`. Peak `win` memory is
+/// therefore `O(dict_size + 1 MiB)` — still bounded, independent of input
+/// length, just with a slightly higher constant floor for tiny dictionaries.
 ///
 /// Feed input with [`push`](Self::push) (which returns any chunks that became
 /// fully buffered) and finish with [`finish`](Self::finish). The caller frames
@@ -1483,6 +1517,13 @@ pub(crate) struct Lzma2StreamEncoder {
     appended: usize,
     /// `true` until the first chunk is emitted.
     first: bool,
+    /// `true` when the next compressed chunk must reset the LZMA state +
+    /// probability model rather than continue it. Set on the first chunk and
+    /// after any uncompressed-fallback chunk: an uncompressed chunk is not run
+    /// through the model on decode, and the discarded compressed attempt has
+    /// already mutated our model, so the two would desync unless the next
+    /// compressed chunk resets both sides back to a known state.
+    need_state_reset: bool,
 }
 
 impl Lzma2StreamEncoder {
@@ -1491,7 +1532,7 @@ impl Lzma2StreamEncoder {
         // dict cap already keeps this `O(dict_size)`.
         let cap_hint = (dict_size as usize)
             .saturating_add(MAX_MATCH_LEN as usize)
-            .saturating_add(WINDOW_SLOP + STREAM_CHUNK_UNCOMP_MAX);
+            .saturating_add(WINDOW_SLOP + CHUNK_UNCOMP_MAX);
         Self {
             core: LzmaEncCore::new(),
             hc: HashChain::new(dict_size, cap_hint),
@@ -1502,20 +1543,22 @@ impl Lzma2StreamEncoder {
             pos: 0,
             appended: 0,
             first: true,
+            need_state_reset: true,
         }
     }
 
     /// Append `data` and emit every chunk that is now fully buffered. A chunk is
-    /// only encoded once a whole `STREAM_CHUNK_UNCOMP_MAX` slice (or the rest of
-    /// the stream, at `finish`) is available, so the optimal parser always sees
-    /// its full forward lookahead within the chunk.
+    /// encoded once a whole `CHUNK_UNCOMP_MAX` slice (or the rest of the stream,
+    /// at `finish`) is available, so the parser always sees its full forward
+    /// lookahead within the chunk. The chunk may end earlier than the requested
+    /// span when its compressed body reaches `CHUNK_COMP_CAP`.
     pub fn push(&mut self, data: &[u8]) -> Vec<Lzma2Chunk> {
         self.win.extend_from_slice(data);
         self.appended += data.len();
         let mut out = Vec::new();
         // Encode while a full chunk's worth of bytes is buffered ahead of `pos`.
-        while self.appended - self.pos >= STREAM_CHUNK_UNCOMP_MAX {
-            out.push(self.encode_one_chunk(self.pos + STREAM_CHUNK_UNCOMP_MAX));
+        while self.appended - self.pos >= CHUNK_UNCOMP_MAX {
+            out.push(self.encode_one_chunk(self.pos + CHUNK_UNCOMP_MAX));
             self.trim_window();
         }
         out
@@ -1525,45 +1568,75 @@ impl Lzma2StreamEncoder {
     pub fn finish(&mut self) -> Vec<Lzma2Chunk> {
         let mut out = Vec::new();
         while self.pos < self.appended {
-            let end = (self.pos + STREAM_CHUNK_UNCOMP_MAX).min(self.appended);
+            let end = (self.pos + CHUNK_UNCOMP_MAX).min(self.appended);
             out.push(self.encode_one_chunk(end));
             self.trim_window();
         }
         out
     }
 
-    /// Encode the chunk `[self.pos, chunk_end)` and advance `self.pos`.
-    fn encode_one_chunk(&mut self, chunk_end: usize) -> Lzma2Chunk {
-        let uncomp_len = chunk_end - self.pos;
-        let body = self.encode_chunk_body(chunk_end);
+    /// Encode a chunk starting at `self.pos`, covering at most up to
+    /// `target_end`, and advance `self.pos` to wherever the parse actually
+    /// stopped (it cuts short if the compressed body reaches `CHUNK_COMP_CAP`).
+    fn encode_one_chunk(&mut self, target_end: usize) -> Lzma2Chunk {
+        // Reset the model on the first chunk and after any uncompressed chunk;
+        // otherwise continue it (control `0x80`) so the adaptive model warms
+        // across chunk boundaries.
+        let reset_state = self.first || self.need_state_reset;
+        let (body, actual_end) = self.encode_chunk_body(target_end, reset_state);
+        let uncomp_len = actual_end - self.pos;
         let use_compressed = !body.is_empty() && body.len() <= 65_536 && body.len() < uncomp_len;
+        // Invariants the framing relies on: a compressed body fits the 16-bit
+        // comp field, and an uncompressed fallback fits the 16-bit uncomp field
+        // (a fallback implies body ≥ uncomp_len and body ≤ ~CHUNK_COMP_CAP).
+        debug_assert!(body.len() <= 65_536);
+        debug_assert!(use_compressed || uncomp_len <= 65_536);
         let chunk = Lzma2Chunk {
             uncomp_len,
             reset_dict: self.first,
+            reset_state,
             body: if use_compressed { Some(body) } else { None },
         };
-        self.pos = chunk_end;
+        self.pos = actual_end;
         self.first = false;
+        // A compressed chunk leaves the model in a state the decoder will
+        // reproduce, so the next chunk may continue it. An uncompressed
+        // fallback does not: the decoder never runs the model over it, and this
+        // chunk's discarded compressed attempt already mutated our copy — force
+        // the next compressed chunk to reset both sides back into sync.
+        self.need_state_reset = !use_compressed;
         chunk
     }
 
-    /// Range-code `[self.pos, chunk_end)` through the shared core/hash chain,
-    /// resetting LZMA state first (keeping `output_pos` and the LZ history).
-    fn encode_chunk_body(&mut self, chunk_end: usize) -> Vec<u8> {
-        self.core.reset_state_keep_pos();
+    /// Range-code from `self.pos` up to at most `target_end` through the shared
+    /// core/hash chain, returning `(body, actual_end)` where `actual_end` is
+    /// where the parse stopped (`≤ target_end`; earlier if the compressed body
+    /// reached `CHUNK_COMP_CAP`).
+    ///
+    /// When `reset_state` is set, re-initialise the LZMA state + probability
+    /// model first (control `0xC0`/`0xE0` semantics); otherwise keep the model
+    /// running and reset only the per-chunk range coder (control `0x80`). Either
+    /// way `output_pos` and the LZ history are preserved.
+    fn encode_chunk_body(&mut self, target_end: usize, reset_state: bool) -> (Vec<u8>, usize) {
+        if reset_state {
+            self.core.reset_state_keep_pos();
+        } else {
+            self.core.reset_range_coder();
+        }
         let base = self.win_base;
         let start = self.pos;
-        if self.params.opt_window == 0 {
+        let actual_end = if self.params.opt_window == 0 {
             encode_greedy(
                 &mut self.core,
                 &mut self.hc,
                 &self.win,
                 base,
                 start,
-                chunk_end,
+                target_end,
                 self.dict_size,
                 self.params,
-            );
+                CHUNK_COMP_CAP,
+            )
         } else {
             encode_optimal(
                 &mut self.core,
@@ -1571,13 +1644,14 @@ impl Lzma2StreamEncoder {
                 &self.win,
                 base,
                 start,
-                chunk_end,
+                target_end,
                 self.dict_size,
                 self.params,
-            );
-        }
+                CHUNK_COMP_CAP,
+            )
+        };
         self.core.rc.flush();
-        self.core.rc.out.clone()
+        (self.core.rc.out.clone(), actual_end)
     }
 
     /// Drop window history older than `dict_size + WINDOW_SLOP` before `pos`, so
@@ -1613,6 +1687,8 @@ fn encode_chunk_body(
     let mut core = LzmaEncCore::new();
     let mut hc = HashChain::new(dict_size, input.len().max(1));
 
+    // One-shot: no compressed-size cap (encode the whole input in a single
+    // range-coded blob); the test caller frames the length externally.
     if optimal {
         encode_optimal(
             &mut core,
@@ -1623,6 +1699,7 @@ fn encode_chunk_body(
             input.len(),
             dict_size,
             params,
+            usize::MAX,
         );
     } else {
         encode_greedy(
@@ -1634,6 +1711,7 @@ fn encode_chunk_body(
             input.len(),
             dict_size,
             params,
+            usize::MAX,
         );
     }
 
@@ -1651,6 +1729,11 @@ fn encode_chunk_body(
 /// emitted match/rep lengths are clamped so the parse stops exactly at
 /// `pos_end` — this lets a continuous encoder slice the output into chunks
 /// without ever crossing a chunk's uncompressed-size boundary.
+/// Returns the position reached (`<= pos_end`). Stops early — at a packet
+/// boundary — once the range-coded output reaches `comp_cap` bytes, so the
+/// caller can keep every LZMA2 chunk's compressed body under the 16-bit
+/// `comp_size` field while still packing a large uncompressed span into one
+/// chunk when the data compresses well.
 #[allow(clippy::too_many_arguments)]
 fn encode_greedy(
     core: &mut LzmaEncCore,
@@ -1661,7 +1744,8 @@ fn encode_greedy(
     pos_end: usize,
     dict_size: u32,
     params: EncoderParams,
-) {
+    comp_cap: usize,
+) -> usize {
     let win_end = base + win.len();
     let mut pos = pos_start;
     while pos < pos_end {
@@ -1721,7 +1805,15 @@ fn encode_greedy(
             core.emit_literal(win, base, pos);
             pos += 1;
         }
+
+        // Cut the chunk here (a clean packet boundary) once its compressed
+        // body has grown large enough that continuing risks overrunning the
+        // 16-bit comp_size field.
+        if core.rc.out.len() >= comp_cap {
+            break;
+        }
     }
+    pos
 }
 
 /// Cost-based optimal parse: forward DP over a look-ahead window, committing
@@ -1731,6 +1823,9 @@ fn encode_greedy(
 /// Encodes `input[pos_start..pos_end]`; matches still reference the whole LZ
 /// history before `pos`, but the parse never advances past `pos_end`, so the
 /// chunk ends exactly there.
+/// Returns the position reached (`<= pos_end`). Stops early — at a committed
+/// window boundary — once the range-coded output reaches `comp_cap` bytes (see
+/// [`encode_greedy`] for why).
 #[allow(clippy::too_many_arguments)]
 fn encode_optimal(
     core: &mut LzmaEncCore,
@@ -1741,7 +1836,8 @@ fn encode_optimal(
     pos_end: usize,
     dict_size: u32,
     params: EncoderParams,
-) {
+    comp_cap: usize,
+) -> usize {
     let prob_prices = build_prob_prices();
     let window = params.opt_window as usize;
     let mut opt = Optimizer::new(window);
@@ -1788,7 +1884,14 @@ fn encode_optimal(
         replay(core, hc, win, base, pos, &opt.decisions);
         pos += parsed;
         since_refresh += opt.decisions.len();
+
+        // Cut the chunk at this committed-window boundary once the compressed
+        // body is large enough (keeps it under the 16-bit comp_size field).
+        if core.rc.out.len() >= comp_cap {
+            break;
+        }
     }
+    pos
 }
 
 /// Parse a single look-ahead window starting at `start`. Fills
