@@ -7,8 +7,8 @@
 
 use std::time::Instant;
 
-use compcol::factory;
 use compcol::Status;
+use compcol::factory;
 
 const LOREM: &[u8] = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, \
 sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim \
@@ -43,9 +43,9 @@ fn build_input(kind: &str, size: usize) -> Vec<u8> {
             let mut d = Vec::with_capacity(size);
             let mut s: u32 = 0x1234_5678;
             let words: &[&[u8]] = &[
-                b"fn ", b"let ", b"mut ", b"self.", b"return ", b"match ", b"=> ",
-                b"Ok(", b"Err(", b"Vec<u8>", b"usize", b"->", b" {\n", b"}\n",
-                b"    ", b"if ", b"else ", b"for ", b"while ", b".iter()", b"()",
+                b"fn ", b"let ", b"mut ", b"self.", b"return ", b"match ", b"=> ", b"Ok(", b"Err(",
+                b"Vec<u8>", b"usize", b"->", b" {\n", b"}\n", b"    ", b"if ", b"else ", b"for ",
+                b"while ", b".iter()", b"()",
             ];
             while d.len() < size {
                 s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);

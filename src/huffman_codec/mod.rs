@@ -556,7 +556,6 @@ impl BitWriter {
     }
 }
 
-/// MSB-first bit reader over a borrowed slice.
 // ─── core transforms ──────────────────────────────────────────────────────
 
 /// Encode `input` into a complete self-delimiting Huffman stream.
@@ -632,7 +631,7 @@ fn decode_stream(input: &[u8]) -> Result<Vec<u8>, Error> {
         let fidx = table.first_idx[length] as u32;
         let shift = max - length as u32;
         for j in 0..count {
-            let sym = table.symbols[(fidx + j) as usize] as u16;
+            let sym = table.symbols[(fidx + j) as usize];
             let entry = ((length as u16) << 8) | sym;
             let base = ((first + j) as usize) << shift;
             for slot in &mut dec_tbl[base..base + (1usize << shift)] {

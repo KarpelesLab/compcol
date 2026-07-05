@@ -167,11 +167,6 @@ impl RawEncoder for Encoder {
     }
 }
 
-/// Compress `input` into `out` as a single Snappy raw block.
-///
-/// Layout:
-/// * Varint-encoded `input.len()`.
-/// * A literal+copy tag stream covering every byte of `input`.
 /// Count bytes matching at `input[a..]` and `input[b..]`, advancing the `a`
 /// cursor up to (not reaching) `a_limit`. `b` is always behind `a`, so `b+len`
 /// stays in bounds whenever `a+len` does. Compares 8 bytes per step via an LE
@@ -197,6 +192,11 @@ fn match_forward(input: &[u8], a: usize, b: usize, a_limit: usize) -> usize {
     len
 }
 
+/// Compress `input` into `out` as a single Snappy raw block.
+///
+/// Layout:
+/// * Varint-encoded `input.len()`.
+/// * A literal+copy tag stream covering every byte of `input`.
 fn compress_block(input: &[u8], out: &mut Vec<u8>) {
     out.clear();
     write_varint_u32(input.len() as u32, out);
