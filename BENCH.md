@@ -107,9 +107,9 @@ after 1 warmup.
 | `snappy` | Lorem 1 MiB | 1048576 | 49552 | 0.05 | 0.10 | 10217 | 0.12 | 9115 | — | — | — | — | — | — | — | — |
 | `snappy` | Zeros 1 MiB | 1048576 | 49157 | 0.05 | 0.10 | 10513 | 0.11 | 9619 | — | — | — | — | — | — | — | — |
 | `snappy` | Random 1 MiB | 1048576 | 1048583 | 1.00 | 0.15 | 7077 | 0.10 | 10573 | — | — | — | — | — | — | — | — |
-| `xz` | Lorem 1 MiB | 1048576 | 1708 | 0.00 | 26.0 | 40.4 | 1.71 | 613.8 | xz | 0.00 | 16.8 | 62.4 | 1.79 | 585.6 | 0.65 | 1.05 |
-| `xz` | Zeros 1 MiB | 1048576 | 1368 | 0.00 | 27.7 | 37.8 | 1.75 | 599.8 | xz | 0.00 | 10.7 | 97.6 | 2.27 | 460.9 | 0.39 | 1.30 |
-| `xz` | Random 1 MiB | 1048576 | 1048680 | 1.00 | 214.3 | 4.89 | 2.16 | 484.5 | xz | 1.00 | 145.4 | 7.21 | 1.63 | 642.8 | 0.68 | 0.75 |
+| `xz` | Lorem 1 MiB | 1048576 | 752 | 0.00 | 28.8 | 36.4 | 1.85 | 566.1 | xz | 0.00 | 21.6 | 48.4 | 1.90 | 553.0 | 0.75 | 1.02 |
+| `xz` | Zeros 1 MiB | 1048576 | 440 | 0.00 | 30.9 | 33.9 | 1.97 | 533.5 | xz | 0.00 | 13.3 | 78.9 | 2.33 | 449.7 | 0.43 | 1.19 |
+| `xz` | Random 1 MiB | 1048576 | 1048680 | 1.00 | 228.4 | 4.59 | 2.49 | 421.4 | xz | 1.00 | 144.1 | 7.27 | 1.59 | 660.5 | 0.63 | 0.64 |
 | `zlib` | Lorem 1 MiB | 1048576 | 5717 | 0.01 | 1.89 | 555.5 | 0.40 | 2612 | py-zlib | 0.00 | 10.8 | 97.5 | 11.0 | 95.7 | 5.70 | 27.3 |
 | `zlib` | Zeros 1 MiB | 1048576 | 1818 | 0.00 | 1.73 | 606.0 | 2.57 | 407.3 | py-zlib | 0.00 | 11.1 | 94.4 | 9.98 | 105.0 | 6.42 | 3.88 |
 | `zlib` | Random 1 MiB | 1048576 | 1048904 | 1.00 | 16.8 | 62.4 | 1.09 | 961.9 | py-zlib | 1.00 | 26.1 | 40.1 | 12.1 | 86.5 | 1.56 | 11.1 |
@@ -143,7 +143,12 @@ after 1 warmup.
   deliberate tradeoff — the encoders were rewritten to bounded-memory
   sliding-window streaming, which costs raw encode speed. Decode is
   strong: `lzma` **48× ref** on Lorem, and Random decode is **24 MB/s**
-  (`lzma`) / **485 MB/s** (`xz`).
+  (`lzma`) / **485 MB/s** (`xz`). The 2026-07 chunk-model-carry fix
+  (continuation control `0x80`, model warms across 64 KiB chunks like
+  native `xz`) shrank `xz` Lorem output **1708 → 752 B** and Zeros
+  **1368 → 440 B** (~2.3–3.1×); the effect grows with input length
+  (16 MiB Lorem: ~21.8 KB → ~5.5 KB). Ratio vs native `xz` is now
+  ~1.9× on Lorem, down from ~7.5×.
 - `bzip2`: encode **22.5 MB/s** Lorem — the SA-IS BWT is the right
   algorithm class; it is bound by the suffix sort and the table
   refinement, not the bit I/O.
