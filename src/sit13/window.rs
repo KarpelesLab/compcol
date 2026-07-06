@@ -38,12 +38,22 @@ pub(crate) fn emit_match(out: &mut Vec<u8>, distance: usize, length: usize) -> R
     if distance == 0 || distance > WINDOW_SIZE || distance > out.len() {
         return Err(Error::InvalidDistance);
     }
-    // `src` starts at `len - distance` and advances by one per pushed byte, so
-    // `src < out.len()` holds at each step (overlap-safe run extension when
-    // distance < length).
-    for src in (out.len() - distance..).take(length) {
-        let b = out[src];
-        out.push(b);
+    // Overlap-safe vectorized copy. `distance == 1` is a single-byte run:
+    // splat the last byte. Otherwise copy in chunks of at most `out.len() - src`
+    // bytes, so every source byte is already materialized before it is appended
+    // (reproducing the cyclic byte sequence the naive per-byte loop would).
+    if distance == 1 {
+        let b = out[out.len() - 1];
+        out.resize(out.len() + length, b);
+    } else {
+        let mut rem = length;
+        let mut src = out.len() - distance;
+        while rem > 0 {
+            let n = rem.min(out.len() - src);
+            out.extend_from_within(src..src + n);
+            src += n;
+            rem -= n;
+        }
     }
     Ok(())
 }

@@ -523,11 +523,12 @@ impl Decoder {
             while done < length_n {
                 let run = (length_n - done).min(ws - src).min(ws - self.window_pos);
                 let sp = self.window_pos;
-                for k in 0..run {
-                    let b = self.window[src + k];
-                    self.window[sp + k] = b;
-                    self.out_queue.push_back(b);
-                }
+                // off >= length_n >= run and the run is capped to avoid a ring
+                // wrap, so source and destination never overlap: bulk-copy the
+                // disjoint window segment, matching the per-byte writes exactly.
+                self.out_queue
+                    .extend(self.window[src..src + run].iter().copied());
+                self.window.copy_within(src..src + run, sp);
                 src = (src + run) & wmask;
                 self.window_pos = (self.window_pos + run) & wmask;
                 done += run;

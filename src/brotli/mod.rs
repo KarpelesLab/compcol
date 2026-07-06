@@ -2251,12 +2251,21 @@ impl Decoder {
             }
             self.total_out += n;
         } else {
-            // Self-overlap (distance < len): replicate byte-by-byte.
-            for _ in 0..len {
-                let g = (self.total_out as u64) - (distance as u64);
-                let byte = self.out[(g - out_base as u64) as usize];
-                self.emit_literal(byte);
+            // Self-overlap (distance < len): expanding copy within the
+            // already-produced region. Each `extend_from_within` copies a
+            // prefix of the growing tail, reproducing the exact RLE sequence
+            // the per-byte loop would emit, but as bulk memcpys.
+            let mut produced = 0usize;
+            while produced < n {
+                let chunk = (self.out.len() - src_start).min(n - produced);
+                self.out.extend_from_within(src_start..src_start + chunk);
+                produced += chunk;
             }
+            // n >= 3 here (distance >= 2 and distance < n), so end-2 is valid.
+            let end = self.out.len();
+            self.p2 = self.out[end - 2];
+            self.p1 = self.out[end - 1];
+            self.total_out += n;
         }
         Ok(())
     }
