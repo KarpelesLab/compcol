@@ -461,7 +461,16 @@ fn try_read_length_at(
     if dw < 22 {
         return Err(Error::Corrupt);
     }
-    if dw > SANITY_MATCH_LEN {
+    // A single match can legitimately be as long as the whole declared output
+    // (highly repetitive input collapses to one long back-reference), so bound
+    // the tier-3 length by the declared total rather than a fixed constant —
+    // otherwise valid streams whose longest match exceeds 256 MiB are wrongly
+    // rejected.
+    let cap = match dec.header {
+        HeaderPhase::Active { target } => target.min(u32::MAX as u64) as u32,
+        _ => SANITY_MATCH_LEN,
+    };
+    if dw > cap {
         return Err(Error::Corrupt);
     }
     Ok(Some((dw + 3, hb_consumed + 1 + 2 + 4, hb_op)))
