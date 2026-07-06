@@ -563,11 +563,11 @@ impl RunCtx {
                     .min(WINDOW_SIZE - src)
                     .min(WINDOW_SIZE - self.window_pos);
                 let sp = self.window_pos;
-                for k in 0..run {
-                    let b = self.window[src + k];
-                    self.window[sp + k] = b;
-                    output.push(b);
-                }
+                // off >= remaining >= run and no wrap inside the run, so the
+                // source and destination ranges are disjoint: append the whole
+                // segment then copy it, matching the per-byte writes exactly.
+                output.extend_from_slice(&self.window[src..src + run]);
+                self.window.copy_within(src..src + run, sp);
                 src = (src + run) & WINDOW_MASK;
                 self.window_pos = (self.window_pos + run) & WINDOW_MASK;
                 done += run;

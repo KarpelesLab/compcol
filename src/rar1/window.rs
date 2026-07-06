@@ -140,9 +140,8 @@ impl Window {
                 let run = (length - done)
                     .min(WINDOW_SIZE - src)
                     .min(WINDOW_SIZE - dst);
-                for k in 0..run {
-                    self.buf[dst + k] = self.buf[src + k];
-                }
+                // Non-overlapping, no wrap within the run: a single memmove.
+                self.buf.copy_within(src..src + run, dst);
                 src = (src + run) & mask;
                 dst = (dst + run) & mask;
                 done += run;
