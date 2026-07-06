@@ -562,10 +562,22 @@ pub fn execute_sequences(
             let b = history[start];
             history.resize(history.len() + ml, b);
         } else {
-            // Self-overlapping (RLE-style): replicate byte-by-byte.
-            for i in 0..ml {
-                let b = history[start + i];
-                history.push(b);
+            // Self-overlapping (period `offset`): copy in growing chunks.
+            // Each pass appends the already-materialized prefix via memcpy;
+            // the copyable source region grows by `n` every iteration (at
+            // least doubling until it catches up), so this runs in
+            // O(log(ml/offset)) memcpys instead of `ml` bounds-checked pushes.
+            // Byte-identical to the scalar loop: each chunk `history[src..src+n]`
+            // is fully produced (src + n <= history.len()) before it is copied,
+            // reproducing the exact cyclic sequence.
+            let mut remaining = ml;
+            let mut src = start;
+            while remaining > 0 {
+                let avail = history.len() - src;
+                let n = remaining.min(avail);
+                history.extend_from_within(src..src + n);
+                src += n;
+                remaining -= n;
             }
         }
     }

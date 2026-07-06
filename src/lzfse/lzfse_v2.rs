@@ -449,9 +449,26 @@ pub(crate) fn decode_block(
         if out.len() + m > start_len + n_raw {
             return Err(Error::Corrupt);
         }
-        for src in (out.len() - d..).take(m) {
-            let b = out[src];
-            out.push(b);
+        // Vectorized match copy. The two guards above already bound-check the
+        // whole copy. `d == 1` is a byte-splat; otherwise copy in growing
+        // chunks: a non-overlapping match (d >= m) collapses to one memcpy, and
+        // a self-overlapping one (1 < d < m) runs in O(log(m/d)) memcpys — each
+        // chunk `out[src..src+n]` is fully materialized before it is copied, so
+        // the emitted bytes are identical to the scalar push loop.
+        let src_pos = out.len() - d;
+        if d == 1 {
+            let b = out[src_pos];
+            out.resize(out.len() + m, b);
+        } else {
+            let mut remaining = m;
+            let mut src = src_pos;
+            while remaining > 0 {
+                let avail = out.len() - src;
+                let n = remaining.min(avail);
+                out.extend_from_within(src..src + n);
+                src += n;
+                remaining -= n;
+            }
         }
     }
 
