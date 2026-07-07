@@ -166,6 +166,20 @@ fn round_trip_repeated_64kib() {
 }
 
 #[test]
+fn round_trip_match_exceeding_16mib_guard() {
+    // Regression: a single back-reference longer than the old fixed 16 MiB
+    // (1<<24) "sanity" cap must still decode. ~20 MiB of a short repeating
+    // phrase collapses to one very long match; the decoder previously rejected
+    // it as a suspected decompression bomb (Error::Corrupt).
+    let phrase = b"the quick brown fox jumps over the lazy dog. ";
+    let mut input = Vec::with_capacity(20 << 20);
+    while input.len() < (20 << 20) {
+        input.extend_from_slice(phrase);
+    }
+    round_trip(&input);
+}
+
+#[test]
 fn round_trip_mixed_short_runs() {
     let mut input = Vec::new();
     input.extend(core::iter::repeat_n(b'a', 10));

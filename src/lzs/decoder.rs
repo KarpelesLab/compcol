@@ -120,7 +120,16 @@ impl Decoder {
                     0b10 => Ok(Some(7)),
                     0b11 => {
                         // Chain: read nibbles until one is != 1111. Each
-                        // 1111 adds 15.
+                        // 1111 adds 15. A single match can legitimately be as
+                        // long as the whole declared output (highly repetitive
+                        // input compresses to one long back-reference), so bound
+                        // the accumulator by the declared total length rather
+                        // than a fixed constant — otherwise valid streams whose
+                        // longest match exceeds ~16 MiB are wrongly rejected.
+                        let cap = match self.header {
+                            HeaderPhase::Active { target } => target.min(u32::MAX as u64) as u32,
+                            _ => SANITY_MATCH_LEN,
+                        };
                         let mut acc: u32 = 8;
                         loop {
                             let nib = match self.bits.read_bits(4) {
@@ -141,7 +150,7 @@ impl Decoder {
                                 Some(v) => v,
                                 None => return Err(Error::Corrupt),
                             };
-                            if acc > SANITY_MATCH_LEN {
+                            if acc > cap {
                                 return Err(Error::Corrupt);
                             }
                         }

@@ -262,6 +262,13 @@ impl Default for Encoder {
 
 impl RawEncoder for Encoder {
     fn raw_encode(&mut self, input: &[u8], _output: &mut [u8]) -> Result<RawProgress, Error> {
+        // The stream is prefixed with a fixed 4-byte little-endian uncompressed
+        // length, so it can represent at most `u32::MAX` bytes. Reject overflow
+        // with a clean error rather than silently truncating the header (which
+        // would make the decoder emit the wrong number of bytes).
+        if self.input.len() as u64 + input.len() as u64 > u32::MAX as u64 {
+            return Err(Error::Unsupported);
+        }
         self.input.extend_from_slice(input);
         Ok(RawProgress {
             consumed: input.len(),

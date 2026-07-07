@@ -131,6 +131,14 @@ impl Encoder {
 
 impl RawEncoder for Encoder {
     fn raw_encode(&mut self, input: &[u8], _output: &mut [u8]) -> Result<RawProgress, Error> {
+        // Snappy's raw block format prefixes the stream with the uncompressed
+        // length as a 32-bit varint, and the match finder addresses positions
+        // with `u32`, so a block can hold at most `u32::MAX` bytes. Reject an
+        // over-length stream with a clean error instead of silently truncating
+        // the length field into a corrupt, undecodable stream.
+        if self.input.len() as u64 + input.len() as u64 > u32::MAX as u64 {
+            return Err(Error::Unsupported);
+        }
         // Buffer the whole input — Snappy needs the total length up front,
         // and back-references can reach anywhere within the block, so we
         // can't emit anything until the caller signals end of input.

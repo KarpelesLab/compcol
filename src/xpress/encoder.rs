@@ -107,6 +107,13 @@ impl RawEncoder for Encoder {
                 done: false,
             });
         }
+        // The match finder addresses positions with `u32`, so above 4 GiB the
+        // hash table truncates positions and can emit wrong-distance matches.
+        // Reject a stream at that limit with a clean error rather than risk
+        // silently corrupt output.
+        if self.raw.len() as u64 + input.len() as u64 > u32::MAX as u64 {
+            return Err(Error::Unsupported);
+        }
         self.raw.extend_from_slice(input);
         Ok(RawProgress {
             consumed: input.len(),

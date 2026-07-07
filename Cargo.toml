@@ -300,3 +300,8 @@ required-features = ["factory"]
 name             = "micro"
 path             = "examples/micro.rs"
 required-features = ["factory"]
+
+[[example]]
+name             = "stress"
+path             = "examples/stress.rs"
+required-features = ["factory"]
