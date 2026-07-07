@@ -313,6 +313,19 @@ fn decoder_reset_allows_reuse() {
 // ─── decoder error rejection ───────────────────────────────────────────
 
 #[test]
+fn oversized_length_field_rejected_without_panic() {
+    // Regression (libFuzzer decoder_xpress crash-9bfdce...): a malformed
+    // stream declaring a huge target plus a huge tier-3 length field used to
+    // overflow `dw + 3` and panic under debug assertions. It must now fail
+    // cleanly (the declared output is never satisfiable) instead of crashing.
+    let crash: &[u8] = &[
+        7, 0, 0, 125, 253, 0, 0, 0, 10, 38, 189, 40, 189, 0, 0, 0, 0, 0, 0, 38, 255, 236, 255, 0,
+        255, 255, 0, 0, 255, 255, 255, 255, 189, 38, 17, 96,
+    ];
+    assert!(decode_chunked(crash, 4096, 4096).is_err());
+}
+
+#[test]
 fn truncated_header_rejected() {
     // Less than 8 bytes ⇒ finish must error.
     let encoded = vec![0u8; 4];

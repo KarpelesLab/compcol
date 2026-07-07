@@ -466,8 +466,10 @@ fn try_read_length_at(
     // the tier-3 length by the declared total rather than a fixed constant —
     // otherwise valid streams whose longest match exceeds 256 MiB are wrongly
     // rejected.
+    // Cap at `u32::MAX - 3` so the `dw + 3` below cannot overflow on a
+    // malformed stream that declares a huge target and a huge length field.
     let cap = match dec.header {
-        HeaderPhase::Active { target } => target.min(u32::MAX as u64) as u32,
+        HeaderPhase::Active { target } => target.min((u32::MAX - 3) as u64) as u32,
         _ => SANITY_MATCH_LEN,
     };
     if dw > cap {
