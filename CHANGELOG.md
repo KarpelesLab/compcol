@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.8](https://github.com/KarpelesLab/compcol/compare/v0.6.7...v0.6.8) - 2026-07-07
+
+### Fixed
+
+- large-file corruption in snappy/lzss/lzs/xpress + stress harness ([#116](https://github.com/KarpelesLab/compcol/pull/116))
+
+### Other
+
+- *(decode)* vectorize match-copy loops (brotli, sit13, rar1/2/5) ([#115](https://github.com/KarpelesLab/compcol/pull/115))
+- *(zstd,lzfse)* vectorize self-overlapping match copy on decode ([#114](https://github.com/KarpelesLab/compcol/pull/114))
+- *(fuzz)* add round-trip fuzz target for the encoders ([#113](https://github.com/KarpelesLab/compcol/pull/113))
+- compression optimizations (match extension, huffman decode, xz/lzma2 ratio) ([#112](https://github.com/KarpelesLab/compcol/pull/112))
+- *(lzss,huffman)* hash-chain match finder + table Huffman decode
+- *(brotli,zstd)* faster encode on low-redundancy input
+
 ### Changed
 
 - *(lzss)* replaced the encoder's O(N·n) brute-force ring-buffer match scan
