@@ -173,6 +173,13 @@ impl RawEncoder for Encoder {
         match self.state {
             EncState::Accumulating => {
                 if !input.is_empty() {
+                    // The header stores the total uncompressed length as a
+                    // little-endian u32, so a stream holds at most `u32::MAX`
+                    // bytes. Reject overflow with a clean error rather than
+                    // silently truncating the header into a corrupt stream.
+                    if self.raw.len() as u64 + input.len() as u64 > u32::MAX as u64 {
+                        return Err(Error::Unsupported);
+                    }
                     self.raw.extend_from_slice(input);
                     consumed = input.len();
                 }
