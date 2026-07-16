@@ -65,11 +65,11 @@ pub fn apply(filter: &Filter, buf: &mut [u8]) -> Result<(), Error> {
     let region = &mut buf[..filter.length as usize];
     match filter.kind {
         FilterKind::X86Call => {
-            x86_e8_decode(filter.start, region, false);
+            x86_e8_decode(filter.start, region, false, true);
             Ok(())
         }
         FilterKind::X86CallJmp => {
-            x86_e8_decode(filter.start, region, true);
+            x86_e8_decode(filter.start, region, true, true);
             Ok(())
         }
         FilterKind::Delta { channels } => {

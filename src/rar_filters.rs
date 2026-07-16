@@ -27,10 +27,18 @@ use alloc::vec::Vec;
 /// variant, `E9`) opcode's 4-byte relative target into absolute form, and
 /// this pass restores the original relative value.
 ///
-/// `start` is the absolute position of `buf[0]` in the unpacked stream.
-/// When `also_e9` is true the filter fires on `0xE8` *and* `0xE9`; when
-/// false only on `0xE8`.
-pub(crate) fn x86_e8_decode(start: u64, buf: &mut [u8], also_e9: bool) {
+/// `start` is the absolute position of `buf[0]` in the unpacked stream
+/// (file-relative for both generations). When `also_e9` is true the filter
+/// fires on `0xE8` *and* `0xE9`; when false only on `0xE8`.
+///
+/// `wrap_16m` selects the position-base arithmetic, where the two container
+/// generations differ: RAR5 reduces the position modulo the 16 MiB virtual
+/// file size (validated against real WinRAR archives in the differential
+/// harness), while RAR3's VM filter uses the unmasked 32-bit position (per
+/// libarchive's RAR3 reader; the two agree below 16 MiB, so windows past
+/// 16 MiB of a large executable are where masking would corrupt RAR3
+/// output).
+pub(crate) fn x86_e8_decode(start: u64, buf: &mut [u8], also_e9: bool, wrap_16m: bool) {
     const FILE_SIZE: u32 = 0x0100_0000;
     if buf.len() < 5 {
         // No room for a [opcode][4-byte rel] sequence.
@@ -49,7 +57,10 @@ pub(crate) fn x86_e8_decode(start: u64, buf: &mut [u8], also_e9: bool) {
         let rel = u32::from_le_bytes([buf[i + 1], buf[i + 2], buf[i + 3], buf[i + 4]]);
         // The offset is computed *after* the opcode byte has been consumed,
         // so the relevant absolute position is start + i + 1.
-        let off = ((start + i as u64 + 1) as u32) & (FILE_SIZE - 1);
+        let mut off = (start + i as u64 + 1) as u32;
+        if wrap_16m {
+            off &= FILE_SIZE - 1;
+        }
         // Decode direction. The two range checks are NESTED on the sign of
         // `rel`, exactly as in unrar/libarchive:
         //
@@ -148,7 +159,7 @@ mod tests {
     #[test]
     fn e8_rewrites_call_target() {
         let mut buf = vec![0x00, 0x00, 0xE8, 0x10, 0x00, 0x00, 0x00, 0x90, 0x90];
-        x86_e8_decode(0, &mut buf, false);
+        x86_e8_decode(0, &mut buf, false, true);
         // off = 2 + 1 = 3; rel = 0x10 in 0..FILE_SIZE => rel - off.
         let expected = 0x10u32.wrapping_sub(3).to_le_bytes();
         assert_eq!(&buf[3..7], &expected);
@@ -158,9 +169,29 @@ mod tests {
     fn e8_ignores_e9_unless_extended() {
         let mut buf = vec![0xE9, 0x10, 0x00, 0x00, 0x00];
         let orig = buf.clone();
-        x86_e8_decode(0, &mut buf, false);
+        x86_e8_decode(0, &mut buf, false, true);
         assert_eq!(buf, orig);
-        x86_e8_decode(0, &mut buf, true);
+        x86_e8_decode(0, &mut buf, true, true);
         assert_ne!(buf, orig);
+    }
+
+    /// RAR3 (unmasked) and RAR5 (16 MiB-wrapped) position bases agree below
+    /// 16 MiB and diverge above — a >16 MiB window must subtract the full
+    /// offset on the RAR3 path.
+    #[test]
+    fn e8_base_masking_diverges_past_16mib() {
+        const START: u64 = 0x0100_0000; // exactly 16 MiB
+        let src = vec![0xE8, 0x10, 0x00, 0x00, 0x00];
+
+        let mut unmasked = src.clone();
+        x86_e8_decode(START, &mut unmasked, false, false);
+        // off = 16 MiB + 1; rel = 0x10 < FILE_SIZE => rel - off (wrapping).
+        let want = 0x10u32.wrapping_sub(0x0100_0001).to_le_bytes();
+        assert_eq!(&unmasked[1..5], &want);
+
+        let mut masked = src.clone();
+        x86_e8_decode(START, &mut masked, false, true);
+        // off wraps to 1 => rel - 1.
+        assert_eq!(&masked[1..5], &0x0Fu32.to_le_bytes());
     }
 }

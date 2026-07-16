@@ -79,21 +79,31 @@ pub(super) struct PendingFilter {
     pub channels: u32,
 }
 
+/// Delta channel-count ceiling, matching unrar's `MAX3_UNPACK_CHANNELS`
+/// (1024). unrar refuses to *run* the transform beyond it and emits the
+/// raw bytes with success; this crate fails closed instead (same policy as
+/// unfinished filter windows — surfacing an error beats returning bytes
+/// that only a container CRC could flag).
+const MAX_DELTA_CHANNELS: u32 = 1024;
+
 /// Run a scheduled filter over its region (already sliced by the caller).
+///
+/// The x86 transforms use the **unmasked** 32-bit position base (RAR3 VM
+/// semantics — see [`x86_e8_decode`]); `filter.start` is file-relative,
+/// which for solid archives means member-relative (unrar seeds the VM with
+/// its per-member written-size counter).
 pub(super) fn apply_pending(filter: &PendingFilter, region: &mut [u8]) -> Result<(), Error> {
     match filter.program {
         StdProgram::Delta => {
-            if filter.channels == 0 || filter.channels as usize > region.len() {
-                // Channel count is supplied by the stream (register 0);
-                // 0 channels is meaningless and more channels than bytes
-                // means most planes are empty — real encoders produce
-                // neither.
+            if filter.channels == 0 || filter.channels > MAX_DELTA_CHANNELS {
                 return Err(Error::Corrupt);
             }
+            // More channels than bytes is well-defined (trailing planes are
+            // empty) and unrar runs it; no length-based bound here.
             delta_decode(filter.channels as usize, region);
         }
-        StdProgram::X86Call => x86_e8_decode(filter.start, region, false),
-        StdProgram::X86CallJmp => x86_e8_decode(filter.start, region, true),
+        StdProgram::X86Call => x86_e8_decode(filter.start, region, false, false),
+        StdProgram::X86CallJmp => x86_e8_decode(filter.start, region, true, false),
     }
     Ok(())
 }
