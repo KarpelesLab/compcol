@@ -102,6 +102,17 @@ impl BitReader {
             let _ = self.drop_bits(drop);
         }
     }
+
+    /// Number of source bytes logically consumed so far. Only meaningful on
+    /// a byte boundary (call [`byte_align`] first). Used by the PPMd path to
+    /// hand the raw byte stream after the block header to the RAR range
+    /// decoder.
+    pub fn consumed_bytes(&self) -> usize {
+        // `byte_pos` is the next byte to pull into `acc`; `nbits` bits are
+        // buffered ahead but unconsumed. On a byte boundary `nbits` is a
+        // multiple of 8.
+        self.byte_pos - (self.nbits as usize) / 8
+    }
 }
 
 #[cfg(test)]

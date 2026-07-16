@@ -21,10 +21,13 @@
 //! This build implements the **LZ77 + Huffman path** in full, including the
 //! in-band standard filters WinRAR declares via main symbol 257 (Delta and
 //! x86 E8/E8E9, recognized by bytecode fingerprint and run natively — no
-//! RarVM interpreter; unknown programs are refused). PPMd-II blocks are
-//! refused with `Error::Unsupported` — see the private `decoder` submodule
-//! for details and limitations. The standalone E8/E9 (x86 near-call)
-//! post-pass filter can also be enabled via [`Decoder::with_e8_filter`].
+//! RarVM interpreter; unknown programs are refused), and **PPMd-II variant
+//! H** blocks (the full PPMII model in [`crate::ppmd`], driven by the RAR
+//! range decoder with the RAR literal/match/end-of-data escape layer). The
+//! standalone E8/E9 (x86 near-call) post-pass filter can also be enabled
+//! via [`Decoder::with_e8_filter`]. PPMd continuations across a new-table
+//! boundary (solid multi-member streams) are refused — see the private
+//! `decoder` submodule for the exact boundary.
 //!
 //! ## Calling convention
 //!

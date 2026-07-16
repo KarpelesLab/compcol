@@ -275,3 +275,24 @@ path             = "fuzz_targets/roundtrip.rs"
 test             = false
 doc              = false
 bench            = false
+
+[[bin]]
+name             = "decoder_rar2"
+path             = "fuzz_targets/decoder_rar2.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "decoder_rar3"
+path             = "fuzz_targets/decoder_rar3.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "decoder_rar5"
+path             = "fuzz_targets/decoder_rar5.rs"
+test             = false
+doc              = false
+bench            = false
