@@ -20,10 +20,14 @@ use super::ppmd7::Ppmd7;
 use super::range_dec::{Mode, RangeDec};
 
 const HEADER_LEN: usize = 11;
+/// Sentinel length meaning "unknown". PPMd has no in-band end-of-stream
+/// marker, so a stream framed with this length can't be decoded reliably
+/// (see [`Decoder::run_decode`]) — it's refused rather than decoded to a
+/// guess.
 const UNKNOWN_LEN: u64 = u64::MAX;
-/// Hard cap on decoded output when the header length is unknown, so a tiny
-/// crafted stream can't drive unbounded work.
-const MAX_UNKNOWN_OUTPUT: usize = 64 * 1024 * 1024;
+/// Hard cap on decoded output, so a tiny crafted stream declaring a huge
+/// length can't drive unbounded allocation/work.
+const MAX_OUTPUT: usize = 64 * 1024 * 1024;
 
 pub struct Decoder {
     in_buf: Vec<u8>,
@@ -78,50 +82,40 @@ impl Decoder {
         let (mut rc, consumed) = RangeDec::init(Mode::SevenZip, &self.in_buf, HEADER_LEN)?;
         let _ = consumed;
 
-        let cap = if expected_len == UNKNOWN_LEN {
-            MAX_UNKNOWN_OUTPUT
-        } else {
-            expected_len.min(MAX_UNKNOWN_OUTPUT as u64) as usize
-        };
-        let mut out = Vec::with_capacity(cap.min(1 << 20));
-
+        // PPMd carries no in-band end-of-stream marker, so a stream whose
+        // header declares an unknown length has no reliable terminal
+        // condition: after the true last symbol the range coder's
+        // finalisation bytes keep decoding into extra (garbage) symbols, and
+        // exhausting the physical input is not an end signal (a high-
+        // probability symbol decodes without consuming any input). Refuse
+        // rather than emit a guess.
         if expected_len == UNKNOWN_LEN {
-            while out.len() < MAX_UNKNOWN_OUTPUT {
-                if rc.overran() {
-                    break;
-                }
-                let sym = model.decode_symbol(&mut rc)?;
-                if rc.overran() {
-                    break;
-                }
-                out.push(sym);
-            }
-        } else {
-            // A declared length larger than the buffer-then-decode ceiling
-            // can't be produced here; reject it up front rather than growing
-            // `out` toward OOM. (A high-probability PPMd symbol can decode
-            // many times without consuming input, so `overran()` alone is not
-            // a sufficient bound.)
-            if expected_len > MAX_UNKNOWN_OUTPUT as u64 {
-                return Err(Error::OutputLimitExceeded);
-            }
-            for _ in 0..expected_len {
-                // Truncated input can't supply more symbols; stop before the
-                // model starts decoding from zero-filled reads.
-                if rc.overran() {
-                    return Err(Error::UnexpectedEnd);
-                }
-                let sym = model.decode_symbol(&mut rc)?;
-                out.push(sym);
-            }
+            return Err(Error::Unsupported);
+        }
+        // A declared length larger than the buffer-then-decode ceiling can't
+        // be produced here; reject it up front rather than growing `out`
+        // toward OOM.
+        if expected_len > MAX_OUTPUT as u64 {
+            return Err(Error::OutputLimitExceeded);
+        }
+        let mut out = Vec::with_capacity((expected_len as usize).min(1 << 20));
+
+        for _ in 0..expected_len {
+            // Truncated input can't supply more symbols; stop before the
+            // model starts decoding from zero-filled reads.
             if rc.overran() {
                 return Err(Error::UnexpectedEnd);
             }
-            // 7z streams leave the range coder at `code == 0` after the last
-            // symbol; a non-zero residue means truncation or corruption.
-            if !rc.is_finished_ok() {
-                return Err(Error::Corrupt);
-            }
+            let sym = model.decode_symbol(&mut rc)?;
+            out.push(sym);
+        }
+        if rc.overran() {
+            return Err(Error::UnexpectedEnd);
+        }
+        // 7z streams leave the range coder at `code == 0` after the last
+        // symbol; a non-zero residue means truncation or corruption.
+        if !rc.is_finished_ok() {
+            return Err(Error::Corrupt);
         }
 
         self.decoded = out;

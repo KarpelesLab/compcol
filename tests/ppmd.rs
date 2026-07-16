@@ -248,6 +248,22 @@ fn header_bad_restoration_is_bad_header() {
 }
 
 #[test]
+fn unknown_declared_length_is_refused() {
+    // PPMd has no in-band end-of-stream marker, so a stream framed with the
+    // "unknown length" sentinel (u64::MAX) has no reliable stopping point:
+    // decoding until the range coder exhausts input appends its finalisation
+    // bytes as extra garbage symbols (reframing the 1280-byte `repeat`
+    // fixture this way used to return 1466 bytes). It must be refused.
+    let (stream, _) = fixture!("repeat");
+    let mut bad = stream.to_vec();
+    bad[3..11].copy_from_slice(&u64::MAX.to_le_bytes());
+    let mut dec = Decoder::new();
+    let mut buf = [0u8; 256];
+    let _ = dec.decode(&bad, &mut buf);
+    assert_eq!(dec.finish(&mut buf), Err(Error::Unsupported));
+}
+
+#[test]
 fn absurd_declared_length_is_rejected_not_oomed() {
     // Regression: a fuzz-found stream with a valid header but a wildly
     // oversized declared length (~71 quadrillion bytes) used to drive the
