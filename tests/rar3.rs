@@ -388,6 +388,40 @@ fn ppmd_block_decodes() {
     decode_and_check_crc(PPMD_NOTES, 20001, 0x0E1A_EC07);
 }
 
+/// A truncated PPMd payload must fail, not fabricate output. Once the range
+/// coder reads past the end of the compressed block, `read_byte` supplies
+/// zeroes and every further symbol is invented; without an overrun check the
+/// decoder would still reach the declared 20001-byte size (with a wrong CRC)
+/// and report success. Dropping the tail bytes must surface an error instead.
+#[test]
+fn ppmd_truncated_payload_errors_not_fabricates() {
+    let truncated = &PPMD_NOTES[..PPMD_NOTES.len() - 14];
+    let mut dec = Decoder::with_unpack_size(20001);
+    // Buffer-then-decode: the failure surfaces on the first finish/drain.
+    let _ = dec.decode(truncated, &mut []);
+    let mut buf = [0u8; 4096];
+    let mut err = None;
+    let mut produced = 0usize;
+    loop {
+        match dec.finish(&mut buf) {
+            Ok((p, status)) => {
+                produced += p.written;
+                if matches!(status, Status::StreamEnd) || p.written == 0 {
+                    break;
+                }
+            }
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        }
+    }
+    assert!(
+        matches!(err, Some(Error::UnexpectedEnd) | Some(Error::Corrupt)),
+        "truncated PPMd should error (got err={err:?}, produced={produced} bytes)"
+    );
+}
+
 // ─── factory (only if compiled in) ───────────────────────────────────────
 
 #[cfg(feature = "factory")]

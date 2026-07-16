@@ -17,7 +17,12 @@
 //!   range decoder in both its 7z and RAR flavours (`range_dec`). The
 //!   standalone framing below uses the 7z flavour; the RAR3/4 decoder
 //!   feeds the same model core through the RAR flavour. Decodes streams
-//!   produced by real PPMd encoders (7-Zip, `pyppmd`, WinRAR/`rar`).
+//!   produced by real PPMd encoders (7-Zip, `pyppmd`, WinRAR/`rar`). One
+//!   known limitation: a stream that *exhausts the suballocator* (a
+//!   high-order model over a large, high-entropy payload in a small arena)
+//!   can desync at the memory-restart point and return [`Error::Corrupt`]
+//!   rather than decoding — it fails closed (never wrong bytes); see the
+//!   `glue_free_blocks` note in `ppmd7`.
 //! - **Encoder**: permanently returns [`Error::Unsupported`]. The PPM
 //!   model maintenance plus carry-less range encoder are out of scope; we
 //!   follow the `lzfse`/`rar*` precedent and ship the encoder as a stub.
@@ -33,9 +38,12 @@
 //! byte 0      : order              (2..=64, inclusive)
 //! byte 1      : mem_size_mb        (1..=255, inclusive)
 //! byte 2      : restoration_method (0=restart, 1=cut-off, 2=freeze)
-//! bytes 3..=10: little-endian u64 uncompressed length
-//!               (0xFFFF_FFFF_FFFF_FFFF means "unknown — decode to
-//!                stream end")
+//! bytes 3..=10: little-endian u64 uncompressed length. PPMd has no
+//!               in-band end-of-stream marker, so the length is
+//!               mandatory: the sentinel 0xFFFF_FFFF_FFFF_FFFF
+//!               ("unknown") is refused, since decoding to physical
+//!               input exhaustion would append range-coder finalisation
+//!               garbage past the true end.
 //! bytes 11..  : the PPMd-coded payload (a raw 7z Ppmd7 stream, i.e.
 //!               a leading 0x00 byte then the range-coded body)
 //! ```

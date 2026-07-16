@@ -419,6 +419,18 @@ impl Ppmd7 {
         // The reference builds a doubly-linked list of all free blocks, sets
         // a head sentinel just past the arena, coalesces adjacent blocks,
         // and re-buckets them. We follow it directly.
+        //
+        // KNOWN LIMITATION (fails closed): this ports the classic LZMA SDK
+        // GlueFreeBlocks. When a stream actually exhausts the suballocator —
+        // e.g. a high-order model over a large, high-entropy payload in a
+        // small (1 MiB) arena — a coalescing/re-bucketing difference from the
+        // exact encoder build can make our allocator fail (and thus restart
+        // the model) at a slightly different symbol than the encoder did,
+        // desyncing the range coder. That surfaces as `Error::Corrupt`, never
+        // wrong bytes and never an out-of-bounds access. Streams that don't
+        // fill the arena (the overwhelming majority) are unaffected. Reaching
+        // full allocator parity across every arena-exhausting input is
+        // tracked as Phase 3 hardening.
         let head = self.align_offset + self.size; // sentinel node ref
         let mut n = head;
         self.glue_count = 255;

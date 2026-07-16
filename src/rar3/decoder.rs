@@ -666,6 +666,16 @@ fn expand(ctx: &mut RunCtx) -> Result<(), Error> {
                 let new_table = ctx.bits.read_bits(1)? != 0;
                 if new_table {
                     parse_block_header(ctx)?;
+                    // A new block header may select PPMd. `expand` decodes
+                    // Huffman-coded symbols; if we continued here we would
+                    // feed the range-coded PPMd payload through the previous
+                    // block's stale Huffman tables and emit garbage. A
+                    // mid-stream switch into PPMd is out of scope (same stance
+                    // as `run_ppmd_block`'s start-new-table handling), so
+                    // refuse rather than misdecode.
+                    if ctx.ppmd.is_some() {
+                        return Err(Error::Unsupported);
+                    }
                 } else {
                     // End of stream marker: any further bytes belong to a
                     // separate stream.
@@ -823,6 +833,13 @@ fn run_ppmd_block(ctx: &mut RunCtx, input: &[u8], hdr: PpmdHeader) -> Result<(),
         let s = m.decode_symbol(rc)?;
         if rc.err() {
             return Err(Error::Corrupt);
+        }
+        // A truncated payload makes the range coder read past the input; once
+        // that happens `read_byte` is feeding zeroes and every further symbol
+        // is fabricated. Fail instead of returning invented output that meets
+        // the declared unpacked size with a wrong CRC.
+        if rc.overran() {
+            return Err(Error::UnexpectedEnd);
         }
         Ok(s)
     };
