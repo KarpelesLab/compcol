@@ -369,24 +369,32 @@ impl RunCtx {
         self.out.reserve(length);
 
         if off == 1 {
-            // Distance-1 run: one repeated byte. Fill directly.
+            // Distance-1 run: one repeated byte, read once before any
+            // window write (src is behind window_pos). Bulk-fill both the
+            // output and the window in wrap-capped segments.
             let b = self.window[src];
-            for _ in 0..length {
-                self.out.push(b);
-                self.window[self.window_pos] = b;
-                self.window_pos = (self.window_pos + 1) & wmask;
+            self.out.resize(self.out.len() + length, b);
+            let mut done = 0usize;
+            while done < length {
+                let run = (length - done).min(wlen - self.window_pos);
+                let sp = self.window_pos;
+                self.window[sp..sp + run].fill(b);
+                self.window_pos = (self.window_pos + run) & wmask;
+                done += run;
             }
         } else if off >= length {
-            // Non-overlapping: src and dst regions are disjoint. Copy in
-            // contiguous window segments (no per-byte recompute of `src`).
+            // Non-overlapping: src and dst regions are disjoint (or dst
+            // precedes src in the ring, where a forward copy is still
+            // exact). `off >= length >= run` and the run is capped against
+            // ring wrap on both cursors, so the bulk copies match the
+            // per-byte writes exactly — same transformation as the rar2/
+            // rar5 match-copy vectorization (#115).
             let mut done = 0usize;
             while done < length {
                 let run = (length - done).min(wlen - src).min(wlen - self.window_pos);
-                for k in 0..run {
-                    let b = self.window[src + k];
-                    self.out.push(b);
-                    self.window[self.window_pos + k] = b;
-                }
+                let sp = self.window_pos;
+                self.out.extend_from_slice(&self.window[src..src + run]);
+                self.window.copy_within(src..src + run, sp);
                 src = (src + run) & wmask;
                 self.window_pos = (self.window_pos + run) & wmask;
                 done += run;
