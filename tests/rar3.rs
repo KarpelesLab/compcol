@@ -356,6 +356,20 @@ fn inband_x86_e8_filter() {
     decode_and_check_crc(FILTER_X86_SLICE, 32768, 0x6188_0029);
 }
 
+/// A stream that declares a filter window it never finishes producing is
+/// malformed: returning the raw pre-filter bytes as a success would be
+/// wrong output. (unrar emits the raw bytes and relies on the container
+/// CRC to flag the file; this crate surfaces the error directly.)
+#[test]
+fn unfinished_filter_window_is_corrupt() {
+    // The delta fixture declares a 49152-byte window up front; capping the
+    // unpack size below that truncates the window.
+    let mut dec = Decoder::with_unpack_size(1000);
+    let (_p, _s) = dec.decode(FILTER_DELTA_BMP, &mut []).unwrap();
+    let mut buf = [0u8; 64];
+    assert_eq!(dec.finish(&mut buf).unwrap_err(), Error::Corrupt);
+}
+
 // ─── factory (only if compiled in) ───────────────────────────────────────
 
 #[cfg(feature = "factory")]

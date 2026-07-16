@@ -74,8 +74,8 @@ flag, and a `compcol` binary turns the library into a Unix-style filter.
 | StuffIt 5 Arsenic (method 15) | `arsenic` | `.sit` | `Unsupported` (decode-only) | full (range coder + inverse BWT + MTF/RLE + de-randomization) | **real StuffIt 5 fixtures (in-stream CRC-32 + SHA vs `unar`)** |
 | RAR 1.x | `rar1` | `.rar` | `Unsupported` (license) | building blocks only (Huffman tables not license-clean) | — |
 | RAR 2.x | `rar2` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + audio predictor | real rar-2.60 fixtures |
-| RAR 3.x | `rar3` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + E8 filter; PPMd & VM filters refused | libarchive RAR3 fixtures |
-| RAR 5.x | `rar5` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + x86 filter; Delta/ARM refused | RARLAB-CLI fixtures |
+| RAR 3.x | `rar3` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + standard filters (Delta, x86 E8/E8E9); PPMd & non-standard VM programs refused | libarchive RAR3 fixtures + **real rar-6.24 archives (differential vs UnRAR 7.23)** |
+| RAR 5.x | `rar5` | `.rar` | `Unsupported` (license) | full LZ77+Huffman + Delta/x86 filters (incl. solid groups); ARM refused | RARLAB-CLI fixtures + **real WinRAR 7.23 archives (differential vs UnRAR 7.23)** |
 | HTTP/2 HPACK (RFC 7541) | `hpack` | — | full (header codec + `h2-huffman` string codec) | full (static+dynamic tables, integer/string coding) | RFC 7541 Appendix C vectors |
 | HTTP/3 QPACK (RFC 9204) | `qpack` | — | full (static + dynamic-table encoder driving the encoder stream; eviction-safe) | full (static+dynamic tables via encoder stream, all field representations) | RFC 9204 Appendix B vectors |
 | Canonical Huffman (standalone) | `huffman` | `.huff` | full (length-limited, self-delimiting) | full | own round-trip |

@@ -43,6 +43,7 @@
 //!   the larger window doesn't change semantics.
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -270,29 +271,25 @@ fn run_decode(
         unpack_size,
         programs: Vec::new(),
         last_filter_slot: 0,
-        pending_filters: Vec::new(),
+        pending_filters: VecDeque::new(),
     });
 
     // The decoder starts by parsing the first block header.
     parse_block_header(&mut ctx)?;
     expand(&mut ctx)?;
 
-    let mut out = core::mem::take(&mut ctx.out);
-
-    // Run the in-band filters over their declared windows, in declaration
-    // order (well-formed streams declare filters in ascending window order,
-    // since each start is relative to the output position at declaration).
-    // A window the stream never finished producing is dropped, matching
-    // unrar, which only executes a filter once its full block has been
-    // decoded.
-    for f in &ctx.pending_filters {
-        let end = f.start.saturating_add(f.length as u64);
-        if end > out.len() as u64 {
-            continue;
-        }
-        apply_pending(f, &mut out[f.start as usize..end as usize])?;
+    // Run any in-band filters whose windows the stream completed. A filter
+    // still pending here declared a window the stream never finished
+    // producing — a truncated or malformed stream. unrar in that situation
+    // writes the raw bytes and relies on the container CRC to flag the
+    // file; this crate's policy is to surface the error instead of
+    // returning pre-filter bytes as a success.
+    ctx.flush_completed_filters()?;
+    if !ctx.pending_filters.is_empty() {
+        return Err(Error::Corrupt);
     }
 
+    let mut out = core::mem::take(&mut ctx.out);
     if e8_enabled {
         apply_e8_filter(&mut out, 0, e8_translate_e9);
     }
@@ -333,8 +330,10 @@ struct RunCtx {
     /// Slot used by the most recent declaration; a declaration without an
     /// explicit slot field reuses it.
     last_filter_slot: usize,
-    /// Scheduled filter instances, applied over the finished output.
-    pending_filters: Vec<PendingFilter>,
+    /// Scheduled filter instances, in declaration order. Applied (and
+    /// popped from the front) as soon as their windows are fully decoded —
+    /// see [`RunCtx::flush_completed_filters`].
+    pending_filters: VecDeque<PendingFilter>,
 }
 
 /// A declared filter program plus its per-slot remembered block length.
@@ -408,7 +407,34 @@ impl RunCtx {
     fn done(&self) -> bool {
         (self.out.len() as u64) >= self.unpack_size
     }
+
+    /// Apply and drop every filter at the *front* of the pending queue
+    /// whose window `[start, start + length)` is fully decoded.
+    ///
+    /// Only a prefix is flushed: a filter behind one whose window is still
+    /// incomplete stays queued even if its own window is complete, so
+    /// overlapping windows (filter chains) always apply in declaration
+    /// order — the same order unrar's stack executes them. `out` is
+    /// append-only and LZ back-references read the (unfiltered) window,
+    /// not `out`, so applying a filter as soon as its window completes is
+    /// equivalent to applying it at the end of the stream.
+    fn flush_completed_filters(&mut self) -> Result<(), Error> {
+        while let Some(&f) = self.pending_filters.front() {
+            let end = f.start + f.length as u64;
+            if end > self.out.len() as u64 {
+                break;
+            }
+            apply_pending(&f, &mut self.out[f.start as usize..end as usize])?;
+            self.pending_filters.pop_front();
+        }
+        Ok(())
+    }
 }
+
+/// Cap on concurrently scheduled filters, matching unrar's
+/// `MAX_UNPACK_FILTERS` (8192). Without a cap, a stream of tiny reused
+/// declarations could grow the pending queue without bound.
+const MAX_PENDING_FILTERS: usize = 8192;
 
 // ─── Block header parsing ────────────────────────────────────────────────
 
@@ -791,8 +817,12 @@ fn parse_declaration_payload(
     let slot = if flags & 0x80 != 0 {
         let v = read_vm_number(db)?;
         if v == 0 {
-            // Full reset: forget all declared programs (and anything
-            // scheduled against them that hasn't completed).
+            // Full reset (unrar's InitFilters): apply the filters whose
+            // windows the stream already completed, then cancel everything
+            // else — a canceled filter must never run, or it would rewrite
+            // output the encoder didn't transform.
+            ctx.flush_completed_filters()?;
+            ctx.pending_filters.clear();
             ctx.programs.clear();
             0
         } else {
@@ -875,12 +905,21 @@ fn parse_declaration_payload(
     if length > cap {
         return Err(Error::Corrupt);
     }
-    ctx.pending_filters.push(PendingFilter {
+    ctx.pending_filters.push_back(PendingFilter {
         start,
         length,
         program,
         channels: r0,
     });
+    if ctx.pending_filters.len() > MAX_PENDING_FILTERS {
+        // Match unrar's cap on concurrently scheduled filters: try to
+        // drain completed windows first; a stream that still exceeds the
+        // cap is hostile or malformed.
+        ctx.flush_completed_filters()?;
+        if ctx.pending_filters.len() > MAX_PENDING_FILTERS {
+            return Err(Error::Corrupt);
+        }
+    }
     Ok(())
 }
 
@@ -964,7 +1003,7 @@ mod tests {
             unpack_size: 0,
             programs: vec![],
             last_filter_slot: 0,
-            pending_filters: vec![],
+            pending_filters: VecDeque::new(),
         }
     }
 
@@ -1008,6 +1047,150 @@ mod tests {
         code.push(body.iter().fold(0u8, |a, &b| a ^ b));
         code.extend_from_slice(body);
         code
+    }
+
+    /// The 29-byte standard Delta program as WinRAR emits it, lifted from
+    /// `tests/fixtures/rar3/filter_delta_gradient_bmp.bin` (rar 6.24
+    /// archive of gradient.bmp). CRC-32 0x0E06077D; byte 0 is the XOR
+    /// checksum of the rest.
+    const DELTA_PROG: [u8; 29] = [
+        0x2F, 0x01, 0x9A, 0x41, 0x80, 0xEC, 0x27, 0x48, 0x2F, 0x09, 0x76, 0x6D, 0xD3, 0xEA, 0x41,
+        0x5B, 0x59, 0x44, 0xE8, 0x17, 0x5C, 0xE1, 0x6C, 0x91, 0x4C, 0x4E, 0x3F, 0x77, 0x00,
+    ];
+
+    fn incomplete_filter(start: u64) -> PendingFilter {
+        PendingFilter {
+            start,
+            length: 100,
+            program: StdProgram::Delta,
+            channels: 1,
+        }
+    }
+
+    #[test]
+    fn delta_program_is_recognized() {
+        assert_eq!(recognize_program(&DELTA_PROG), Some(StdProgram::Delta));
+    }
+
+    /// A reset declaration (slot field 0) must first run the filters whose
+    /// windows are already complete, then cancel everything still pending —
+    /// a canceled filter must never rewrite output.
+    #[test]
+    fn reset_applies_completed_and_cancels_pending() {
+        let mut ctx = test_ctx();
+        ctx.out = vec![1, 0, 0, 0, 9, 9, 9, 9];
+        ctx.programs.push(ProgramSlot {
+            program: StdProgram::Delta,
+            last_block_length: 4,
+        });
+        ctx.pending_filters.push_back(PendingFilter {
+            start: 0,
+            length: 4,
+            program: StdProgram::Delta,
+            channels: 1,
+        });
+        ctx.pending_filters.push_back(incomplete_filter(4));
+
+        // Payload: slot reset, block_start 0, explicit length 4, r0 = 1
+        // channel, then the (new, post-reset) Delta program bytecode.
+        let mut w = BitWriter::new();
+        w.push_vm_number(0);
+        w.push_vm_number(0);
+        w.push_vm_number(4);
+        w.push(0x01, 7); // register mask: r0 only
+        w.push_vm_number(1);
+        w.push_vm_number(DELTA_PROG.len() as u32);
+        for &b in &DELTA_PROG {
+            w.push(b as u32, 8);
+        }
+        let mut db = BitReader::new();
+        db.feed_slice(&w.bytes);
+        parse_declaration_payload(&mut ctx, 0xB0, &mut db).unwrap();
+
+        // The completed 1-channel delta over [1,0,0,0] ran: prev-integrate
+        // gives [0xFF; 4]. The trailing bytes stay raw.
+        assert_eq!(&ctx.out[..4], &[0xFF; 4]);
+        assert_eq!(&ctx.out[4..], &[9; 4]);
+        // The incomplete filter was canceled; only the fresh declaration
+        // (window at out position 8) is scheduled against the fresh slot.
+        assert_eq!(ctx.pending_filters.len(), 1);
+        assert_eq!(ctx.pending_filters[0].start, 8);
+        assert_eq!(ctx.programs.len(), 1);
+    }
+
+    /// The pending queue is capped (unrar's MAX_UNPACK_FILTERS): once no
+    /// completed window can be drained, further declarations are corrupt.
+    #[test]
+    fn pending_filter_cap_is_enforced() {
+        let mut ctx = test_ctx();
+        ctx.programs.push(ProgramSlot {
+            program: StdProgram::Delta,
+            last_block_length: 5,
+        });
+        for _ in 0..MAX_PENDING_FILTERS {
+            ctx.pending_filters.push_back(incomplete_filter(1_000_000));
+        }
+        // Reuse-slot declaration: block_start only, remembered length.
+        let mut w = BitWriter::new();
+        w.push_vm_number(0);
+        let mut db = BitReader::new();
+        db.feed_slice(&w.bytes);
+        assert_eq!(
+            parse_declaration_payload(&mut ctx, 0x00, &mut db),
+            Err(Error::Corrupt)
+        );
+    }
+
+    /// A declaration without an explicit length (flags bit 5 clear) reuses
+    /// the slot's remembered length from the previous declaration.
+    #[test]
+    fn slot_reuse_inherits_remembered_length() {
+        let mut ctx = test_ctx();
+        // First declaration: fresh Delta program, explicit length 4.
+        let mut w = BitWriter::new();
+        w.push_vm_number(0);
+        w.push_vm_number(0);
+        w.push_vm_number(4);
+        w.push(0x01, 7);
+        w.push_vm_number(1);
+        w.push_vm_number(DELTA_PROG.len() as u32);
+        for &b in &DELTA_PROG {
+            w.push(b as u32, 8);
+        }
+        let mut db = BitReader::new();
+        db.feed_slice(&w.bytes);
+        parse_declaration_payload(&mut ctx, 0xB0, &mut db).unwrap();
+
+        // Second declaration: no slot field, no explicit length — inherits
+        // slot 0's remembered length; window 16 bytes further out.
+        let mut w = BitWriter::new();
+        w.push_vm_number(16);
+        let mut db = BitReader::new();
+        db.feed_slice(&w.bytes);
+        parse_declaration_payload(&mut ctx, 0x00, &mut db).unwrap();
+
+        assert_eq!(ctx.pending_filters.len(), 2);
+        assert_eq!(ctx.pending_filters[1].start, 16);
+        assert_eq!(ctx.pending_filters[1].length, 4);
+    }
+
+    /// Only a *prefix* of completed windows may flush: a completed filter
+    /// queued behind an incomplete one must wait so that overlapping
+    /// windows always apply in declaration order.
+    #[test]
+    fn flush_is_prefix_ordered() {
+        let mut ctx = test_ctx();
+        ctx.out = vec![7; 8];
+        ctx.pending_filters.push_back(incomplete_filter(4));
+        ctx.pending_filters.push_back(PendingFilter {
+            start: 0,
+            length: 4,
+            program: StdProgram::Delta,
+            channels: 1,
+        });
+        ctx.flush_completed_filters().unwrap();
+        assert_eq!(ctx.pending_filters.len(), 2, "nothing may flush");
+        assert_eq!(ctx.out, vec![7; 8], "output must be untouched");
     }
 
     #[test]
@@ -1107,7 +1290,7 @@ mod tests {
             unpack_size: 0,
             programs: vec![],
             last_filter_slot: 0,
-            pending_filters: vec![],
+            pending_filters: VecDeque::new(),
         };
         // Promote slot 2 (value 30) — result should be [30, 10, 20, 40].
         promote_offset(&mut ctx, 2, 30);
