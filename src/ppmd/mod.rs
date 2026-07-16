@@ -9,31 +9,18 @@
 //!
 //! ### What this build ships
 //!
-//! This module ships the **framing layer** plus a working carry-less
-//! 7z range decoder (see `range_dec.rs`) and the order-0/order-(-1)
-//! base of the PPMII context tree. The full PPMII variant H model
-//! (with the information-inheritance `CreateSuccessors`/`UpdateModel`
-//! routines, masked-context escape handling, and SEE adaptation) is
-//! large enough that completing it in one pass would have left the
-//! codec in a half-finished, untested state — exactly the failure mode
-//! the project guidance says to avoid. So:
-//!
-//! - **Decoder**: parses the 11-byte framing header (order, mem,
-//!   restoration method, uncompressed length), validates parameters,
-//!   and decodes the range-coded payload using the order-0 model.
-//!   This works for the *trivial subset* where every literal in the
-//!   payload was emitted from the model's order-(-1) escape path
-//!   (i.e. a stream whose body is essentially random-access raw
-//!   bytes encoded under the uniform-frequency seed model). Payloads
-//!   produced by real PPMd encoders, which traverse the full
-//!   information-inheritance tree, will land on the
-//!   [`Error::Unsupported`] tag once the decoder detects that the
-//!   uniform seed model has been escaped beyond — same gap pattern
-//!   as `lzfse`'s `bvx2` blocks.
-//! - **Encoder**: permanently returns [`Error::Unsupported`]. The
-//!   PPM model maintenance plus carry-less range encoder were out of
-//!   scope; we follow the `lzfse`/`rar*` precedent and ship the
-//!   encoder as a stub.
+//! - **Decoder**: the **full PPMII variant H model** (`ppmd7`) — the
+//!   information-inheritance context tree (`CreateSuccessors` /
+//!   `UpdateModel`), the binary-context fast path, the masked-escape
+//!   suffix walk, SEE (secondary escape estimation), tree-wide `Rescale`,
+//!   and the sub-allocator with block coalescing — driven by a carry-less
+//!   range decoder in both its 7z and RAR flavours (`range_dec`). The
+//!   standalone framing below uses the 7z flavour; the RAR3/4 decoder
+//!   feeds the same model core through the RAR flavour. Decodes streams
+//!   produced by real PPMd encoders (7-Zip, `pyppmd`, WinRAR/`rar`).
+//! - **Encoder**: permanently returns [`Error::Unsupported`]. The PPM
+//!   model maintenance plus carry-less range encoder are out of scope; we
+//!   follow the `lzfse`/`rar*` precedent and ship the encoder as a stub.
 //!
 //! ### Wire framing
 //!
@@ -43,20 +30,20 @@
 //! "alone" framing:
 //!
 //! ```text
-//! byte 0      : order              (2..=16, inclusive)
-//! byte 1      : mem_size_mb        (1..=256, inclusive)
+//! byte 0      : order              (2..=64, inclusive)
+//! byte 1      : mem_size_mb        (1..=255, inclusive)
 //! byte 2      : restoration_method (0=restart, 1=cut-off, 2=freeze)
 //! bytes 3..=10: little-endian u64 uncompressed length
 //!               (0xFFFF_FFFF_FFFF_FFFF means "unknown — decode to
 //!                stream end")
-//! bytes 11..  : the PPMd-coded payload
+//! bytes 11..  : the PPMd-coded payload (a raw 7z Ppmd7 stream, i.e.
+//!               a leading 0x00 byte then the range-coded body)
 //! ```
 //!
-//! Only the `restart` restoration method is exercised by the range-
-//! coded payload (the 7z PPMd model only ever calls `RestartModel` on
-//! memory pressure). The byte is kept in the header so the framing
-//! matches archive-wrapper conventions; values other than 0 are
-//! accepted and ignored.
+//! The order and memory size must match what the encoder used (they are
+//! not otherwise recoverable from the stream). The restoration-method
+//! byte is retained for archive-wrapper parity; the model restarts on
+//! memory pressure regardless.
 //!
 //! ### References
 //!
@@ -72,12 +59,17 @@ extern crate alloc;
 use crate::error::Error;
 use crate::traits::{Algorithm, RawEncoder, RawProgress};
 
-mod arena;
 mod decoder;
-mod model;
+mod ppmd7;
 mod range_dec;
 
 pub use decoder::Decoder;
+
+// Re-exported for the RAR3/4 PPMd path; unused when `ppmd` is built alone.
+#[cfg(feature = "rar3")]
+pub(crate) use ppmd7::Ppmd7;
+#[cfg(feature = "rar3")]
+pub(crate) use range_dec::{Mode as RangeMode, RangeDec};
 
 /// Zero-sized marker type implementing [`Algorithm`] for PPMd.
 #[derive(Debug, Clone, Copy, Default)]

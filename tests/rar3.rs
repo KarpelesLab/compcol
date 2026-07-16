@@ -180,12 +180,15 @@ fn decodes_libarchive_test_txt_tight_output_buffer() {
     assert_eq!(out, TESTDIR_TEST_TXT_EXPECTED);
 }
 
-// ─── PPMd rejection ──────────────────────────────────────────────────────
+// ─── PPMd continuation rejection ─────────────────────────────────────────
 
 #[test]
-fn ppmd_block_is_unsupported() {
-    // A block whose first bit (after byte-align) is 1 = PPMd flag.
-    // 0x80 = 1000_0000 → byte-aligned start, top bit = 1 ⇒ PPMd.
+fn ppmd_continuation_without_model_is_unsupported() {
+    // Top bit set ⇒ PPMd block; the next 7 flag bits are 0, so flag 0x20
+    // (fresh model + memory/order) is clear. That marks a continuation
+    // reusing a live model — which a standalone first block can't have, so
+    // we refuse it. (A real, self-contained PPMd block decodes — see
+    // `ppmd_block_decodes`.)
     let ppmd_marker = [0x80u8, 0x00, 0x00, 0x00];
     let mut dec = Decoder::with_unpack_size(32);
     let (_p, _status) = dec.decode(&ppmd_marker, &mut []).unwrap();
@@ -368,6 +371,21 @@ fn unfinished_filter_window_is_corrupt() {
     let (_p, _s) = dec.decode(FILTER_DELTA_BMP, &mut []).unwrap();
     let mut buf = [0u8; 64];
     assert_eq!(dec.finish(&mut buf).unwrap_err(), Error::Corrupt);
+}
+
+// ─── PPMd-II variant H block (real-archive fixture) ──────────────────────
+//
+// The raw v29 payload of `notes.txt` from a `rar 6.24 -mct+` (forced
+// text/PPMd) archive — a self-contained PPMd block (bit-0 of the block
+// header set) that decodes to 20001 bytes. Expected CRC-32 is the archive's
+// own FILE_CRC; extraction was cross-checked byte-identical against UnRAR
+// 7.23. This exercises the RAR range decoder plus the full PPMII model
+// (context tree, escapes, SEE, rescale) through the rar3 entry point.
+static PPMD_NOTES: &[u8] = include_bytes!("fixtures/rar3/ppmd_notes.bin");
+
+#[test]
+fn ppmd_block_decodes() {
+    decode_and_check_crc(PPMD_NOTES, 20001, 0x0E1A_EC07);
 }
 
 // ─── factory (only if compiled in) ───────────────────────────────────────

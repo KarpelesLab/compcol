@@ -14,33 +14,37 @@
 //!
 //! ## What's supported
 //!
-//! - Non-PPMd blocks (the "LZ77 + Huffman" path used by the vast majority
-//!   of RAR3 archives).
-//! - All five Huffman codes (precode + main + offset + low-offset + length).
-//! - The 4-deep rolling-offset buffer, short offsets (codes 263..=270), and
-//!   the full match-length / offset machinery.
-//! - The keep-table flag — successive blocks may reuse the previous code
-//!   lengths.
+//! - The **LZ77 + Huffman path** used by the vast majority of RAR3
+//!   archives: all five Huffman codes (precode, main, offset, low-offset,
+//!   length), the 4-deep rolling-offset buffer, short offsets (codes 263
+//!   through 270), the full match-length / offset machinery, and the
+//!   keep-table flag (successive blocks reusing the previous code lengths).
 //! - **In-band standard filters** (main symbol 257): Delta and x86
 //!   E8/E8E9 declarations are recognized by their bytecode fingerprint and
 //!   run natively over their declared output windows — see
 //!   `super::filters` for the recognition scheme and provenance.
+//! - **PPMd-II variant H blocks** (bit-0 of the block header): the full
+//!   PPMII model in [`crate::ppmd`] driven by the RAR range decoder, with
+//!   the RAR escape layer (literals, LZ matches, end-of-data) on top. A
+//!   single self-contained block decodes end to end — see
+//!   [`run_ppmd_block`].
 //! - The standalone E8/E9 post-pass filter when enabled via
 //!   [`Decoder::with_e8_filter`].
 //!
 //! ## What's refused
 //!
-//! - **PPMd-II blocks** (the bit-0 flag in the block header). PPMd-II is a
-//!   ~1500-line context-mixed arithmetic coder; implementing it faithfully
-//!   is out of scope for this build. Streams containing a PPMd block fail
-//!   with `Error::Unsupported`.
+//! - **PPMd continuations across a new-table boundary** (a PPMd block that
+//!   reuses a still-live model from a previous block, i.e. no fresh
+//!   memory/order flag, or a `start-new-table` control code mid-stream).
+//!   These arise only in solid multi-member streams — out of scope here —
+//!   and fail with `Error::Unsupported`.
 //! - **Filter declarations carrying any other VM program** (custom
 //!   bytecode, or legacy standard programs no current archiver emits —
 //!   Itanium, RGB, the audio predictor). These fail with
 //!   `Error::Unsupported` rather than interpreting RarVM bytecode.
-//! - **Dictionary sizes** other than the default 4 MiB. Streams compressed
-//!   with smaller dictionaries decode correctly with the larger window —
-//!   the larger window doesn't change semantics.
+//! - **Dictionary sizes** other than the default 4 MiB for the LZ path.
+//!   Streams compressed with smaller dictionaries decode correctly with the
+//!   larger window — the larger window doesn't change semantics.
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -60,6 +64,7 @@ use super::tables::{
     LOW_OFFSET_SIZE, MAIN_SIZE, OFFSET_BASE, OFFSET_EXTRA_BITS, OFFSET_SIZE, PRECODE_SIZE,
     SHORT_BASE, SHORT_EXTRA_BITS,
 };
+use crate::ppmd::{Ppmd7, RangeDec, RangeMode};
 
 /// Streaming RAR 3.x decoder. See module docs for the calling convention.
 pub struct Decoder {
@@ -272,11 +277,16 @@ fn run_decode(
         programs: Vec::new(),
         last_filter_slot: 0,
         pending_filters: VecDeque::new(),
+        ppmd: None,
     });
 
     // The decoder starts by parsing the first block header.
     parse_block_header(&mut ctx)?;
-    expand(&mut ctx)?;
+    if let Some(hdr) = ctx.ppmd.take() {
+        run_ppmd_block(&mut ctx, &input, hdr)?;
+    } else {
+        expand(&mut ctx)?;
+    }
 
     // Run any in-band filters whose windows the stream completed. A filter
     // still pending here declared a window the stream never finished
@@ -334,6 +344,25 @@ struct RunCtx {
     /// popped from the front) as soon as their windows are fully decoded —
     /// see [`RunCtx::flush_completed_filters`].
     pending_filters: VecDeque<PendingFilter>,
+    /// Set when the first block header selected the PPMd path; carries the
+    /// parameters needed to drive the PPMd model over the raw byte stream.
+    ppmd: Option<PpmdHeader>,
+}
+
+/// Parameters lifted from a PPMd block header (bit-0 of the block header
+/// set). See [`parse_block_header`].
+struct PpmdHeader {
+    /// Suballocator size in bytes (`(mem + 1) << 20`).
+    mem_size: u32,
+    /// Model max order.
+    max_order: u32,
+    /// The RAR-layer escape byte (a decoded symbol equal to this introduces
+    /// a control code rather than a literal).
+    escape: u8,
+    /// Explicit `InitEsc` seed if the header carried one.
+    init_esc: Option<u8>,
+    /// Byte offset in the input where the range-coded payload begins.
+    payload_start: usize,
 }
 
 /// A declared filter program plus its per-slot remembered block length.
@@ -451,13 +480,45 @@ fn parse_block_header(ctx: &mut RunCtx) -> Result<(), Error> {
     // including the very first one (where alignment is a no-op since we
     // start on a byte boundary).
     ctx.bits.byte_align();
-    // 1 bit: PPMd-block flag. We reject PPMd unconditionally.
+    // 1 bit: PPMd-block flag.
     let is_ppmd = ctx.bits.read_bits(1)?;
     if is_ppmd != 0 {
-        // PPMd-II would consume 7 more flag bits and possibly 2 more
-        // bytes here; we don't bother reading them since we're refusing
-        // the stream.
-        return Err(Error::Unsupported);
+        // PPMd block header: 7 flag bits, then (per flags) a memory byte,
+        // an escape byte, and an order derived from the flags.
+        //   flag 0x20: read 8-bit mem → suballocator = (mem+1)<<20, and
+        //              order = (flags & 0x1F) + 1 (values > 16 expand as
+        //              16 + (order-16)*3).
+        //   flag 0x40: read 8-bit escape/InitEsc seed (else escape = 2).
+        // A header without 0x20 is a continuation reusing the live model —
+        // not produced for a standalone first block, so we refuse it.
+        let flags = ctx.bits.read_bits(7)?;
+        if flags & 0x20 == 0 {
+            return Err(Error::Unsupported);
+        }
+        let mem_mb = ctx.bits.read_bits(8)?;
+        let mem_size = (mem_mb + 1).saturating_mul(1 << 20);
+        let mut max_order = (flags & 0x1F) + 1;
+        if max_order > 16 {
+            max_order = 16 + (max_order - 16) * 3;
+        }
+        if max_order < 2 {
+            return Err(Error::Corrupt);
+        }
+        let (escape, init_esc) = if flags & 0x40 != 0 {
+            let e = ctx.bits.read_bits(8)? as u8;
+            (e, Some(e))
+        } else {
+            (2u8, None)
+        };
+        ctx.bits.byte_align();
+        ctx.ppmd = Some(PpmdHeader {
+            mem_size,
+            max_order,
+            escape,
+            init_esc,
+            payload_start: ctx.bits.consumed_bytes(),
+        });
+        return Ok(());
     }
     // 1 bit: keep-table flag. 0 ⇒ reset the persistent length table.
     let keep_table = ctx.bits.read_bits(1)? != 0;
@@ -739,6 +800,76 @@ fn expand(ctx: &mut RunCtx) -> Result<(), Error> {
     }
 }
 
+// ─── PPMd-II variant H block ─────────────────────────────────────────────
+
+/// Drive the RAR PPMd block: the range-coded payload (starting at
+/// `hdr.payload_start` in `input`) feeds the shared [`Ppmd7`] model through
+/// the RAR range decoder. Decoded byte symbols are literals unless they
+/// equal the escape byte, which introduces a control code (end-of-data, an
+/// LZ match, a new table, or a literal-escape). Matches copy through the
+/// same sliding window as the LZ path so they interleave seamlessly.
+fn run_ppmd_block(ctx: &mut RunCtx, input: &[u8], hdr: PpmdHeader) -> Result<(), Error> {
+    let mut model = Ppmd7::new(hdr.mem_size)?;
+    model.init(hdr.max_order);
+    if let Some(e) = hdr.init_esc {
+        model.set_init_esc(e as u32);
+    }
+    if hdr.payload_start > input.len() {
+        return Err(Error::UnexpectedEnd);
+    }
+    let (mut rc, _) = RangeDec::init(RangeMode::Rar, input, hdr.payload_start)?;
+
+    let sym = |m: &mut Ppmd7, rc: &mut RangeDec| -> Result<u8, Error> {
+        let s = m.decode_symbol(rc)?;
+        if rc.err() {
+            return Err(Error::Corrupt);
+        }
+        Ok(s)
+    };
+
+    while !ctx.done() {
+        let s = sym(&mut model, &mut rc)?;
+        if s != hdr.escape {
+            ctx.emit_literal(s);
+            continue;
+        }
+        let code = sym(&mut model, &mut rc)?;
+        match code {
+            0 => {
+                // start-new-table: a fresh block header follows. Supporting
+                // a mid-stream codec switch (back to Huffman, or a new PPMd
+                // table) is out of scope; no single-file corpus archive
+                // reaches this before the unpacked size is met.
+                return Err(Error::Unsupported);
+            }
+            2 => break,                          // end of PPMd data
+            3 => return Err(Error::Unsupported), // VM filter in PPMd stream
+            4 => {
+                // 24-bit distance from three symbols (big-endian), then a
+                // length symbol. Distance +2, length +32.
+                let mut dist = 0u32;
+                for i in (0..3).rev() {
+                    let b = sym(&mut model, &mut rc)? as u32;
+                    dist |= b << (i * 8);
+                }
+                let len = sym(&mut model, &mut rc)? as u32;
+                ctx.emit_match(dist + 2, len + 32)?;
+            }
+            5 => {
+                // Distance-1 run: length symbol, length +4.
+                let len = sym(&mut model, &mut rc)? as u32;
+                ctx.emit_match(1, len + 4)?;
+            }
+            _ => {
+                // Any other control code encodes a literal equal to the
+                // escape byte (the control symbol is consumed and dropped).
+                ctx.emit_literal(hdr.escape);
+            }
+        }
+    }
+    Ok(())
+}
+
 // ─── In-band filter declarations (main symbol 257) ──────────────────────
 
 /// Upper bound on a filter's block length, derived from the RarVM memory
@@ -1012,6 +1143,7 @@ mod tests {
             programs: vec![],
             last_filter_slot: 0,
             pending_filters: VecDeque::new(),
+            ppmd: None,
         }
     }
 
@@ -1299,6 +1431,7 @@ mod tests {
             programs: vec![],
             last_filter_slot: 0,
             pending_filters: VecDeque::new(),
+            ppmd: None,
         };
         // Promote slot 2 (value 30) — result should be [30, 10, 20, 40].
         promote_offset(&mut ctx, 2, 30);

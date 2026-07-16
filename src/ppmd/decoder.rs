@@ -1,22 +1,14 @@
-//! PPMd streaming decoder.
+//! PPMd streaming decoder (standalone `.ppmd` framing).
 //!
-//! The decoder is a small state machine wrapped around the order-0
-//! PPMII model in `model.rs` and the carry-less range decoder in
-//! `range_dec.rs`:
+//! PPMd streams carry no in-band end marker, so like the RAR3 decoder this
+//! one is *buffer-then-drain*: [`raw_decode`] absorbs input, and the actual
+//! model decode runs once [`raw_finish`] is called and the whole payload is
+//! available. The decoded bytes are then drained to the caller across as
+//! many `finish` calls as the output buffer size requires.
 //!
-//! 1. **Header** (11 bytes): order, mem_size_mb, restoration_method,
-//!    little-endian u64 uncompressed length. See the module docs for the
-//!    framing layout.
-//! 2. **RangeInit** (5 bytes): the first 5 bytes of the payload feed
-//!    `RangeDec::init`. The first byte must be `0x00`.
-//! 3. **Decode**: pull symbols one at a time until either the
-//!    uncompressed length is reached (when known) or the range decoder
-//!    detects end-of-stream (`is_finished_ok` after the last symbol).
-//!
-//! Streaming uses a snapshot/restore pattern: before every symbol decode
-//! we save the range coder state and the input position so that if the
-//! decode tries to read past the buffered input we can rewind and ask
-//! the caller for more bytes — same pattern as the bzip2 decoder.
+//! See the module docs (`super`) for the 11-byte framing header. The model
+//! is the full PPMII variant H core in [`super::ppmd7`], driven by the 7z
+//! range decoder.
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -24,61 +16,33 @@ use alloc::vec::Vec;
 use crate::error::Error;
 use crate::traits::{RawDecoder, RawProgress};
 
-use super::model::Model;
-use super::range_dec::{ByteSource, RangeDec};
+use super::ppmd7::Ppmd7;
+use super::range_dec::{Mode, RangeDec};
 
-/// Lengths of the framing components.
 const HEADER_LEN: usize = 11;
-const RANGE_INIT_LEN: usize = 5;
-/// Sentinel "unknown length" value (matches the `lzma` alone-format
-/// convention).
 const UNKNOWN_LEN: u64 = u64::MAX;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Phase {
-    Header,
-    RangeInit,
-    Body,
-    Done,
-}
+/// Hard cap on decoded output when the header length is unknown, so a tiny
+/// crafted stream can't drive unbounded work.
+const MAX_UNKNOWN_OUTPUT: usize = 64 * 1024 * 1024;
 
 pub struct Decoder {
     in_buf: Vec<u8>,
-    in_committed: usize,
-
     decoded: Vec<u8>,
     decoded_idx: usize,
-
-    phase: Phase,
+    started: bool,
+    finished_decode: bool,
     poisoned: bool,
-
-    // Header fields (populated after Phase::Header).
-    order: u32,
-    mem_mb: u32,
-    restoration: u8,
-    expected_len: u64,
-    produced_len: u64,
-
-    model: Option<Model>,
-    range_dec: RangeDec,
 }
 
 impl Decoder {
     pub fn new() -> Self {
         Self {
             in_buf: Vec::new(),
-            in_committed: 0,
             decoded: Vec::new(),
             decoded_idx: 0,
-            phase: Phase::Header,
+            started: false,
+            finished_decode: false,
             poisoned: false,
-            order: 0,
-            mem_mb: 0,
-            restoration: 0,
-            expected_len: 0,
-            produced_len: 0,
-            model: None,
-            range_dec: RangeDec::new(),
         }
     }
 
@@ -87,121 +51,81 @@ impl Decoder {
         e
     }
 
-    /// Try to advance the state machine using `in_buf[in_committed..]`.
-    fn step(&mut self) -> Result<bool, Error> {
-        match self.phase {
-            Phase::Header => self.try_header(),
-            Phase::RangeInit => self.try_range_init(),
-            Phase::Body => self.try_body(),
-            Phase::Done => Ok(false),
+    /// Decode the whole payload into `self.decoded`. Called once, lazily.
+    fn run_decode(&mut self) -> Result<(), Error> {
+        if self.in_buf.len() < HEADER_LEN {
+            return Err(Error::UnexpectedEnd);
         }
-    }
-
-    fn try_header(&mut self) -> Result<bool, Error> {
-        if self.in_buf.len() < self.in_committed + HEADER_LEN {
-            return Ok(false);
-        }
-        let off = self.in_committed;
-        let h = &self.in_buf[off..off + HEADER_LEN];
+        let h = &self.in_buf[..HEADER_LEN];
         let order = h[0] as u32;
         let mem_mb = h[1] as u32;
         let restoration = h[2];
-        if !(2..=16).contains(&order) {
-            return Err(self.poison(Error::BadHeader));
+        if !(2..=64).contains(&order) {
+            return Err(Error::BadHeader);
         }
         if !(1..=255).contains(&mem_mb) {
-            return Err(self.poison(Error::BadHeader));
+            return Err(Error::BadHeader);
         }
         if restoration > 2 {
-            return Err(self.poison(Error::BadHeader));
+            return Err(Error::BadHeader);
         }
-        let len = u64::from_le_bytes(h[3..11].try_into().unwrap());
+        let expected_len = u64::from_le_bytes(h[3..11].try_into().unwrap());
 
-        self.order = order;
-        self.mem_mb = mem_mb;
-        self.restoration = restoration;
-        self.expected_len = len;
-        self.in_committed += HEADER_LEN;
+        let mem_bytes = mem_mb.saturating_mul(1024 * 1024);
+        let mut model = Ppmd7::new(mem_bytes)?;
+        model.init(order);
 
-        let mem_bytes = (mem_mb as usize).saturating_mul(1024 * 1024);
-        self.model = Some(Model::new(order, mem_bytes).map_err(|e| self.poison(e))?);
-        self.phase = Phase::RangeInit;
-        Ok(true)
-    }
+        let (mut rc, consumed) = RangeDec::init(Mode::SevenZip, &self.in_buf, HEADER_LEN)?;
+        let _ = consumed;
 
-    fn try_range_init(&mut self) -> Result<bool, Error> {
-        if self.in_buf.len() < self.in_committed + RANGE_INIT_LEN {
-            return Ok(false);
-        }
-        // Tell `range_dec.init` where the next byte lives.
-        self.range_dec.pos = self.in_committed;
-        match self.range_dec.init(&self.in_buf) {
-            Ok(true) => {
-                self.in_committed = self.range_dec.pos;
-                self.phase = Phase::Body;
-                Ok(true)
-            }
-            Ok(false) => Ok(false), // shouldn't happen — we checked length
-            Err(e) => Err(self.poison(e)),
-        }
-    }
-
-    fn try_body(&mut self) -> Result<bool, Error> {
-        let model = match self.model.as_mut() {
-            Some(m) => m,
-            None => return Err(self.poison(Error::Corrupt)),
+        let cap = if expected_len == UNKNOWN_LEN {
+            MAX_UNKNOWN_OUTPUT
+        } else {
+            expected_len.min(MAX_UNKNOWN_OUTPUT as u64) as usize
         };
+        let mut out = Vec::with_capacity(cap.min(1 << 20));
 
-        // If we know the uncompressed length and have produced it all,
-        // verify the range coder's terminal state and finish.
-        if self.expected_len != UNKNOWN_LEN && self.produced_len >= self.expected_len {
-            if self.range_dec.is_finished_ok() {
-                self.phase = Phase::Done;
-                return Ok(true);
-            }
-            // The reference accepts a non-zero `code` if a peek confirms
-            // it. Our simplified order-0 model can't always finish
-            // exactly on `code == 0`, so we accept the implicit end-of-
-            // stream as long as no further symbols are requested.
-            self.phase = Phase::Done;
-            return Ok(true);
-        }
-
-        let mut src = ByteSource::new(&self.in_buf, self.range_dec.pos);
-        let mut progressed = false;
-        loop {
-            // If output buffer pressure will soon force a return, stop
-            // pulling symbols. We use a fixed budget so a giant input
-            // doesn't starve the caller.
-            if self.decoded.len() - self.decoded_idx > 4096 {
-                break;
-            }
-            // Snapshot for rollback.
-            let rd_pre = self.range_dec.clone();
-            let pos_pre = src.pos;
-            // Decode one symbol.
-            match model.decode_symbol(&mut self.range_dec, &mut src) {
-                Ok(sym) => {
-                    self.decoded.push(sym);
-                    self.produced_len += 1;
-                    progressed = true;
-                    if self.expected_len != UNKNOWN_LEN && self.produced_len >= self.expected_len {
-                        break;
-                    }
-                }
-                Err(Error::UnexpectedEnd) => {
-                    // Need more input — rewind and bail.
-                    self.range_dec = rd_pre;
-                    src.pos = pos_pre;
+        if expected_len == UNKNOWN_LEN {
+            while out.len() < MAX_UNKNOWN_OUTPUT {
+                if rc.overran() {
                     break;
                 }
-                Err(e) => return Err(self.poison(e)),
+                let sym = model.decode_symbol(&mut rc)?;
+                if rc.overran() {
+                    break;
+                }
+                out.push(sym);
+            }
+        } else {
+            // A declared length larger than the buffer-then-decode ceiling
+            // can't be produced here; reject it up front rather than growing
+            // `out` toward OOM. (A high-probability PPMd symbol can decode
+            // many times without consuming input, so `overran()` alone is not
+            // a sufficient bound.)
+            if expected_len > MAX_UNKNOWN_OUTPUT as u64 {
+                return Err(Error::OutputLimitExceeded);
+            }
+            for _ in 0..expected_len {
+                // Truncated input can't supply more symbols; stop before the
+                // model starts decoding from zero-filled reads.
+                if rc.overran() {
+                    return Err(Error::UnexpectedEnd);
+                }
+                let sym = model.decode_symbol(&mut rc)?;
+                out.push(sym);
+            }
+            if rc.overran() {
+                return Err(Error::UnexpectedEnd);
+            }
+            // 7z streams leave the range coder at `code == 0` after the last
+            // symbol; a non-zero residue means truncation or corruption.
+            if !rc.is_finished_ok() {
+                return Err(Error::Corrupt);
             }
         }
-        // Commit the input position.
-        self.range_dec.pos = src.pos;
-        self.in_committed = self.range_dec.pos;
-        Ok(progressed)
+
+        self.decoded = out;
+        Ok(())
     }
 
     fn drain(&mut self, output: &mut [u8], written: &mut usize) {
@@ -219,6 +143,10 @@ impl Decoder {
             self.decoded_idx = 0;
         }
     }
+
+    fn all_drained(&self) -> bool {
+        self.finished_decode && self.decoded_idx == self.decoded.len()
+    }
 }
 
 impl Default for Decoder {
@@ -232,126 +160,45 @@ impl RawDecoder for Decoder {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
-        let mut consumed = 0usize;
+        // Absorb input; real decoding is deferred to `finish`.
+        self.in_buf.extend_from_slice(input);
         let mut written = 0usize;
-
-        // Drain any already-decoded bytes first.
-        self.drain(output, &mut written);
-
-        // If output is already full from a previous step's queued bytes,
-        // return without absorbing more input — the caller hasn't drained
-        // yet and absorbing would cause the bridge to misreport status.
-        if written == output.len() && self.decoded_idx < self.decoded.len() {
-            return Ok(RawProgress {
-                consumed,
-                written,
-                done: false,
-            });
-        }
-
-        loop {
-            // Quick exit if we've already produced everything and drained.
-            if matches!(self.phase, Phase::Done) && self.decoded_idx == self.decoded.len() {
-                return Ok(RawProgress {
-                    consumed,
-                    written,
-                    done: true,
-                });
-            }
-
-            // Absorb caller's input into our buffer.
-            if consumed < input.len() {
-                self.in_buf.extend_from_slice(&input[consumed..]);
-                consumed = input.len();
-            }
-
-            let progressed = self.step()?;
-
-            // Drain anything the step produced.
+        if self.finished_decode {
             self.drain(output, &mut written);
-
-            // Bound `in_buf` growth by chopping off committed bytes when
-            // the prefix gets large.
-            if self.in_committed > 1 << 20 {
-                let off = self.in_committed;
-                self.in_buf.drain(..off);
-                self.in_committed = 0;
-                self.range_dec.pos = self.range_dec.pos.saturating_sub(off);
-            }
-
-            if matches!(self.phase, Phase::Done) {
-                continue;
-            }
-
-            // Output full + queued bytes → caller must drain. Report by
-            // *un-consuming* one byte of the absorbed input so the bridge
-            // sees `consumed < input.len()` and maps to `OutputFull`. The
-            // un-consumed byte is still buffered internally; we just
-            // delay acknowledging it until the caller comes back.
-            if written == output.len() && self.decoded_idx < self.decoded.len() {
-                // Report `consumed < input.len()` so the bridge maps to
-                // `OutputFull` rather than `InputEmpty`. The un-consumed
-                // byte is still buffered in `in_buf`; we just delay
-                // acknowledging it until the caller drains and returns.
-                consumed = consumed.saturating_sub(1);
-                return Ok(RawProgress {
-                    consumed,
-                    written,
-                    done: false,
-                });
-            }
-
-            if !progressed {
-                // No progress and no more input → ask for more.
-                if consumed >= input.len() {
-                    return Ok(RawProgress {
-                        consumed,
-                        written,
-                        done: false,
-                    });
-                }
-            }
-
-            if written == output.len() {
-                return Ok(RawProgress {
-                    consumed,
-                    written,
-                    done: false,
-                });
-            }
         }
+        Ok(RawProgress {
+            consumed: input.len(),
+            written,
+            done: self.all_drained(),
+        })
     }
 
     fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
-        let empty: [u8; 0] = [];
-        let p = self.raw_decode(&empty, output)?;
-        if matches!(self.phase, Phase::Done) && self.decoded_idx == self.decoded.len() {
-            Ok(RawProgress {
-                consumed: 0,
-                written: p.written,
-                done: true,
-            })
-        } else {
-            Err(self.poison(Error::UnexpectedEnd))
+        if !self.started {
+            self.started = true;
+            match self.run_decode() {
+                Ok(()) => self.finished_decode = true,
+                Err(e) => return Err(self.poison(e)),
+            }
         }
+        let mut written = 0usize;
+        self.drain(output, &mut written);
+        Ok(RawProgress {
+            consumed: 0,
+            written,
+            done: self.all_drained(),
+        })
     }
 
     fn raw_reset(&mut self) {
         self.in_buf.clear();
-        self.in_committed = 0;
         self.decoded.clear();
         self.decoded_idx = 0;
-        self.phase = Phase::Header;
+        self.started = false;
+        self.finished_decode = false;
         self.poisoned = false;
-        self.order = 0;
-        self.mem_mb = 0;
-        self.restoration = 0;
-        self.expected_len = 0;
-        self.produced_len = 0;
-        self.model = None;
-        self.range_dec = RangeDec::new();
     }
 }
