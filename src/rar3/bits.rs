@@ -103,6 +103,17 @@ impl BitReader {
         }
     }
 
+    /// Reposition the reader to an absolute byte offset in the fed buffer,
+    /// discarding any buffered look-ahead bits. Used when the PPMd path
+    /// hands control back to the bit domain: the range decoder consumed raw
+    /// bytes past the reader's position, and the next block header starts
+    /// at the byte where the range-coded data ended.
+    pub fn seek_byte(&mut self, pos: usize) {
+        self.byte_pos = pos.min(self.buf.len());
+        self.acc = 0;
+        self.nbits = 0;
+    }
+
     /// Number of source bytes logically consumed so far. Only meaningful on
     /// a byte boundary (call [`byte_align`] first). Used by the PPMd path to
     /// hand the raw byte stream after the block header to the RAR range

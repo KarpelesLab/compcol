@@ -19,25 +19,35 @@
 //!   length), the 4-deep rolling-offset buffer, short offsets (codes 263
 //!   through 270), the full match-length / offset machinery, and the
 //!   keep-table flag (successive blocks reusing the previous code lengths).
-//! - **In-band standard filters** (main symbol 257): Delta and x86
-//!   E8/E8E9 declarations are recognized by their bytecode fingerprint and
-//!   run natively over their declared output windows — see
-//!   `super::filters` for the recognition scheme and provenance.
+//! - **In-band standard filters** (main symbol 257, or escape code 3 in a
+//!   PPMd block): Delta and x86 E8/E8E9 declarations are recognized by
+//!   their bytecode fingerprint and run natively over their declared
+//!   output windows — see `super::filters` for the recognition scheme and
+//!   provenance.
 //! - **PPMd-II variant H blocks** (bit-0 of the block header): the full
 //!   PPMII model in [`crate::ppmd`] driven by the RAR range decoder, with
-//!   the RAR escape layer (literals, LZ matches, end-of-data) on top. A
-//!   single self-contained block decodes end to end — see
-//!   [`run_ppmd_block`].
+//!   the RAR escape layer (literals, LZ matches, filters, end-of-data) on
+//!   top — see [`run_ppmd`]. Mid-stream switches between LZ and PPMd (the
+//!   `start-new-table` paths in both domains) are followed, including PPMd
+//!   continuation headers that reuse the live model.
+//! - **Solid groups** ([`Decoder::with_solid`] +
+//!   [`Decoder::begin_solid_member`]): the LZ window, code tables, offset
+//!   history, filter programs and PPMd model persist across members. Each
+//!   member's payload is decoded as its own byte-aligned stream, with the
+//!   end-of-member markers consumed through the shared state (a PPMd
+//!   member's marker updates the model, exactly as the encoder's did).
 //! - The standalone E8/E9 post-pass filter when enabled via
 //!   [`Decoder::with_e8_filter`].
 //!
 //! ## What's refused
 //!
-//! - **PPMd continuations across a new-table boundary** (a PPMd block that
-//!   reuses a still-live model from a previous block, i.e. no fresh
-//!   memory/order flag, or a `start-new-table` control code mid-stream).
-//!   These arise only in solid multi-member streams — out of scope here —
-//!   and fail with `Error::Unsupported`.
+//! - **Cross-member range-coder state**: a PPMd block whose range coder
+//!   would have to straddle a solid member boundary (a member ending
+//!   without an end-of-data marker mid-PPMd, or a new PPMd block starting
+//!   exactly at the boundary via an inline table announcement). rar 6.24
+//!   always ends PPMd members with a marker and starts PPMd blocks with a
+//!   header in the member that uses them, so these arise only in crafted
+//!   streams; they fail with `Error::Unsupported`.
 //! - **Filter declarations carrying any other VM program** (custom
 //!   bytecode, or legacy standard programs no current archiver emits —
 //!   Itanium, RGB, the audio predictor). These fail with
@@ -84,6 +94,14 @@ pub struct Decoder {
     e8_translate_e9: bool,
     /// Set on any irrecoverable error.
     poisoned: bool,
+    /// Solid-group mode: end-of-member markers are consumed (through the
+    /// PPMd model where applicable) and the decode context persists across
+    /// [`Decoder::begin_solid_member`] calls.
+    solid: bool,
+    /// The persistent decode context (window, code tables, offset history,
+    /// filter programs, PPMd model). Created on the first `finish`; dropped
+    /// after each stream unless `solid`.
+    ctx: Option<Box<RunCtx>>,
 }
 
 enum State {
@@ -112,20 +130,16 @@ impl Decoder {
             e8_enabled: false,
             e8_translate_e9: false,
             poisoned: false,
+            solid: false,
+            ctx: None,
         }
     }
 
     /// Construct a decoder that will produce at most `n` uncompressed bytes.
     pub fn with_unpack_size(n: u64) -> Self {
-        Self {
-            state: State::Buffering { input: Vec::new() },
-            out_buf: Vec::new(),
-            out_drained: 0,
-            unpack_size: n,
-            e8_enabled: false,
-            e8_translate_e9: false,
-            poisoned: false,
-        }
+        let mut d = Self::new();
+        d.unpack_size = n;
+        d
     }
 
     /// Enable the standalone E8 (and optionally E9) filter as a post-pass.
@@ -133,6 +147,40 @@ impl Decoder {
         self.e8_enabled = true;
         self.e8_translate_e9 = translate_e9;
         self
+    }
+
+    /// Enable solid-group mode. In a RAR3 **solid** archive the members of
+    /// a solid group share one compression history: the LZ window, code
+    /// tables, offset history, declared filter programs and any live PPMd
+    /// model all persist from one member to the next, while each member's
+    /// compressed payload is its own byte-aligned stream. Decode the first
+    /// member as usual, then call [`Decoder::begin_solid_member`] before
+    /// feeding each subsequent member.
+    ///
+    /// Solid mode also makes truncation a hard error: a member whose stream
+    /// ends before its declared unpacked size poisons the whole group (the
+    /// shared history would desync every later member), where the default
+    /// mode returns the short output and leaves the verdict to the caller.
+    pub fn with_solid(mut self) -> Self {
+        self.solid = true;
+        self
+    }
+
+    /// Prepare to decode the next member of a solid group: keeps the shared
+    /// compression history and expects `unpack_size` uncompressed bytes from
+    /// the next member's compressed payload (fed via `decode`/`finish` as
+    /// usual). Only valid on a [`Decoder::with_solid`] decoder whose current
+    /// member has fully drained.
+    pub fn begin_solid_member(&mut self, unpack_size: u64) -> Result<(), Error> {
+        if self.poisoned {
+            return Err(Error::Corrupt);
+        }
+        if !self.solid || !matches!(self.state, State::Done) {
+            return Err(Error::Unsupported);
+        }
+        self.unpack_size = unpack_size;
+        self.state = State::Buffering { input: Vec::new() };
+        Ok(())
     }
 
     fn poison<T>(&mut self, e: Error) -> Result<T, Error> {
@@ -202,15 +250,25 @@ impl RawDecoder for Decoder {
         // If we still need to decode, do it now.
         if let State::Buffering { input } = &mut self.state {
             let input = core::mem::take(input);
-            // Move into a separate scope so the `match` borrow ends before
-            // we mutate `self.state`.
-            match run_decode(
-                input,
-                self.unpack_size,
-                self.e8_enabled,
-                self.e8_translate_e9,
-            ) {
-                Ok(out) => {
+            let ctx = self
+                .ctx
+                .get_or_insert_with(|| Box::new(RunCtx::new(self.unpack_size)));
+            ctx.unpack_size = self.unpack_size;
+            let result = if self.unpack_size == 0 {
+                Ok(Vec::new())
+            } else {
+                run_member(ctx, &input, self.solid)
+            };
+            match result {
+                Ok(mut out) => {
+                    if self.e8_enabled {
+                        apply_e8_filter(&mut out, 0, self.e8_translate_e9);
+                    }
+                    if !self.solid {
+                        // Match the pre-solid memory profile: a one-shot
+                        // stream has no further use for the 4 MiB window.
+                        self.ctx = None;
+                    }
                     self.out_buf = out;
                     self.out_drained = 0;
                     self.state = State::Draining;
@@ -232,60 +290,63 @@ impl RawDecoder for Decoder {
         self.out_buf.clear();
         self.out_drained = 0;
         self.poisoned = false;
-        // unpack_size and filter flags are configuration; preserved across
-        // reset to match the LZX/Quantum conventions.
+        // A reset starts a fresh stream: any solid history is gone.
+        self.ctx = None;
+        // unpack_size, solid and filter flags are configuration; preserved
+        // across reset to match the LZX/Quantum conventions.
     }
 }
 
 // ─── Internal decode pipeline ─────────────────────────────────────────────
 
-fn run_decode(
-    input: Vec<u8>,
-    unpack_size: u64,
-    e8_enabled: bool,
-    e8_translate_e9: bool,
-) -> Result<Vec<u8>, Error> {
-    if unpack_size == 0 {
-        return Ok(Vec::new());
+/// Decode one member's compressed payload against the (possibly carried-
+/// over) context. In solid mode the end-of-member marker is consumed so the
+/// persistent state is exactly what the next member's stream expects.
+fn run_member(ctx: &mut RunCtx, input: &[u8], solid: bool) -> Result<Vec<u8>, Error> {
+    // Each member's payload is its own byte-aligned stream (the container
+    // resets the bit input at every member boundary), so the reader is
+    // rebuilt even when the rest of the context carries over.
+    ctx.bits = BitReader::new();
+    ctx.bits.feed_slice(input);
+    ctx.out = Vec::new();
+    // Filter *programs* persist across solid members, but scheduled filter
+    // instances never span a member boundary.
+    ctx.pending_filters.clear();
+
+    // A fresh stream — or a previous member that announced new tables —
+    // starts with a block header; otherwise symbol decoding continues
+    // directly under the carried-over tables (or PPMd model).
+    if !ctx.tables_read {
+        parse_block_header(ctx)?;
     }
-    let mut br = BitReader::new();
-    br.feed_slice(&input);
+    loop {
+        let seg = match ctx.block {
+            BlockKind::Lz => expand(ctx, solid)?,
+            BlockKind::Ppm => run_ppmd(ctx, input, solid)?,
+        };
+        match seg {
+            Segment::MemberEnd => break,
+            Segment::NewTable => parse_block_header(ctx)?,
+            Segment::NewTableThenEnd => {
+                parse_block_header(ctx)?;
+                if matches!(ctx.block, BlockKind::Ppm) {
+                    // A PPMd block starting exactly at the member boundary
+                    // would prime its range coder from this member's tail
+                    // bytes and keep pulling from the next member's payload
+                    // — cross-member coder state we don't support (rar 6.24
+                    // starts such blocks with a header in the next member
+                    // instead).
+                    return Err(Error::Unsupported);
+                }
+                break;
+            }
+        }
+    }
 
-    let mut ctx = Box::new(RunCtx {
-        bits: br,
-        // The length table survives across blocks: a successive block can
-        // signal "keep table" with a single header bit and reuse what was
-        // most recently decoded.
-        lengths: vec![0u8; HUFF_TABLE_SIZE],
-        main: None,
-        offset: None,
-        low_offset: None,
-        length: None,
-        old_offsets: [1u32, 1, 1, 1],
-        last_offset: 0,
-        last_length: 0,
-        last_low_offset: 0,
-        num_low_offset_repeats: 0,
-        out: Vec::new(),
-        window: vec![0u8; DICT_DEFAULT_SIZE],
-        wmask: {
-            debug_assert!(DICT_DEFAULT_SIZE.is_power_of_two());
-            DICT_DEFAULT_SIZE - 1
-        },
-        window_pos: 0,
-        unpack_size,
-        programs: Vec::new(),
-        last_filter_slot: 0,
-        pending_filters: VecDeque::new(),
-        ppmd: None,
-    });
-
-    // The decoder starts by parsing the first block header.
-    parse_block_header(&mut ctx)?;
-    if let Some(hdr) = ctx.ppmd.take() {
-        run_ppmd_block(&mut ctx, &input, hdr)?;
-    } else {
-        expand(&mut ctx)?;
+    if solid && (ctx.out.len() as u64) < ctx.unpack_size {
+        // A short member desyncs the shared history for every member after
+        // it; fail the group rather than hand back silently-short output.
+        return Err(Error::UnexpectedEnd);
     }
 
     // Run any in-band filters whose windows the stream completed. A filter
@@ -299,11 +360,28 @@ fn run_decode(
         return Err(Error::Corrupt);
     }
 
-    let mut out = core::mem::take(&mut ctx.out);
-    if e8_enabled {
-        apply_e8_filter(&mut out, 0, e8_translate_e9);
-    }
-    Ok(out)
+    Ok(core::mem::take(&mut ctx.out))
+}
+
+/// How a run of symbol decoding ended.
+enum Segment {
+    /// The member is complete (declared size produced and, in solid mode,
+    /// the end-of-member marker consumed).
+    MemberEnd,
+    /// An in-band "new code tables follow" boundary mid-member: parse a
+    /// block header and continue decoding this member.
+    NewTable,
+    /// "New code tables follow" arrived exactly at the member's declared
+    /// size: the tables land in this member's tail bytes and the *next*
+    /// member continues under them without a header of its own.
+    NewTableThenEnd,
+}
+
+/// Which decoding mode the current block uses. Persists across solid
+/// members: a member may continue a block the previous member started.
+enum BlockKind {
+    Lz,
+    Ppm,
 }
 
 struct RunCtx {
@@ -344,25 +422,27 @@ struct RunCtx {
     /// popped from the front) as soon as their windows are fully decoded —
     /// see [`RunCtx::flush_completed_filters`].
     pending_filters: VecDeque<PendingFilter>,
-    /// Set when the first block header selected the PPMd path; carries the
-    /// parameters needed to drive the PPMd model over the raw byte stream.
-    ppmd: Option<PpmdHeader>,
+    /// The live PPMd model, if any block has created one. Persists across
+    /// blocks and solid members: a later PPMd block header without the
+    /// reset flag reuses it (with a freshly initialised range coder).
+    ppmd: Option<Box<PpmdBlock>>,
+    /// Decoding mode of the current block (LZ+Huffman or PPMd).
+    block: BlockKind,
+    /// Whether valid LZ code tables are in effect, i.e. whether the next
+    /// member of a solid group starts decoding symbols directly instead of
+    /// parsing a block header first. Cleared by PPMd block headers (a
+    /// member after a PPMd block always re-reads a header) and by an
+    /// end-of-member marker announcing new tables.
+    tables_read: bool,
 }
 
-/// Parameters lifted from a PPMd block header (bit-0 of the block header
-/// set). See [`parse_block_header`].
-struct PpmdHeader {
-    /// Suballocator size in bytes (`(mem + 1) << 20`).
-    mem_size: u32,
-    /// Model max order.
-    max_order: u32,
+/// A live PPMd model plus the RAR escape layer's current escape byte.
+struct PpmdBlock {
+    model: Ppmd7,
     /// The RAR-layer escape byte (a decoded symbol equal to this introduces
-    /// a control code rather than a literal).
+    /// a control code rather than a literal). Persists across blocks and
+    /// members; updated by headers carrying an explicit escape byte.
     escape: u8,
-    /// Explicit `InitEsc` seed if the header carried one.
-    init_esc: Option<u8>,
-    /// Byte offset in the input where the range-coded payload begins.
-    payload_start: usize,
 }
 
 /// A declared filter program plus its per-slot remembered block length.
@@ -373,6 +453,40 @@ struct ProgramSlot {
 }
 
 impl RunCtx {
+    fn new(unpack_size: u64) -> Self {
+        RunCtx {
+            bits: BitReader::new(),
+            // The length table survives across blocks (and solid members):
+            // a successive block can signal "keep table" with a single
+            // header bit and delta-code against what was most recently
+            // decoded.
+            lengths: vec![0u8; HUFF_TABLE_SIZE],
+            main: None,
+            offset: None,
+            low_offset: None,
+            length: None,
+            old_offsets: [1u32, 1, 1, 1],
+            last_offset: 0,
+            last_length: 0,
+            last_low_offset: 0,
+            num_low_offset_repeats: 0,
+            out: Vec::new(),
+            window: vec![0u8; DICT_DEFAULT_SIZE],
+            wmask: {
+                debug_assert!(DICT_DEFAULT_SIZE.is_power_of_two());
+                DICT_DEFAULT_SIZE - 1
+            },
+            window_pos: 0,
+            unpack_size,
+            programs: Vec::new(),
+            last_filter_slot: 0,
+            pending_filters: VecDeque::new(),
+            ppmd: None,
+            block: BlockKind::Lz,
+            tables_read: false,
+        }
+    }
+
     fn emit_literal(&mut self, b: u8) {
         self.out.push(b);
         self.window[self.window_pos] = b;
@@ -483,43 +597,58 @@ fn parse_block_header(ctx: &mut RunCtx) -> Result<(), Error> {
     // 1 bit: PPMd-block flag.
     let is_ppmd = ctx.bits.read_bits(1)?;
     if is_ppmd != 0 {
-        // PPMd block header: 7 flag bits, then (per flags) a memory byte,
-        // an escape byte, and an order derived from the flags.
-        //   flag 0x20: read 8-bit mem → suballocator = (mem+1)<<20, and
-        //              order = (flags & 0x1F) + 1 (values > 16 expand as
-        //              16 + (order-16)*3).
-        //   flag 0x40: read 8-bit escape/InitEsc seed (else escape = 2).
-        // A header without 0x20 is a continuation reusing the live model —
-        // not produced for a standalone first block, so we refuse it.
+        // PPMd block header: 7 flag bits, then (per flags) a memory byte
+        // and an escape byte.
+        //   flag 0x20: model reset — read 8-bit mem → suballocator =
+        //              (mem+1)<<20, and order = (flags & 0x1F) + 1 (values
+        //              > 16 expand as 16 + (order-16)*3). Without 0x20 the
+        //              block *continues* the live model from an earlier
+        //              block or solid member (fresh range coder, same
+        //              statistics); there must be one.
+        //   flag 0x40: read 8-bit escape/InitEsc seed (else escape = 2 on
+        //              reset; unchanged on continuation).
         let flags = ctx.bits.read_bits(7)?;
-        if flags & 0x20 == 0 {
-            return Err(Error::Unsupported);
-        }
-        let mem_mb = ctx.bits.read_bits(8)?;
-        let mem_size = (mem_mb + 1).saturating_mul(1 << 20);
-        let mut max_order = (flags & 0x1F) + 1;
-        if max_order > 16 {
-            max_order = 16 + (max_order - 16) * 3;
-        }
-        if max_order < 2 {
-            return Err(Error::Corrupt);
-        }
-        let (escape, init_esc) = if flags & 0x40 != 0 {
-            let e = ctx.bits.read_bits(8)? as u8;
-            (e, Some(e))
+        if flags & 0x20 != 0 {
+            let mem_mb = ctx.bits.read_bits(8)?;
+            let mem_size = (mem_mb + 1).saturating_mul(1 << 20);
+            let mut max_order = (flags & 0x1F) + 1;
+            if max_order > 16 {
+                max_order = 16 + (max_order - 16) * 3;
+            }
+            if max_order < 2 {
+                return Err(Error::Corrupt);
+            }
+            let (escape, init_esc) = if flags & 0x40 != 0 {
+                let e = ctx.bits.read_bits(8)? as u8;
+                (e, Some(e))
+            } else {
+                (2u8, None)
+            };
+            let mut model = Ppmd7::new(mem_size)?;
+            model.init(max_order);
+            if let Some(e) = init_esc {
+                model.set_init_esc(e as u32);
+            }
+            ctx.ppmd = Some(Box::new(PpmdBlock { model, escape }));
         } else {
-            (2u8, None)
-        };
+            let ppmd = ctx.ppmd.as_deref_mut().ok_or(Error::Corrupt)?;
+            if flags & 0x40 != 0 {
+                // An explicit escape byte updates the escape layer; the
+                // live model's InitEsc is a model-creation parameter and
+                // stays as-is.
+                ppmd.escape = ctx.bits.read_bits(8)? as u8;
+            }
+            // The order bits are informational on a continuation — the
+            // live model keeps the order it was built with.
+        }
         ctx.bits.byte_align();
-        ctx.ppmd = Some(PpmdHeader {
-            mem_size,
-            max_order,
-            escape,
-            init_esc,
-            payload_start: ctx.bits.consumed_bytes(),
-        });
+        ctx.block = BlockKind::Ppm;
+        // A PPMd block never leaves LZ tables in effect: after a PPMd
+        // member, the next member always starts with its own header.
+        ctx.tables_read = false;
         return Ok(());
     }
+    ctx.block = BlockKind::Lz;
     // 1 bit: keep-table flag. 0 ⇒ reset the persistent length table.
     let keep_table = ctx.bits.read_bits(1)? != 0;
     if !keep_table {
@@ -627,15 +756,19 @@ fn parse_block_header(ctx: &mut RunCtx) -> Result<(), Error> {
         &ctx.lengths[MAIN_SIZE + OFFSET_SIZE + LOW_OFFSET_SIZE
             ..MAIN_SIZE + OFFSET_SIZE + LOW_OFFSET_SIZE + LENGTH_SIZE],
     )?));
+    ctx.tables_read = true;
     Ok(())
 }
 
 // ─── Expansion ───────────────────────────────────────────────────────────
 
-fn expand(ctx: &mut RunCtx) -> Result<(), Error> {
+fn expand(ctx: &mut RunCtx, solid: bool) -> Result<Segment, Error> {
     loop {
         if ctx.done() {
-            return Ok(());
+            if solid {
+                return read_member_end_lz(ctx);
+            }
+            return Ok(Segment::MemberEnd);
         }
 
         // Decode the next main-tree symbol.
@@ -643,9 +776,14 @@ fn expand(ctx: &mut RunCtx) -> Result<(), Error> {
         let sym = match main_tree.decode(&mut ctx.bits) {
             Ok(s) => s,
             Err(Error::UnexpectedEnd) => {
+                if solid {
+                    // A short member desyncs the group; `run_member` turns
+                    // this into a hard error rather than short output.
+                    return Err(Error::UnexpectedEnd);
+                }
                 // Stream ran out before we've reached unpack_size. The
                 // caller's count of output bytes is authoritative.
-                return Ok(());
+                return Ok(Segment::MemberEnd);
             }
             Err(e) => return Err(e),
         };
@@ -657,30 +795,26 @@ fn expand(ctx: &mut RunCtx) -> Result<(), Error> {
 
         match sym {
             256 => {
-                // End-of-block marker; followed by a single bit deciding
-                // between "this is the end of the stream" and "a new code
-                // table follows". The PPMd-vs-Huffman test makes one more
-                // bit (the "new file" flag) optional in libarchive's port,
-                // but unarr just reads `start_new_table` directly. We
-                // follow unarr here: one bit = start_new_table.
+                // End-of-block marker. One bit: set ⇒ new code tables
+                // follow immediately (the caller parses a block header —
+                // which may also switch this member to PPMd — and decoding
+                // continues). Clear ⇒ this member's data ends here; a
+                // second bit then announces whether the *next* member of a
+                // solid group starts with its own table header or keeps
+                // decoding under the current tables. (Framing per the
+                // libarchive/unarr RAR readers' descriptions, validated
+                // against the solid corpus.)
                 let new_table = ctx.bits.read_bits(1)? != 0;
                 if new_table {
-                    parse_block_header(ctx)?;
-                    // A new block header may select PPMd. `expand` decodes
-                    // Huffman-coded symbols; if we continued here we would
-                    // feed the range-coded PPMd payload through the previous
-                    // block's stale Huffman tables and emit garbage. A
-                    // mid-stream switch into PPMd is out of scope (same stance
-                    // as `run_ppmd_block`'s start-new-table handling), so
-                    // refuse rather than misdecode.
-                    if ctx.ppmd.is_some() {
-                        return Err(Error::Unsupported);
-                    }
-                } else {
-                    // End of stream marker: any further bytes belong to a
-                    // separate stream.
-                    return Ok(());
+                    return Ok(Segment::NewTable);
                 }
+                if solid {
+                    let next_has_header = ctx.bits.read_bits(1)? != 0;
+                    ctx.tables_read = !next_has_header;
+                }
+                // For a one-shot stream any further bytes belong to a
+                // separate stream; the second marker bit is irrelevant.
+                return Ok(Segment::MemberEnd);
             }
             257 => {
                 // Filter declaration: a standard-program instance gets
@@ -810,93 +944,200 @@ fn expand(ctx: &mut RunCtx) -> Result<(), Error> {
     }
 }
 
+/// In solid mode, consume the end-of-member marker once the member's
+/// declared size has been produced, so `tables_read` reflects what the
+/// next member's stream expects. A well-formed member ends with the 256
+/// marker; a stream that simply stops (no marker) leaves the tables in
+/// effect, and anything else is data beyond the declared size, which we
+/// leave unread (the next member's payload is a fresh stream regardless).
+fn read_member_end_lz(ctx: &mut RunCtx) -> Result<Segment, Error> {
+    let main_tree = ctx.main.as_ref().ok_or(Error::InvalidHuffmanTree)?;
+    let sym = match main_tree.decode(&mut ctx.bits) {
+        Ok(s) => s,
+        Err(Error::UnexpectedEnd) => return Ok(Segment::MemberEnd),
+        Err(e) => return Err(e),
+    };
+    if sym != 256 {
+        return Ok(Segment::MemberEnd);
+    }
+    if ctx.bits.read_bits(1)? != 0 {
+        // New tables land in this member's tail; the next member continues
+        // symbol decoding under them directly.
+        return Ok(Segment::NewTableThenEnd);
+    }
+    let next_has_header = ctx.bits.read_bits(1)? != 0;
+    ctx.tables_read = !next_has_header;
+    Ok(Segment::MemberEnd)
+}
+
 // ─── PPMd-II variant H block ─────────────────────────────────────────────
 
-/// Drive the RAR PPMd block: the range-coded payload (starting at
-/// `hdr.payload_start` in `input`) feeds the shared [`Ppmd7`] model through
+/// Drive a RAR PPMd block: the range-coded payload (starting at the bit
+/// reader's current byte position) feeds the live [`Ppmd7`] model through
 /// the RAR range decoder. Decoded byte symbols are literals unless they
 /// equal the escape byte, which introduces a control code (end-of-data, an
-/// LZ match, a new table, or a literal-escape). Matches copy through the
-/// same sliding window as the LZ path so they interleave seamlessly.
-fn run_ppmd_block(ctx: &mut RunCtx, input: &[u8], hdr: PpmdHeader) -> Result<(), Error> {
-    let mut model = Ppmd7::new(hdr.mem_size)?;
-    model.init(hdr.max_order);
-    if let Some(e) = hdr.init_esc {
-        model.set_init_esc(e as u32);
-    }
-    if hdr.payload_start > input.len() {
+/// LZ match, a filter declaration, a new table, or a literal-escape).
+/// Matches copy through the same sliding window as the LZ path so they
+/// interleave seamlessly. On return the bit reader is repositioned to the
+/// byte where the range-coded data ended.
+fn run_ppmd(ctx: &mut RunCtx, input: &[u8], solid: bool) -> Result<Segment, Error> {
+    ctx.bits.byte_align();
+    let payload_start = ctx.bits.consumed_bytes();
+    if payload_start > input.len() {
         return Err(Error::UnexpectedEnd);
     }
-    let (mut rc, _) = RangeDec::init(RangeMode::Rar, input, hdr.payload_start)?;
+    // Take the model out of the context so the emit helpers can borrow the
+    // context mutably alongside it; it is put back on every path.
+    let mut pb = ctx.ppmd.take().ok_or(Error::Corrupt)?;
+    let result = run_ppmd_inner(ctx, input, payload_start, &mut pb, solid);
+    ctx.ppmd = Some(pb);
+    let (seg, end_pos) = result?;
+    ctx.bits.seek_byte(end_pos);
+    Ok(seg)
+}
 
-    let sym = |m: &mut Ppmd7, rc: &mut RangeDec| -> Result<u8, Error> {
-        let s = m.decode_symbol(rc)?;
-        if rc.err() {
-            return Err(Error::Corrupt);
-        }
-        // A truncated payload makes the range coder read past the input; once
-        // that happens `read_byte` is feeding zeroes and every further symbol
-        // is fabricated. Fail instead of returning invented output that meets
-        // the declared unpacked size with a wrong CRC.
-        if rc.overran() {
-            return Err(Error::UnexpectedEnd);
-        }
-        Ok(s)
-    };
+/// Decode one PPMd symbol, failing closed on range-coder errors and on
+/// payload overrun (a truncated payload makes the coder read fabricated
+/// zero bytes).
+fn ppmd_symbol(m: &mut Ppmd7, rc: &mut RangeDec) -> Result<u8, Error> {
+    let s = m.decode_symbol(rc)?;
+    if rc.err() {
+        return Err(Error::Corrupt);
+    }
+    if rc.overran() {
+        return Err(Error::UnexpectedEnd);
+    }
+    Ok(s)
+}
 
-    while !ctx.done() {
-        let s = sym(&mut model, &mut rc)?;
-        if s != hdr.escape {
+fn run_ppmd_inner(
+    ctx: &mut RunCtx,
+    input: &[u8],
+    payload_start: usize,
+    pb: &mut PpmdBlock,
+    solid: bool,
+) -> Result<(Segment, usize), Error> {
+    let (mut rc, _) = RangeDec::init(RangeMode::Rar, input, payload_start)?;
+
+    loop {
+        if ctx.done() {
+            if !solid {
+                return Ok((Segment::MemberEnd, rc.pos()));
+            }
+            // The encoder coded this member's end marker through the model;
+            // decode it the same way or the shared statistics desync from
+            // the encoder's for every later member. If the payload is
+            // exhausted right here instead, the member boundary splits a
+            // still-running range coder across payloads — cross-member
+            // coder state we don't support (rar 6.24 ends PPMd members
+            // with an explicit marker).
+            let s = ppmd_symbol(&mut pb.model, &mut rc).map_err(|e| match e {
+                Error::UnexpectedEnd => Error::Unsupported,
+                other => other,
+            })?;
+            if s != pb.escape {
+                return Err(Error::Corrupt);
+            }
+            let code = ppmd_symbol(&mut pb.model, &mut rc)?;
+            return match code {
+                2 => Ok((Segment::MemberEnd, rc.pos())),
+                0 => Ok((Segment::NewTableThenEnd, rc.pos())),
+                _ => Err(Error::Corrupt),
+            };
+        }
+        let s = ppmd_symbol(&mut pb.model, &mut rc)?;
+        if s != pb.escape {
             ctx.emit_literal(s);
             continue;
         }
-        let code = sym(&mut model, &mut rc)?;
+        let code = ppmd_symbol(&mut pb.model, &mut rc)?;
         match code {
             0 => {
-                // start-new-table: a fresh block header follows. Supporting
-                // a mid-stream codec switch (back to Huffman, or a new PPMd
-                // table) is out of scope; no single-file corpus archive
-                // reaches this before the unpacked size is met.
-                return Err(Error::Unsupported);
+                // start-new-table: a fresh block header follows in the bit
+                // domain at the coder's byte position (it may keep PPMd
+                // with or without a model reset, or switch back to LZ).
+                return Ok((Segment::NewTable, rc.pos()));
             }
-            2 => break,                          // end of PPMd data
-            3 => return Err(Error::Unsupported), // VM filter in PPMd stream
+            2 => {
+                // End of PPMd data before the declared size: short member.
+                // Solid mode turns this into an error in `run_member`.
+                return Ok((Segment::MemberEnd, rc.pos()));
+            }
+            3 => {
+                // A filter declaration carried in the PPMd stream: the same
+                // wire layout as main symbol 257, with every byte decoded
+                // through the model.
+                read_filter_declaration_ppmd(ctx, &mut pb.model, &mut rc)?;
+            }
             4 => {
                 // 24-bit distance from three symbols (big-endian), then a
                 // length symbol. Distance +2, length +32.
                 let mut dist = 0u32;
                 for i in (0..3).rev() {
-                    let b = sym(&mut model, &mut rc)? as u32;
+                    let b = ppmd_symbol(&mut pb.model, &mut rc)? as u32;
                     dist |= b << (i * 8);
                 }
-                let len = sym(&mut model, &mut rc)? as u32;
+                let len = ppmd_symbol(&mut pb.model, &mut rc)? as u32;
                 ctx.emit_match(dist + 2, len + 32)?;
             }
             5 => {
                 // Distance-1 run: length symbol, length +4.
-                let len = sym(&mut model, &mut rc)? as u32;
+                let len = ppmd_symbol(&mut pb.model, &mut rc)? as u32;
                 ctx.emit_match(1, len + 4)?;
             }
             _ => {
                 // Any other control code encodes a literal equal to the
                 // escape byte (the control symbol is consumed and dropped).
-                ctx.emit_literal(hdr.escape);
+                ctx.emit_literal(pb.escape);
             }
         }
     }
-    Ok(())
+}
+
+/// Parse a filter declaration whose bytes arrive as PPMd symbols (escape
+/// code 3): an 8-bit flags byte, a 1/2/3-byte length field, then `length`
+/// payload bytes forming the same self-contained declaration payload the
+/// bit-domain parser (main symbol 257) reads.
+fn read_filter_declaration_ppmd(
+    ctx: &mut RunCtx,
+    model: &mut Ppmd7,
+    rc: &mut RangeDec,
+) -> Result<(), Error> {
+    let flags = ppmd_symbol(model, rc)? as u32;
+    let mut decl_len = (flags & 0x07) + 1;
+    if decl_len == 7 {
+        decl_len = ppmd_symbol(model, rc)? as u32 + 7;
+    } else if decl_len == 8 {
+        let hi = ppmd_symbol(model, rc)? as u32;
+        let lo = ppmd_symbol(model, rc)? as u32;
+        decl_len = (hi << 8) | lo;
+    }
+    if decl_len == 0 {
+        return Err(Error::Corrupt);
+    }
+    let mut payload = vec![0u8; decl_len as usize];
+    for b in payload.iter_mut() {
+        *b = ppmd_symbol(model, rc)?;
+    }
+    let mut db = BitReader::new();
+    db.feed_slice(&payload);
+    parse_declaration_payload(ctx, flags, &mut db).map_err(|e| match e {
+        Error::UnexpectedEnd => Error::Corrupt,
+        other => other,
+    })
 }
 
 // ─── In-band filter declarations (main symbol 257) ──────────────────────
 
-/// Upper bound on a filter's block length, derived from the RarVM memory
-/// the standard programs operate in (0x40000 bytes, of which 0x3C000 lie
-/// below the global-data area). Delta needs separate source and
-/// destination halves, so its windows are capped at half that. Real
-/// encoders stay far below both caps and split large regions into several
-/// filter blocks.
-const FILTER_MAX_BLOCK: u32 = 0x3C000;
-const FILTER_MAX_BLOCK_DELTA: u32 = 0x1E000;
+/// Upper bound on a filter's block length: the RarVM memory the standard
+/// programs operate in (0x40000 bytes — modern unrar lets a block use all
+/// of it). Delta needs separate source and destination halves, so its
+/// windows are capped at half that. Real encoders stay far below both caps
+/// and split large regions into several filter blocks. Beyond the cap
+/// UnRAR 7.23 skips the transform and emits the raw bytes with success;
+/// this crate fails closed instead (same policy as unfinished windows).
+const FILTER_MAX_BLOCK: u32 = 0x40000;
+const FILTER_MAX_BLOCK_DELTA: u32 = 0x20000;
 
 /// Read a RarVM variable-length number: a 2-bit tag selects a 4-, 8-
 /// (with a sign-extension-style escape for values below 16), 16- or 32-bit
@@ -973,11 +1214,14 @@ fn parse_declaration_payload(
     let slot = if flags & 0x80 != 0 {
         let v = read_vm_number(db)?;
         if v == 0 {
-            // Full reset (unrar's InitFilters): apply the filters whose
-            // windows the stream already completed, then cancel everything
-            // else — a canceled filter must never run, or it would rewrite
-            // output the encoder didn't transform.
-            ctx.flush_completed_filters()?;
+            // Full reset (unrar's InitFilters30): cancel every scheduled
+            // filter — *including* ones whose windows are complete but not
+            // yet applied. unrar executes filters only when it flushes
+            // decoded output, which lags decoding by up to a window, so a
+            // reset discards them and their windows stay raw bytes. (For
+            // multi-window outputs the reference may have flushed — and
+            // applied — earlier filters before the reset; real encoders
+            // only reset at stream start, so that corner stays unmodeled.)
             ctx.pending_filters.clear();
             ctx.programs.clear();
             0
@@ -1161,6 +1405,8 @@ mod tests {
             last_filter_slot: 0,
             pending_filters: VecDeque::new(),
             ppmd: None,
+            block: BlockKind::Lz,
+            tables_read: false,
         }
     }
 
@@ -1229,17 +1475,20 @@ mod tests {
         assert_eq!(recognize_program(&DELTA_PROG), Some(StdProgram::Delta));
     }
 
-    /// A reset declaration (slot field 0) must first run the filters whose
-    /// windows are already complete, then cancel everything still pending —
-    /// a canceled filter must never rewrite output.
+    /// A reset declaration (slot field 0) cancels every scheduled filter —
+    /// including completed-but-unapplied windows. unrar's InitFilters30
+    /// discards its whole filter stack (execution happens at output-flush
+    /// time, which lags decoding), so those windows stay raw bytes; a
+    /// canceled filter must never rewrite output.
     #[test]
-    fn reset_applies_completed_and_cancels_pending() {
+    fn reset_cancels_all_pending_without_applying() {
         let mut ctx = test_ctx();
         ctx.out = vec![1, 0, 0, 0, 9, 9, 9, 9];
         ctx.programs.push(ProgramSlot {
             program: StdProgram::Delta,
             last_block_length: 4,
         });
+        // A completed-but-unapplied window plus an incomplete one.
         ctx.pending_filters.push_back(PendingFilter {
             start: 0,
             length: 4,
@@ -1264,12 +1513,10 @@ mod tests {
         db.feed_slice(&w.bytes);
         parse_declaration_payload(&mut ctx, 0xB0, &mut db).unwrap();
 
-        // The completed 1-channel delta over [1,0,0,0] ran: prev-integrate
-        // gives [0xFF; 4]. The trailing bytes stay raw.
-        assert_eq!(&ctx.out[..4], &[0xFF; 4]);
-        assert_eq!(&ctx.out[4..], &[9; 4]);
-        // The incomplete filter was canceled; only the fresh declaration
-        // (window at out position 8) is scheduled against the fresh slot.
+        // Nothing ran: both prior filters were canceled outright.
+        assert_eq!(ctx.out, vec![1, 0, 0, 0, 9, 9, 9, 9]);
+        // Only the fresh declaration (window at out position 8) is
+        // scheduled against the fresh slot table.
         assert_eq!(ctx.pending_filters.len(), 1);
         assert_eq!(ctx.pending_filters[0].start, 8);
         assert_eq!(ctx.programs.len(), 1);
@@ -1428,28 +1675,8 @@ mod tests {
     #[test]
     fn promote_offset_rotates_correctly() {
         // Construct a context-shaped struct just to test the helper.
-        let mut ctx = RunCtx {
-            bits: BitReader::new(),
-            lengths: vec![],
-            main: None,
-            offset: None,
-            low_offset: None,
-            length: None,
-            old_offsets: [10, 20, 30, 40],
-            last_offset: 0,
-            last_length: 0,
-            last_low_offset: 0,
-            num_low_offset_repeats: 0,
-            out: vec![],
-            window: vec![0u8; 16],
-            wmask: 15,
-            window_pos: 0,
-            unpack_size: 0,
-            programs: vec![],
-            last_filter_slot: 0,
-            pending_filters: VecDeque::new(),
-            ppmd: None,
-        };
+        let mut ctx = test_ctx();
+        ctx.old_offsets = [10, 20, 30, 40];
         // Promote slot 2 (value 30) — result should be [30, 10, 20, 40].
         promote_offset(&mut ctx, 2, 30);
         assert_eq!(ctx.old_offsets, [30, 10, 20, 40]);
