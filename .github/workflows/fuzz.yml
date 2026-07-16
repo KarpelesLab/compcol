@@ -56,6 +56,9 @@ jobs:
           - decoder_lzah
           - decoder_sit13
           - decoder_arsenic
+          - decoder_rar2
+          - decoder_rar3
+          - decoder_rar5
           - roundtrip
     steps:
       - uses: actions/checkout@v6
