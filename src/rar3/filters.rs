@@ -1,21 +1,102 @@
 //! RAR 3.x post-decompression filters.
 //!
-//! RAR3 supports a small set of "VM filters" that the encoder embeds as
-//! bytecode programs in symbol 257 of the main code. The decoder is then
-//! supposed to instantiate an interpreter for a stack-based RISC-like VM
-//! ("RarVM"). Faithfully implementing RarVM is a large effort (the
-//! upstream interpreter is several hundred lines plus a full instruction
-//! set) and is out of scope for this build.
+//! ## In-band standard filters (main symbol 257)
 //!
-//! What we do support is the **stand-alone Intel E8/E9 x86 call translation
-//! filter** which can be activated through an external selector
-//! ([`Decoder::with_e8_filter`]). This filter is what the vast majority of
-//! RAR3 streams over x86 executables actually use, and the operation is
-//! the same as the LZX intel-call-translation post-pass.
+//! RAR3 embeds filters as bytecode programs for a stack-based RISC-like VM
+//! ("RarVM") in symbol 257 of the main code. We do **not** interpret
+//! arbitrary programs: WinRAR's compressor only ever emits a fixed set of
+//! standard programs, so — like libarchive and unrar in practice — we
+//! recognize the standard programs (by bytecode length + CRC-32,
+//! [`recognize_program`]) and run native transforms:
 //!
-//! Future versions of this module may grow Itanium, RGB delta and audio
-//! delta filters if there's demand; for now any in-band filter declaration
-//! is refused with `Error::Unsupported`.
+//! - **Delta** (channel de-interleave; emitted for bitmaps, WAV audio and
+//!   other channel-interleaved content; channel count arrives in VM
+//!   register 0),
+//! - **x86 E8** and **E8/E9** call(-jump) translation.
+//!
+//! The transforms themselves live in [`crate::rar_filters`], shared with
+//! the RAR5 decoder, and were validated byte-for-byte against WinRAR
+//! archives (UnRAR 7.23 ground truth). Streams declaring any other program
+//! (custom bytecode, or the legacy Itanium/RGB/audio-predictor standard
+//! programs, which current archivers no longer emit) fail with
+//! `Error::Unsupported` — never wrong bytes.
+//!
+//! ## Stand-alone E8/E9 pass
+//!
+//! Separately, the **stand-alone Intel E8/E9 call translation pass**
+//! ([`apply_e8_filter`]) can be activated by the caller via
+//! `Decoder::with_e8_filter`. It predates in-band filter support and is an
+//! LZX-style whole-output transform, *not* the same arithmetic as the
+//! in-band x86 filter; it is kept for callers that relied on it.
+
+use crate::checksum::Crc32;
+use crate::error::Error;
+use crate::rar_filters::{delta_decode, x86_e8_decode};
+
+/// A standard RarVM filter program we recognize and can run natively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StdProgram {
+    /// Channel de-interleave; channel count comes from VM register 0.
+    Delta,
+    /// x86 `0xE8` (CALL) relative-address restore.
+    X86Call,
+    /// x86 `0xE8`/`0xE9` (CALL/JMP) relative-address restore.
+    X86CallJmp,
+}
+
+/// Identify a standard filter program from its bytecode.
+///
+/// WinRAR's compressor emits each standard filter as a fixed byte string,
+/// so `(length, CRC-32)` is a stable fingerprint — the same recognition
+/// scheme libarchive uses. The Delta and x86-E8 fingerprints below were
+/// computed from programs extracted out of real rar 6.24 archives (this
+/// crate's differential corpus); the E8E9 fingerprint (emitted by older
+/// WinRAR 3.x builds) matches the value documented in libarchive
+/// (BSD-licensed `archive_read_support_format_rar.c`).
+///
+/// Returns `None` for anything else — including the legacy Itanium / RGB /
+/// audio-predictor standard programs, which no current archiver emits.
+pub(super) fn recognize_program(code: &[u8]) -> Option<StdProgram> {
+    let mut crc = Crc32::new();
+    crc.update(code);
+    match (code.len(), crc.finalize()) {
+        (29, 0x0E06_077D) => Some(StdProgram::Delta),
+        (53, 0xAD57_6887) => Some(StdProgram::X86Call),
+        (57, 0x3CD7_E57E) => Some(StdProgram::X86CallJmp),
+        _ => None,
+    }
+}
+
+/// A parsed, scheduled instance of a standard filter: it rewrites the
+/// window `[start, start + length)` of the unpacked stream.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PendingFilter {
+    /// Absolute byte offset in the unpacked stream.
+    pub start: u64,
+    pub length: u32,
+    pub program: StdProgram,
+    /// VM register 0 at declaration time — the Delta channel count.
+    pub channels: u32,
+}
+
+/// Run a scheduled filter over its region (already sliced by the caller).
+pub(super) fn apply_pending(filter: &PendingFilter, region: &mut [u8]) -> Result<(), Error> {
+    match filter.program {
+        StdProgram::Delta => {
+            if filter.channels == 0 || filter.channels as usize > region.len() {
+                // Channel count is supplied by the stream (register 0);
+                // 0 channels is meaningless and more channels than bytes
+                // means most planes are empty — real encoders produce
+                // neither.
+                return Err(Error::Corrupt);
+            }
+            delta_decode(filter.channels as usize, region);
+        }
+        StdProgram::X86Call => x86_e8_decode(filter.start, region, false),
+        StdProgram::X86CallJmp => x86_e8_decode(filter.start, region, true),
+    }
+    Ok(())
+}
 
 /// Apply the E8/E9 (x86 near-call) translation filter to `data` in place.
 ///
