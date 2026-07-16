@@ -100,12 +100,24 @@ fn apply_e8(start: u64, buf: &mut [u8], extended: bool) -> Result<(), Error> {
         // Libarchive: the offset is computed *after* the opcode byte has
         // been consumed, so the relevant absolute position is start + i + 1.
         let off = ((start + i as u64 + 1) as u32) & (FILE_SIZE - 1);
-        // RAR5 transform: if the high bit of `rel` is set and the high bit
-        // of `(rel + off)` is clear, add FILE_SIZE; else if the high bit of
-        // `(rel - FILE_SIZE)` is set, subtract `off`. Otherwise leave alone.
-        // This mirrors the libarchive description verbatim.
-        let new = if (rel & 0x8000_0000) != 0 && (rel.wrapping_add(off) & 0x8000_0000) == 0 {
-            rel.wrapping_add(FILE_SIZE)
+        // RAR5 transform, decode direction. The two range checks are
+        // NESTED on the sign of `rel`, exactly as in unrar/libarchive:
+        //
+        //   if (addr < 0)          { if (addr + off >= 0)   addr += FILE_SIZE; }
+        //   else                   { if (addr < FILE_SIZE)  addr -= off;       }
+        //
+        // Flattening the second check into an `else if` is a bug: a
+        // negative `rel` that stays negative after adding `off` (a byte
+        // pattern the encoder never rewrote — e.g. a stray 0xE8 inside a
+        // ModRM/displacement sequence followed by high bytes) also passes
+        // `(rel - FILE_SIZE) & 0x8000_0000 != 0` and would be wrongly
+        // rewritten, corrupting real x86 code on decode.
+        let new = if (rel & 0x8000_0000) != 0 {
+            if (rel.wrapping_add(off) & 0x8000_0000) == 0 {
+                rel.wrapping_add(FILE_SIZE)
+            } else {
+                rel
+            }
         } else if (rel.wrapping_sub(FILE_SIZE) & 0x8000_0000) != 0 {
             rel.wrapping_sub(off)
         } else {
@@ -155,6 +167,66 @@ mod tests {
         let original = buf.clone();
         let f = Filter {
             start: 0,
+            length: buf.len() as u32,
+            kind: FilterKind::X86Call,
+        };
+        apply(&f, &mut buf).unwrap();
+        assert_eq!(buf, original);
+    }
+
+    /// Regression: a "false positive" E8 byte (ModRM/displacement bytes in
+    /// real x86 code, not a CALL opcode) followed by an operand whose signed
+    /// value is negative and stays negative after adding the position must
+    /// be left alone — unrar's filter only adds FILE_SIZE when the sum goes
+    /// non-negative, and only subtracts the position from values in
+    /// `0..FILE_SIZE`. Case taken verbatim from a WinRAR 7.23 archive of
+    /// notepad.exe's first 32 KiB: at offset 5496 the byte 0xE8 (part of
+    /// `mov rcx,[rsp+...]` encoding, not a call) is followed by the operand
+    /// 0xCC000006; the buggy flat `else if` subtracted the position and
+    /// corrupted the output (48 bytes across 15 sites in one 32 KiB slice).
+    #[test]
+    fn e8_filter_leaves_negative_out_of_range_operand_alone() {
+        // E8 at index 0, start chosen so off = 5497 (the real archive's
+        // position), operand 0xCC000006 little-endian.
+        let mut buf = alloc::vec![0xE8, 0x06, 0x00, 0x00, 0xCC, 0x90, 0x90];
+        let original = buf.clone();
+        let f = Filter {
+            start: 5496,
+            length: buf.len() as u32,
+            kind: FilterKind::X86Call,
+        };
+        apply(&f, &mut buf).unwrap();
+        assert_eq!(
+            buf, original,
+            "negative out-of-range operand must not be rewritten"
+        );
+    }
+
+    /// The companion positive case: a negative operand that becomes
+    /// non-negative when the position is added IS rewritten (+FILE_SIZE).
+    #[test]
+    fn e8_filter_wraps_negative_in_range_operand() {
+        // rel = -16 (0xFFFFFFF0), off = 0x20 -> rel + off = 0x10 >= 0,
+        // so the decoder adds FILE_SIZE.
+        let mut buf = alloc::vec![0xE8, 0xF0, 0xFF, 0xFF, 0xFF, 0x90, 0x90];
+        let f = Filter {
+            start: 0x1F, // off = start + 0 + 1 = 0x20
+            length: buf.len() as u32,
+            kind: FilterKind::X86Call,
+        };
+        apply(&f, &mut buf).unwrap();
+        let expected = 0xFFFF_FFF0u32.wrapping_add(0x0100_0000).to_le_bytes();
+        assert_eq!(&buf[1..5], &expected);
+    }
+
+    /// A non-negative operand at or above FILE_SIZE is also left alone.
+    #[test]
+    fn e8_filter_leaves_large_positive_operand_alone() {
+        // rel = 0x01000000 == FILE_SIZE: not in 0..FILE_SIZE, untouched.
+        let mut buf = alloc::vec![0xE8, 0x00, 0x00, 0x00, 0x01, 0x90, 0x90];
+        let original = buf.clone();
+        let f = Filter {
+            start: 100,
             length: buf.len() as u32,
             kind: FilterKind::X86Call,
         };
