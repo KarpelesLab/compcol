@@ -96,6 +96,15 @@ impl<'a> RangeDec<'a> {
         self.pos > self.input.len()
     }
 
+    /// Byte position in the input the decoder has consumed up to (including
+    /// the init bytes and any normalisation look-ahead). RAR3 resumes its
+    /// bit-domain block headers at this offset when a PPMd block ends.
+    #[inline]
+    #[cfg_attr(not(feature = "rar3"), allow(dead_code))]
+    pub(crate) fn pos(&self) -> usize {
+        self.pos.min(self.input.len())
+    }
+
     #[inline]
     fn read_byte(&mut self) -> u8 {
         let b = self.input.get(self.pos).copied().unwrap_or(0);
