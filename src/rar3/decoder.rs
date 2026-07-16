@@ -21,6 +21,10 @@
 //!   the full match-length / offset machinery.
 //! - The keep-table flag — successive blocks may reuse the previous code
 //!   lengths.
+//! - **In-band standard filters** (main symbol 257): Delta and x86
+//!   E8/E8E9 declarations are recognized by their bytecode fingerprint and
+//!   run natively over their declared output windows — see
+//!   `super::filters` for the recognition scheme and provenance.
 //! - The standalone E8/E9 post-pass filter when enabled via
 //!   [`Decoder::with_e8_filter`].
 //!
@@ -30,9 +34,10 @@
 //!   ~1500-line context-mixed arithmetic coder; implementing it faithfully
 //!   is out of scope for this build. Streams containing a PPMd block fail
 //!   with `Error::Unsupported`.
-//! - **In-band VM filter declarations** (main symbols 257..=261 that emit
-//!   bytecode for the RarVM interpreter). These also fail with
-//!   `Error::Unsupported`. The standalone E8/E9 filter remains available.
+//! - **Filter declarations carrying any other VM program** (custom
+//!   bytecode, or legacy standard programs no current archiver emits —
+//!   Itanium, RGB, the audio predictor). These fail with
+//!   `Error::Unsupported` rather than interpreting RarVM bytecode.
 //! - **Dictionary sizes** other than the default 4 MiB. Streams compressed
 //!   with smaller dictionaries decode correctly with the larger window —
 //!   the larger window doesn't change semantics.
@@ -45,7 +50,9 @@ use crate::error::Error;
 use crate::traits::{RawDecoder, RawProgress};
 
 use super::bits::BitReader;
-use super::filters::apply_e8_filter;
+use super::filters::{
+    PendingFilter, StdProgram, apply_e8_filter, apply_pending, recognize_program,
+};
 use super::huffman::Huffman;
 use super::tables::{
     DICT_DEFAULT_SIZE, HUFF_TABLE_SIZE, LENGTH_BASE, LENGTH_EXTRA_BITS, LENGTH_SIZE,
@@ -261,6 +268,9 @@ fn run_decode(
         },
         window_pos: 0,
         unpack_size,
+        programs: Vec::new(),
+        last_filter_slot: 0,
+        pending_filters: Vec::new(),
     });
 
     // The decoder starts by parsing the first block header.
@@ -268,6 +278,21 @@ fn run_decode(
     expand(&mut ctx)?;
 
     let mut out = core::mem::take(&mut ctx.out);
+
+    // Run the in-band filters over their declared windows, in declaration
+    // order (well-formed streams declare filters in ascending window order,
+    // since each start is relative to the output position at declaration).
+    // A window the stream never finished producing is dropped, matching
+    // unrar, which only executes a filter once its full block has been
+    // decoded.
+    for f in &ctx.pending_filters {
+        let end = f.start.saturating_add(f.length as u64);
+        if end > out.len() as u64 {
+            continue;
+        }
+        apply_pending(f, &mut out[f.start as usize..end as usize])?;
+    }
+
     if e8_enabled {
         apply_e8_filter(&mut out, 0, e8_translate_e9);
     }
@@ -301,6 +326,22 @@ struct RunCtx {
     wmask: usize,
     window_pos: usize,
     unpack_size: u64,
+    /// RarVM program slots declared so far (recognized standard programs
+    /// only) with the per-slot remembered block length — a declaration may
+    /// omit the length and reuse the slot's previous one.
+    programs: Vec<ProgramSlot>,
+    /// Slot used by the most recent declaration; a declaration without an
+    /// explicit slot field reuses it.
+    last_filter_slot: usize,
+    /// Scheduled filter instances, applied over the finished output.
+    pending_filters: Vec<PendingFilter>,
+}
+
+/// A declared filter program plus its per-slot remembered block length.
+#[derive(Debug, Clone, Copy)]
+struct ProgramSlot {
+    program: StdProgram,
+    last_block_length: u32,
 }
 
 impl RunCtx {
@@ -537,8 +578,10 @@ fn expand(ctx: &mut RunCtx) -> Result<(), Error> {
                 }
             }
             257 => {
-                // Filter program declaration — refuse.
-                return Err(Error::Unsupported);
+                // Filter declaration: a standard-program instance gets
+                // scheduled over a window of upcoming output; anything we
+                // can't run natively fails the stream (inside the parser).
+                read_filter_declaration(ctx)?;
             }
             258 => {
                 // Repeat last (offset, length).
@@ -662,6 +705,185 @@ fn expand(ctx: &mut RunCtx) -> Result<(), Error> {
     }
 }
 
+// ─── In-band filter declarations (main symbol 257) ──────────────────────
+
+/// Upper bound on a filter's block length, derived from the RarVM memory
+/// the standard programs operate in (0x40000 bytes, of which 0x3C000 lie
+/// below the global-data area). Delta needs separate source and
+/// destination halves, so its windows are capped at half that. Real
+/// encoders stay far below both caps and split large regions into several
+/// filter blocks.
+const FILTER_MAX_BLOCK: u32 = 0x3C000;
+const FILTER_MAX_BLOCK_DELTA: u32 = 0x1E000;
+
+/// Read a RarVM variable-length number: a 2-bit tag selects a 4-, 8-
+/// (with a sign-extension-style escape for values below 16), 16- or 32-bit
+/// payload.
+fn read_vm_number(bits: &mut BitReader) -> Result<u32, Error> {
+    Ok(match bits.read_bits(2)? {
+        0 => bits.read_bits(4)?,
+        1 => {
+            let v = bits.read_bits(8)?;
+            if v >= 16 {
+                v
+            } else {
+                0xFFFF_FF00 | (v << 4) | bits.read_bits(4)?
+            }
+        }
+        2 => bits.read_bits(16)?,
+        _ => bits.read_bits(32)?,
+    })
+}
+
+/// Parse the declaration that follows main symbol 257 and schedule the
+/// filter it describes.
+///
+/// Wire layout (validated bit-exact against rar 6.24 archives; see the
+/// module docs in `filters.rs` for provenance): an 8-bit flags byte and a
+/// 1/2/3-byte length field are read from the main bitstream, then `length`
+/// payload bytes (8 bits each, unaligned). The payload forms its own
+/// MSB-first bit domain containing, in order:
+///
+/// 1. flags bit 7: a program-slot number (RarVM number; 0 resets all
+///    declared programs and selects slot 0, n>0 selects slot n-1). Absent →
+///    reuse the most recent slot.
+/// 2. Window start relative to the current output position (RarVM number;
+///    flags bit 6 adds 258).
+/// 3. flags bit 5: explicit window length (RarVM number). Absent → the
+///    slot's remembered length.
+/// 4. flags bit 4: a 7-bit register mask followed by a RarVM number per set
+///    bit (registers r0..r6; Delta receives its channel count in r0).
+/// 5. For a first-use slot: bytecode as a RarVM number length plus that
+///    many bytes, the first being an XOR checksum of the rest.
+/// 6. flags bit 3: trailing global data — not needed by any standard
+///    program, ignored here.
+fn read_filter_declaration(ctx: &mut RunCtx) -> Result<(), Error> {
+    let flags = ctx.bits.read_bits(8)?;
+    let mut decl_len = (flags & 0x07) + 1;
+    if decl_len == 7 {
+        decl_len = ctx.bits.read_bits(8)? + 7;
+    } else if decl_len == 8 {
+        decl_len = ctx.bits.read_bits(16)?;
+    }
+    if decl_len == 0 {
+        return Err(Error::Corrupt);
+    }
+    let mut payload = vec![0u8; decl_len as usize];
+    for b in payload.iter_mut() {
+        *b = ctx.bits.read_bits(8)? as u8;
+    }
+    // The payload is its own bit domain; running out of payload bits means
+    // the declaration is malformed, not that the caller should feed more
+    // input, so map UnexpectedEnd to Corrupt.
+    let mut db = BitReader::new();
+    db.feed_slice(&payload);
+    parse_declaration_payload(ctx, flags, &mut db).map_err(|e| match e {
+        Error::UnexpectedEnd => Error::Corrupt,
+        other => other,
+    })
+}
+
+fn parse_declaration_payload(
+    ctx: &mut RunCtx,
+    flags: u32,
+    db: &mut BitReader,
+) -> Result<(), Error> {
+    let slot = if flags & 0x80 != 0 {
+        let v = read_vm_number(db)?;
+        if v == 0 {
+            // Full reset: forget all declared programs (and anything
+            // scheduled against them that hasn't completed).
+            ctx.programs.clear();
+            0
+        } else {
+            (v - 1) as usize
+        }
+    } else {
+        ctx.last_filter_slot
+    };
+    // A slot may reference an existing program or append exactly one new
+    // one; skipping ahead is malformed.
+    if slot > ctx.programs.len() {
+        return Err(Error::Corrupt);
+    }
+    ctx.last_filter_slot = slot;
+
+    let mut start = read_vm_number(db)? as u64;
+    if flags & 0x40 != 0 {
+        start += 258;
+    }
+    let start = ctx.out.len() as u64 + start;
+
+    let explicit_length = if flags & 0x20 != 0 {
+        Some(read_vm_number(db)?)
+    } else {
+        None
+    };
+
+    // Registers r0..r6. Only r0 matters to the standard transforms (Delta's
+    // channel count), but all present values must be consumed to stay in
+    // sync with the fields that follow.
+    let mut r0 = 0u32;
+    if flags & 0x10 != 0 {
+        let mask = db.read_bits(7)?;
+        for r in 0..7 {
+            if mask & (1 << r) != 0 {
+                let v = read_vm_number(db)?;
+                if r == 0 {
+                    r0 = v;
+                }
+            }
+        }
+    }
+
+    if slot == ctx.programs.len() {
+        // First use of this slot: bytecode follows.
+        let code_len = read_vm_number(db)?;
+        if code_len == 0 || code_len >= 0x1_0000 {
+            return Err(Error::Corrupt);
+        }
+        let mut code = vec![0u8; code_len as usize];
+        for b in code.iter_mut() {
+            *b = db.read_bits(8)? as u8;
+        }
+        // The first bytecode byte is an XOR checksum of the rest.
+        let checksum = code[1..].iter().fold(0u8, |acc, &b| acc ^ b);
+        if checksum != code[0] {
+            return Err(Error::Corrupt);
+        }
+        let program = recognize_program(&code).ok_or(Error::Unsupported)?;
+        ctx.programs.push(ProgramSlot {
+            program,
+            last_block_length: 0,
+        });
+    }
+    // (flags bit 3: global data would follow here; no standard program
+    // reads it, so it stays unparsed — the payload is self-contained.)
+
+    let length = explicit_length.unwrap_or(ctx.programs[slot].last_block_length);
+    ctx.programs[slot].last_block_length = length;
+    if length == 0 {
+        // A zero-length window is a no-op declaration.
+        return Ok(());
+    }
+    let program = ctx.programs[slot].program;
+    let cap = if program == StdProgram::Delta {
+        FILTER_MAX_BLOCK_DELTA
+    } else {
+        FILTER_MAX_BLOCK
+    };
+    if length > cap {
+        return Err(Error::Corrupt);
+    }
+    ctx.pending_filters.push(PendingFilter {
+        start,
+        length,
+        program,
+        channels: r0,
+    });
+    Ok(())
+}
+
 /// Promote the offset at `idx` (in the rolling buffer) to position 0,
 /// shifting everything above it down. Used by symbols 259..=262.
 fn promote_offset(ctx: &mut RunCtx, idx: usize, offs: u32) {
@@ -680,6 +902,179 @@ mod tests {
     use crate::traits::Decoder as _;
     extern crate std;
     use std::vec;
+
+    /// MSB-first bit writer used to hand-build declaration payloads.
+    struct BitWriter {
+        bytes: std::vec::Vec<u8>,
+        nbits: u32,
+    }
+    impl BitWriter {
+        fn new() -> Self {
+            Self {
+                bytes: std::vec::Vec::new(),
+                nbits: 0,
+            }
+        }
+        fn push(&mut self, value: u32, n: u32) {
+            for i in (0..n).rev() {
+                let bit = ((value >> i) & 1) as u8;
+                if self.nbits.is_multiple_of(8) {
+                    self.bytes.push(0);
+                }
+                let last = self.bytes.len() - 1;
+                self.bytes[last] |= bit << (7 - (self.nbits % 8));
+                self.nbits += 1;
+            }
+        }
+        /// Push a value in RarVM variable-number encoding (shortest form).
+        fn push_vm_number(&mut self, v: u32) {
+            if v < 16 {
+                self.push(0, 2);
+                self.push(v, 4);
+            } else if v < 256 {
+                self.push(1, 2);
+                self.push(v, 8);
+            } else if v < 0x1_0000 {
+                self.push(2, 2);
+                self.push(v, 16);
+            } else {
+                self.push(3, 2);
+                self.push(v, 32);
+            }
+        }
+    }
+
+    fn test_ctx() -> RunCtx {
+        RunCtx {
+            bits: BitReader::new(),
+            lengths: vec![],
+            main: None,
+            offset: None,
+            low_offset: None,
+            length: None,
+            old_offsets: [1, 1, 1, 1],
+            last_offset: 0,
+            last_length: 0,
+            last_low_offset: 0,
+            num_low_offset_repeats: 0,
+            out: vec![],
+            window: vec![0u8; 16],
+            wmask: 15,
+            window_pos: 0,
+            unpack_size: 0,
+            programs: vec![],
+            last_filter_slot: 0,
+            pending_filters: vec![],
+        }
+    }
+
+    #[test]
+    fn vm_number_all_tag_widths() {
+        let mut w = BitWriter::new();
+        w.push_vm_number(9); // tag 0, 4-bit
+        w.push_vm_number(200); // tag 1, 8-bit (>= 16)
+        w.push_vm_number(0x1234); // tag 2, 16-bit
+        w.push_vm_number(0x0102_0304); // tag 3, 32-bit
+        // tag 1 with an 8-bit value below 16: extends to 0xFFFFFF00-form.
+        w.push(1, 2);
+        w.push(5, 8);
+        w.push(0xA, 4);
+        let mut r = BitReader::new();
+        r.feed_slice(&w.bytes);
+        assert_eq!(read_vm_number(&mut r).unwrap(), 9);
+        assert_eq!(read_vm_number(&mut r).unwrap(), 200);
+        assert_eq!(read_vm_number(&mut r).unwrap(), 0x1234);
+        assert_eq!(read_vm_number(&mut r).unwrap(), 0x0102_0304);
+        assert_eq!(read_vm_number(&mut r).unwrap(), 0xFFFF_FF5A);
+    }
+
+    /// Build the payload of a declaration introducing a fresh program.
+    /// `code` must carry a valid XOR checksum byte already.
+    fn new_program_payload(block_start: u32, block_len: u32, code: &[u8]) -> std::vec::Vec<u8> {
+        let mut w = BitWriter::new();
+        w.push_vm_number(0); // slot field: reset-all + slot 0
+        w.push_vm_number(block_start);
+        w.push_vm_number(block_len);
+        w.push_vm_number(code.len() as u32);
+        for &b in code {
+            w.push(b as u32, 8);
+        }
+        w.bytes
+    }
+
+    /// Wrap arbitrary bytecode with its XOR checksum byte.
+    fn with_checksum(body: &[u8]) -> std::vec::Vec<u8> {
+        let mut code = std::vec::Vec::with_capacity(body.len() + 1);
+        code.push(body.iter().fold(0u8, |a, &b| a ^ b));
+        code.extend_from_slice(body);
+        code
+    }
+
+    #[test]
+    fn unknown_program_is_unsupported() {
+        // Valid declaration framing around bytecode we don't recognize
+        // (flags: slot present + explicit length = 0xA0).
+        let code = with_checksum(&[0x12, 0x34, 0x56, 0x78]);
+        let payload = new_program_payload(0, 64, &code);
+        let mut ctx = test_ctx();
+        let mut db = BitReader::new();
+        db.feed_slice(&payload);
+        assert_eq!(
+            parse_declaration_payload(&mut ctx, 0xA0, &mut db),
+            Err(Error::Unsupported)
+        );
+    }
+
+    #[test]
+    fn bad_bytecode_checksum_is_corrupt() {
+        let mut code = with_checksum(&[0x12, 0x34]);
+        code[0] ^= 0xFF; // break the checksum
+        let payload = new_program_payload(0, 64, &code);
+        let mut ctx = test_ctx();
+        let mut db = BitReader::new();
+        db.feed_slice(&payload);
+        assert_eq!(
+            parse_declaration_payload(&mut ctx, 0xA0, &mut db),
+            Err(Error::Corrupt)
+        );
+    }
+
+    #[test]
+    fn slot_skipping_ahead_is_corrupt() {
+        // Slot field 3 => slot index 2 with no programs declared.
+        let mut w = BitWriter::new();
+        w.push_vm_number(3);
+        let mut ctx = test_ctx();
+        let mut db = BitReader::new();
+        db.feed_slice(&w.bytes);
+        assert_eq!(
+            parse_declaration_payload(&mut ctx, 0x80, &mut db),
+            Err(Error::Corrupt)
+        );
+    }
+
+    #[test]
+    fn truncated_main_stream_mid_declaration_is_unexpected_end() {
+        // flags byte 0x86 declares (6&7)+1 = 7 → an extra 8-bit length
+        // field must follow, but the stream ends first.
+        let mut ctx = test_ctx();
+        ctx.bits.feed_slice(&[0x86]);
+        assert!(matches!(
+            read_filter_declaration(&mut ctx),
+            Err(Error::UnexpectedEnd)
+        ));
+    }
+
+    #[test]
+    fn payload_bits_running_out_is_corrupt() {
+        // flags 0xA0, decl_len 1, payload [0xFF]: the slot field's 2-bit
+        // tag reads 0b11 → a 32-bit number that the 1-byte payload can't
+        // hold. Inside the payload's own bit domain that's a malformed
+        // declaration, so the wrapper maps it to Corrupt.
+        let mut ctx = test_ctx();
+        ctx.bits.feed_slice(&[0xA0, 0xFF]);
+        assert_eq!(read_filter_declaration(&mut ctx), Err(Error::Corrupt));
+    }
 
     #[test]
     fn unpack_size_zero_is_immediate_done() {
@@ -710,6 +1105,9 @@ mod tests {
             wmask: 15,
             window_pos: 0,
             unpack_size: 0,
+            programs: vec![],
+            last_filter_slot: 0,
+            pending_filters: vec![],
         };
         // Promote slot 2 (value 30) — result should be [30, 10, 20, 40].
         promote_offset(&mut ctx, 2, 30);

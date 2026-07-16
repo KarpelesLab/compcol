@@ -287,6 +287,75 @@ fn decoder_with_e8_filter_round_trip_on_synthetic_data() {
     assert_eq!(out, TESTDIR_TEST_TXT_EXPECTED);
 }
 
+// ─── In-band standard filters (real-archive fixtures) ────────────────────
+//
+// Payloads lifted out of archives created with RARLAB `rar` 6.24 (the last
+// encoder able to write RAR4) over synthetic content: the fixture bytes are
+// exactly what follows the RAR4 file header. The expected CRC-32 is the
+// archive's own FILE_CRC header field (CRC-32 of the uncompressed file,
+// written by the encoder); extraction was additionally cross-checked
+// byte-identical against WinRAR `UnRAR.exe` 7.23 by the differential
+// harness. Each stream opens with a main-symbol-257 declaration carrying a
+// standard RarVM program that the decoder must recognize and run natively.
+
+/// gradient.bmp — Delta filter, 3 channels, window 49152 of 49206 bytes.
+static FILTER_DELTA_BMP: &[u8] = include_bytes!("fixtures/rar3/filter_delta_gradient_bmp.bin");
+/// ramp.wav — Delta filter, 2 channels (rar 6.24 uses Delta for WAV, not
+/// the legacy audio predictor), window 16384 of 16428 bytes.
+static FILTER_DELTA_WAV: &[u8] = include_bytes!("fixtures/rar3/filter_delta_ramp_wav.bin");
+/// calls.bin at -m5 — Delta filter, 12 channels.
+static FILTER_DELTA12_CALLS: &[u8] = include_bytes!("fixtures/rar3/m5_calls_delta12.bin");
+/// x86slice.bin — x86 E8 (call-only) filter over the whole 32 KiB.
+static FILTER_X86_SLICE: &[u8] = include_bytes!("fixtures/rar3/filter_x86_slice.bin");
+
+/// Bitwise CRC-32 (IEEE, reflected 0xEDB88320) — small and table-free;
+/// test-only, so speed is irrelevant.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn decode_and_check_crc(block: &[u8], unpack_size: u64, want_crc: u32) -> Vec<u8> {
+    let out = decode_full(block, unpack_size);
+    assert_eq!(out.len() as u64, unpack_size, "unpacked size mismatch");
+    assert_eq!(
+        crc32(&out),
+        want_crc,
+        "decoded bytes differ from the archive's FILE_CRC"
+    );
+    out
+}
+
+#[test]
+fn inband_delta_filter_bmp_three_channels() {
+    let out = decode_and_check_crc(FILTER_DELTA_BMP, 49206, 0x2347_E5ED);
+    // Spot-check: it really is the bitmap (BMP magic survives filtering).
+    assert_eq!(&out[..2], b"BM");
+}
+
+#[test]
+fn inband_delta_filter_wav_two_channels() {
+    let out = decode_and_check_crc(FILTER_DELTA_WAV, 16428, 0x0E8F_2810);
+    assert_eq!(&out[..4], b"RIFF");
+}
+
+#[test]
+fn inband_delta_filter_twelve_channels() {
+    decode_and_check_crc(FILTER_DELTA12_CALLS, 6146, 0x6C08_D7DF);
+}
+
+#[test]
+fn inband_x86_e8_filter() {
+    decode_and_check_crc(FILTER_X86_SLICE, 32768, 0x6188_0029);
+}
+
 // ─── factory (only if compiled in) ───────────────────────────────────────
 
 #[cfg(feature = "factory")]

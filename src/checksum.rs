@@ -57,13 +57,13 @@ impl Default for Adler32 {
 
 /// IEEE / gzip CRC-32. Polynomial `0xEDB88320` (reflected), initial value
 /// `0xFFFFFFFF`, final XOR `0xFFFFFFFF`.
-#[cfg(any(feature = "gzip", test))]
+#[cfg(any(feature = "gzip", feature = "rar3", test))]
 #[derive(Debug, Clone, Copy)]
 pub struct Crc32 {
     state: u32,
 }
 
-#[cfg(any(feature = "gzip", test))]
+#[cfg(any(feature = "gzip", feature = "rar3", test))]
 impl Crc32 {
     pub const fn new() -> Self {
         Self { state: 0xFFFF_FFFF }
@@ -102,12 +102,15 @@ impl Crc32 {
         self.state ^ 0xFFFF_FFFF
     }
 
+    /// Only the gzip codec re-arms a CRC mid-stream; rar3's filter
+    /// recognition uses one-shot instances.
+    #[cfg(any(feature = "gzip", test))]
     pub fn reset(&mut self) {
         *self = Self::new();
     }
 }
 
-#[cfg(any(feature = "gzip", test))]
+#[cfg(any(feature = "gzip", feature = "rar3", test))]
 impl Default for Crc32 {
     fn default() -> Self {
         Self::new()
@@ -118,7 +121,7 @@ impl Default for Crc32 {
 /// standard 256-entry CRC-32 table; `CRC32_TABLE8[n]` for `n >= 1` advances
 /// the CRC by an extra byte position, so eight bytes can be folded per
 /// iteration. See Intel's "Slicing-by-8" technique.
-#[cfg(any(feature = "gzip", test))]
+#[cfg(any(feature = "gzip", feature = "rar3", test))]
 const CRC32_TABLE8: [[u32; 256]; 8] = {
     let mut tables = [[0u32; 256]; 8];
 
