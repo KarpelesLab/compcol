@@ -352,6 +352,9 @@ impl RawDecoder for Decoder {
         self.pending_filters.clear();
         self.ready.clear();
         self.out_queue_start = 0;
+        // A reset starts an unrelated stream: stale solid-group boundaries
+        // would skew every later x86 filter's position base.
+        self.file_boundaries.clear();
     }
 }
 

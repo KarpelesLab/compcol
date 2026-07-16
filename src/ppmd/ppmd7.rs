@@ -343,22 +343,28 @@ impl Ppmd7 {
         self.pu16(s + 4, ((v >> 16) & 0xFFFF) as u16);
     }
 
-    /// Copy state `src` onto state `dst` (6 bytes).
+    /// Copy state `src` onto state `dst` (6 bytes) — one range check, one
+    /// block copy, like [`Ppmd7::copy_units`] (rescale's insertion sort
+    /// calls this in a loop).
     #[inline]
     fn st_copy(&mut self, dst: u32, src: u32) {
-        for i in 0..6 {
-            let b = self.gu8(src + i);
-            self.pu8(dst + i, b);
+        let (d, s) = (dst as usize, src as usize);
+        if d + 6 <= self.base.len() && s + 6 <= self.base.len() {
+            self.base.copy_within(s..s + 6, d);
+        } else {
+            self.err = true;
         }
     }
     /// Swap two 6-byte states.
     #[inline]
     fn st_swap(&mut self, a: u32, b: u32) {
-        for i in 0..6 {
-            let x = self.gu8(a + i);
-            let y = self.gu8(b + i);
-            self.pu8(a + i, y);
-            self.pu8(b + i, x);
+        let (a, b) = (a as usize, b as usize);
+        if a + 6 <= self.base.len() && b + 6 <= self.base.len() {
+            for i in 0..6 {
+                self.base.swap(a + i, b + i);
+            }
+        } else {
+            self.err = true;
         }
     }
 
@@ -1094,9 +1100,20 @@ impl Ppmd7 {
     /// Decode one byte symbol. `Err(Corrupt)` on model/stream inconsistency
     /// (the reference's `-1`/`-2` returns) or arena OOB.
     pub(crate) fn decode_symbol(&mut self, rc: &mut RangeDec) -> Result<u8, Error> {
-        let mut char_mask = [0u8; 256];
+        // Initialised on entry to the escape path; the fast paths below
+        // return without ever reading it.
+        let mut char_mask: [u8; 256];
 
-        if self.ctx_num_stats(self.min_context) != 1 {
+        // `num_stats` is a raw arena u16: a context ref that has been
+        // corrupted (or dangles into freed/zeroed arena) can present 0 or
+        // an impossible count (> 256 — the alphabet is bytes). Both would
+        // wrap the `- 1` walks below; fail closed instead.
+        let root_stats = self.ctx_num_stats(self.min_context);
+        if root_stats == 0 || root_stats > 256 {
+            return Err(Error::Corrupt);
+        }
+
+        if root_stats != 1 {
             let mut s = self.ctx_stats(self.min_context);
             let count = rc.get_threshold(self.ctx_summ_freq(self.min_context));
             let mut hi_cnt = self.st_freq(s) as u32;
@@ -1130,9 +1147,7 @@ impl Ppmd7 {
             }
             self.hi_bits_flag = self.hb2flag[self.st_symbol(self.found_state) as usize] as u32;
             rc.decode(hi_cnt, self.ctx_summ_freq(self.min_context) - hi_cnt);
-            for m in char_mask.iter_mut() {
-                *m = 0xFF;
-            }
+            char_mask = [0xFF; 256];
             char_mask[self.st_symbol(s) as usize] = 0;
             let mut i = self.ctx_num_stats(self.min_context) - 1;
             while i != 0 {
@@ -1158,15 +1173,14 @@ impl Ppmd7 {
             let newp = prob - get_mean(prob);
             self.bin_summ[row][col] = newp as u16;
             self.init_esc = K_EXP_ESCAPE[(newp >> 10) as usize & 0xF] as u32;
-            for m in char_mask.iter_mut() {
-                *m = 0xFF;
-            }
+            char_mask = [0xFF; 256];
             let os = Self::one_state(self.min_context);
             char_mask[self.st_symbol(os) as usize] = 0;
             self.prev_success = 0;
         }
 
         // Escape loop.
+        let mut ps: [u32; 256] = [0; 256];
         loop {
             if self.err || rc.err() {
                 return Err(Error::Corrupt);
@@ -1185,8 +1199,16 @@ impl Ppmd7 {
             }
             let mut hi_cnt = 0u32;
             let mut s = self.ctx_stats(self.min_context);
-            let num = self.ctx_num_stats(self.min_context) - num_masked;
-            let mut ps: [u32; 256] = [0; 256];
+            // In a consistent model a suffix context is a superset of its
+            // children, so its `num_stats` exceeds the masked count and
+            // never tops 256 (byte alphabet). A corrupt tree can violate
+            // both; the subtraction would wrap and the `ps` walk below
+            // would run past the array. Fail closed.
+            let cur_stats = self.ctx_num_stats(self.min_context);
+            if cur_stats <= num_masked || cur_stats > 256 {
+                return Err(Error::Corrupt);
+            }
+            let num = cur_stats - num_masked;
             let mut i = 0usize;
             loop {
                 let sym = self.st_symbol(s) as usize;

@@ -247,6 +247,20 @@ fn header_bad_restoration_is_bad_header() {
     assert_eq!(dec.finish(&mut buf), Err(Error::BadHeader));
 }
 
+/// A hostile stream with an obviously invalid header must be rejected as
+/// soon as the 11 header bytes have arrived — from `decode` itself — not
+/// after the caller has piped (and the decoder buffered) the whole payload.
+#[test]
+fn bad_header_is_rejected_at_decode_time() {
+    let mut bad = make_header(0, 16, 0, 100); // order 0: invalid
+    bad.extend_from_slice(&[0u8; 64]);
+    let mut dec = Decoder::new();
+    let mut buf = [0u8; 16];
+    assert_eq!(dec.decode(&bad, &mut buf).unwrap_err(), Error::BadHeader);
+    // The error is sticky and stays the same across calls.
+    assert_eq!(dec.finish(&mut buf), Err(Error::BadHeader));
+}
+
 #[test]
 fn unknown_declared_length_is_refused() {
     // PPMd has no in-band end-of-stream marker, so a stream framed with the

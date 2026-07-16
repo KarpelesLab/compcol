@@ -34,8 +34,49 @@ pub struct Decoder {
     decoded: Vec<u8>,
     decoded_idx: usize,
     started: bool,
+    header_checked: bool,
     finished_decode: bool,
-    poisoned: bool,
+    /// Set on the first irrecoverable error; every later call re-reports
+    /// the same error (so an early header rejection in `decode` reads the
+    /// same from a follow-up `finish`).
+    poisoned: Option<Error>,
+}
+
+/// Validate the 11-byte framing header, returning the declared unpacked
+/// length. Called from `raw_decode` as soon as 11 bytes have been buffered
+/// (so a hostile stream with a bad header is rejected immediately instead
+/// of after buffering its whole payload) and again from `run_decode`.
+fn validate_header(h: &[u8]) -> Result<u64, Error> {
+    let order = h[0] as u32;
+    let mem_mb = h[1] as u32;
+    let restoration = h[2];
+    if !(2..=64).contains(&order) {
+        return Err(Error::BadHeader);
+    }
+    if !(1..=255).contains(&mem_mb) {
+        return Err(Error::BadHeader);
+    }
+    if restoration > 2 {
+        return Err(Error::BadHeader);
+    }
+    let expected_len = u64::from_le_bytes(h[3..11].try_into().unwrap());
+    // PPMd carries no in-band end-of-stream marker, so a stream whose
+    // header declares an unknown length has no reliable terminal
+    // condition: after the true last symbol the range coder's finalisation
+    // bytes keep decoding into extra (garbage) symbols, and exhausting the
+    // physical input is not an end signal (a high-probability symbol
+    // decodes without consuming any input). Refuse rather than emit a
+    // guess.
+    if expected_len == UNKNOWN_LEN {
+        return Err(Error::Unsupported);
+    }
+    // A declared length larger than the buffer-then-decode ceiling can't
+    // be produced here; reject it up front rather than growing the output
+    // toward OOM.
+    if expected_len > MAX_OUTPUT as u64 {
+        return Err(Error::OutputLimitExceeded);
+    }
+    Ok(expected_len)
 }
 
 impl Decoder {
@@ -45,13 +86,14 @@ impl Decoder {
             decoded: Vec::new(),
             decoded_idx: 0,
             started: false,
+            header_checked: false,
             finished_decode: false,
-            poisoned: false,
+            poisoned: None,
         }
     }
 
     fn poison(&mut self, e: Error) -> Error {
-        self.poisoned = true;
+        self.poisoned = Some(e);
         e
     }
 
@@ -63,17 +105,7 @@ impl Decoder {
         let h = &self.in_buf[..HEADER_LEN];
         let order = h[0] as u32;
         let mem_mb = h[1] as u32;
-        let restoration = h[2];
-        if !(2..=64).contains(&order) {
-            return Err(Error::BadHeader);
-        }
-        if !(1..=255).contains(&mem_mb) {
-            return Err(Error::BadHeader);
-        }
-        if restoration > 2 {
-            return Err(Error::BadHeader);
-        }
-        let expected_len = u64::from_le_bytes(h[3..11].try_into().unwrap());
+        let expected_len = validate_header(h)?;
 
         let mem_bytes = mem_mb.saturating_mul(1024 * 1024);
         let mut model = Ppmd7::new(mem_bytes)?;
@@ -82,22 +114,6 @@ impl Decoder {
         let (mut rc, consumed) = RangeDec::init(Mode::SevenZip, &self.in_buf, HEADER_LEN)?;
         let _ = consumed;
 
-        // PPMd carries no in-band end-of-stream marker, so a stream whose
-        // header declares an unknown length has no reliable terminal
-        // condition: after the true last symbol the range coder's
-        // finalisation bytes keep decoding into extra (garbage) symbols, and
-        // exhausting the physical input is not an end signal (a high-
-        // probability symbol decodes without consuming any input). Refuse
-        // rather than emit a guess.
-        if expected_len == UNKNOWN_LEN {
-            return Err(Error::Unsupported);
-        }
-        // A declared length larger than the buffer-then-decode ceiling can't
-        // be produced here; reject it up front rather than growing `out`
-        // toward OOM.
-        if expected_len > MAX_OUTPUT as u64 {
-            return Err(Error::OutputLimitExceeded);
-        }
         let mut out = Vec::with_capacity((expected_len as usize).min(1 << 20));
 
         for _ in 0..expected_len {
@@ -151,11 +167,19 @@ impl Default for Decoder {
 
 impl RawDecoder for Decoder {
     fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
-        if self.poisoned {
-            return Err(Error::Corrupt);
+        if let Some(e) = self.poisoned {
+            return Err(e);
         }
-        // Absorb input; real decoding is deferred to `finish`.
+        // Absorb input; real decoding is deferred to `finish`. The header
+        // is validated as soon as it is complete so a hostile stream fails
+        // after 11 bytes instead of after buffering its whole payload.
         self.in_buf.extend_from_slice(input);
+        if !self.header_checked && self.in_buf.len() >= HEADER_LEN {
+            self.header_checked = true;
+            if let Err(e) = validate_header(&self.in_buf[..HEADER_LEN]) {
+                return Err(self.poison(e));
+            }
+        }
         let mut written = 0usize;
         if self.finished_decode {
             self.drain(output, &mut written);
@@ -168,8 +192,8 @@ impl RawDecoder for Decoder {
     }
 
     fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
-        if self.poisoned {
-            return Err(Error::Corrupt);
+        if let Some(e) = self.poisoned {
+            return Err(e);
         }
         if !self.started {
             self.started = true;
@@ -192,7 +216,8 @@ impl RawDecoder for Decoder {
         self.decoded.clear();
         self.decoded_idx = 0;
         self.started = false;
+        self.header_checked = false;
         self.finished_decode = false;
-        self.poisoned = false;
+        self.poisoned = None;
     }
 }
