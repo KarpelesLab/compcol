@@ -155,6 +155,12 @@ impl Huffman {
             return Err(Error::InvalidHuffmanTree);
         }
         let max = self.max_length as u32;
+        // Slow-path scan lower bound. A LUT miss below (peek succeeded but no
+        // code ≤ PRIMARY_BITS matched) proves the code is longer than
+        // PRIMARY_BITS, so the canonical scan can skip lengths 1..=PRIMARY_BITS
+        // entirely. It stays 1 only when the fast-path peek itself failed
+        // (stream near end), where a short code may still be valid.
+        let mut min_len = 1u32;
 
         // Fast path: when we can peek PRIMARY_BITS bits, a single LUT
         // lookup resolves any code of length ≤ PRIMARY_BITS.
@@ -162,17 +168,20 @@ impl Huffman {
             let entry = self.lut[idx as usize];
             let len = (entry >> LUT_LEN_SHIFT) as u32;
             if len > 0 {
-                reader.drop_bits(len)?;
+                // `peek(PRIMARY_BITS)` succeeded and `len <= PRIMARY_BITS`, so
+                // the bits are buffered — consume without re-checking.
+                reader.consume(len);
                 return Ok(entry & LUT_SYM_MASK);
             }
             // Long code (> PRIMARY_BITS) -- fall through to the slow path.
+            min_len = PRIMARY_BITS + 1;
         }
 
         // Peek `max` bits; if not enough, peek the remaining smaller widths
         // one at a time. For RAR3 trees this is unlikely to matter -- most
         // codes fit in the buffer easily.
         let lookahead = self.peek_padded(reader, max)?;
-        for length in 1..=max {
+        for length in min_len..=max {
             let code = lookahead >> (max - length);
             let count = self.counts[length as usize] as u32;
             if count > 0 {

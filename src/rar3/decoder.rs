@@ -302,13 +302,30 @@ impl RawDecoder for Decoder {
 /// Decode one member's compressed payload against the (possibly carried-
 /// over) context. In solid mode the end-of-member marker is consumed so the
 /// persistent state is exactly what the next member's stream expects.
+/// Cap on speculative preallocation of the output buffer, so a hostile
+/// `unpack_size` can't drive a huge up-front allocation. Real members past
+/// this still decode; `out` just grows the rest of the way.
+const OUT_PREALLOC_CAP: u64 = 64 << 20;
+
+/// Bytes to reserve up front for a member's output, from its declared
+/// `unpack_size`. Avoids ~log2(size) grow-and-copy reallocations while a
+/// large member decodes. The `u64::MAX` sentinel means "unknown length"
+/// (no declared size) — reserve nothing rather than speculate.
+fn out_prealloc(unpack_size: u64) -> usize {
+    if unpack_size == u64::MAX {
+        0
+    } else {
+        unpack_size.min(OUT_PREALLOC_CAP) as usize
+    }
+}
+
 fn run_member(ctx: &mut RunCtx, input: &[u8], solid: bool) -> Result<Vec<u8>, Error> {
     // Each member's payload is its own byte-aligned stream (the container
     // resets the bit input at every member boundary), so the reader is
     // rebuilt even when the rest of the context carries over.
     ctx.bits = BitReader::new();
     ctx.bits.feed_slice(input);
-    ctx.out = Vec::new();
+    ctx.out = Vec::with_capacity(out_prealloc(ctx.unpack_size));
     // Filter *programs* persist across solid members, but scheduled filter
     // instances never span a member boundary.
     ctx.pending_filters.clear();
@@ -470,7 +487,7 @@ impl RunCtx {
             last_length: 0,
             last_low_offset: 0,
             num_low_offset_repeats: 0,
-            out: Vec::new(),
+            out: Vec::with_capacity(out_prealloc(unpack_size)),
             window: vec![0u8; DICT_DEFAULT_SIZE],
             wmask: {
                 debug_assert!(DICT_DEFAULT_SIZE.is_power_of_two());
