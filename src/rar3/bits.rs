@@ -84,10 +84,29 @@ impl BitReader {
         Ok(())
     }
 
+    /// Consume `n` bits that a prior `peek(m >= n)` on the *same* buffered
+    /// state already proved are available — no availability check. The caller
+    /// must guarantee `n <= nbits` (true immediately after a successful
+    /// `peek`); misuse corrupts the bit position, so keep it to the hot paths
+    /// that peek-then-consume. `n == 0` is a no-op (the shift below is only
+    /// valid for `1..=64`).
+    #[inline]
+    pub fn consume(&mut self, n: u32) {
+        debug_assert!(n <= self.nbits);
+        if n == 0 {
+            return;
+        }
+        self.acc <<= n;
+        self.nbits -= n;
+    }
+
     /// Read and consume `n` bits in a single call.
+    #[inline]
     pub fn read_bits(&mut self, n: u32) -> Result<u32, Error> {
+        // `peek` guarantees `nbits >= n` on success, so the consume is
+        // check-free.
         let v = self.peek(n)?;
-        self.drop_bits(n)?;
+        self.consume(n);
         Ok(v)
     }
 
