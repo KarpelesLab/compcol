@@ -196,7 +196,9 @@ arsenic = ["alloc"]
 # the encoders permanently return `Error::Unsupported`.
 rar1    = ["alloc"]
 rar2    = ["alloc"]
-rar3    = ["alloc"]
+# RAR3/4 v29: LZ77+Huffman, in-band standard filters, and PPMd-II var H
+# blocks (the latter via the shared `ppmd` model core).
+rar3    = ["alloc", "ppmd"]
 rar5    = ["alloc"]
 # ZIP method 1 (Shrink): PKZIP 1.x dynamic LZW with partial-clear marker.
 # Decoder-only — the encoder permanently returns `Error::Unsupported`.

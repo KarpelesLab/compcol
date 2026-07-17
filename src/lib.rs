@@ -47,7 +47,7 @@ pub mod tokio_io;
 // `lz4`) doesn't pull them in via `cfg(test)`.
 #[cfg(any(feature = "deflate", feature = "deflate64"))]
 mod bits;
-#[cfg(any(feature = "zlib", feature = "gzip"))]
+#[cfg(any(feature = "zlib", feature = "gzip", feature = "rar3"))]
 mod checksum;
 #[cfg(any(feature = "deflate", feature = "deflate64"))]
 mod huffman;
@@ -170,6 +170,12 @@ pub mod rar3;
 
 #[cfg(feature = "rar5")]
 pub mod rar5;
+
+// Standard post-decompression filter transforms (x86 E8/E8E9, Delta) shared
+// by the rar3 and rar5 decoders — the two container generations declare
+// filters differently but run the same byte transforms.
+#[cfg(any(feature = "rar3", feature = "rar5"))]
+pub(crate) mod rar_filters;
 
 #[cfg(feature = "zip_reduce")]
 pub mod zip_reduce;

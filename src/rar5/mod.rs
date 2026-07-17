@@ -19,9 +19,16 @@
 //! - Single-volume RAR5 LZ77+Huffman compressed-data runs.
 //! - Cross-block table reuse (`table_present` bit set or clear).
 //! - The four-deep distance LRU and the "repeat last match" command.
-//! - The x86 E8 and x86 E8/E9 post-decompression filters (filter types
-//!   1 and 2). Delta (type 0), ARM (type 3), and the rare types 4–7
-//!   are recognised on the wire but return [`Error::Unsupported`].
+//! - The Delta (type 0), x86 E8 (type 1) and x86 E8/E9 (type 2)
+//!   post-decompression filters. ARM (type 3) and the rare types 4–7 are
+//!   recognised on the wire but return [`Error::Unsupported`]. The
+//!   transforms live in the crate-internal `rar_filters` module, shared
+//!   with the RAR3 decoder.
+//! - **Solid groups**, when the caller drives them as one continuous
+//!   stream: the LZ window carries across the group's members naturally,
+//!   and [`Decoder::add_file_boundary`] lets the container register each
+//!   member's starting offset so the x86 filters compute file-relative
+//!   addresses (unrar semantics). See the decoder docs.
 //!
 //! # What the decoder does *not* do
 //!
@@ -29,11 +36,8 @@
 //!   main header, file headers, multi-volume continuations, encryption,
 //!   recovery records, …) is not decoded here. Callers extract the inner
 //!   compressed-data run from the container themselves and feed it to
-//!   the decoder's `decode()` method.
-//! - **No solid-archive cross-file dictionary sharing.** RAR5's solid mode
-//!   keeps the LZ window alive across consecutive file entries; this
-//!   decoder treats every stream independently.
-//! - **No filter chains for non-`X86Call` filter types.**
+//!   the decoder's `decode()` method. For solid groups that includes
+//!   concatenating the members' runs and slicing the decoded output.
 //! - **No CRC32/Blake2sp verification.** Those checksums live in the file
 //!   header, not the compressed stream.
 //!

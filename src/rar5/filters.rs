@@ -7,7 +7,7 @@
 //!
 //! ## Filter types
 //!
-//! - `0` — Delta. RGB pre-processing (channel deinterleaving).
+//! - `0` — Delta. Channel de-interleave (bitmap/audio pre-processing).
 //! - `1` — x86 E8 call-translation. Rewrites the 4-byte relative target of
 //!   every `0xE8` opcode.
 //! - `2` — x86 E8/E9 call+jump-translation. Same as `1` but also fires on
@@ -16,9 +16,10 @@
 //! - `4..=7` — Audio, RGB, Itanium, PPM. Not used in any RAR5 stream we have
 //!   seen in the wild; treated as `Unsupported`.
 //!
-//! This crate implements filters `1` and `2` (the most common) and rejects
-//! the rest with `Error::Unsupported`. Adding more filters means extending
-//! the dispatch in [`apply`].
+//! This crate implements filters `0`, `1` and `2` and rejects ARM and the
+//! rest with `Error::Unsupported`. Adding more filters means extending the
+//! dispatch in [`apply`]. The byte transforms themselves live in
+//! [`crate::rar_filters`], shared with the RAR3 decoder.
 //!
 //! ## Activation
 //!
@@ -29,10 +30,11 @@
 //! block_length)`.
 
 use crate::error::Error;
+use crate::rar_filters::{delta_decode, x86_e8_decode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterKind {
-    /// 0 — RGB delta. `channels` is the channel count (1..=32).
+    /// 0 — Delta. `channels` is the channel count (1..=32).
     Delta { channels: u8 },
     /// 1 — x86 `0xE8` (CALL) relative-address rewrite.
     X86Call,
@@ -60,65 +62,30 @@ pub fn apply(filter: &Filter, buf: &mut [u8]) -> Result<(), Error> {
     if (buf.len() as u64) < filter.length as u64 {
         return Err(Error::Corrupt);
     }
+    let region = &mut buf[..filter.length as usize];
     match filter.kind {
-        FilterKind::X86Call => apply_e8(filter.start, &mut buf[..filter.length as usize], false),
-        FilterKind::X86CallJmp => apply_e8(filter.start, &mut buf[..filter.length as usize], true),
-        // Filters we recognise on the wire but do not implement. Rejecting
-        // these is honest: the decoder is decoder-only and we can either
-        // surface "unsupported" up to the caller (so they can fall back to
-        // the official `unrar`) or silently mangle the stream. We pick
-        // honesty.
-        FilterKind::Delta { .. } => Err(Error::Unsupported),
+        FilterKind::X86Call => {
+            x86_e8_decode(filter.start, region, false, true);
+            Ok(())
+        }
+        FilterKind::X86CallJmp => {
+            x86_e8_decode(filter.start, region, true, true);
+            Ok(())
+        }
+        FilterKind::Delta { channels } => {
+            if channels == 0 {
+                // The wire format encodes channels-1 in 5 bits, so 0 can't
+                // be parsed off the stream; guard against caller misuse.
+                return Err(Error::Corrupt);
+            }
+            delta_decode(channels as usize, region);
+            Ok(())
+        }
+        // Recognised on the wire but not implemented. Rejecting is honest:
+        // the caller can fall back to the official unrar instead of us
+        // silently mangling the stream.
         FilterKind::Arm => Err(Error::Unsupported),
     }
-}
-
-/// RAR5 x86 call/jump filter. Operates on a 16 MiB virtual file-size window;
-/// the relative target of each opcode is normalised so that the *absolute*
-/// target is encoded instead, which compresses better.
-///
-/// `start` is the absolute position of `buf[0]` in the unpacked stream.
-/// When `extended` is true the filter fires on `0xE8` *and* `0xE9`; when
-/// false it only fires on `0xE8`. The transform is its own inverse.
-fn apply_e8(start: u64, buf: &mut [u8], extended: bool) -> Result<(), Error> {
-    const FILE_SIZE: u32 = 0x0100_0000;
-    if buf.len() < 5 {
-        // No room for a [opcode][4-byte rel] sequence.
-        return Ok(());
-    }
-    let last = buf.len() - 4;
-    let mut i = 0;
-    while i < last {
-        let b = buf[i];
-        let matches = b == 0xE8 || (extended && b == 0xE9);
-        if !matches {
-            i += 1;
-            continue;
-        }
-        // 4-byte little-endian relative target sitting at buf[i+1..i+5].
-        let rel = u32::from_le_bytes([buf[i + 1], buf[i + 2], buf[i + 3], buf[i + 4]]);
-        // Libarchive: the offset is computed *after* the opcode byte has
-        // been consumed, so the relevant absolute position is start + i + 1.
-        let off = ((start + i as u64 + 1) as u32) & (FILE_SIZE - 1);
-        // RAR5 transform: if the high bit of `rel` is set and the high bit
-        // of `(rel + off)` is clear, add FILE_SIZE; else if the high bit of
-        // `(rel - FILE_SIZE)` is set, subtract `off`. Otherwise leave alone.
-        // This mirrors the libarchive description verbatim.
-        let new = if (rel & 0x8000_0000) != 0 && (rel.wrapping_add(off) & 0x8000_0000) == 0 {
-            rel.wrapping_add(FILE_SIZE)
-        } else if (rel.wrapping_sub(FILE_SIZE) & 0x8000_0000) != 0 {
-            rel.wrapping_sub(off)
-        } else {
-            rel
-        };
-        let nb = new.to_le_bytes();
-        buf[i + 1] = nb[0];
-        buf[i + 2] = nb[1];
-        buf[i + 3] = nb[2];
-        buf[i + 4] = nb[3];
-        i += 5;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -162,15 +129,83 @@ mod tests {
         assert_eq!(buf, original);
     }
 
+    /// Regression: a "false positive" E8 byte (ModRM/displacement bytes in
+    /// real x86 code, not a CALL opcode) followed by an operand whose signed
+    /// value is negative and stays negative after adding the position must
+    /// be left alone — unrar's filter only adds FILE_SIZE when the sum goes
+    /// non-negative, and only subtracts the position from values in
+    /// `0..FILE_SIZE`. Case taken verbatim from a WinRAR 7.23 archive of
+    /// notepad.exe's first 32 KiB: at offset 5496 the byte 0xE8 (part of
+    /// `mov rcx,[rsp+...]` encoding, not a call) is followed by the operand
+    /// 0xCC000006; the buggy flat `else if` subtracted the position and
+    /// corrupted the output (48 bytes across 15 sites in one 32 KiB slice).
     #[test]
-    fn delta_and_arm_return_unsupported() {
-        let mut buf = alloc::vec![0; 16];
+    fn e8_filter_leaves_negative_out_of_range_operand_alone() {
+        // E8 at index 0, start chosen so off = 5497 (the real archive's
+        // position), operand 0xCC000006 little-endian.
+        let mut buf = alloc::vec![0xE8, 0x06, 0x00, 0x00, 0xCC, 0x90, 0x90];
+        let original = buf.clone();
+        let f = Filter {
+            start: 5496,
+            length: buf.len() as u32,
+            kind: FilterKind::X86Call,
+        };
+        apply(&f, &mut buf).unwrap();
+        assert_eq!(
+            buf, original,
+            "negative out-of-range operand must not be rewritten"
+        );
+    }
+
+    /// The companion positive case: a negative operand that becomes
+    /// non-negative when the position is added IS rewritten (+FILE_SIZE).
+    #[test]
+    fn e8_filter_wraps_negative_in_range_operand() {
+        // rel = -16 (0xFFFFFFF0), off = 0x20 -> rel + off = 0x10 >= 0,
+        // so the decoder adds FILE_SIZE.
+        let mut buf = alloc::vec![0xE8, 0xF0, 0xFF, 0xFF, 0xFF, 0x90, 0x90];
+        let f = Filter {
+            start: 0x1F, // off = start + 0 + 1 = 0x20
+            length: buf.len() as u32,
+            kind: FilterKind::X86Call,
+        };
+        apply(&f, &mut buf).unwrap();
+        let expected = 0xFFFF_FFF0u32.wrapping_add(0x0100_0000).to_le_bytes();
+        assert_eq!(&buf[1..5], &expected);
+    }
+
+    /// A non-negative operand at or above FILE_SIZE is also left alone.
+    #[test]
+    fn e8_filter_leaves_large_positive_operand_alone() {
+        // rel = 0x01000000 == FILE_SIZE: not in 0..FILE_SIZE, untouched.
+        let mut buf = alloc::vec![0xE8, 0x00, 0x00, 0x00, 0x01, 0x90, 0x90];
+        let original = buf.clone();
+        let f = Filter {
+            start: 100,
+            length: buf.len() as u32,
+            kind: FilterKind::X86Call,
+        };
+        apply(&f, &mut buf).unwrap();
+        assert_eq!(buf, original);
+    }
+
+    #[test]
+    fn delta_three_channels_reinterleaves() {
+        // Planar deltas: ch0=[1,1], ch1=[2,2], ch2=[3,3] over a 6-byte
+        // region. Decode integrates each channel with prev - delta.
+        let mut buf = alloc::vec![1u8, 1, 2, 2, 3, 3];
         let f = Filter {
             start: 0,
             length: buf.len() as u32,
             kind: FilterKind::Delta { channels: 3 },
         };
-        assert_eq!(apply(&f, &mut buf), Err(Error::Unsupported));
+        apply(&f, &mut buf).unwrap();
+        assert_eq!(buf, [0xFF, 0xFE, 0xFD, 0xFE, 0xFC, 0xFA]);
+    }
+
+    #[test]
+    fn arm_returns_unsupported() {
+        let mut buf = alloc::vec![0; 16];
         let f = Filter {
             start: 0,
             length: buf.len() as u32,
