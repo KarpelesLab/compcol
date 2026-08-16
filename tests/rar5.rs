@@ -520,3 +520,61 @@ mod factory {
         );
     }
 }
+
+// ─── regression: no-progress stall at the terminal state ────────────────
+
+/// A completed rar5 stream must report `StreamEnd`, not `OutputFull` with
+/// nothing consumed and nothing written.
+///
+/// `raw_decode` returns as soon as `State::Done` is reached, *before* the
+/// block that accepts more caller bytes, so reporting `done: false` there
+/// left a container that hands over trailing bytes (the next file header of
+/// a solid group, say) receiving `OutputFull` — "call me again" — with
+/// nothing to make progress on. A caller looping until `StreamEnd` then
+/// spun on unchanged state: CPU-bound, flat RSS, uninterruptible from
+/// outside the decoder.
+#[test]
+fn completed_stream_reports_stream_end_not_a_stall() {
+    let mut dec = Decoder::with_unpack_size_and_window(FIXTURE_AAA_UNPACK, 128 * 1024);
+    let mut out = vec![0u8; FIXTURE_AAA_UNPACK as usize + 64];
+    let mut total = 0usize;
+    let mut saw_end = false;
+    for _ in 0..64 {
+        let (p, status) = dec.decode(FIXTURE_AAA, &mut out[total..]).unwrap();
+        total += p.written;
+        if matches!(status, Status::StreamEnd) {
+            saw_end = true;
+            break;
+        }
+        assert!(
+            !(p.consumed == 0 && p.written == 0 && status == Status::OutputFull),
+            "decoder asked to be called again without making progress"
+        );
+    }
+    assert!(saw_end, "a fully decoded stream must report StreamEnd");
+    assert_eq!(total, FIXTURE_AAA_UNPACK as usize);
+}
+
+/// The same, with trailing bytes arriving in a *later* call — the shape a
+/// container produces when it passes the next header after the payload.
+#[test]
+fn trailing_bytes_after_completion_do_not_stall() {
+    let mut dec = Decoder::with_unpack_size_and_window(FIXTURE_AAA_UNPACK, 128 * 1024);
+    let mut out = vec![0u8; FIXTURE_AAA_UNPACK as usize + 64];
+    let mut total = 0usize;
+    for _ in 0..64 {
+        let (p, status) = dec.decode(FIXTURE_AAA, &mut out[total..]).unwrap();
+        total += p.written;
+        if matches!(status, Status::StreamEnd) {
+            break;
+        }
+        if p.consumed == 0 && p.written == 0 {
+            break;
+        }
+    }
+    let (p, status) = dec.decode(&[0xAA; 32], &mut out).unwrap();
+    assert!(
+        !(p.consumed == 0 && p.written == 0 && status == Status::OutputFull),
+        "trailing bytes after completion must not produce a no-progress OutputFull"
+    );
+}

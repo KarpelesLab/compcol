@@ -256,10 +256,15 @@ impl RawDecoder for Decoder {
                 self.state = State::Done;
             }
             if matches!(self.state, State::Done) {
+                // Terminal: report completion so the bridge yields StreamEnd.
+                // This returns before the "accept more bytes" block below, so
+                // reporting `false` left a container that passes trailing
+                // bytes (the next header) getting OutputFull with nothing
+                // consumed and nothing written — an unbreakable caller loop.
                 return Ok(RawProgress {
                     consumed,
                     written,
-                    done: false,
+                    done: true,
                 });
             }
             if written == output.len() && !self.ready.is_empty() {

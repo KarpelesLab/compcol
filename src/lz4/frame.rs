@@ -1156,10 +1156,14 @@ impl RawDecoder for Decoder {
                     });
                 }
                 DecPhase::Done => {
+                    // Only reachable if the caller keeps calling after the
+                    // StreamEnd reported when the frame completed above, but
+                    // the state is terminal either way — report it as such
+                    // rather than as "call me again with no progress".
                     return Ok(RawProgress {
                         consumed,
                         written,
-                        done: false,
+                        done: true,
                     });
                 }
             }

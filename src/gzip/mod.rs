@@ -465,12 +465,21 @@ impl RawDecoder for Decoder {
                         continue;
                     }
                     // Anything other than the gzip magic means the
-                    // stream ended. Fall through to Done, which will
+                    // stream ended. Hand off to Done, which will
                     // silently swallow the trailing bytes — gzip(1)
                     // does the same (the input could be a concatenated
                     // gzip+something-else file, and decoders are
                     // expected to be permissive).
+                    //
+                    // `continue` is required: match arms do not fall
+                    // through, so without it the no-progress check at the
+                    // bottom of the loop returns first (this iteration
+                    // consumed nothing) and the Done arm never runs. That
+                    // left a caller holding trailing bytes getting
+                    // `OutputFull` with no progress forever — exactly the
+                    // spin the Done arm exists to prevent.
                     self.phase = DecPhase::Done;
+                    continue;
                 }
                 DecPhase::Done => {
                     // Swallow any trailing bytes the caller still has

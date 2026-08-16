@@ -616,10 +616,16 @@ impl RawDecoder for Decoder {
                     self.phase = DecPhase::Done;
                 }
                 DecPhase::Done => {
+                    // Report completion so the bridge yields
+                    // `Status::StreamEnd`. Concatenated frames are not
+                    // supported (see the module docs), so this is terminal.
+                    // Reporting `false` here left a frame with trailing bytes
+                    // returning `OutputFull` with nothing consumed and nothing
+                    // written, spinning any caller that loops until StreamEnd.
                     return Ok(RawProgress {
                         consumed,
                         written,
-                        done: false,
+                        done: true,
                     });
                 }
             }
@@ -628,7 +634,7 @@ impl RawDecoder for Decoder {
                 return Ok(RawProgress {
                     consumed,
                     written,
-                    done: false,
+                    done: matches!(self.phase, DecPhase::Done),
                 });
             }
         }

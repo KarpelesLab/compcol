@@ -314,10 +314,12 @@ impl RawDecoder for Decoder {
                 }
 
                 DecState::Done => {
+                    // Terminal: report completion so the bridge yields
+                    // StreamEnd. See the matching note in `lzx`.
                     return Ok(RawProgress {
                         consumed,
                         written,
-                        done: false,
+                        done: true,
                     });
                 }
             }

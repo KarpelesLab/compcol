@@ -1746,10 +1746,16 @@ impl RawDecoder for Decoder {
                     }
                 }
                 DecPhase::Done => {
+                    // Terminal (Done follows the Stream Footer; concatenated
+                    // streams are not supported). Report completion so the
+                    // bridge yields StreamEnd. Reporting `false` left a caller
+                    // that hands over trailing bytes after the footer getting
+                    // `OutputFull` with nothing consumed and nothing written,
+                    // spinning on unchanged state.
                     return Ok(RawProgress {
                         consumed,
                         written,
-                        done: false,
+                        done: true,
                     });
                 }
             }

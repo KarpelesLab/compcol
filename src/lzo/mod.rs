@@ -396,10 +396,13 @@ impl RawDecoder for Decoder {
                     }
                 }
                 DecPhase::Done => {
+                    // Terminal (a zero-length block terminates the stream), so
+                    // report completion and let the bridge yield StreamEnd.
+                    // See the matching note in `lz4`.
                     return Ok(RawProgress {
                         consumed,
                         written,
-                        done: false,
+                        done: true,
                     });
                 }
             }
