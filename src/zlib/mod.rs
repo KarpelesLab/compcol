@@ -332,19 +332,27 @@ impl RawDecoder for Decoder {
                     self.phase = DecPhase::Done;
                 }
                 DecPhase::Done => {
+                    // Report completion so the bridge maps this to
+                    // `Status::StreamEnd`. Reporting `false` here left a
+                    // stream with trailing bytes after the adler32 returning
+                    // `OutputFull` with nothing consumed and nothing written,
+                    // spinning any caller that loops until StreamEnd.
                     return Ok(RawProgress {
                         consumed,
                         written,
-                        done: false,
+                        done: true,
                     });
                 }
             }
 
             if consumed == initial_consumed && written == initial_written {
+                // The trailer can complete from `trailer_carryover` without
+                // consuming caller input, so this guard can also be the exit
+                // taken once the stream is finished.
                 return Ok(RawProgress {
                     consumed,
                     written,
-                    done: false,
+                    done: matches!(self.phase, DecPhase::Done),
                 });
             }
         }

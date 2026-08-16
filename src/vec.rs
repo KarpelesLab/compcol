@@ -120,7 +120,18 @@ pub fn decompress_to_vec_with<A: Algorithm>(
         match status {
             Status::StreamEnd => return Ok(out),
             Status::InputEmpty => break,
-            Status::OutputFull => continue,
+            // `OutputFull` normally means "drain and call again", but a
+            // decoder that reports it without consuming input or writing
+            // output has stalled, and looping would spin on unchanged state
+            // forever — CPU-bound with no allocation, so neither an output
+            // cap nor a memory cap can stop it. Hand off to `finish`, which
+            // either completes the stream or reports the real error.
+            Status::OutputFull => {
+                if p.consumed == 0 && p.written == 0 {
+                    break;
+                }
+                continue;
+            }
         }
     }
     loop {
@@ -181,7 +192,14 @@ pub fn decompress_to_vec_capped_with<A: Algorithm>(
         match status {
             Status::StreamEnd => return Ok(out),
             Status::InputEmpty => break,
-            Status::OutputFull => continue,
+            // See `decompress_to_vec_with`: a stalled decoder reporting
+            // `OutputFull` with no progress would otherwise spin forever.
+            Status::OutputFull => {
+                if p.consumed == 0 && p.written == 0 {
+                    break;
+                }
+                continue;
+            }
         }
     }
     loop {

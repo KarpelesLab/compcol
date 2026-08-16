@@ -663,3 +663,37 @@ fn zlib_decoder_fdict0_ignores_configured_dictionary() {
     let out = drain_full(dec, &encoded).unwrap();
     assert_eq!(&out[..], plaintext);
 }
+
+// ─── regression: no-progress stall on trailing bytes (DoS) ──────────────
+
+/// The zlib framing of the same crafted stream covered in `tests/deflate.rs`:
+/// a valid 24-byte payload (adler32 checks out) followed by trailing
+/// garbage. `DecPhase::Done` returned `done: false`, so the bridge reported
+/// `Status::OutputFull` with no progress and any loop waiting for
+/// `StreamEnd` spun forever. Offset 5 is where the `78 00`-style zlib
+/// header starts in the reporter's payload.
+static TRAILING_GARBAGE: &[u8] = include_bytes!("fixtures/deflate/trailing_garbage_stall.bin");
+
+const TRAILING_GARBAGE_PLAIN: &[u8] = b"NNNNNNNNNNNNNNJNNNNNNNNH";
+
+#[test]
+fn trailing_bytes_after_adler_report_stream_end() {
+    let stream = &TRAILING_GARBAGE[5..];
+    let mut dec = <Zlib>::decoder();
+    let mut out = vec![0u8; 4096];
+    let (p, status) = dec.decode(stream, &mut out).unwrap();
+    assert_eq!(&out[..p.written], TRAILING_GARBAGE_PLAIN);
+    assert_eq!(status, Status::StreamEnd);
+    let (p2, status2) = dec.decode(&stream[p.consumed..], &mut out).unwrap();
+    assert!(
+        !(p2.consumed == 0 && p2.written == 0 && status2 == Status::OutputFull),
+        "decoder asked to be called again without making progress"
+    );
+}
+
+#[test]
+fn trailing_bytes_do_not_stall_decompress_to_vec() {
+    // Before the fix this call never returned.
+    let got = compcol::vec::decompress_to_vec::<Zlib>(&TRAILING_GARBAGE[5..]).unwrap();
+    assert_eq!(got, TRAILING_GARBAGE_PLAIN);
+}

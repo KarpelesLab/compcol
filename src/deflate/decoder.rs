@@ -344,9 +344,15 @@ impl RawDecoder for Decoder {
         }
 
         Ok(RawProgress {
+            // Report completion so the bridge maps this to `Status::StreamEnd`.
+            // Reporting `false` here once the BFINAL block has been consumed
+            // leaves a stream with trailing bytes returning `OutputFull` with
+            // nothing consumed and nothing written, and a caller that loops
+            // until StreamEnd (e.g. `vec::decompress_to_vec`) then spins
+            // forever on unchanged state.
+            done: matches!(self.state, DecState::Done),
             consumed,
             written,
-            done: false,
         })
     }
 
