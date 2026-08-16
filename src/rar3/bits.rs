@@ -84,10 +84,29 @@ impl BitReader {
         Ok(())
     }
 
+    /// Consume `n` bits that a prior `peek(m >= n)` on the *same* buffered
+    /// state already proved are available — no availability check. The caller
+    /// must guarantee `n <= nbits` (true immediately after a successful
+    /// `peek`); misuse corrupts the bit position, so keep it to the hot paths
+    /// that peek-then-consume. `n == 0` is a no-op (the shift below is only
+    /// valid for `1..=64`).
+    #[inline]
+    pub fn consume(&mut self, n: u32) {
+        debug_assert!(n <= self.nbits);
+        if n == 0 {
+            return;
+        }
+        self.acc <<= n;
+        self.nbits -= n;
+    }
+
     /// Read and consume `n` bits in a single call.
+    #[inline]
     pub fn read_bits(&mut self, n: u32) -> Result<u32, Error> {
+        // `peek` guarantees `nbits >= n` on success, so the consume is
+        // check-free.
         let v = self.peek(n)?;
-        self.drop_bits(n)?;
+        self.consume(n);
         Ok(v)
     }
 
@@ -101,6 +120,28 @@ impl BitReader {
             // fail, but use `drop_bits` to keep one code path.
             let _ = self.drop_bits(drop);
         }
+    }
+
+    /// Reposition the reader to an absolute byte offset in the fed buffer,
+    /// discarding any buffered look-ahead bits. Used when the PPMd path
+    /// hands control back to the bit domain: the range decoder consumed raw
+    /// bytes past the reader's position, and the next block header starts
+    /// at the byte where the range-coded data ended.
+    pub fn seek_byte(&mut self, pos: usize) {
+        self.byte_pos = pos.min(self.buf.len());
+        self.acc = 0;
+        self.nbits = 0;
+    }
+
+    /// Number of source bytes logically consumed so far. Only meaningful on
+    /// a byte boundary (call [`byte_align`] first). Used by the PPMd path to
+    /// hand the raw byte stream after the block header to the RAR range
+    /// decoder.
+    pub fn consumed_bytes(&self) -> usize {
+        // `byte_pos` is the next byte to pull into `acc`; `nbits` bits are
+        // buffered ahead but unconsumed. On a byte boundary `nbits` is a
+        // multiple of 8.
+        self.byte_pos - (self.nbits as usize) / 8
     }
 }
 

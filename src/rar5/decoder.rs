@@ -48,6 +48,11 @@
 //! container framing themselves (header blocks, file headers, multi-volume
 //! continuations, etc.) and hand the inner compressed-data run to this
 //! decoder.
+//!
+//! When the run is a **solid group** (several files sharing one LZ
+//! stream), the container should also register each member's starting
+//! offset via [`Decoder::add_file_boundary`] so the x86 filters can
+//! compute file-relative addresses, as unrar does.
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -107,6 +112,12 @@ pub struct Decoder {
     /// Absolute offset (in the unpacked stream) of the first byte still in
     /// `out_queue`. Used to identify which pending filters fire when.
     out_queue_start: u64,
+    /// Sorted starting offsets (in the unpacked stream) of the files a
+    /// solid group concatenates, registered via
+    /// [`Decoder::add_file_boundary`]. Position-dependent filters (x86)
+    /// compute their addresses relative to the containing file, matching
+    /// unrar/libarchive. An implicit boundary at 0 always exists.
+    file_boundaries: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -171,6 +182,39 @@ impl Decoder {
             pending_filters: Vec::new(),
             ready: VecDeque::new(),
             out_queue_start: 0,
+            file_boundaries: Vec::new(),
+        }
+    }
+
+    /// Declare that a new file starts at absolute unpacked-stream offset
+    /// `pos` — needed when this decoder runs over a **solid group** (one
+    /// continuous LZ stream concatenating several files).
+    ///
+    /// The x86 E8/E8E9 filters rewrite call targets relative to the start
+    /// of the *containing file*, not the solid stream (unrar resets its
+    /// position base per extracted file; libarchive tracks the same value
+    /// as `solid_offset`). A container driving a solid group should
+    /// register each member's starting offset (the cumulative unpacked
+    /// sizes of the members before it) before decoding; boundaries may be
+    /// registered ahead of time and in any order. Without registrations
+    /// every filter is file-relative to offset 0, which is correct for the
+    /// single-file (non-solid) case.
+    ///
+    /// Like the unpack size, boundaries are treated as stream-shape
+    /// configuration: they survive [`reset`](crate::Decoder::reset).
+    pub fn add_file_boundary(&mut self, pos: u64) {
+        if let Err(idx) = self.file_boundaries.binary_search(&pos) {
+            self.file_boundaries.insert(idx, pos);
+        }
+    }
+
+    /// Starting offset of the file containing unpacked-stream position
+    /// `pos` (0 when no boundary at or before `pos` is registered).
+    fn file_start_for(&self, pos: u64) -> u64 {
+        match self.file_boundaries.binary_search(&pos) {
+            Ok(_) => pos,
+            Err(0) => 0,
+            Err(idx) => self.file_boundaries[idx - 1],
         }
     }
 
@@ -308,6 +352,9 @@ impl RawDecoder for Decoder {
         self.pending_filters.clear();
         self.ready.clear();
         self.out_queue_start = 0;
+        // A reset starts an unrelated stream: stale solid-group boundaries
+        // would skew every later x86 filter's position base.
+        self.file_boundaries.clear();
     }
 }
 
@@ -639,7 +686,16 @@ impl Decoder {
                     // Propagate filter failures instead of silently emitting
                     // the raw, unfiltered bytes. An unsupported or corrupt
                     // filter would otherwise yield wrong output with no error.
-                    super::filters::apply(&f, &mut region)?;
+                    //
+                    // The transform's position base is relative to the
+                    // *containing file*, not the solid stream (see
+                    // `add_file_boundary`); identical to `f.start` in the
+                    // single-file case.
+                    let file_rel = super::filters::Filter {
+                        start: f.start - self.file_start_for(f.start),
+                        ..f
+                    };
+                    super::filters::apply(&file_rel, &mut region)?;
                     for &b in &region {
                         self.ready.push_back(b);
                     }

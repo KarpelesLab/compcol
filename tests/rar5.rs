@@ -63,7 +63,13 @@ const FIXTURE_E8_UNPACK: u64 = 1506;
 /// Drive a freshly-constructed decoder to completion against a single input
 /// slice and return the produced bytes.
 fn decode_once(comp: &[u8], unpack: u64, window: usize) -> Result<Vec<u8>, Error> {
-    let mut dec = Decoder::with_unpack_size_and_window(unpack, window);
+    let dec = Decoder::with_unpack_size_and_window(unpack, window);
+    drive(dec, comp, unpack)
+}
+
+/// Drive an already-configured decoder (e.g. one with file boundaries
+/// registered) to completion against a single input slice.
+fn drive(mut dec: Decoder, comp: &[u8], unpack: u64) -> Result<Vec<u8>, Error> {
     let mut out = vec![0u8; unpack as usize];
     let mut total = 0usize;
 
@@ -391,6 +397,93 @@ fn reset_clears_state() {
     let mut expected = vec![b'A'; 200];
     expected.push(b'\n');
     assert_eq!(&out2[..total2], expected.as_slice());
+}
+
+// ─── Real-archive fixtures: Delta filter + solid-group boundaries ────────
+//
+// Packed runs lifted out of archives produced by WinRAR 7.23 (`rar5`
+// format, m3, 128 KiB window) over synthetic content — the fixture bytes
+// are exactly the member's compressed run following its file header. The
+// expected CRC-32s are the archives' own per-file data-CRC header fields;
+// extraction is additionally cross-checked byte-identical against
+// `UnRAR.exe` 7.23 by the differential harness.
+
+/// gradient.bmp, non-solid — carries a Delta filter (3 channels).
+static RAR5_DELTA_GRADIENT: &[u8] = include_bytes!("fixtures/rar5/delta_gradient_bmp.bin");
+
+/// A whole solid group: six members sharing one continuous LZ stream, in
+/// this order. x86slice.bin carries x86 E8 filters, gradient.bmp/ramp.wav/
+/// calls.bin carry Delta filters.
+static RAR5_SOLID_GROUP: &[u8] = include_bytes!("fixtures/rar5/solid_group_m3.bin");
+
+/// (name, start offset in the group's output, unpacked size, CRC-32) per
+/// member, from the archive's file headers.
+const SOLID_MEMBERS: [(&str, u64, u64, u32); 6] = [
+    ("notes.txt", 0, 20001, 0x0E1A_EC07),
+    ("calls.bin", 20001, 6146, 0x6C08_D7DF),
+    ("x86slice.bin", 26147, 32768, 0x6188_0029),
+    ("gradient.bmp", 58915, 49206, 0x2347_E5ED),
+    ("ramp.wav", 108121, 16428, 0x0E8F_2810),
+    ("photo.jpg", 124549, 8198, 0x8420_E285),
+];
+const SOLID_TOTAL: u64 = 132_747;
+const SOLID_WINDOW: usize = 0x20000;
+
+/// Bitwise CRC-32 (IEEE, reflected 0xEDB88320) — table-free, test-only.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+#[test]
+fn delta_filter_end_to_end() {
+    let out = decode_once(RAR5_DELTA_GRADIENT, 49206, 0x20000).unwrap();
+    assert_eq!(out.len(), 49206);
+    assert_eq!(&out[..2], b"BM", "BMP magic must survive de-filtering");
+    assert_eq!(
+        crc32(&out),
+        0x2347_E5ED,
+        "must match the archive's data CRC"
+    );
+}
+
+#[test]
+fn solid_group_with_file_boundaries_end_to_end() {
+    let mut dec = Decoder::with_unpack_size_and_window(SOLID_TOTAL, SOLID_WINDOW);
+    for (_, start, _, _) in SOLID_MEMBERS {
+        dec.add_file_boundary(start);
+    }
+    let out = drive(dec, RAR5_SOLID_GROUP, SOLID_TOTAL).unwrap();
+    assert_eq!(out.len() as u64, SOLID_TOTAL);
+    for (name, start, size, want_crc) in SOLID_MEMBERS {
+        let member = &out[start as usize..(start + size) as usize];
+        assert_eq!(crc32(member), want_crc, "{name} differs from its data CRC");
+    }
+}
+
+/// Regression guard for the solid x86 position-base bug: without the
+/// registered boundaries the E8 transform runs with solid-stream offsets
+/// and corrupts the x86 member, while the position-independent Delta
+/// members still decode correctly.
+#[test]
+fn solid_group_without_boundaries_corrupts_only_x86_member() {
+    let dec = Decoder::with_unpack_size_and_window(SOLID_TOTAL, SOLID_WINDOW);
+    let out = drive(dec, RAR5_SOLID_GROUP, SOLID_TOTAL).unwrap();
+    for (name, start, size, want_crc) in SOLID_MEMBERS {
+        let got = crc32(&out[start as usize..(start + size) as usize]);
+        if name == "x86slice.bin" {
+            assert_ne!(got, want_crc, "x86 member should differ without boundaries");
+        } else {
+            assert_eq!(got, want_crc, "{name} is position-independent");
+        }
+    }
 }
 
 // ─── factory (only if the feature is enabled) ────────────────────────────

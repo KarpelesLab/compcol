@@ -18,11 +18,17 @@
 //! 2. **PPMd-II** — an Order-N context-mixed arithmetic coder. Used by some
 //!    text-heavy archives and `-m5` (best compression) runs.
 //!
-//! This build implements the **LZ77 + Huffman path** in full. PPMd-II blocks
-//! are refused with `Error::Unsupported` — see the private `decoder` submodule for details and
-//! limitations. The standalone E8/E9 (x86 near-call) post-pass filter can
-//! be enabled via [`Decoder::with_e8_filter`]; the in-band RarVM filter
-//! mechanism (main symbols 257..=261) is refused.
+//! This build implements the **LZ77 + Huffman path** in full, including the
+//! in-band standard filters WinRAR declares via main symbol 257 or PPMd
+//! escape code 3 (Delta and x86 E8/E8E9, recognized by bytecode fingerprint
+//! and run natively — no RarVM interpreter; unknown programs are refused),
+//! **PPMd-II variant H** blocks (the full PPMII model in [`crate::ppmd`],
+//! driven by the RAR range decoder with the RAR literal/match/end-of-data
+//! escape layer), mid-stream switches between the two, and **solid
+//! multi-member groups** (shared LZ window, code tables, filter programs
+//! and PPMd model across members — see [`Decoder::with_solid`] /
+//! [`Decoder::begin_solid_member`]). The standalone E8/E9 (x86 near-call)
+//! post-pass filter can also be enabled via [`Decoder::with_e8_filter`].
 //!
 //! ## Calling convention
 //!
@@ -47,6 +53,12 @@
 //!     if p.done { break }
 //! }
 //! ```
+//!
+//! For a **solid group**, construct the decoder with
+//! [`Decoder::with_solid`], decode the first member as above, then call
+//! [`Decoder::begin_solid_member`] with the next member's unpacked size
+//! before feeding its payload — each member's payload is its own
+//! byte-aligned stream, but the compression history carries over.
 //!
 //! ## References
 //!
