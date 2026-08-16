@@ -174,7 +174,7 @@ fn raw_only_pseudo_random() {
     // First token byte must be a raw-literal tag (0x80..=0xFF).
     assert!(
         !encoded.is_empty() && encoded[0] >= 0x80,
-        "expected raw-literal tag, got {:#02x}",
+        "expected raw-literal tag, got {:#04x}",
         encoded[0]
     );
     let decoded = decode_chunked(&encoded, encoded.len(), encoded.len() * 4);
@@ -196,7 +196,7 @@ fn short_match_form_exercised() {
     let tag_after_lit = encoded[2];
     assert!(
         tag_after_lit < 0x40,
-        "expected short-match tag after literal, got {:#02x}",
+        "expected short-match tag after literal, got {:#04x}",
         tag_after_lit
     );
     let decoded = decode_chunked(&encoded, encoded.len(), encoded.len() * 2);
