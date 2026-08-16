@@ -240,9 +240,13 @@ impl RawDecoder for Decoder {
         }
 
         Ok(RawProgress {
+            // See the matching note in `deflate`: reporting `false` after the
+            // BFINAL block leaves a trailing-garbage stream stuck returning
+            // `OutputFull` with no progress, spinning any loop that waits for
+            // `Status::StreamEnd`.
+            done: matches!(self.state, DecState::Done),
             consumed,
             written,
-            done: false,
         })
     }
 

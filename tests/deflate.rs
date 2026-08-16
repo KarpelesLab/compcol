@@ -905,3 +905,51 @@ fn small_window_decoder_accepts_capped_and_rejects_far_refs() {
     // The full 32 KiB-window decoder still reads the full-window stream fine.
     assert_eq!(decode_chunked(&full, full.len(), 4096).unwrap(), input);
 }
+
+// ─── regression: no-progress stall on trailing bytes (DoS) ──────────────
+
+/// Crafted stream reported against 0.6.8: a valid 24-byte DEFLATE stream
+/// followed by ~120 bytes of trailing garbage. The decoder reached its
+/// internal `Done` state but `raw_decode` hardcoded `done: false`, so the
+/// bridge saw "input left, output not full" and reported
+/// `Status::OutputFull` with nothing consumed and nothing written. Any
+/// caller looping until `StreamEnd` — including `vec::decompress_to_vec` —
+/// then spun on unchanged state: CPU-bound, flat RSS, no output, so no
+/// memory or output-size cap could stop it.
+///
+/// The payload is the reporter's, offset 7 (their harness prefixes 5 bytes
+/// and the stream is wrapped in zlib; byte 7 is where raw DEFLATE starts).
+static TRAILING_GARBAGE: &[u8] = include_bytes!("fixtures/deflate/trailing_garbage_stall.bin");
+
+/// The decoded payload both the raw-DEFLATE and zlib framings produce.
+const TRAILING_GARBAGE_PLAIN: &[u8] = b"NNNNNNNNNNNNNNJNNNNNNNNH";
+
+#[test]
+fn trailing_bytes_after_final_block_report_stream_end() {
+    let stream = &TRAILING_GARBAGE[7..];
+    let mut dec = <Deflate>::decoder();
+    let mut out = vec![0u8; 4096];
+    let (p, status) = dec.decode(stream, &mut out).unwrap();
+    assert_eq!(&out[..p.written], TRAILING_GARBAGE_PLAIN);
+    assert_eq!(
+        status,
+        Status::StreamEnd,
+        "a completed BFINAL block must report StreamEnd even with trailing \
+         bytes left in the input; reporting OutputFull with no progress \
+         spins the caller forever"
+    );
+    // The stall is the real hazard: whatever the status, a second call must
+    // never report "call me again" while making no progress.
+    let (p2, status2) = dec.decode(&stream[p.consumed..], &mut out).unwrap();
+    assert!(
+        !(p2.consumed == 0 && p2.written == 0 && status2 == Status::OutputFull),
+        "decoder asked to be called again without making progress"
+    );
+}
+
+#[test]
+fn trailing_bytes_do_not_stall_decompress_to_vec() {
+    // Before the fix this call never returned.
+    let got = compcol::vec::decompress_to_vec::<Deflate>(&TRAILING_GARBAGE[7..]).unwrap();
+    assert_eq!(got, TRAILING_GARBAGE_PLAIN);
+}
