@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.9](https://github.com/KarpelesLab/compcol/compare/v0.6.8...v0.6.9) - 2026-08-16
+
+### Added
+
+- *(rar3)* RAR4 (v29) decode — in-band filters, PPMd-II var H, solid groups ([#122](https://github.com/KarpelesLab/compcol/pull/122))
+
+### Fixed
+
+- *(deflate,deflate64,zlib)* report StreamEnd instead of stalling on trailing bytes ([#123](https://github.com/KarpelesLab/compcol/pull/123))
+- *(rar5)* correct x86 E8/E9 filter range checks ([#121](https://github.com/KarpelesLab/compcol/pull/121))
+- *(lzx,amiga_lzx)* reject >=4 GiB input instead of truncating the u32 length header ([#118](https://github.com/KarpelesLab/compcol/pull/118))
+
+### Other
+
+- *(fuzz)* dedicated fuzz targets for rar2/rar3/rar5 decoders ([#120](https://github.com/KarpelesLab/compcol/pull/120))
+
 ## [0.6.8](https://github.com/KarpelesLab/compcol/compare/v0.6.7...v0.6.8) - 2026-07-07
 
 ### Fixed
