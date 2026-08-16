@@ -347,10 +347,14 @@ impl RawDecoder for Decoder {
                 }
 
                 DecState::Done => {
+                    // Terminal: report completion so the bridge yields
+                    // StreamEnd. Reporting `false` left a stream with
+                    // trailing bytes returning OutputFull with nothing
+                    // consumed and nothing written, spinning the caller.
                     return Ok(RawProgress {
                         consumed,
                         written,
-                        done: false,
+                        done: true,
                     });
                 }
             }

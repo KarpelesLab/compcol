@@ -465,10 +465,15 @@ impl RawDecoder for Decoder {
                     }
                 }
                 DecPhase::Done => {
+                    // Terminal (a zero-length block terminates the stream), so
+                    // report completion and let the bridge yield StreamEnd.
+                    // Reporting `false` left a stream with trailing bytes
+                    // returning OutputFull with no progress, spinning any
+                    // caller that loops until StreamEnd.
                     return Ok(RawProgress {
                         consumed,
                         written,
-                        done: false,
+                        done: true,
                     });
                 }
             }
