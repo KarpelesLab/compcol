@@ -587,3 +587,67 @@ mod factory {
         );
     }
 }
+
+// ─── regression: low-distance repeat state must reset per LZ block ──────
+
+/// The 490-byte packed run of `lowdist-reset.bin` from libarchive's
+/// `test_read_format_rar3_lowdist_reset.rar` (method 0x35, version 29,
+/// not solid, 64 bytes unpacked, FILE_CRC 0x6FF838DC).
+///
+/// As with the other libarchive-derived fixtures here, these bytes are the
+/// output of an unrelated proprietary encoder rather than any part of
+/// libarchive's own source, and the file's stored CRC is what the
+/// assertion below checks against — the expected plaintext is a property of
+/// the archive, not of libarchive's reader.
+///
+/// The archive packs its member as two LZ blocks. The second block's header
+/// starts a new table domain, but `parse_block_header` used to carry
+/// `last_low_offset` / `num_low_offset_repeats` across it, so the first
+/// low-distance match after the boundary added a stale addend and every
+/// byte from offset 46 on was wrong — decoding to the right *length* with
+/// the wrong *contents*, which is exactly the failure mode a length check
+/// can't catch. Reported as #126.
+static LOWDIST_RESET: &[u8] = include_bytes!("fixtures/rar3/lowdist_reset.bin");
+
+const LOWDIST_RESET_UNPACK: u64 = 64;
+const LOWDIST_RESET_CRC: u32 = 0x6FF8_38DC;
+
+#[rustfmt::skip]
+const LOWDIST_RESET_EXPECTED: &[u8] = &[
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0d, 0x0e,
+    0x0f, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36,
+];
+
+#[test]
+fn lowdist_repeat_state_resets_across_lz_blocks() {
+    let out = decode_full(LOWDIST_RESET, LOWDIST_RESET_UNPACK);
+    assert_eq!(out.len() as u64, LOWDIST_RESET_UNPACK);
+    assert_eq!(
+        out, LOWDIST_RESET_EXPECTED,
+        "decoded bytes diverge from the archive's contents"
+    );
+    // The archive's own FILE_CRC is the ground truth here: it is what makes
+    // the expected bytes above verifiable independently of any other reader.
+    assert_eq!(
+        crc32(&out),
+        LOWDIST_RESET_CRC,
+        "decoded bytes don't match the archive's stored FILE_CRC"
+    );
+}
+
+/// The same stream fed one byte at a time — the block boundary that carries
+/// the low-distance reset then lands mid-call, so this covers the resumable
+/// path as well as the single-shot one.
+#[test]
+fn lowdist_repeat_state_resets_when_fed_bytewise() {
+    let mut dec = Decoder::with_unpack_size(LOWDIST_RESET_UNPACK);
+    for chunk in LOWDIST_RESET.chunks(1) {
+        dec.decode(chunk, &mut []).unwrap();
+    }
+    let mut out = Vec::with_capacity(LOWDIST_RESET_UNPACK as usize);
+    drain(&mut dec, &mut out);
+    assert_eq!(crc32(&out), LOWDIST_RESET_CRC);
+    assert_eq!(out, LOWDIST_RESET_EXPECTED);
+}

@@ -666,6 +666,20 @@ fn parse_block_header(ctx: &mut RunCtx) -> Result<(), Error> {
         return Ok(());
     }
     ctx.block = BlockKind::Lz;
+    // The low-distance repeat state belongs to the table set of the block
+    // that established it. A new LZ block header starts a new table domain,
+    // so carrying `last_low_offset` (and any outstanding repeat count) into
+    // it feeds the wrong addend into this block's first low-distance match
+    // and silently corrupts the output from that point on.
+    //
+    // This deliberately happens *before* the keep-table flag is read, so it
+    // applies to keep-table blocks too — a block that reuses the previous
+    // code lengths still starts a fresh low-distance run. unrar and
+    // libarchive both clear it exactly here (libarchive's `parse_codes`:
+    // "Low-distance repeat state belongs to the current LZ table and must
+    // not be reused after starting a new table").
+    ctx.last_low_offset = 0;
+    ctx.num_low_offset_repeats = 0;
     // 1 bit: keep-table flag. 0 ⇒ reset the persistent length table.
     let keep_table = ctx.bits.read_bits(1)? != 0;
     if !keep_table {
