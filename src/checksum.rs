@@ -76,8 +76,8 @@ impl Crc32 {
         // precomputed tables. This shortens the per-byte dependency chain
         // and branch/load count versus the byte-at-a-time loop while
         // producing identical CRCs.
-        let mut chunks = data.chunks_exact(8);
-        for c in &mut chunks {
+        let (chunks, remainder) = data.as_chunks::<8>();
+        for c in chunks {
             let lo = u32::from_le_bytes([c[0], c[1], c[2], c[3]]) ^ s;
             let hi = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
             s = CRC32_TABLE8[7][(lo & 0xFF) as usize]
@@ -91,7 +91,7 @@ impl Crc32 {
         }
 
         // Tail: fewer than 8 bytes remain.
-        for &b in chunks.remainder() {
+        for &b in remainder {
             let idx = ((s ^ b as u32) & 0xFF) as usize;
             s = (s >> 8) ^ CRC32_TABLE8[0][idx];
         }

@@ -529,17 +529,16 @@ impl<'a> RangeDecoder<'a> {
                 let slot = node & (TREE_NODES - 1);
                 let p = probs[slot];
                 let bound = (range >> PROB_BITS) * (p as u32);
-                let bit;
-                if code < bound {
+                let bit = if code < bound {
                     range = bound;
                     probs[slot] = p + (((1u16 << PROB_BITS) - p) >> MOVE_BITS);
-                    bit = 0usize;
+                    0usize
                 } else {
                     code -= bound;
                     range -= bound;
                     probs[slot] = p - (p >> MOVE_BITS);
-                    bit = 1usize;
-                }
+                    1usize
+                };
                 node = (node << 1) | bit;
                 while range < TOP {
                     range <<= 8;

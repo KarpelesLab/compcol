@@ -346,9 +346,7 @@ impl RawDecoder for Decoder {
         self.poisoned = false;
         self.input.clear();
         self.unpack_so_far = 0;
-        for b in &mut self.window {
-            *b = 0;
-        }
+        self.window.fill(0);
         self.window_pos = 0;
         self.dist_cache = [0; 4];
         self.last_len = 0;

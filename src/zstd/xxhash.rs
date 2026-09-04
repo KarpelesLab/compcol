@@ -92,13 +92,12 @@ impl Xxh64 {
         }
 
         // Bulk stripes straight from the input.
-        let mut chunks = data.chunks_exact(32);
-        for stripe in &mut chunks {
+        let (stripes, rem) = data.as_chunks::<32>();
+        for stripe in stripes {
             Self::process_stripe(&mut self.acc, stripe);
         }
 
         // Carry the trailing partial stripe.
-        let rem = chunks.remainder();
         if !rem.is_empty() {
             self.buf[..rem.len()].copy_from_slice(rem);
             self.buf_len = rem.len();
