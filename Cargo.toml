@@ -52,6 +52,7 @@ all = [
     "arc_crunch", "arc_squeeze", "arc_squash",
     "hpack", "qpack",
     "huffman", "rangecoder", "mtf", "bwt",
+    "checksum",
 ]
 # Enables `alloc`-backed conveniences (e.g. the `factory` module, the
 # `compcol::vec` one-shot helpers). Pulled in automatically by features
@@ -268,6 +269,12 @@ mtf     = ["alloc"]
 # Reversible block transform with a per-block primary index; pairs with `mtf`
 # and an entropy coder.
 bwt     = ["alloc"]
+# Publishes the running checksums the deflate-family codecs use internally as
+# `compcol::checksum` — `Crc32` (IEEE/gzip, reflected 0xEDB88320, slice-by-8)
+# and `Adler32` (RFC 1950). The module is compiled either way when a codec
+# needs it; this feature is only about making it public API. No `alloc`: both
+# are plain `u32` state machines usable in `no_std`.
+checksum = []
 # `compcol::tokio_io` — async mirrors of compcol::io for the tokio
 # runtime. Pulls the tokio dependency for its AsyncRead/AsyncWrite
 # trait definitions; the rest of the crate stays dep-free.
