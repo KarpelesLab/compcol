@@ -47,10 +47,21 @@ pub mod tokio_io;
 // `lz4`) doesn't pull them in via `cfg(test)`.
 #[cfg(any(feature = "deflate", feature = "deflate64"))]
 mod bits;
-#[cfg(any(feature = "zlib", feature = "gzip", feature = "rar3"))]
+#[cfg(all(
+    not(feature = "checksum"),
+    any(feature = "zlib", feature = "gzip", feature = "rar3")
+))]
 mod checksum;
 #[cfg(any(feature = "deflate", feature = "deflate64"))]
 mod huffman;
+
+// Adler-32 / CRC-32 running checksums. Compiled privately whenever a codec
+// needs them (above); the `checksum` feature is purely about promoting them to
+// public API for callers that have to verify a container's checksum fields
+// themselves — the codecs here decode data streams, not container framing, so
+// those checks land on the caller.
+#[cfg(feature = "checksum")]
+pub mod checksum;
 
 #[cfg(feature = "rle")]
 pub mod rle;
