@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.11](https://github.com/KarpelesLab/compcol/compare/v0.6.10...v0.6.11) - 2026-09-04
+
+### Added
+
+- *(checksum)* expose Crc32/Adler32 as public API behind a `checksum` feature ([#127](https://github.com/KarpelesLab/compcol/pull/127))
+
+### Fixed
+
+- *(rar3)* reset the low-distance repeat state at each LZ block header ([#130](https://github.com/KarpelesLab/compcol/pull/130))
+- *(lints)* satisfy the new Rust 1.98 clippy lints ([#128](https://github.com/KarpelesLab/compcol/pull/128))
+
 ## [0.6.10](https://github.com/KarpelesLab/compcol/compare/v0.6.9...v0.6.10) - 2026-08-16
 
 ### Fixed
