@@ -19,11 +19,6 @@ gzip-both = ["compcol/gzip"]
 [dependencies]
 compcol = { path = "../..", default-features = false, features = ["embed"] }
 
-# Same temporary override as the crate's own manifest, which does not apply
-# from here: drop it with that one once minizlib 0.1.2 is published.
-[patch.crates-io]
-minizlib = { git = "https://github.com/KarpelesLab/minizlib", rev = "6806b44ac1e0db68fa749afad1393dde9af48bc2" }
-
 [profile.release]
 opt-level = "z"
 lto = true

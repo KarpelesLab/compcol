@@ -1,14 +1,15 @@
-//! The `embed` build of the gzip container: `minizlib`'s codecs behind the
-//! same names as the standard build. See [`crate::embed`].
+//! The `embed` build of the gzip container: the small codecs behind the same
+//! names as the standard build. See [`crate::embed`].
 //!
 //! The header written is the minimal ten bytes (no name, no flags,
 //! `XFL = 0`, `OS = 255`); the trailer's CRC-32 and `ISIZE` are verified on
 //! decode. Header fields of incoming streams (`FEXTRA`, `FNAME`, `FCOMMENT`,
-//! `FHCRC`) are skipped. Only the first member of a concatenated stream is
-//! decoded.
+//! `FHCRC`) are skipped; concatenated members decode as one stream, as in
+//! the standard build.
 
 use crate::embed::WINDOW;
-use crate::embed::codec::codec;
+use crate::embed::codec;
+use crate::embed::format::Gzip;
 
 /// Tunables for the gzip encoder — accepted for compatibility with the
 /// standard build, **without effect** in `embed` mode: the encoder has one
@@ -29,4 +30,4 @@ impl Default for EncoderConfig {
 /// build's `()`.
 type DecoderConfig = ();
 
-codec!(minizlib::Gzip, |_| WINDOW);
+codec!(Gzip, |_| WINDOW);

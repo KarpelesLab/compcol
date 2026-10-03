@@ -51,8 +51,8 @@ pub mod tokio_io;
 // surface that downstream crates see is the per-algorithm modules below.
 // Gated on the features that consume them so a narrow build (e.g. just
 // `lz4`) doesn't pull them in via `cfg(test)`. The `embed` build of the
-// deflate family gets its bit reader, Huffman decoder and checksums from
-// `minizlib` instead, so none of this is compiled for it.
+// deflate family has its own, smaller, under `embed`, so none of this is
+// compiled for it.
 #[cfg(any(
     all(feature = "deflate", not(feature = "embed")),
     feature = "deflate64"
@@ -73,7 +73,7 @@ mod checksum;
 mod huffman;
 
 // The embedded-target mode: documentation of what it changes, its sizes,
-// and the `minizlib`-backed wrappers the deflate-family modules use.
+// and the small codecs the deflate-family modules are built from.
 #[cfg(feature = "embed")]
 pub mod embed;
 

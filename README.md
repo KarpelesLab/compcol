@@ -543,15 +543,14 @@ that have a small variant are built as that variant **under their usual
 names** — `compcol::gzip::Gzip`, `compcol::zlib::Encoder`,
 `compcol::deflate::Decoder` keep their paths and their `Encoder` /
 `Decoder` contracts, so the same code compiles either way — with no heap,
-little stack and little code. Today that is the deflate family, backed by
-the [`minizlib`](https://crates.io/crates/minizlib) crate (same author,
-MIT, `no_std`, no `unsafe`): a push decoder in the manner of zlib's `puff`
-that keeps ~1.1 KiB of state and a 32 KiB window, and a greedy
-fixed-Huffman encoder. Everything else is unchanged by `embed`; the
+little stack and little code. Today that is the deflate family: a push
+decoder in the manner of zlib's `puff` that keeps ~1.1 KiB of state and a
+32 KiB window, and a greedy fixed-Huffman encoder, both written straight
+against the crate's traits. Everything else is unchanged by `embed`; the
 `alloc`-backed codecs stay available if you enable `alloc`.
 
 The codec structs own all their memory (a decoder is ≈ 34 KB, an encoder
-≈ 11 KB) and are `const`-constructible with an all-zero state, so they can
+≈ 6 KB) and are `const`-constructible with an all-zero state, so they can
 live in a `static` in `.bss`:
 
 ```rust
@@ -575,17 +574,17 @@ fn unpack(packed: &[u8], out: &mut [u8]) -> Result<usize, compcol::Error> {
 What the `embed` deflate family gives up: ratio (fixed Huffman codes,
 matches within 4 KiB blocks: roughly 40–45 % on text where `gzip -6` gets
 20 %; `level` is accepted and ignored), speed (tens of MB/s), sync flush
-(`Error::Unsupported`), preset dictionaries, and concatenated gzip members.
+(`Error::Unsupported`) and preset dictionaries.
 `compcol::embed` documents the details and the sizes CI holds the build
 to on a Cortex-M4 (`thumbv7em-none-eabi`, `opt-level = "z"`, LTO):
 
 | configuration           | code      | stack   |
 |-------------------------|----------:|--------:|
-| gzip / zlib decode      | ≤ 4.6 KB  | ≤ 256 B |
-| raw deflate decode      | ≤ 4.3 KB  | ≤ 256 B |
+| gzip / zlib decode      | ≤ 4.3 KB  | ≤ 256 B |
+| raw deflate decode      | ≤ 3.9 KB  | ≤ 256 B |
 | gzip / zlib encode      | ≤ 2.0 KB  | ≤ 256 B |
 | raw deflate encode      | ≤ 1.7 KB  | ≤ 256 B |
-| gzip encode + decode    | ≤ 6.5 KB  | ≤ 256 B |
+| gzip encode + decode    | ≤ 6.0 KB  | ≤ 256 B |
 
 No panic machinery is linked, and no static RAM is needed beyond the codec
 struct itself. `tools/footprint/check.sh` reproduces the measurement;

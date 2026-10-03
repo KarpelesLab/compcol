@@ -506,8 +506,6 @@ fn unsupported_method_rejected() {
     assert_eq!(err, Error::Unsupported);
 }
 
-// The `embed` decoder reports this with a different `Error` variant (see tests/embed.rs).
-#[cfg(not(feature = "embed"))]
 #[test]
 fn reserved_flag_rejected() {
     // Top bit of FLG (0x80) is reserved; setting it must be rejected.
@@ -529,8 +527,6 @@ fn corrupted_crc_rejected() {
     assert_eq!(err, Error::ChecksumMismatch);
 }
 
-// The `embed` decoder reports this with a different `Error` variant (see tests/embed.rs).
-#[cfg(not(feature = "embed"))]
 #[test]
 fn corrupted_isize_rejected() {
     let input = b"some payload bytes";
@@ -674,8 +670,6 @@ mod factory {
 
 // ─── multi-member streams (RFC 1952 §2.2) ───────────────────────────────
 
-// The `embed` decoder stops at the first gzip member.
-#[cfg(not(feature = "embed"))]
 #[test]
 fn multi_member_stream_decodes_concatenated_members() {
     // Encode two separate payloads, concatenate, decode as one stream.
@@ -692,8 +686,6 @@ fn multi_member_stream_decodes_concatenated_members() {
     assert_eq!(decoded, b"hello, world!\n");
 }
 
-// The `embed` decoder stops at the first gzip member.
-#[cfg(not(feature = "embed"))]
 #[test]
 fn multi_member_stream_with_three_members() {
     let mut all = Vec::new();
@@ -740,8 +732,6 @@ fn trailing_garbage_after_last_member_is_ignored() {
     assert_eq!(decoded, payload);
 }
 
-// The `embed` decoder stops at the first gzip member.
-#[cfg(not(feature = "embed"))]
 #[test]
 fn second_member_with_corrupted_crc_errors() {
     let mut enc1 = Encoder::new();

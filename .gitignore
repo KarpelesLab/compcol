@@ -3,3 +3,7 @@
 /Cargo.lock
 # Per-agent worktrees created by Claude Code's parallel-agent tooling.
 /.claude/
+
+# The bare-metal footprint harness builds in place (see tools/footprint/check.sh).
+/tools/footprint/target
+/tools/footprint/Cargo.lock

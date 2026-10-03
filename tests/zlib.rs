@@ -405,8 +405,6 @@ fn corrupted_adler_rejected() {
     assert_eq!(err, Error::ChecksumMismatch);
 }
 
-// The `embed` decoder reports this with a different `Error` variant (see tests/embed.rs).
-#[cfg(not(feature = "embed"))]
 #[test]
 fn corrupt_header_unsupported_cm_rejected() {
     // CMF=0x77 (CM=7, not deflate)
@@ -689,16 +687,12 @@ fn zlib_decoder_fdict0_ignores_configured_dictionary() {
 /// `Status::OutputFull` with no progress and any loop waiting for
 /// `StreamEnd` spun forever. Offset 5 is where the `78 00`-style zlib
 /// header starts in the reporter's payload.
-#[cfg(not(feature = "embed"))]
 static TRAILING_GARBAGE: &[u8] = include_bytes!("fixtures/deflate/trailing_garbage_stall.bin");
 
-#[cfg(not(feature = "embed"))]
 const TRAILING_GARBAGE_PLAIN: &[u8] = b"NNNNNNNNNNNNNNJNNNNNNNNH";
 
 // The fixture's zlib header has CINFO = 15 (an 8 MiB window), which RFC 1950
 // forbids and the `embed` decoder rejects as `Unsupported`; the standard one
-// ignores CINFO. tests/embed.rs covers trailing bytes with a valid header.
-#[cfg(not(feature = "embed"))]
 #[test]
 fn trailing_bytes_after_adler_report_stream_end() {
     let stream = &TRAILING_GARBAGE[5..];
@@ -716,8 +710,6 @@ fn trailing_bytes_after_adler_report_stream_end() {
 
 // The fixture's zlib header has CINFO = 15 (an 8 MiB window), which RFC 1950
 // forbids and the `embed` decoder rejects as `Unsupported`; the standard one
-// ignores CINFO. tests/embed.rs covers trailing bytes with a valid header.
-#[cfg(not(feature = "embed"))]
 #[test]
 fn trailing_bytes_do_not_stall_decompress_to_vec() {
     // Before the fix this call never returned.

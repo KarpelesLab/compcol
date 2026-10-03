@@ -74,21 +74,13 @@ rle90   = ["alloc"]
 # Embedded-target mode: the algorithms below that have a small variant are
 # built as that variant — low stack, no heap, little code — under the same
 # names, so the same downstream code compiles either way. Today that is the
-# deflate family (`deflate`, `zlib`, `gzip`), backed by the `minizlib` crate
-# (same author, MIT): a puff-style push decoder keeping ~1.1 KiB of state and
-# a 32 KiB window, and a greedy fixed-Huffman encoder. See `compcol::embed`
-# for what differs (no preset dictionaries, no sync flush, a fixed ratio
-# regardless of `level`) and for the measured sizes CI holds the build to.
-# Does not pull `alloc`; combine with `--no-default-features`.
-embed = [
-    "dep:minizlib",
-    "minizlib/decompress",
-    "minizlib/compress",
-    "minizlib/checksum",
-    "minizlib/stored",
-    "minizlib/fixed",
-    "minizlib/dynamic",
-]
+# deflate family (`deflate`, `zlib`, `gzip`): a puff-style push decoder
+# keeping ~1.1 KiB of state and a 32 KiB window, and a greedy fixed-Huffman
+# encoder. See `compcol::embed` for what differs (no preset dictionaries, no
+# sync flush, a fixed ratio regardless of `level`) and for the measured sizes
+# CI holds the build to. Does not pull `alloc`; combine with
+# `--no-default-features`.
+embed = []
 # RFC 1951 raw deflate. The standard build needs `alloc` for the 32 KiB
 # sliding window and the per-block symbol/bit buffers (enable `alloc` or
 # `std` alongside; a build with neither fails with a message saying so);
@@ -99,9 +91,9 @@ deflate = []
 # does not depend on the `deflate` feature.
 deflate64 = ["alloc"]
 # RFC 1950 zlib (deflate + Adler-32 + 2-byte header / 4-byte trailer).
-zlib    = ["deflate", "minizlib?/zlib"]
+zlib    = ["deflate"]
 # RFC 1952 gzip (deflate + CRC-32 + 10-byte header / 8-byte trailer).
-gzip    = ["deflate", "minizlib?/gzip"]
+gzip    = ["deflate"]
 # LZMA (Lempel–Ziv–Markov chain). Range-coded, depends on alloc for the
 # probability tables and the LZ window.
 lzma    = ["alloc"]
@@ -311,17 +303,6 @@ unsafe_code = "forbid"
 # AsyncWrite traits, which live under the default-off `io-util` feature
 # in tokio's modular layout.
 tokio = { version = "1", default-features = false, optional = true }
-# Optional, pulled in only by the `embed` feature: the small deflate-family
-# codecs. Same author, no_std, no alloc, no unsafe, no dependencies. The
-# containers are enabled from this crate's `zlib` / `gzip` features.
-minizlib = { version = "0.1.1", default-features = false, optional = true }
-
-# TEMPORARY, until minizlib 0.1.2 is published: the `embed` wrappers need
-# the output accessors, owned tables and const constructors that landed on
-# minizlib's master in commit 6806b44. Drop this section and bump the
-# requirement above to "0.1.2" once that release is on crates.io.
-[patch.crates-io]
-minizlib = { git = "https://github.com/KarpelesLab/minizlib", rev = "6806b44ac1e0db68fa749afad1393dde9af48bc2" }
 
 [dev-dependencies]
 # Test-only: the async tests need a runtime + the AsyncReadExt /

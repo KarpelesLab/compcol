@@ -1,8 +1,9 @@
-//! The `embed` build of raw deflate: `minizlib`'s codecs behind the same
+//! The `embed` build of raw deflate: the small codecs behind the same
 //! names as the standard build. See [`crate::embed`].
 
 use crate::embed::WINDOW;
-use crate::embed::codec::codec;
+use crate::embed::codec;
+use crate::embed::format::Raw;
 
 /// Tunables for the deflate encoder — accepted for compatibility with the
 /// standard build, **without effect** in `embed` mode: the encoder has one
@@ -84,4 +85,4 @@ impl DecoderConfig {
     }
 }
 
-codec!(minizlib::Raw, |config| config.window_size);
+codec!(Raw, |config| config.window_size);

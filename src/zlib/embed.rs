@@ -1,5 +1,5 @@
-//! The `embed` build of the zlib container: `minizlib`'s codecs behind the
-//! same names as the standard build. See [`crate::embed`].
+//! The `embed` build of the zlib container: the small codecs behind the same
+//! names as the standard build. See [`crate::embed`].
 //!
 //! The header written is `78 01` (deflate, 32 KiB window, "fastest"
 //! compression level, no dictionary); the trailer is the Adler-32 of the
@@ -7,7 +7,8 @@
 //! `Error::Unsupported`.
 
 use crate::embed::WINDOW;
-use crate::embed::codec::codec;
+use crate::embed::codec;
+use crate::embed::format::Zlib;
 
 /// Tunables for the zlib encoder — accepted for compatibility with the
 /// standard build, **without effect** in `embed` mode: the encoder has one
@@ -32,4 +33,4 @@ impl Default for EncoderConfig {
 #[non_exhaustive]
 pub struct DecoderConfig {}
 
-codec!(minizlib::Zlib, |_| WINDOW);
+codec!(Zlib, |_| WINDOW);

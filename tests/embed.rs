@@ -1,4 +1,4 @@
-//! Tests for the `embed` build of the deflate family: the `minizlib`-backed
+//! Tests for the `embed` build of the deflate family: the small
 //! `deflate` / `zlib` / `gzip` codecs behind the standard names.
 //!
 //! Correctness is checked against reference streams from CPython's zlib
@@ -361,9 +361,13 @@ fn encoded_stream_is_independent_of_input_chunking() {
     let whole = encode_chunked(&mut zlib::Zlib::encoder(), &input, usize::MAX, 65536);
     for &in_chunk in &[1usize, 7, BLOCK - 1, BLOCK, BLOCK + 1, 2 * BLOCK + 3] {
         for &out_chunk in &[1usize, 64, 65536] {
-            assert_eq!(
-                encode_chunked(&mut zlib::Zlib::encoder(), &input, in_chunk, out_chunk),
-                whole
+            let got = encode_chunked(&mut zlib::Zlib::encoder(), &input, in_chunk, out_chunk);
+            let first = got.iter().zip(&whole).position(|(a, b)| a != b);
+            assert!(
+                got == whole,
+                "in {in_chunk} out {out_chunk}: lengths {} vs {}, first difference at {first:?}",
+                got.len(),
+                whole.len()
             );
         }
     }
@@ -409,7 +413,7 @@ fn rejects_corrupt_streams_with_the_right_errors() {
     let good = fixture!("text_l9.zlib");
 
     let mut bad = good.to_vec();
-    bad[0] = 0x79; // CMF/FLG check fails
+    bad[1] ^= 0x01; // FCHECK fails
     assert_eq!(
         decode_all::<zlib::Zlib>(&bad).unwrap_err(),
         Error::BadHeader
@@ -470,7 +474,18 @@ fn rejects_corrupt_streams_with_the_right_errors() {
     bad[at] ^= 0x01; // ISIZE
     assert_eq!(
         decode_all::<gzip::Gzip>(&bad).unwrap_err(),
-        Error::ChecksumMismatch
+        Error::TrailerMismatch
+    );
+    let mut bad = good.to_vec();
+    bad[3] |= 0x80; // reserved flag
+    assert_eq!(
+        decode_all::<gzip::Gzip>(&bad).unwrap_err(),
+        Error::Unsupported
+    );
+    // A stored block whose length check fails.
+    assert_eq!(
+        decode_all::<deflate::Deflate>(&[0x01, 0x05, 0x00, 0x00, 0x00]).unwrap_err(),
+        Error::Corrupt
     );
 }
 
@@ -479,7 +494,7 @@ fn errors_poison_until_reset() {
     let mut dec = zlib::Zlib::decoder();
     let mut buf = [0u8; 64];
     assert_eq!(
-        dec.decode(&[0x79, 0x9c], &mut buf).unwrap_err(),
+        dec.decode(&[0x78, 0x9d], &mut buf).unwrap_err(),
         Error::BadHeader
     );
     assert_eq!(
@@ -499,23 +514,41 @@ fn trailing_bytes_are_left_unconsumed_and_report_stream_end() {
     assert_eq!(back, text(60_000));
     assert_eq!(consumed, fixture!("text_l1.zlib").len());
 
-    // Once ended, further calls are no-ops reporting StreamEnd.
+    // Once ended, further calls are no-ops reporting StreamEnd. A gzip
+    // stream only ends for sure with a byte that does not start another
+    // member, or with `finish`: as in the standard build.
     let mut dec = gzip::Gzip::decoder();
     let mut buf = vec![0u8; 65536];
     let (p, status) = dec.decode(fixture!("text_l6.gz"), &mut buf).unwrap();
-    assert_eq!(status, Status::StreamEnd);
+    assert_eq!(status, Status::InputEmpty);
     assert_eq!(p.consumed, fixture!("text_l6.gz").len());
     let (p, status) = dec.decode(b"more", &mut buf).unwrap();
     assert_eq!((p.consumed, p.written, status), (0, 0, Status::StreamEnd));
+    let (p, status) = dec.decode(b"more", &mut buf).unwrap();
+    assert_eq!((p.consumed, p.written, status), (0, 0, Status::StreamEnd));
+
+    let mut dec = gzip::Gzip::decoder();
+    dec.decode(fixture!("text_l6.gz"), &mut buf).unwrap();
+    assert_eq!(dec.finish(&mut buf).unwrap().1, Status::StreamEnd);
 }
 
 #[test]
-fn second_gzip_member_is_not_decoded() {
+fn concatenated_gzip_members_decode_as_one_stream() {
     let one = fixture!("text_l6.gz");
-    let two = [one, one].concat();
-    let (back, consumed) = decode_chunked(&mut gzip::Gzip::decoder(), &two, 100, 1000).unwrap();
-    assert_eq!(back, text(60_000));
-    assert_eq!(consumed, one.len());
+    let two = [one, one, fixture!("empty.gz")].concat();
+    for &(in_chunk, out_chunk) in &[(100usize, 1000usize), (1, 1), (usize::MAX, 65536)] {
+        let (back, consumed) =
+            decode_chunked(&mut gzip::Gzip::decoder(), &two, in_chunk, out_chunk).unwrap();
+        assert_eq!(back, [text(60_000), text(60_000)].concat());
+        assert_eq!(consumed, two.len());
+    }
+    // A corrupt second member is an error, not silently the end.
+    let mut bad = two.clone();
+    bad[one.len() + one.len() - 6] ^= 1;
+    assert_eq!(
+        decode_chunked(&mut gzip::Gzip::decoder(), &bad, 100, 1000).unwrap_err(),
+        Error::ChecksumMismatch
+    );
 }
 
 #[test]

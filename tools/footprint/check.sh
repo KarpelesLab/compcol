@@ -43,14 +43,14 @@ check() {
 # their sum; the code and stack ceilings are the table in `compcol::embed`.
 # Keep all three in sync.
 DECODER=34816
-ENCODER=11008
+ENCODER=6272
 echo '| configuration          | code / max      | RAM / max       | stack / max | panics | .data | verdict |'
 echo '|------------------------|----------------:|----------------:|------------:|-------:|------:|---------|'
-check 'gzip decode'          gzip-decode    4600 $DECODER 256
-check 'zlib decode'          zlib-decode    4600 $DECODER 256
-check 'raw deflate decode'   deflate-decode 4300 $DECODER 256
+check 'gzip decode'          gzip-decode    4200 $DECODER 256
+check 'zlib decode'          zlib-decode    4300 $DECODER 256
+check 'raw deflate decode'   deflate-decode 3900 $DECODER 256
 check 'gzip encode'          gzip-encode    2000 $ENCODER 256
 check 'zlib encode'          zlib-encode    2000 $ENCODER 256
 check 'raw deflate encode'   deflate-encode 1700 $ENCODER 256
-check 'gzip encode + decode' gzip-both      6500 $((DECODER + ENCODER)) 256
+check 'gzip encode + decode' gzip-both      6000 $((DECODER + ENCODER)) 256
 exit $status
