@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1](https://github.com/KarpelesLab/compcol/compare/v0.7.0...v0.7.1) - 2026-10-03
+
+### Added
+
+- *(embed)* `embed::flate`, the low-level API absorbed from minizlib ([#135](https://github.com/KarpelesLab/compcol/pull/135))
+
 ## [0.7.0](https://github.com/KarpelesLab/compcol/compare/v0.6.11...v0.7.0) - 2026-10-03
 
 ### Added
