@@ -309,6 +309,8 @@ tokio = { version = "1", default-features = false, optional = true }
 # AsyncWriteExt convenience methods that the library itself doesn't
 # use. Production consumers can pick their own tokio feature set.
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "io-util"] }
+# Test-only: the reference the `embed::flate` tests round-trip against.
+flate2 = "1"
 
 [[bin]]
 name             = "compcol"

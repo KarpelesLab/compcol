@@ -24,6 +24,13 @@ gzip-len = ["compcol/gzip"]
 gzip-compress = ["compcol/gzip"]
 zlib-compress = ["compcol/zlib"]
 deflate-compress = ["compcol/deflate"]
+flate-gunzip = ["compcol/gzip"]
+flate-stream = ["compcol/gzip"]
+flate-len = ["compcol/gzip"]
+flate-push = ["compcol/gzip"]
+flate-gzip = ["compcol/gzip"]
+flate-compress-stream = ["compcol/gzip"]
+flate-compress-push = ["compcol/gzip"]
 
 [dependencies]
 compcol = { path = "../..", default-features = false, features = ["embed"] }

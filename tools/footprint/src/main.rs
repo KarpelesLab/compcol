@@ -217,3 +217,146 @@ pub extern "C" fn entry(
     }
     decode(dec, mid.get(..n as usize).unwrap_or(&[]), dst)
 }
+
+// ─── `embed::flate`: the caller's memory, any input, any output ─────────
+
+/// Buffer in, buffer out.
+#[cfg(feature = "flate-gunzip")]
+#[unsafe(no_mangle)]
+pub extern "C" fn entry(src: *const u8, src_len: usize, dst: *mut u8, dst_len: usize) -> isize {
+    use compcol::embed::flate::{Buffer, gunzip};
+    let src = unsafe { core::slice::from_raw_parts(src, src_len) };
+    let dst = unsafe { core::slice::from_raw_parts_mut(dst, dst_len) };
+    gunzip(src, Buffer::new(dst)).map_or(-1, |len| len as isize)
+}
+
+/// Stream in, stream out, through the caller's window.
+#[cfg(feature = "flate-stream")]
+#[unsafe(no_mangle)]
+pub extern "C" fn entry(
+    read: extern "C" fn(*mut u8, usize) -> usize,
+    write: extern "C" fn(*const u8, usize),
+    window: *mut u8,
+    window_len: usize,
+    max_len: u64,
+) -> isize {
+    use compcol::embed::flate::{Reader, Stream, gunzip};
+    let window = unsafe { core::slice::from_raw_parts_mut(window, window_len) };
+    let mut scratch = [0; 64];
+    let input = Reader::new(&mut scratch, |buf| Ok(read(buf.as_mut_ptr(), buf.len())));
+    let output = Stream::new(window, max_len, |data| {
+        write(data.as_ptr(), data.len());
+        Ok(())
+    });
+    gunzip(input, output).map_or(-1, |len| len as isize)
+}
+
+/// The length only.
+#[cfg(feature = "flate-len")]
+#[unsafe(no_mangle)]
+pub extern "C" fn entry(src: *const u8, src_len: usize, max_len: u64) -> isize {
+    let src = unsafe { core::slice::from_raw_parts(src, src_len) };
+    compcol::embed::flate::gunzip_len(src, max_len).map_or(-1, |len| len as isize)
+}
+
+/// Pushed in, buffer out.
+#[cfg(feature = "flate-push")]
+#[unsafe(no_mangle)]
+pub extern "C" fn entry(
+    read: extern "C" fn(*mut u8, usize) -> usize,
+    dst: *mut u8,
+    dst_len: usize,
+) -> isize {
+    use compcol::embed::flate::{Buffer, Decompressor, Gzip};
+    let dst = unsafe { core::slice::from_raw_parts_mut(dst, dst_len) };
+    let mut chunk = [0; 64];
+    let mut decompressor = Decompressor::<_, Gzip>::new(Buffer::new(dst));
+    loop {
+        let len = read(chunk.as_mut_ptr(), chunk.len()).min(chunk.len());
+        if len == 0 {
+            return decompressor.finish().map_or(-1, |len| len as isize);
+        }
+        if decompressor.write(&chunk[..len]).is_err() {
+            return -1;
+        }
+    }
+}
+
+/// Compression: buffer in, buffer out, with the caller's table.
+#[cfg(feature = "flate-gzip")]
+#[unsafe(no_mangle)]
+pub extern "C" fn entry(
+    src: *const u8,
+    src_len: usize,
+    dst: *mut u8,
+    dst_len: usize,
+    table: *mut u16,
+    table_len: usize,
+) -> isize {
+    use compcol::embed::flate::{Buffer, gzip};
+    let src = unsafe { core::slice::from_raw_parts(src, src_len) };
+    let dst = unsafe { core::slice::from_raw_parts_mut(dst, dst_len) };
+    let table = unsafe { core::slice::from_raw_parts_mut(table, table_len) };
+    gzip(src, table, Buffer::new(dst)).map_or(-1, |len| len as isize)
+}
+
+/// Compression: stream in, a chunk at a time, stream out.
+#[cfg(feature = "flate-compress-stream")]
+#[unsafe(no_mangle)]
+pub extern "C" fn entry(
+    read: extern "C" fn(*mut u8, usize) -> usize,
+    write: extern "C" fn(*const u8, usize),
+    table: *mut u16,
+    table_len: usize,
+) -> isize {
+    use compcol::embed::flate::{Compressor, Gzip, NO_LIMIT, Stream};
+    let table = unsafe { core::slice::from_raw_parts_mut(table, table_len) };
+    let mut chunk = [0; 512];
+    let mut buffer = [0; 64];
+    let output = Stream::new(&mut buffer, NO_LIMIT, |data| {
+        write(data.as_ptr(), data.len());
+        Ok(())
+    });
+    let mut compressor = Compressor::<_, Gzip>::new(output, table);
+    loop {
+        let len = read(chunk.as_mut_ptr(), chunk.len()).min(chunk.len());
+        if len == 0 {
+            return compressor.finish().map_or(-1, |len| len as isize);
+        }
+        if compressor.write(&chunk[..len]).is_err() {
+            return -1;
+        }
+    }
+}
+
+/// Compression: pushed in, gathered in the caller's buffer, stream out.
+#[cfg(feature = "flate-compress-push")]
+#[unsafe(no_mangle)]
+pub extern "C" fn entry(
+    read: extern "C" fn(*mut u8, usize) -> usize,
+    write: extern "C" fn(*const u8, usize),
+    table: *mut u16,
+    table_len: usize,
+    gather: *mut u8,
+    gather_len: usize,
+) -> isize {
+    use compcol::embed::flate::{BufferedCompressor, Gzip, NO_LIMIT, Stream};
+    let table = unsafe { core::slice::from_raw_parts_mut(table, table_len) };
+    let gather = unsafe { core::slice::from_raw_parts_mut(gather, gather_len) };
+    let mut chunk = [0; 64];
+    let mut buffer = [0; 64];
+    let output = Stream::new(&mut buffer, NO_LIMIT, |data| {
+        write(data.as_ptr(), data.len());
+        Ok(())
+    });
+    let mut compressor = BufferedCompressor::<_, Gzip>::new(output, table, gather);
+    loop {
+        let len = read(chunk.as_mut_ptr(), chunk.len()).min(chunk.len());
+        if len == 0 {
+            return compressor.finish().map_or(-1, |len| len as isize);
+        }
+        if compressor.write(&chunk[..len]).is_err() {
+            return -1;
+        }
+    }
+}

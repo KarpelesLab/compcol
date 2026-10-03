@@ -35,6 +35,12 @@
 //!   table, output)` makes one block of a whole slice, with a hash table of
 //!   the caller's of any size.
 //!
+//! And **at the lowest level**, `embed::flate`, the API of `minizlib`: the
+//! caller's own memory throughout (the output buffer or a window of any
+//! size as history, a table of any size to compress with), input pulled
+//! through a callback or an iterator or pushed, output to a buffer, a
+//! callback or a mere count, and a richer error type of its own.
+//!
 //! What it gives up compared to the standard build:
 //!
 //! - **Ratio.** The encoder emits fixed-Huffman blocks only, finds matches
@@ -103,6 +109,13 @@
 //! | gzip `compress`                     | ≤ 1 000      | ≤ 160         |
 //! | zlib `compress`                     | ≤ 950        | ≤ 160         |
 //! | raw deflate `compress`              | ≤ 800        | ≤ 160         |
+//! | `flate`: `gunzip`, buffer out     | ≤ 2 550      | ≤ 1 450       |
+//! | `flate`: `gunzip`, streams        | ≤ 2 900      | ≤ 1 600       |
+//! | `flate`: `gunzip_len`             | ≤ 2 400      | ≤ 1 450       |
+//! | `flate`: `Decompressor`           | ≤ 3 650      | ≤ 1 500       |
+//! | `flate`: `gzip`, buffer out       | ≤ 1 050      | ≤ 192         |
+//! | `flate`: `Compressor`, streams    | ≤ 1 450      | ≤ 840         |
+//! | `flate`: `BufferedCompressor`     | ≤ 1 600      | ≤ 448         |
 //!
 //! "Stack" is the deepest call path from the entry point, every function's
 //! frame read off the disassembly (`tools/footprint/stack.py`); nothing
@@ -111,7 +124,10 @@
 //! 330 of stack, streaming encoders at 1 350–1 750 and about 210, the
 //! one-shot decoders at 1 850–2 250 and 1 340, the one-shot encoders at
 //! 750–950 and 125. The table is a contract, not a report; the constants in
-//! this module are the same ceilings for the host-side tests.
+//! this module are the same ceilings for the host-side tests. The `flate`
+//! rows include the stack of the program around them (a 512-byte chunk for
+//! the `Compressor`, 64-byte buffers elsewhere), not that of the input and
+//! output callbacks, the only calls made through a pointer.
 #![cfg_attr(docsrs, doc(cfg(feature = "embed")))]
 
 #[cfg(feature = "deflate")]
@@ -120,6 +136,8 @@ mod checksum;
 pub(crate) mod decoder;
 #[cfg(feature = "deflate")]
 pub(crate) mod encoder;
+#[cfg(feature = "deflate")]
+pub mod flate;
 #[cfg(feature = "deflate")]
 pub(crate) mod format;
 #[cfg(feature = "deflate")]

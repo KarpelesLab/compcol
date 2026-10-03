@@ -586,6 +586,22 @@ fn unpack(packed: &[u8], out: &mut [u8]) -> Result<usize, compcol::Error> {
 }
 ```
 
+`compcol::embed::flate` goes one level lower, with the API of the retired
+`minizlib` crate: the memory is all the caller's, the input and output
+whatever the caller plugs in. It decodes into the caller's buffer, or
+through a window of the caller's of any size, pulls its input through a
+callback or an iterator or has it pushed, and compresses a chunk at a time
+with the caller's table, all with no state but a little stack.
+
+```rust
+use compcol::embed::flate::{gunzip, Error, Reader, Stream};
+
+let mut scratch = [0; 64];
+let input = Reader::new(&mut scratch, |buf| uart.read(buf).map_err(|_| Error::Io));
+let output = Stream::new(&mut window, max_len, |data| flash.write(data).map_err(|_| Error::Io));
+let len = gunzip(input, output)?;                         // ~1.5 KiB of stack
+```
+
 What the `embed` deflate family gives up: ratio (fixed Huffman codes,
 matches within a block: with the default sizes roughly 40–45 % on text
 where `gzip -6` gets 20 %; `level` is accepted and ignored), speed (tens of
@@ -604,6 +620,11 @@ to on a Cortex-M4 (`thumbv7em-none-eabi`, `opt-level = "z"`, LTO):
 | raw deflate `decompress`        | ≤ 2.0 KB  | ≤ 1.4 KB  |
 | gzip / zlib `compress`          | ≤ 1.0 KB  | ≤ 160 B   |
 | raw deflate `compress`          | ≤ 0.8 KB  | ≤ 160 B   |
+| `flate`: `gunzip`, buffer out   | ≤ 2.55 KB | ≤ 1.45 KB |
+| `flate`: `gunzip`, streams      | ≤ 2.9 KB  | ≤ 1.6 KB  |
+| `flate`: `Decompressor`         | ≤ 3.65 KB | ≤ 1.5 KB  |
+| `flate`: `gzip`, buffer out     | ≤ 1.05 KB | ≤ 192 B   |
+| `flate`: `Compressor`, streams  | ≤ 1.45 KB | ≤ 840 B   |
 
 No panic machinery is linked, and no static RAM is needed beyond the codec
 struct itself. `tools/footprint/check.sh` reproduces the measurement;
