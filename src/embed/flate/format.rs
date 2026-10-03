@@ -14,13 +14,20 @@ mod sealed {
 /// A container for compressed data, to decompress from:
 /// [`Gzip`](struct.Gzip.html), [`Zlib`](struct.Zlib.html), [`Raw`], or
 /// [`Detect`](struct.Detect.html) for whichever of the first two comes.
-pub trait Container: sealed::Sealed + Checksum {
+pub trait Container: sealed::Sealed + Checksum + Sized {
     /// How many of the `trailer` words there are, at most. Zero means no
     /// header either.
     #[doc(hidden)]
     const TRAILER: usize;
+    /// A fresh container: no data seen yet. A constant, so that the codecs
+    /// can be built in `const` context, and all zeros, so that one built in
+    /// a `static` lands in `.bss`.
     #[doc(hidden)]
-    fn new() -> Self;
+    const INIT: Self;
+    #[doc(hidden)]
+    fn new() -> Self {
+        Self::INIT
+    }
     /// Whether a stream starting with `first` is a gzip one.
     #[doc(hidden)]
     fn detect(&mut self, first: u8) -> bool;
@@ -54,10 +61,7 @@ impl Checksum for Gzip {
 #[cfg(feature = "gzip")]
 impl Container for Gzip {
     const TRAILER: usize = 2;
-
-    fn new() -> Self {
-        Gzip(Crc32::new())
-    }
+    const INIT: Self = Gzip(Crc32::new());
 
     fn detect(&mut self, _: u8) -> bool {
         true
@@ -91,10 +95,7 @@ impl Checksum for Zlib {
 #[cfg(feature = "zlib")]
 impl Container for Zlib {
     const TRAILER: usize = 1;
-
-    fn new() -> Self {
-        Zlib(Adler32::new())
-    }
+    const INIT: Self = Zlib(Adler32::new());
 
     fn detect(&mut self, _: u8) -> bool {
         false
@@ -124,10 +125,7 @@ impl Checksum for Raw {
 
 impl Container for Raw {
     const TRAILER: usize = 0;
-
-    fn new() -> Self {
-        Raw
-    }
+    const INIT: Self = Raw;
 
     fn detect(&mut self, _: u8) -> bool {
         false
@@ -166,14 +164,11 @@ impl Checksum for Detect {
 #[cfg(all(feature = "gzip", feature = "zlib"))]
 impl Container for Detect {
     const TRAILER: usize = 2;
-
-    fn new() -> Self {
-        Detect {
-            gzip: Gzip::new(),
-            zlib: Zlib::new(),
-            is_gzip: false,
-        }
-    }
+    const INIT: Self = Detect {
+        gzip: Gzip::INIT,
+        zlib: Zlib::INIT,
+        is_gzip: false,
+    };
 
     fn detect(&mut self, first: u8) -> bool {
         // A zlib stream cannot start with 0x1f: the low nibble of its first

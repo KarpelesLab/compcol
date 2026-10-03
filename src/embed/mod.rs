@@ -113,9 +113,9 @@
 //! | `flate`: `gunzip`, streams        | ≤ 2 900      | ≤ 1 600       |
 //! | `flate`: `gunzip_len`             | ≤ 2 400      | ≤ 1 450       |
 //! | `flate`: `Decompressor`           | ≤ 3 650      | ≤ 1 500       |
-//! | `flate`: `gzip`, buffer out       | ≤ 1 050      | ≤ 192         |
-//! | `flate`: `Compressor`, streams    | ≤ 1 450      | ≤ 840         |
-//! | `flate`: `BufferedCompressor`     | ≤ 1 600      | ≤ 448         |
+//! | `flate`: `gzip`, buffer out       | ≤ 1 100      | ≤ 192         |
+//! | `flate`: `Compressor`, streams    | ≤ 1 500      | ≤ 840         |
+//! | `flate`: `BufferedCompressor`     | ≤ 1 700      | ≤ 448         |
 //!
 //! "Stack" is the deepest call path from the entry point, every function's
 //! frame read off the disassembly (`tools/footprint/stack.py`); nothing
