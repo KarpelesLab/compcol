@@ -86,7 +86,7 @@ jobs:
       - name: Test embed deflate family without alloc
         run: |
           cargo test --no-default-features --features embed,deflate,zlib,gzip \
-            --test embed --test embed_flate_roundtrip --test embed_flate_compress --test embed_flate_push
+            --test embed --test embed_flate_roundtrip --test embed_flate_compress --test embed_flate_push --test embed_flate_embedding
 
   narrow_clippy:
     # Catches dead-code lint regressions in the shared bits/checksum/huffman

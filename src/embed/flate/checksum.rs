@@ -15,69 +15,25 @@ impl Checksum for () {
     fn update(&mut self, _: &[u8]) {}
 }
 
-// The running values start out as the algorithms define them, rather than
-// all zeros as `embed`'s own codecs keep them: next to the `u64` fields of a
-// `Decompressor`, zeros would have its initialisation done by `memclr8`, one
-// more routine of `compiler_builtins` to link.
-
-/// CRC-32 (IEEE, reflected), a nibble at a time, with `embed`'s table.
+// `embed`'s own checksums, whose initial state is zero: a codec built in a
+// `static` then lands in `.bss` rather than in `.data`, and costs no flash.
+#[cfg(feature = "zlib")]
+pub(crate) use super::super::checksum::Adler32;
 #[cfg(feature = "gzip")]
-pub(crate) struct Crc32(u32);
-
-#[cfg(feature = "gzip")]
-impl Crc32 {
-    pub(crate) fn new() -> Self {
-        Crc32(!0)
-    }
-
-    pub(crate) fn value(&self) -> u32 {
-        !self.0
-    }
-}
+pub(crate) use super::super::checksum::Crc32;
 
 #[cfg(feature = "gzip")]
 impl Checksum for Crc32 {
+    #[inline]
     fn update(&mut self, data: &[u8]) {
-        let table = &super::super::checksum::TABLE;
-        let mut c = self.0;
-        for &b in data {
-            c ^= b as u32;
-            c = table[(c & 0xf) as usize] ^ (c >> 4);
-            c = table[(c & 0xf) as usize] ^ (c >> 4);
-        }
-        self.0 = c;
-    }
-}
-
-/// Adler-32 (RFC 1950).
-#[cfg(feature = "zlib")]
-pub(crate) struct Adler32 {
-    a: u32,
-    b: u32,
-}
-
-#[cfg(feature = "zlib")]
-impl Adler32 {
-    pub(crate) fn new() -> Self {
-        Adler32 { a: 1, b: 0 }
-    }
-
-    pub(crate) fn value(&self) -> u32 {
-        self.b << 16 | self.a
+        Crc32::update(self, data);
     }
 }
 
 #[cfg(feature = "zlib")]
 impl Checksum for Adler32 {
+    #[inline]
     fn update(&mut self, data: &[u8]) {
-        // 5552 is the most bytes that can be summed before `b` overflows.
-        for chunk in data.chunks(5552) {
-            for &x in chunk {
-                self.a += x as u32;
-                self.b += self.a;
-            }
-            self.a %= 65521;
-            self.b %= 65521;
-        }
+        Adler32::update(self, data);
     }
 }

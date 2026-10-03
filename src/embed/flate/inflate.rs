@@ -28,7 +28,7 @@ pub(crate) struct Tables {
 }
 
 impl Tables {
-    pub(crate) fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Tables {
             counts: [Counts([0; MAX_BITS + 1]), Counts([0; MAX_BITS + 1])],
             symbol: [0; MAX_SYMS],

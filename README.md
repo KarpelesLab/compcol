@@ -623,8 +623,8 @@ to on a Cortex-M4 (`thumbv7em-none-eabi`, `opt-level = "z"`, LTO):
 | `flate`: `gunzip`, buffer out   | ≤ 2.55 KB | ≤ 1.45 KB |
 | `flate`: `gunzip`, streams      | ≤ 2.9 KB  | ≤ 1.6 KB  |
 | `flate`: `Decompressor`         | ≤ 3.65 KB | ≤ 1.5 KB  |
-| `flate`: `gzip`, buffer out     | ≤ 1.05 KB | ≤ 192 B   |
-| `flate`: `Compressor`, streams  | ≤ 1.45 KB | ≤ 840 B   |
+| `flate`: `gzip`, buffer out     | ≤ 1.1 KB  | ≤ 192 B   |
+| `flate`: `Compressor`, streams  | ≤ 1.5 KB  | ≤ 840 B   |
 
 No panic machinery is linked, and no static RAM is needed beyond the codec
 struct itself. `tools/footprint/check.sh` reproduces the measurement;

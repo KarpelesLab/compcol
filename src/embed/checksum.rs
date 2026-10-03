@@ -26,7 +26,7 @@ const fn table() -> [u32; 16] {
 }
 
 #[cfg(feature = "gzip")]
-pub(super) static TABLE: [u32; 16] = table();
+static TABLE: [u32; 16] = table();
 
 /// CRC-32 (IEEE, reflected), a nibble at a time.
 #[cfg(feature = "gzip")]

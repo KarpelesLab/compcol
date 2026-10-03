@@ -67,7 +67,7 @@ check 'flate gunzip'               flate-gunzip       2550 0 1450
 check 'flate gunzip, streams'      flate-stream       2900 0 1600
 check 'flate gunzip_len'           flate-len          2400 0 1450
 check 'flate Decompressor'         flate-push         3650 0 1500
-check 'flate gzip'                 flate-gzip         1050 0 192
-check 'flate Compressor'           flate-compress-stream 1450 0 840
-check 'flate BufferedCompressor'   flate-compress-push 1600 0 448
+check 'flate gzip'                 flate-gzip         1100 0 192
+check 'flate Compressor'           flate-compress-stream 1500 0 840
+check 'flate BufferedCompressor'   flate-compress-push 1700 0 448
 exit $status
