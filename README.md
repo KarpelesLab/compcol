@@ -543,15 +543,30 @@ that have a small variant are built as that variant **under their usual
 names** — `compcol::gzip::Gzip`, `compcol::zlib::Encoder`,
 `compcol::deflate::Decoder` keep their paths and their `Encoder` /
 `Decoder` contracts, so the same code compiles either way — with no heap,
-little stack and little code. Today that is the deflate family: a push
-decoder in the manner of zlib's `puff` that keeps ~1.1 KiB of state and a
-32 KiB window, and a greedy fixed-Huffman encoder, both written straight
-against the crate's traits. Everything else is unchanged by `embed`; the
-`alloc`-backed codecs stay available if you enable `alloc`.
+little stack and little code. Today that is the deflate family: a decoder
+in the manner of zlib's `puff` and a greedy fixed-Huffman encoder, both
+written straight against the crate's traits. Everything else is unchanged
+by `embed`; the `alloc`-backed codecs stay available if you enable `alloc`.
 
-The codec structs own all their memory (a decoder is ≈ 34 KB, an encoder
-≈ 6 KB) and are `const`-constructible with an all-zero state, so they can
-live in a `static` in `.bss`:
+When the data is in memory, the one-shot functions need nothing but a
+little stack: `decompress` uses the output slice as its history window,
+and `compress` takes a hash table of yours, of any size.
+
+```rust
+use compcol::gzip;
+
+let len = gzip::decompress(packed, &mut out)?;            // ~1.3 KiB of stack, no window
+let len = gzip::decompressed_len(packed, 1 << 20)?;      // no output at all
+let len = gzip::compress(data, &mut [0u16; 1024], &mut out)?;
+```
+
+The streaming codecs own all their memory and are `const`-constructible
+with an all-zero state, so they can live in a `static` in `.bss`. Their
+sizes are picked at build time: `gzip::Decoder` holds a 32 KiB window
+(≈ 34 KB in all), and `gzip::WindowedDecoder::<4096>` a 4 KiB one, enough
+for streams whose encoder kept within it; `gzip::Encoder` compresses 4 KiB
+blocks with a 1024-entry table (≈ 6 KB), and `gzip::BlockEncoder::<B, T>`
+any other sizes, larger ones for a better ratio.
 
 ```rust
 use compcol::{gzip, Decoder, Status};
@@ -572,19 +587,23 @@ fn unpack(packed: &[u8], out: &mut [u8]) -> Result<usize, compcol::Error> {
 ```
 
 What the `embed` deflate family gives up: ratio (fixed Huffman codes,
-matches within 4 KiB blocks: roughly 40–45 % on text where `gzip -6` gets
-20 %; `level` is accepted and ignored), speed (tens of MB/s), sync flush
-(`Error::Unsupported`) and preset dictionaries.
+matches within a block: with the default sizes roughly 40–45 % on text
+where `gzip -6` gets 20 %; `level` is accepted and ignored), speed (tens of
+MB/s), sync flush (`Error::Unsupported`) and preset dictionaries.
 `compcol::embed` documents the details and the sizes CI holds the build
 to on a Cortex-M4 (`thumbv7em-none-eabi`, `opt-level = "z"`, LTO):
 
-| configuration           | code      | stack   |
-|-------------------------|----------:|--------:|
-| gzip / zlib decode      | ≤ 4.3 KB  | ≤ 256 B |
-| raw deflate decode      | ≤ 3.9 KB  | ≤ 256 B |
-| gzip / zlib encode      | ≤ 2.0 KB  | ≤ 256 B |
-| raw deflate encode      | ≤ 1.7 KB  | ≤ 256 B |
-| gzip encode + decode    | ≤ 6.0 KB  | ≤ 256 B |
+| configuration                   | code      | stack     |
+|---------------------------------|----------:|----------:|
+| gzip / zlib streaming decode    | ≤ 4.0 KB  | ≤ 352 B   |
+| raw deflate streaming decode    | ≤ 3.4 KB  | ≤ 352 B   |
+| gzip / zlib streaming encode    | ≤ 1.85 KB | ≤ 256 B   |
+| raw deflate streaming encode    | ≤ 1.5 KB  | ≤ 224 B   |
+| gzip encode + decode            | ≤ 6.2 KB  | ≤ 416 B   |
+| gzip / zlib `decompress`        | ≤ 2.4 KB  | ≤ 1.4 KB  |
+| raw deflate `decompress`        | ≤ 2.0 KB  | ≤ 1.4 KB  |
+| gzip / zlib `compress`          | ≤ 1.0 KB  | ≤ 160 B   |
+| raw deflate `compress`          | ≤ 0.8 KB  | ≤ 160 B   |
 
 No panic machinery is linked, and no static RAM is needed beyond the codec
 struct itself. `tools/footprint/check.sh` reproduces the measurement;

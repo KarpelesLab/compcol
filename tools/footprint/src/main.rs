@@ -77,12 +77,20 @@ fn encode<E: Encoder>(enc: &mut E, src: &[u8], dst: &mut [u8]) -> isize {
 
 macro_rules! decoder_entry {
     ($feature:literal, $module:ident) => {
+        decoder_entry!($feature, compcol::$module::Decoder);
+    };
+    ($feature:literal, $decoder:ty) => {
         #[cfg(feature = $feature)]
-        static mut DECODER: compcol::$module::Decoder = compcol::$module::Decoder::new();
+        static mut DECODER: $decoder = <$decoder>::new();
 
         #[cfg(feature = $feature)]
         #[unsafe(no_mangle)]
-        pub extern "C" fn entry(src: *const u8, src_len: usize, dst: *mut u8, dst_len: usize) -> isize {
+        pub extern "C" fn entry(
+            src: *const u8,
+            src_len: usize,
+            dst: *mut u8,
+            dst_len: usize,
+        ) -> isize {
             let src = unsafe { core::slice::from_raw_parts(src, src_len) };
             let dst = unsafe { core::slice::from_raw_parts_mut(dst, dst_len) };
             let dec = unsafe { &mut *core::ptr::addr_of_mut!(DECODER) };
@@ -94,12 +102,20 @@ macro_rules! decoder_entry {
 
 macro_rules! encoder_entry {
     ($feature:literal, $module:ident) => {
+        encoder_entry!($feature, compcol::$module::Encoder);
+    };
+    ($feature:literal, $encoder:ty) => {
         #[cfg(feature = $feature)]
-        static mut ENCODER: compcol::$module::Encoder = compcol::$module::Encoder::new();
+        static mut ENCODER: $encoder = <$encoder>::new();
 
         #[cfg(feature = $feature)]
         #[unsafe(no_mangle)]
-        pub extern "C" fn entry(src: *const u8, src_len: usize, dst: *mut u8, dst_len: usize) -> isize {
+        pub extern "C" fn entry(
+            src: *const u8,
+            src_len: usize,
+            dst: *mut u8,
+            dst_len: usize,
+        ) -> isize {
             let src = unsafe { core::slice::from_raw_parts(src, src_len) };
             let dst = unsafe { core::slice::from_raw_parts_mut(dst, dst_len) };
             let enc = unsafe { &mut *core::ptr::addr_of_mut!(ENCODER) };
@@ -115,6 +131,64 @@ decoder_entry!("deflate-decode", deflate);
 encoder_entry!("gzip-encode", gzip);
 encoder_entry!("zlib-encode", zlib);
 encoder_entry!("deflate-encode", deflate);
+// The same codecs with smaller sizes picked at build time.
+decoder_entry!("gzip-decode-4k", compcol::gzip::WindowedDecoder<4096>);
+encoder_entry!("gzip-encode-small", compcol::gzip::BlockEncoder<1024, 256>);
+
+/// The one-shot decoders: slice to slice, no state, the output as window.
+macro_rules! decompress_entry {
+    ($feature:literal, $module:ident) => {
+        #[cfg(feature = $feature)]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn entry(
+            src: *const u8,
+            src_len: usize,
+            dst: *mut u8,
+            dst_len: usize,
+        ) -> isize {
+            let src = unsafe { core::slice::from_raw_parts(src, src_len) };
+            let dst = unsafe { core::slice::from_raw_parts_mut(dst, dst_len) };
+            compcol::$module::decompress(src, dst).map_or(-1, |len| len as isize)
+        }
+    };
+}
+
+decompress_entry!("gzip-decompress", gzip);
+decompress_entry!("zlib-decompress", zlib);
+decompress_entry!("deflate-decompress", deflate);
+
+/// The length only: no output at all.
+#[cfg(feature = "gzip-len")]
+#[unsafe(no_mangle)]
+pub extern "C" fn entry(src: *const u8, src_len: usize, max_len: usize) -> isize {
+    let src = unsafe { core::slice::from_raw_parts(src, src_len) };
+    compcol::gzip::decompressed_len(src, max_len).map_or(-1, |len| len as isize)
+}
+
+/// The one-shot encoders: slice to slice, with the caller's table.
+macro_rules! compress_entry {
+    ($feature:literal, $module:ident) => {
+        #[cfg(feature = $feature)]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn entry(
+            src: *const u8,
+            src_len: usize,
+            dst: *mut u8,
+            dst_len: usize,
+            table: *mut u16,
+            table_len: usize,
+        ) -> isize {
+            let src = unsafe { core::slice::from_raw_parts(src, src_len) };
+            let dst = unsafe { core::slice::from_raw_parts_mut(dst, dst_len) };
+            let table = unsafe { core::slice::from_raw_parts_mut(table, table_len) };
+            compcol::$module::compress(src, table, dst).map_or(-1, |len| len as isize)
+        }
+    };
+}
+
+compress_entry!("gzip-compress", gzip);
+compress_entry!("zlib-compress", zlib);
+compress_entry!("deflate-compress", deflate);
 
 /// Encode, then decode the result: both halves in one binary.
 #[cfg(feature = "gzip-both")]

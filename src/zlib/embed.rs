@@ -6,13 +6,13 @@
 //! data, verified on decode. Streams with `FDICT` set are rejected with
 //! `Error::Unsupported`.
 
-use crate::embed::WINDOW;
 use crate::embed::codec;
 use crate::embed::format::Zlib;
 
 /// Tunables for the zlib encoder — accepted for compatibility with the
 /// standard build, **without effect** in `embed` mode: the encoder has one
-/// speed and one ratio, and the header always advertises `FLEVEL = 0`.
+/// speed, its ratio is set by the sizes of a [`BlockEncoder`], and
+/// the header always advertises `FLEVEL = 0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncoderConfig {
     /// Compression level in `1..=9`. Ignored.
@@ -33,4 +33,5 @@ impl Default for EncoderConfig {
 #[non_exhaustive]
 pub struct DecoderConfig {}
 
-codec!(Zlib, |_| WINDOW);
+// No window-size setting: the whole of the decoder's window is used.
+codec!(Zlib, |_| usize::MAX);

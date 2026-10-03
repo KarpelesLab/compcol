@@ -2,9 +2,11 @@
 """Bounds the stack a bare-metal Thumb binary uses, from its disassembly.
 
 Each function's frame is what its prologue reserves: the registers it
-pushes and what it subtracts from `sp`. Direct calls (`bl`, and `b` to
-another function for tail calls) give the call graph, and the deepest path
-from `entry` gives the bound. There are no indirect calls to miss: the
+pushes and what it subtracts from `sp`, up to its first branch. That
+includes what comes after setting up the frame pointer (`add r7, sp, #n`)
+and the wide `subw sp, sp, #n` of large frames. Direct calls (`bl`, and `b`
+to another function for tail calls) give the call graph, and the deepest
+path from `entry` gives the bound. There are no indirect calls to miss: the
 codecs are generic, not trait objects. Prints the deepest path, and with -v
 every function's frame and callees.
 
@@ -53,8 +55,10 @@ for line in text.splitlines():
             frames[name] += 4 * count
         elif op in ("vpush",):
             frames[name] += 8 * len(args.strip("{}").split(","))
-        elif op in ("sub", "sub.w") and args.startswith("sp,"):
+        elif op in ("sub", "sub.w", "subw") and args.startswith("sp,"):
             frames[name] += int(args.split("#")[1], 0)
+        elif op in ("add", "add.w") and not args.startswith("sp,"):
+            pass  # the frame pointer, `add r7, sp, #n`: more may follow
         elif op in ("pop", "pop.w", "add", "add.w", "bl", "blx", "bx") or op.startswith("b"):
             prologue = False
     if op in ("bl", "blx") or (op in ("b", "b.w") and "<" in args):

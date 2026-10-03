@@ -15,7 +15,7 @@
     feature = "gzip"
 ))]
 
-use compcol::embed::{BLOCK, DECODER_SIZE, ENCODER_SIZE, WINDOW};
+use compcol::embed::{BLOCK, DECODER_SIZE, ENCODER_SIZE, TABLE, WINDOW};
 use compcol::{Algorithm, Decoder, Encoder, Error, Flush, Status, deflate, gzip, zlib};
 
 // ─── reference data, as `generate.py` derives it ────────────────────────
@@ -698,6 +698,334 @@ fn level_is_accepted_and_ignored() {
     assert_eq!(decode_all::<deflate::Deflate>(&d).unwrap(), data);
 }
 
+// ─── sizes picked at build time ─────────────────────────────────────────
+
+#[test]
+fn sized_codecs_take_the_memory_their_sizes_say() {
+    assert!(size_of::<gzip::WindowedDecoder<4096>>() <= 4096 + 2048);
+    assert!(size_of::<zlib::WindowedDecoder<256>>() <= 256 + 2048);
+    assert!(size_of::<deflate::WindowedDecoder<1>>() <= 1 + 2048);
+    assert!(size_of::<gzip::BlockEncoder<1024, 256>>() <= 1024 + 2 * 256 + 128);
+    assert!(size_of::<zlib::BlockEncoder<32768, 4096>>() <= 32768 + 2 * 4096 + 128);
+    // The defaults are the documented constants.
+    assert_eq!(
+        size_of::<gzip::Decoder>(),
+        size_of::<gzip::WindowedDecoder<WINDOW>>()
+    );
+    assert_eq!(
+        size_of::<gzip::Encoder>(),
+        size_of::<gzip::BlockEncoder<BLOCK, TABLE>>()
+    );
+}
+
+/// Sized codecs are `const`-constructible too.
+static SMALL_DECODER: std::sync::Mutex<gzip::WindowedDecoder<1024>> =
+    std::sync::Mutex::new(gzip::WindowedDecoder::new());
+static SMALL_ENCODER: std::sync::Mutex<gzip::BlockEncoder<1024, 256>> =
+    std::sync::Mutex::new(gzip::BlockEncoder::new());
+
+#[test]
+fn a_small_window_decodes_what_stays_within_it() {
+    let data = [text(30_000), random(3000), text(10_000)].concat();
+    // Blocks no larger than the window keep every match within it.
+    let encoded = encode_chunked(&mut *SMALL_ENCODER.lock().unwrap(), &data, 333, 77);
+    for (in_chunk, out_chunk) in [(1, 1), (100, 7), (usize::MAX, 65536)] {
+        let mut dec = SMALL_DECODER.lock().unwrap();
+        dec.reset();
+        let (back, consumed) = decode_chunked(&mut *dec, &encoded, in_chunk, out_chunk).unwrap();
+        assert_eq!(back, data);
+        assert_eq!(consumed, encoded.len());
+    }
+}
+
+#[test]
+fn a_small_window_rejects_what_reaches_beyond_it() {
+    let mut dec = zlib::WindowedDecoder::<4096>::new();
+    assert_eq!(
+        decode_chunked(&mut dec, fixture!("far.zlib"), 1000, 1000).unwrap_err(),
+        Error::InvalidDistance
+    );
+    // Just within the window decodes; `window_size` still tightens it.
+    let stream = fixture!("far_exact.deflate");
+    let mut dec = Box::new(deflate::WindowedDecoder::<32768>::new());
+    assert_eq!(
+        decode_chunked(&mut *dec, stream, 100, 100).unwrap().0,
+        far_exact()
+    );
+    let mut dec = Box::new(deflate::WindowedDecoder::<16384>::new());
+    assert_eq!(
+        decode_chunked(&mut *dec, stream, 100, 100).unwrap_err(),
+        Error::InvalidDistance
+    );
+    let tight = deflate::DecoderConfig::default().with_window_size(16);
+    let encoded = encode_chunked(&mut deflate::Encoder::new(), &text(1000), 1000, 1000);
+    let mut dec = deflate::WindowedDecoder::<256>::with_config(tight);
+    assert_eq!(
+        decode_chunked(&mut dec, &encoded, 1000, 1000).unwrap_err(),
+        Error::InvalidDistance
+    );
+}
+
+#[test]
+fn block_and_table_sizes_set_the_ratio() {
+    let data = text(200_000);
+    let small = encode_chunked(&mut zlib::BlockEncoder::<256, 64>::new(), &data, 5000, 5000);
+    let default = encode_chunked(&mut zlib::Encoder::new(), &data, 5000, 5000);
+    let big = encode_chunked(
+        &mut *Box::new(zlib::BlockEncoder::<32768, 4096>::new()),
+        &data,
+        5000,
+        5000,
+    );
+    assert!(big.len() < default.len() && default.len() < small.len());
+    for encoded in [&small, &default, &big] {
+        assert_eq!(decode_all::<zlib::Zlib>(encoded).unwrap(), data);
+    }
+    // The smallest sizes still make a valid stream, whatever the chunking.
+    let one = encode_chunked(
+        &mut deflate::BlockEncoder::<1, 1>::new(),
+        &data[..3000],
+        7,
+        3,
+    );
+    assert_eq!(decode_all::<deflate::Deflate>(&one).unwrap(), &data[..3000]);
+}
+
+#[test]
+fn blocks_past_32_kib_keep_matches_within_reach() {
+    // A repeat 40 000 bytes back is in the block, and out of deflate's
+    // reach: the encoder must not use it.
+    let data = [random(40_000), random(40_000)].concat();
+    let mut enc = Box::new(gzip::BlockEncoder::<65536, 65536>::new());
+    let encoded = encode_chunked(&mut *enc, &data, 9999, 4096);
+    assert_eq!(decode_all::<gzip::Gzip>(&encoded).unwrap(), data);
+}
+
+// ─── one shot ───────────────────────────────────────────────────────────
+
+/// Runs the one-shot functions of a module over `data`, checking them
+/// against each other and against the streaming decoder.
+macro_rules! one_shot_round_trip {
+    ($module:ident, $algorithm:ty, $data:expr, $table:expr) => {{
+        let data: &[u8] = $data;
+        let mut out = vec![0u8; data.len() * 9 / 8 + 64];
+        let n = $module::compress(data, $table, &mut out).unwrap();
+        let encoded = &out[..n];
+        assert_eq!(decode_all::<$algorithm>(encoded).unwrap(), data);
+        let mut back = vec![0u8; data.len()];
+        assert_eq!($module::decompress(encoded, &mut back), Ok(data.len()));
+        assert_eq!(back, data);
+        assert_eq!(
+            $module::decompressed_len(encoded, usize::MAX),
+            Ok(data.len())
+        );
+        n
+    }};
+}
+
+#[test]
+fn one_shot_functions_round_trip() {
+    let mut table = vec![0u16; 4096];
+    for data in [vec![], text(1), text(50_000), random(20_000), far()] {
+        one_shot_round_trip!(gzip, gzip::Gzip, &data, &mut table);
+        one_shot_round_trip!(zlib, zlib::Zlib, &data, &mut table);
+        one_shot_round_trip!(deflate, deflate::Deflate, &data, &mut table);
+    }
+}
+
+#[test]
+fn one_shot_compress_takes_any_table() {
+    let data = text(30_000);
+    let mut sizes = Vec::new();
+    // Not cleared, not a power of two, or nothing at all: all valid.
+    for len in [0, 1, 3, 1000, 4096, 70_000] {
+        let mut table = vec![0x5a5au16; len];
+        sizes.push(one_shot_round_trip!(zlib, zlib::Zlib, &data, &mut table));
+    }
+    assert!(sizes[0] > data.len(), "no table, no matches: literals only");
+    assert!(sizes[4] < sizes[3] && sizes[3] < sizes[0]);
+}
+
+#[test]
+fn one_shot_compress_is_a_block_encoder_with_one_block() {
+    let data = text(60_000);
+    let mut table = [0u16; 1024];
+    let mut out = vec![0u8; 70_000];
+    let n = gzip::compress(&data, &mut table, &mut out).unwrap();
+    let mut enc = Box::new(gzip::BlockEncoder::<65536, 1024>::new());
+    assert_eq!(&out[..n], encode_chunked(&mut *enc, &data, 1000, 100));
+}
+
+#[test]
+fn one_shot_decodes_the_reference_streams() {
+    let mut out = vec![0u8; 100_000];
+    let expected = text(60_000);
+    for stream in [
+        fixture!("text_l0.zlib"),
+        fixture!("text_l1.zlib"),
+        fixture!("text_l9.zlib"),
+    ] {
+        assert_eq!(zlib::decompress(stream, &mut out), Ok(expected.len()));
+        assert_eq!(&out[..expected.len()], expected);
+        assert_eq!(
+            zlib::decompressed_len(stream, usize::MAX),
+            Ok(expected.len())
+        );
+    }
+    for stream in [fixture!("text_l6.gz"), fixture!("text_fancy.gz")] {
+        assert_eq!(gzip::decompress(stream, &mut out), Ok(expected.len()));
+        assert_eq!(&out[..expected.len()], expected);
+    }
+    let n = deflate::decompress(fixture!("text_l6.deflate"), &mut out).unwrap();
+    assert_eq!(&out[..n], expected);
+    let n = zlib::decompress(fixture!("far.zlib"), &mut out).unwrap();
+    assert_eq!(&out[..n], far());
+    let n = deflate::decompress(fixture!("far_exact.deflate"), &mut out).unwrap();
+    assert_eq!(&out[..n], far_exact());
+    let n = zlib::decompress(fixture!("random.zlib"), &mut out).unwrap();
+    assert_eq!(&out[..n], random(20_000));
+    assert_eq!(zlib::decompress(fixture!("empty.zlib"), &mut out), Ok(0));
+    assert_eq!(gzip::decompress(fixture!("empty.gz"), &mut out), Ok(0));
+    let mut out = vec![0u8; 1 + 258 * 2000];
+    assert_eq!(
+        deflate::decompress(fixture!("bomb.deflate"), &mut out),
+        Ok(out.len())
+    );
+    assert!(out[..].iter().all(|&b| b == out[0]));
+}
+
+#[test]
+fn one_shot_outputs_are_bounded() {
+    let data = text(10_000);
+    let mut gz = vec![0u8; 20_000];
+    let n = gzip::compress(&data, &mut [0; 1024], &mut gz).unwrap();
+    let gz = &gz[..n];
+    let mut short = vec![0u8; data.len() - 1];
+    assert_eq!(gzip::decompress(gz, &mut short), Err(Error::OutputTooSmall));
+    assert_eq!(
+        gzip::decompressed_len(gz, data.len() - 1),
+        Err(Error::OutputLimitExceeded)
+    );
+    assert_eq!(gzip::decompressed_len(gz, data.len()), Ok(data.len()));
+    // Compressing into one byte too few fails, whatever byte it is.
+    for len in [0, 1, 10, n / 2, n - 1] {
+        let mut out = vec![0u8; len];
+        assert_eq!(
+            gzip::compress(&data, &mut [0; 1024], &mut out),
+            Err(Error::OutputTooSmall)
+        );
+    }
+    let bomb = fixture!("bomb.deflate");
+    assert_eq!(
+        deflate::decompressed_len(bomb, 1000),
+        Err(Error::OutputLimitExceeded)
+    );
+    assert_eq!(
+        deflate::decompress(bomb, &mut [0; 1000]),
+        Err(Error::OutputTooSmall)
+    );
+}
+
+#[test]
+fn one_shot_rejects_corrupt_streams() {
+    let data = text(5000);
+    let mut buf = vec![0u8; 10_000];
+    let mut out = vec![0u8; data.len()];
+
+    let n = zlib::compress(&data, &mut [0; 1024], &mut buf).unwrap();
+    let z = &buf[..n];
+    for cut in 0..z.len() {
+        assert_eq!(
+            zlib::decompress(&z[..cut], &mut out),
+            Err(Error::UnexpectedEnd)
+        );
+        assert_eq!(
+            zlib::decompressed_len(&z[..cut], usize::MAX),
+            Err(Error::UnexpectedEnd)
+        );
+    }
+    let mut bad = z.to_vec();
+    bad[1] ^= 1;
+    assert_eq!(zlib::decompress(&bad, &mut out), Err(Error::BadHeader));
+    let mut bad = z.to_vec();
+    bad[0] = 0x77;
+    assert_eq!(zlib::decompress(&bad, &mut out), Err(Error::Unsupported));
+    let mut bad = z.to_vec();
+    *bad.last_mut().unwrap() ^= 1;
+    assert_eq!(
+        zlib::decompress(&bad, &mut out),
+        Err(Error::ChecksumMismatch)
+    );
+    // Counting cannot check the data, only the structure.
+    assert_eq!(zlib::decompressed_len(&bad, usize::MAX), Ok(data.len()));
+
+    let n = gzip::compress(&data, &mut [0; 1024], &mut buf).unwrap();
+    let g = &buf[..n];
+    for cut in 0..g.len() {
+        assert_eq!(
+            gzip::decompress(&g[..cut], &mut out),
+            Err(Error::UnexpectedEnd)
+        );
+    }
+    let mut bad = g.to_vec();
+    bad[n - 8] ^= 1;
+    assert_eq!(
+        gzip::decompress(&bad, &mut out),
+        Err(Error::ChecksumMismatch)
+    );
+    let mut bad = g.to_vec();
+    bad[n - 4] ^= 1;
+    assert_eq!(
+        gzip::decompress(&bad, &mut out),
+        Err(Error::TrailerMismatch)
+    );
+    assert_eq!(
+        gzip::decompressed_len(&bad, usize::MAX),
+        Err(Error::TrailerMismatch)
+    );
+    let mut bad = g.to_vec();
+    bad[0] = 0x1e;
+    assert_eq!(gzip::decompress(&bad, &mut out), Err(Error::BadHeader));
+
+    // A block type of 3; and a fixed block that starts with a match, of 3
+    // bytes from 1 back, before there is anything to copy from.
+    assert_eq!(
+        deflate::decompress(&[0x07], &mut out),
+        Err(Error::InvalidBlockType)
+    );
+    assert_eq!(
+        deflate::decompress(&[0x03, 0x02, 0x00, 0x00], &mut out),
+        Err(Error::InvalidDistance)
+    );
+    assert_eq!(
+        deflate::decompressed_len(&[0x03, 0x02, 0x00, 0x00], usize::MAX),
+        Err(Error::InvalidDistance)
+    );
+}
+
+#[test]
+fn one_shot_ignores_what_follows_and_reads_every_gzip_member() {
+    let mut a = vec![0u8; 1000];
+    let n = gzip::compress(b"first, ", &mut [], &mut a).unwrap();
+    a.truncate(n);
+    let mut b = vec![0u8; 1000];
+    let n = gzip::compress(b"second", &mut [], &mut b).unwrap();
+    b.truncate(n);
+    let mut out = [0u8; 64];
+    let both = [a.clone(), b.clone()].concat();
+    assert_eq!(gzip::decompress(&both, &mut out), Ok(13));
+    assert_eq!(&out[..13], b"first, second");
+    assert_eq!(gzip::decompressed_len(&both, 13), Ok(13));
+    // Anything but another member is left alone, as gzip does.
+    let padded = [a.clone(), vec![0; 7]].concat();
+    assert_eq!(gzip::decompress(&padded, &mut out), Ok(7));
+    let mut z = vec![0u8; 1000];
+    let n = zlib::compress(b"zlib", &mut [0; 16], &mut z).unwrap();
+    z.truncate(n);
+    z.extend_from_slice(b"trailing");
+    assert_eq!(zlib::decompress(&z, &mut out), Ok(4));
+}
+
 // ─── stack ──────────────────────────────────────────────────────────────
 
 /// Both directions run on a thread with the least stack the platform
@@ -722,6 +1050,14 @@ fn codecs_run_on_a_small_stack() {
             assert_eq!(back, data);
             let (bomb, _) = decode_chunked(&mut *raw, fixture!("bomb.deflate"), 27, 1).unwrap();
             assert_eq!(bomb.len(), 1 + 258 * 2000);
+            // The one-shot functions keep their state on the stack: about
+            // 1.3 KiB to decode, the table being the caller's to encode.
+            let mut table = vec![0u16; 1024];
+            let mut gz = vec![0u8; data.len() * 2];
+            let n = gzip::compress(&data, &mut table, &mut gz).unwrap();
+            let mut back = vec![0u8; data.len()];
+            assert_eq!(gzip::decompress(&gz[..n], &mut back), Ok(data.len()));
+            assert_eq!(back, data);
         })
         .unwrap();
     handle.join().expect("the codecs overflowed a 16 KiB stack");
