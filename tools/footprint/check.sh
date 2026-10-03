@@ -62,4 +62,12 @@ check 'gzip decompressed length'   gzip-len           2200 0 1400
 check 'gzip compress'              gzip-compress      1000 0 160
 check 'zlib compress'              zlib-compress       950 0 160
 check 'raw deflate compress'       deflate-compress    800 0 160
+# `embed::flate`: no struct of its own, the memory is the caller's.
+check 'flate gunzip'               flate-gunzip       2550 0 1450
+check 'flate gunzip, streams'      flate-stream       2900 0 1600
+check 'flate gunzip_len'           flate-len          2400 0 1450
+check 'flate Decompressor'         flate-push         3650 0 1500
+check 'flate gzip'                 flate-gzip         1050 0 192
+check 'flate Compressor'           flate-compress-stream 1450 0 840
+check 'flate BufferedCompressor'   flate-compress-push 1600 0 448
 exit $status
