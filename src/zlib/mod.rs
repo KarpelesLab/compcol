@@ -12,7 +12,8 @@
 //! - 4-byte big-endian Adler-32 of the **uncompressed** data.
 //!
 //! With the `embed` feature, `Encoder`, `Decoder` and their configs are the
-//! allocation-free variants over `minizlib` instead; see `compcol::embed`
+//! allocation-free variants instead, alongside one-shot `decompress`,
+//! `decompressed_len` and `compress` functions; see `compcol::embed`
 //! for what differs (no preset dictionary, no sync flush).
 
 #[cfg(not(feature = "embed"))]
@@ -23,7 +24,10 @@ pub use full::{Decoder, DecoderConfig, Encoder, EncoderConfig};
 #[cfg(feature = "embed")]
 mod embed;
 #[cfg(feature = "embed")]
-pub use embed::{Decoder, DecoderConfig, Encoder, EncoderConfig};
+pub use embed::{
+    BlockEncoder, Decoder, DecoderConfig, Encoder, EncoderConfig, WindowedDecoder, compress,
+    decompress, decompressed_len,
+};
 
 use crate::traits::Algorithm;
 

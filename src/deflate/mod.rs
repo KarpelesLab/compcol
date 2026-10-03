@@ -12,7 +12,8 @@
 //! The decoder keeps the 32 KiB sliding window on the heap.
 //!
 //! With the `embed` feature, `Encoder`, `Decoder` and their configs are the
-//! allocation-free variants over `minizlib` instead; see `compcol::embed`
+//! allocation-free variants instead, alongside one-shot `decompress`,
+//! `decompressed_len` and `compress` functions; see `compcol::embed`
 //! for what differs.
 
 #[cfg(not(feature = "embed"))]
@@ -30,11 +31,14 @@ pub use decoder::{Decoder, DecoderConfig};
 #[cfg(not(feature = "embed"))]
 pub use encoder::{Encoder, EncoderConfig};
 
-// The `embed` build: the same names over `minizlib`. See `crate::embed`.
+// The `embed` build: the same names, small. See `crate::embed`.
 #[cfg(feature = "embed")]
 mod embed;
 #[cfg(feature = "embed")]
-pub use embed::{Decoder, DecoderConfig, Encoder, EncoderConfig};
+pub use embed::{
+    BlockEncoder, Decoder, DecoderConfig, Encoder, EncoderConfig, WindowedDecoder, compress,
+    decompress, decompressed_len,
+};
 
 use crate::traits::Algorithm;
 

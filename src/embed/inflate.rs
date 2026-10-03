@@ -2,11 +2,12 @@
 //! canonical Huffman codes decoded one bit at a time from the count of codes
 //! of each length (in the manner of zlib's `puff`: slower than lookup
 //! tables, but next to no code and no table to build), and the history
-//! window the output goes through.
+//! window the push decoder's output goes through.
 //!
 //! Everything that loops is cut into steps that are methods of their own,
 //! for the state machine in `decoder` to take one at a time and roll back
-//! when the input runs out midway. Nothing here indexes in a way that could
+//! when the input runs out midway, and for the one-shot functions in
+//! `oneshot` to loop over. Nothing here indexes in a way that could
 //! panic: a bare-metal build must link no panic machinery.
 
 use super::WINDOW;
@@ -20,14 +21,11 @@ pub(super) const MAX_LEN_SYMS: usize = 288;
 const MAX_DIST_SYMS: usize = 32;
 pub(super) const MAX_SYMS: usize = MAX_LEN_SYMS + MAX_DIST_SYMS;
 
-const MASK: usize = WINDOW - 1;
-const _: () = assert!(WINDOW.is_power_of_two() && WINDOW >= 32768);
-
 /// How many codes there are of each length. Aligned so that clearing it is
 /// a job for `memclr4`, which is linked anyway, rather than for another
 /// routine of `compiler_builtins`.
 #[repr(align(4))]
-pub(super) struct Counts([u16; MAX_BITS + 1]);
+pub(super) struct Counts(pub(super) [u16; MAX_BITS + 1]);
 
 /// The storage of the two codes of a block, kept in the decoder between
 /// pieces of input.
@@ -82,7 +80,7 @@ pub(super) enum Symbol {
 }
 
 impl<'a> Huffman<'a> {
-    fn new(count: &'a mut Counts, symbol: &'a mut [u16]) -> Self {
+    pub(super) fn new(count: &'a mut Counts, symbol: &'a mut [u16]) -> Self {
         Huffman {
             count,
             symbol,
@@ -163,24 +161,43 @@ pub(super) fn build_codes(
 
 // ─── the window and the output ──────────────────────────────────────────
 
-/// The last [`WINDOW`] bytes produced, which back-references copy from.
-pub(super) struct Window {
-    buf: [u8; WINDOW],
+/// Where the decoded bytes go: the push decoder's [`Windowed`] sink, or one
+/// of the one-shot outputs in `oneshot`.
+pub(crate) trait Out {
+    /// Appends a byte. The push decoder has made sure there is room; the
+    /// one-shot outputs fail when there is none.
+    fn put(&mut self, byte: u8) -> Result<(), Error>;
+    /// Fails unless a back-reference `dist` bytes back can be followed.
+    fn check_dist(&self, dist: u32) -> Result<(), Error>;
+}
+
+/// The last `N` bytes produced, which back-references copy from. `N` is a
+/// power of two, at most deflate's 32 KiB reach.
+pub(super) struct Window<const N: usize> {
+    buf: [u8; N],
     /// Bytes produced so far, modulo 2<sup>32</sup>; the next one goes at
-    /// `pos & MASK`.
+    /// `pos % N`.
     pos: u32,
-    /// How many bytes the window holds, up to `WINDOW`.
+    /// How many bytes the window holds, up to `N`.
     avail: u32,
     /// The farthest back a reference may reach, if the caller asked for a
-    /// check stricter than `WINDOW`; zero otherwise, so that a fresh window
-    /// is all zeros and a `static` decoder lands in `.bss`.
+    /// check stricter than `N`; zero otherwise, so that a fresh window is
+    /// all zeros and a `static` decoder lands in `.bss`.
     max_dist: u32,
 }
 
-impl Window {
+impl<const N: usize> Window<N> {
+    const MASK: usize = N - 1;
+    /// Rejects, at build time, a window deflate cannot use.
+    const VALID: () = assert!(
+        N.is_power_of_two() && N <= WINDOW,
+        "the window must be a power of two of at most 32768 bytes"
+    );
+
     pub(super) const fn new() -> Self {
+        let () = Self::VALID;
         Window {
-            buf: [0; WINDOW],
+            buf: [0; N],
             pos: 0,
             avail: 0,
             max_dist: 0,
@@ -188,7 +205,7 @@ impl Window {
     }
 
     pub(super) fn set_max_dist(&mut self, max_dist: usize) {
-        self.max_dist = max_dist.clamp(1, WINDOW) as u32;
+        self.max_dist = max_dist.clamp(1, N) as u32;
     }
 
     /// Bytes produced so far, modulo 2<sup>32</sup>.
@@ -203,11 +220,11 @@ impl Window {
 
     #[inline]
     fn put(&mut self, byte: u8) {
-        if let Some(slot) = self.buf.get_mut(self.pos as usize & MASK) {
+        if let Some(slot) = self.buf.get_mut(self.pos as usize & Self::MASK) {
             *slot = byte;
         }
         self.pos = self.pos.wrapping_add(1);
-        if self.avail < WINDOW as u32 {
+        if self.avail < N as u32 {
             self.avail += 1;
         }
     }
@@ -216,14 +233,17 @@ impl Window {
     #[inline]
     fn back(&self, dist: u32) -> u8 {
         self.buf
-            .get(self.pos.wrapping_sub(dist) as usize & MASK)
+            .get(self.pos.wrapping_sub(dist) as usize & Self::MASK)
             .copied()
             .unwrap_or(0)
     }
 
+    /// Distances past what the window holds, `N` at most, fail like any
+    /// other bad distance: with a window smaller than the encoder's, a
+    /// stream can be valid and still not decodable.
     fn check_dist(&self, dist: u32) -> Result<(), Error> {
         let max_dist = match self.max_dist {
-            0 => WINDOW as u32,
+            0 => N as u32,
             max_dist => max_dist,
         };
         if dist == 0 || dist > max_dist || dist > self.avail {
@@ -233,48 +253,43 @@ impl Window {
     }
 }
 
-/// Where one call's output goes: into the window always, and into the
-/// caller's slice when there is one (none when discarding), up to `room`
-/// bytes either way. The container's checksum is fed from the slice, in
-/// bulk, or a byte at a time when there is none.
-pub(super) struct Sink<'a, F> {
-    pub(super) window: &'a mut Window,
+/// Where one call of the push decoder puts its output: into the window and
+/// into the caller's slice, as far as that goes. The container's checksum
+/// is fed from the slice, in bulk.
+pub(super) struct Windowed<'a, F, const N: usize> {
+    pub(super) window: &'a mut Window<N>,
     pub(super) format: &'a mut F,
     dst: &'a mut [u8],
     /// Bytes produced this call.
     pub(super) len: usize,
-    /// Bytes still allowed this call.
-    pub(super) room: usize,
     /// Bytes of `dst` fed to the checksum so far.
     flushed: usize,
 }
 
-impl<'a, F: Format> Sink<'a, F> {
-    pub(super) fn new(
-        window: &'a mut Window,
-        format: &'a mut F,
-        dst: &'a mut [u8],
-        room: usize,
-    ) -> Self {
-        Sink {
+impl<'a, F: Format, const N: usize> Windowed<'a, F, N> {
+    pub(super) fn new(window: &'a mut Window<N>, format: &'a mut F, dst: &'a mut [u8]) -> Self {
+        Windowed {
             window,
             format,
             dst,
             len: 0,
-            room,
             flushed: 0,
         }
     }
 
+    /// Bytes the slice still has room for.
     #[inline]
-    fn put(&mut self, byte: u8) {
+    pub(super) fn room(&self) -> usize {
+        self.dst.len() - self.len
+    }
+
+    #[inline]
+    fn push(&mut self, byte: u8) {
         self.window.put(byte);
-        match self.dst.get_mut(self.len) {
-            Some(slot) => *slot = byte,
-            None => self.format.update(&[byte]),
+        if let Some(slot) = self.dst.get_mut(self.len) {
+            *slot = byte;
         }
         self.len += 1;
-        self.room -= 1;
     }
 
     /// Copies `n` bytes from `dist` back.
@@ -282,17 +297,30 @@ impl<'a, F: Format> Sink<'a, F> {
         self.window.check_dist(dist)?;
         for _ in 0..n {
             let byte = self.window.back(dist);
-            self.put(byte);
+            self.push(byte);
         }
         Ok(())
     }
 
     /// Feeds the checksum what the slice holds that it has not had.
     pub(super) fn flush(&mut self) {
-        if let Some(data) = self.dst.get(self.flushed..self.len.min(self.dst.len())) {
+        if let Some(data) = self.dst.get(self.flushed..self.len) {
             self.format.update(data);
         }
-        self.flushed = self.len.min(self.dst.len());
+        self.flushed = self.len;
+    }
+}
+
+impl<F: Format, const N: usize> Out for Windowed<'_, F, N> {
+    #[inline]
+    fn put(&mut self, byte: u8) -> Result<(), Error> {
+        self.push(byte);
+        Ok(())
+    }
+
+    #[inline]
+    fn check_dist(&self, dist: u32) -> Result<(), Error> {
+        self.window.check_dist(dist)
     }
 }
 
@@ -300,9 +328,9 @@ impl<'a, F: Format> Sink<'a, F> {
 
 /// The decoder's view of one call: the input left, the output, and the bit
 /// buffer, which the containers read their headers and trailers through too.
-pub(super) struct Inflate<'a, F> {
+pub(super) struct Inflate<'a, O> {
     pub(super) input: &'a [u8],
-    pub(super) sink: Sink<'a, F>,
+    pub(super) sink: O,
     pub(super) bit_buf: u32,
     pub(super) bit_cnt: u32,
     /// Whether the input has run out. From then on it reads as zeros, which
@@ -310,7 +338,7 @@ pub(super) struct Inflate<'a, F> {
     pub(super) exhausted: bool,
 }
 
-impl<F: Format> Inflate<'_, F> {
+impl<O: Out> Inflate<'_, O> {
     /// Reads `need` bits, at most 16, least significant first.
     ///
     /// This cannot fail: once the input has run out, zeros are read and
@@ -347,7 +375,7 @@ impl<F: Format> Inflate<'_, F> {
         self.bits(self.bit_cnt & 7);
     }
 
-    fn ready(&self) -> Result<(), Error> {
+    pub(super) fn ready(&self) -> Result<(), Error> {
         if self.exhausted {
             return Err(Error::UnexpectedEnd);
         }
@@ -368,8 +396,7 @@ impl<F: Format> Inflate<'_, F> {
     pub(super) fn stored_byte(&mut self) -> Result<(), Error> {
         let byte = self.bits(8) as u8;
         self.ready()?;
-        self.sink.put(byte);
-        Ok(())
+        self.sink.put(byte)
     }
 
     /// Reads how many literal/length, distance and code length symbols a
@@ -416,7 +443,7 @@ impl<F: Format> Inflate<'_, F> {
     pub(super) fn length(&mut self, code: &Huffman) -> Result<Symbol, Error> {
         let sym = self.decode(code)? as u32;
         if sym < 256 {
-            self.sink.put(sym as u8);
+            self.sink.put(sym as u8)?;
             return Ok(Symbol::Literal);
         }
         if sym == 256 {
@@ -452,19 +479,11 @@ impl<F: Format> Inflate<'_, F> {
             _ => return Err(Error::InvalidHuffmanTree),
         };
         self.ready()?;
-        self.sink.window.check_dist(dist)?;
+        self.sink.check_dist(dist)?;
         Ok(dist)
     }
 
-    /// Copies up to `len` bytes from `dist` back, as many as the output has
-    /// room for. Returns how many are left.
-    pub(super) fn copy(&mut self, dist: u32, len: u32) -> Result<u32, Error> {
-        let n = (len as usize).min(self.sink.room);
-        self.sink.copy(dist, n)?;
-        Ok(len - n as u32)
-    }
-
-    fn decode(&mut self, code: &Huffman) -> Result<u16, Error> {
+    pub(super) fn decode(&mut self, code: &Huffman) -> Result<u16, Error> {
         let mut bits = 0i32;
         let mut first = 0i32;
         let mut index = 0i32;
@@ -485,5 +504,15 @@ impl<F: Format> Inflate<'_, F> {
             bits <<= 1;
         }
         Err(Error::InvalidHuffmanTree)
+    }
+}
+
+impl<F: Format, const N: usize> Inflate<'_, Windowed<'_, F, N>> {
+    /// Copies up to `len` bytes from `dist` back, as many as the output has
+    /// room for. Returns how many are left.
+    pub(super) fn copy(&mut self, dist: u32, len: u32) -> Result<u32, Error> {
+        let n = (len as usize).min(self.sink.room());
+        self.sink.copy(dist, n)?;
+        Ok(len - n as u32)
     }
 }

@@ -13,7 +13,7 @@
 
 use super::format::Format;
 use super::inflate::{
-    Inflate, MAX_LEN_SYMS, MAX_SYMS, ORDER, Sink, Symbol, Tables, Window, build_codes,
+    Inflate, MAX_LEN_SYMS, MAX_SYMS, ORDER, Symbol, Tables, Window, Windowed, build_codes,
     fixed_lengths,
 };
 use crate::error::Error;
@@ -84,9 +84,12 @@ struct Context {
     tables: Tables,
 }
 
-/// A deflate-family decoder in format `F`.
-pub(crate) struct Decoder<F> {
-    window: Window,
+/// The decoder's view of one call, over a window of `N` bytes.
+type Push<'a, F, const N: usize> = Inflate<'a, Windowed<'a, F, N>>;
+
+/// A deflate-family decoder in format `F`, with a window of `N` bytes.
+pub(crate) struct Decoder<F, const N: usize> {
+    window: Window<N>,
     context: Context,
     format: F,
     state: State,
@@ -95,7 +98,7 @@ pub(crate) struct Decoder<F> {
     poisoned: bool,
 }
 
-impl<F: Format> Decoder<F> {
+impl<F: Format, const N: usize> Decoder<F, N> {
     pub(crate) const fn new() -> Self {
         Decoder {
             window: Window::new(),
@@ -117,7 +120,7 @@ impl<F: Format> Decoder<F> {
     }
 
     /// Rejects back-references farther than `window_size` bytes, clamped to
-    /// `1..=WINDOW`.
+    /// `1..=N`.
     pub(crate) fn set_window_size(&mut self, window_size: usize) {
         self.window.set_max_dist(window_size);
     }
@@ -127,13 +130,12 @@ impl<F: Format> Decoder<F> {
         error
     }
 
-    /// Takes steps until the input, the output (`room` bytes, into `dst`
-    /// when it has them) or the stream runs out. Returns how much input was
-    /// consumed and how much output produced.
-    fn run(&mut self, input: &[u8], dst: &mut [u8], room: usize) -> Result<(usize, usize), Error> {
+    /// Takes steps until the input, the output or the stream runs out.
+    /// Returns how much input was consumed and how much output produced.
+    fn run(&mut self, input: &[u8], dst: &mut [u8]) -> Result<(usize, usize), Error> {
         let mut inflate = Inflate {
             input,
-            sink: Sink::new(&mut self.window, &mut self.format, dst, room),
+            sink: Windowed::new(&mut self.window, &mut self.format, dst),
             bit_buf: self.bit_buf,
             bit_cnt: self.bit_cnt,
             exhausted: false,
@@ -144,12 +146,14 @@ impl<F: Format> Decoder<F> {
                 State::Done => break,
                 // These produce output, a byte at least; the rest can go on
                 // with none.
-                State::Stored(1..) | State::Length | State::Copy(..) if inflate.sink.room == 0 => {
+                State::Stored(1..) | State::Length | State::Copy(..)
+                    if inflate.sink.room() == 0 =>
+                {
                     break;
                 }
                 // Another member or not is decided by a byte that is only
                 // consumed if it starts one.
-                State::Next => match inflate.input.first() {
+                State::Next if F::GZIP => match inflate.input.first() {
                     None => break,
                     Some(0x1f) => self.state = State::Member,
                     Some(_) => self.state = State::Done,
@@ -186,13 +190,22 @@ impl<F: Format> Decoder<F> {
 impl Context {
     /// Takes the step `state` calls for. Returns the state that follows,
     /// which is void, as the rest of what this does, if the input ran out.
-    fn step<F: Format>(
+    fn step<F: Format, const N: usize>(
         &mut self,
-        inflate: &mut Inflate<'_, F>,
+        inflate: &mut Push<'_, F, N>,
         state: State,
     ) -> Result<State, Error> {
         let (mut len_code, mut dist_code) = self.tables.codes();
 
+        // The states of a container other than `F` cannot come up: ruled out
+        // by `F`'s constants, their code is left out of the build.
+        let gzip = matches!(
+            state,
+            State::Member | State::Skip(..) | State::Fields(..) | State::Size(..)
+        );
+        if (gzip && !F::GZIP) || (matches!(state, State::Checksum) && F::TRAILER == 0) {
+            return Err(Error::Corrupt);
+        }
         Ok(match state {
             State::Start => {
                 if F::GZIP {
@@ -339,13 +352,17 @@ impl Context {
                 let size = inflate.word();
                 self.verify(inflate, check, size)?
             }
-            State::Next | State::Done => state,
+            // `Next` and `Done` are `run`'s.
+            _ => return Err(Error::Corrupt),
         })
     }
 
     /// Ends a block, and the deflate stream if this was its last, leaving
     /// the input on a byte boundary and the checksum fed everything.
-    fn block_end<F: Format>(&self, inflate: &mut Inflate<'_, F>) -> Result<State, Error> {
+    fn block_end<F: Format, const N: usize>(
+        &self,
+        inflate: &mut Push<'_, F, N>,
+    ) -> Result<State, Error> {
         if !self.last {
             return Ok(State::Block);
         }
@@ -359,9 +376,9 @@ impl Context {
 
     /// Checks the trailer of a stream against its data: the checksum, and
     /// for gzip the length. Returns what comes after the stream.
-    fn verify<F: Format>(
+    fn verify<F: Format, const N: usize>(
         &self,
-        inflate: &mut Inflate<'_, F>,
+        inflate: &mut Push<'_, F, N>,
         check: u32,
         size: u32,
     ) -> Result<State, Error> {
@@ -380,13 +397,12 @@ impl Context {
     }
 }
 
-impl<F: Format> RawDecoder for Decoder<F> {
+impl<F: Format, const N: usize> RawDecoder for Decoder<F, N> {
     fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
-        let room = output.len();
-        let (consumed, written) = self.run(input, output, room).map_err(|e| self.poison(e))?;
+        let (consumed, written) = self.run(input, output).map_err(|e| self.poison(e))?;
         Ok(RawProgress {
             consumed,
             written,
@@ -422,7 +438,21 @@ impl<F: Format> RawDecoder for Decoder<F> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
-        let (consumed, written) = self.run(input, &mut [], n).map_err(|e| self.poison(e))?;
+        // Decoded through a scrap of stack, so that decoding proper never
+        // has to tell where its output goes.
+        let mut scrap = [0; 64];
+        let (mut consumed, mut written) = (0, 0);
+        while written < n {
+            let want = (n - written).min(scrap.len());
+            let rest = input.get(consumed..).unwrap_or(&[]);
+            let dst = scrap.get_mut(..want).unwrap_or(&mut []);
+            let (c, w) = self.run(rest, dst).map_err(|e| self.poison(e))?;
+            consumed += c;
+            written += w;
+            if w < want {
+                break;
+            }
+        }
         Ok(RawProgress {
             consumed,
             written,

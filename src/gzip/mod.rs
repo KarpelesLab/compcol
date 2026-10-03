@@ -27,8 +27,9 @@
 //!   trailer.
 //!
 //! With the `embed` feature, `Encoder` and `Decoder` are the allocation-free
-//! variants over `minizlib` instead; see `compcol::embed` for what differs
-//! (no sync flush, single-member streams only).
+//! variants instead, alongside one-shot `decompress`, `decompressed_len` and
+//! `compress` functions; see `compcol::embed` for what differs (no sync
+//! flush, a fixed ratio).
 
 #[cfg(not(feature = "embed"))]
 mod full;
@@ -38,7 +39,10 @@ pub use full::{Decoder, Encoder, EncoderConfig};
 #[cfg(feature = "embed")]
 mod embed;
 #[cfg(feature = "embed")]
-pub use embed::{Decoder, Encoder, EncoderConfig};
+pub use embed::{
+    BlockEncoder, Decoder, Encoder, EncoderConfig, WindowedDecoder, compress, decompress,
+    decompressed_len,
+};
 
 use crate::traits::Algorithm;
 

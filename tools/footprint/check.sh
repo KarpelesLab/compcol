@@ -35,22 +35,31 @@ check() {
         verdict=FAIL
         status=1
     fi
-    printf '| %-22s | %6d / %-6d | %6d / %-6d | %5d / %-5d | %6d | %4d | %s |\n' \
+    printf '| %-26s | %6d / %-6d | %6d / %-6d | %5d / %-5d | %6d | %5d | %s |\n' \
         "$label" "$code" "$max_code" "$ram" "$max_ram" "$stack" "$max_stack" "$panics" "$data" "$verdict"
 }
 
 # The RAM ceilings are `compcol::embed::{DECODER_SIZE, ENCODER_SIZE}`, and
-# their sum; the code and stack ceilings are the table in `compcol::embed`.
-# Keep all three in sync.
+# their sum, or the same sums for the smaller sizes; the code and stack
+# ceilings are the table in `compcol::embed`. Keep all three in sync.
 DECODER=34816
 ENCODER=6272
-echo '| configuration          | code / max      | RAM / max       | stack / max | panics | .data | verdict |'
-echo '|------------------------|----------------:|----------------:|------------:|-------:|------:|---------|'
-check 'gzip decode'          gzip-decode    4200 $DECODER 256
-check 'zlib decode'          zlib-decode    4300 $DECODER 256
-check 'raw deflate decode'   deflate-decode 3900 $DECODER 256
-check 'gzip encode'          gzip-encode    2000 $ENCODER 256
-check 'zlib encode'          zlib-encode    2000 $ENCODER 256
-check 'raw deflate encode'   deflate-encode 1700 $ENCODER 256
-check 'gzip encode + decode' gzip-both      6000 $((DECODER + ENCODER)) 256
+echo '| configuration              | code / max      | RAM / max       | stack / max   | panics | .data | verdict |'
+echo '|----------------------------|----------------:|----------------:|--------------:|-------:|------:|---------|'
+check 'gzip decode'                gzip-decode        4000 $DECODER 352
+check 'zlib decode'                zlib-decode        4000 $DECODER 352
+check 'raw deflate decode'         deflate-decode     3400 $DECODER 352
+check 'gzip encode'                gzip-encode        1850 $ENCODER 256
+check 'zlib encode'                zlib-encode        1850 $ENCODER 256
+check 'raw deflate encode'         deflate-encode     1500 $ENCODER 224
+check 'gzip encode + decode'       gzip-both          6200 $((DECODER + ENCODER)) 416
+check 'gzip decode, 4 KiB window'  gzip-decode-4k     4000 $((4096 + 2048)) 352
+check 'gzip encode, 1 KiB block'   gzip-encode-small  1850 $((1024 + 2 * 256 + 128)) 256
+check 'gzip decompress'            gzip-decompress    2400 0 1400
+check 'zlib decompress'            zlib-decompress    2200 0 1400
+check 'raw deflate decompress'     deflate-decompress 2000 0 1400
+check 'gzip decompressed length'   gzip-len           2200 0 1400
+check 'gzip compress'              gzip-compress      1000 0 160
+check 'zlib compress'              zlib-compress       950 0 160
+check 'raw deflate compress'       deflate-compress    800 0 160
 exit $status
