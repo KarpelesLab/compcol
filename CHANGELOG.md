@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/KarpelesLab/compcol/compare/v0.6.11...v0.7.0) - 2026-10-03
+
+### Added
+
+- *(embed)* one-shot functions, build-time sizes, honest footprint ceilings ([#134](https://github.com/KarpelesLab/compcol/pull/134))
+- `embed` feature — a small, allocation-free deflate family for embedded targets ([#133](https://github.com/KarpelesLab/compcol/pull/133))
+
+### Other
+
+- *(readme)* bring README up to date with the current API and codec set ([#131](https://github.com/KarpelesLab/compcol/pull/131))
+
 ## [0.6.11](https://github.com/KarpelesLab/compcol/compare/v0.6.10...v0.6.11) - 2026-09-04
 
 ### Added
