@@ -24,6 +24,12 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+#[cfg(all(feature = "deflate", not(feature = "alloc"), not(feature = "embed")))]
+compile_error!(
+    "compcol: the standard `deflate` / `zlib` / `gzip` codecs need the `alloc` feature \
+     (enable `alloc` or `std`); for an allocation-free build enable `embed` instead"
+);
+
 mod error;
 mod traits;
 
@@ -44,16 +50,32 @@ pub mod tokio_io;
 // Shared internals used by the deflate-family codecs. Kept private; the
 // surface that downstream crates see is the per-algorithm modules below.
 // Gated on the features that consume them so a narrow build (e.g. just
-// `lz4`) doesn't pull them in via `cfg(test)`.
-#[cfg(any(feature = "deflate", feature = "deflate64"))]
+// `lz4`) doesn't pull them in via `cfg(test)`. The `embed` build of the
+// deflate family gets its bit reader, Huffman decoder and checksums from
+// `minizlib` instead, so none of this is compiled for it.
+#[cfg(any(
+    all(feature = "deflate", not(feature = "embed")),
+    feature = "deflate64"
+))]
 mod bits;
 #[cfg(all(
     not(feature = "checksum"),
-    any(feature = "zlib", feature = "gzip", feature = "rar3")
+    any(
+        all(any(feature = "zlib", feature = "gzip"), not(feature = "embed")),
+        feature = "rar3"
+    )
 ))]
 mod checksum;
-#[cfg(any(feature = "deflate", feature = "deflate64"))]
+#[cfg(any(
+    all(feature = "deflate", not(feature = "embed")),
+    feature = "deflate64"
+))]
 mod huffman;
+
+// The embedded-target mode: documentation of what it changes, its sizes,
+// and the `minizlib`-backed wrappers the deflate-family modules use.
+#[cfg(feature = "embed")]
+pub mod embed;
 
 // Adler-32 / CRC-32 running checksums. Compiled privately whenever a codec
 // needs them (above); the `checksum` feature is purely about promoting them to
@@ -69,16 +91,18 @@ pub mod rle;
 #[cfg(feature = "rle90")]
 pub mod rle90;
 
-#[cfg(feature = "deflate")]
+// The deflate family needs `alloc` in the standard build and nothing in the
+// `embed` one; a build with neither gets the `compile_error!` above alone.
+#[cfg(all(feature = "deflate", any(feature = "alloc", feature = "embed")))]
 pub mod deflate;
 
 #[cfg(feature = "deflate64")]
 pub mod deflate64;
 
-#[cfg(feature = "zlib")]
+#[cfg(all(feature = "zlib", any(feature = "alloc", feature = "embed")))]
 pub mod zlib;
 
-#[cfg(feature = "gzip")]
+#[cfg(all(feature = "gzip", any(feature = "alloc", feature = "embed")))]
 pub mod gzip;
 
 #[cfg(feature = "lzma")]

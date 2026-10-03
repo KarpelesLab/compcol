@@ -5,7 +5,8 @@
 //! These tests exercise the wire shape, decodability at every sync boundary,
 //! history preservation across `Sync`, and history reset on `Full`.
 
-#![cfg(feature = "deflate")]
+// The `embed` build of the deflate family has no sync flush: see tests/embed.rs.
+#![cfg(all(feature = "deflate", not(feature = "embed")))]
 
 use compcol::deflate::{Decoder, Encoder};
 use compcol::{Decoder as _, Encoder as _, Error, Flush, Status};

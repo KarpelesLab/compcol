@@ -80,7 +80,9 @@ jobs:
           # a no-op for the native targets.
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
         run: |
-          cargo build --release --bin compcol --all-features --target ${{ matrix.target }}
+          # `all`, not `--all-features`: the latter would turn on `embed`
+          # and ship the small deflate codecs instead of the standard ones.
+          cargo build --release --bin compcol --features all --target ${{ matrix.target }}
 
       - name: Stage archive contents
         shell: bash
@@ -133,7 +135,7 @@ jobs:
       - name: Build both Apple slices
         run: |
           for t in x86_64-apple-darwin aarch64-apple-darwin; do
-            cargo build --release --bin compcol --all-features --target "$t"
+            cargo build --release --bin compcol --features all --target "$t"
           done
 
       - name: Lipo into universal artifact

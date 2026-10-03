@@ -295,6 +295,8 @@ fn level_1_flevel_bits_set_correctly() {
     );
 }
 
+// Levels (and the FLEVEL bits they set) are a knob of the standard encoder; the `embed` one ignores them.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn level_3_flevel_bits_set_correctly() {
     // Levels 2..=5 → FLEVEL = 1.
@@ -306,6 +308,8 @@ fn level_3_flevel_bits_set_correctly() {
     assert_eq!(total % 31, 0);
 }
 
+// Levels (and the FLEVEL bits they set) are a knob of the standard encoder; the `embed` one ignores them.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn level_6_flevel_bits_set_correctly() {
     // Level 6 → FLEVEL = 2 (default).
@@ -320,6 +324,8 @@ fn level_6_flevel_bits_set_correctly() {
     assert_eq!(total % 31, 0);
 }
 
+// Levels (and the FLEVEL bits they set) are a knob of the standard encoder; the `embed` one ignores them.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn level_9_flevel_bits_set_correctly() {
     // Levels 7..=9 → FLEVEL = 3 (maximum).
@@ -399,6 +405,8 @@ fn corrupted_adler_rejected() {
     assert_eq!(err, Error::ChecksumMismatch);
 }
 
+// The `embed` decoder reports this with a different `Error` variant (see tests/embed.rs).
+#[cfg(not(feature = "embed"))]
 #[test]
 fn corrupt_header_unsupported_cm_rejected() {
     // CMF=0x77 (CM=7, not deflate)
@@ -553,6 +561,7 @@ mod factory {
 
 // ─── FDICT / preset dictionary (#22) ──────────────────────────────────────
 
+#[cfg(not(feature = "embed"))]
 use compcol::zlib::DecoderConfig;
 
 fn drain_full(mut dec: Decoder, encoded: &[u8]) -> Result<Vec<u8>, Error> {
@@ -583,10 +592,14 @@ fn drain_full(mut dec: Decoder, encoded: &[u8]) -> Result<Vec<u8>, Error> {
 /// Real FDICT-set zlib stream produced by Python's `zlib.compressobj(zdict=DICT)`.
 /// CMF=0x78, FLG=0xF9 (FDICT=1, FCHECK chosen so `(CMF*256 + FLG) % 31 == 0`).
 /// DICTID = Adler-32 of the dictionary, big-endian: `0x81AC1048`.
+#[cfg(not(feature = "embed"))]
 const FDICT_DICTIONARY: &[u8] = b"the quick brown fox jumps over the lazy dog. ";
+#[cfg(not(feature = "embed"))]
 const FDICT_PAYLOAD: &[u8] = b"the quick brown fox is quicker than the lazy dog!";
 
 /// FDICT=1 stream with a configured matching dictionary decodes cleanly.
+// Preset dictionaries need the heap-backed decoder; the `embed` build has none.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn zlib_decoder_fdict_decodes_with_matching_dictionary() {
     let encoded = hex("78f981ac10482bc1a238b3182204569c9887a2431100c4ce11cb");
@@ -620,6 +633,8 @@ fn zlib_decoder_fdict_without_dictionary_is_unsupported() {
 /// FDICT=1 stream with the WRONG dictionary errors as ChecksumMismatch
 /// (the on-wire DICTID is the dictionary's Adler-32, so any non-matching
 /// dict surfaces as a checksum failure before we touch the deflate body).
+// Preset dictionaries need the heap-backed decoder; the `embed` build has none.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn zlib_decoder_fdict_with_wrong_dictionary_errors_checksum_mismatch() {
     let encoded = hex("78f981ac10482bc1a238b3182204569c9887a2431100c4ce11cb");
@@ -634,6 +649,8 @@ fn zlib_decoder_fdict_with_wrong_dictionary_errors_checksum_mismatch() {
 /// FDICT=0 streams still decode normally even when a dictionary is
 /// configured — the dictionary is held but only consulted when the
 /// stream's FDICT bit is set.
+// Preset dictionaries need the heap-backed decoder; the `embed` build has none.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn zlib_decoder_fdict0_ignores_configured_dictionary() {
     // Build a normal FDICT=0 stream by encoding "hello zlib" with our own
@@ -672,10 +689,16 @@ fn zlib_decoder_fdict0_ignores_configured_dictionary() {
 /// `Status::OutputFull` with no progress and any loop waiting for
 /// `StreamEnd` spun forever. Offset 5 is where the `78 00`-style zlib
 /// header starts in the reporter's payload.
+#[cfg(not(feature = "embed"))]
 static TRAILING_GARBAGE: &[u8] = include_bytes!("fixtures/deflate/trailing_garbage_stall.bin");
 
+#[cfg(not(feature = "embed"))]
 const TRAILING_GARBAGE_PLAIN: &[u8] = b"NNNNNNNNNNNNNNJNNNNNNNNH";
 
+// The fixture's zlib header has CINFO = 15 (an 8 MiB window), which RFC 1950
+// forbids and the `embed` decoder rejects as `Unsupported`; the standard one
+// ignores CINFO. tests/embed.rs covers trailing bytes with a valid header.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn trailing_bytes_after_adler_report_stream_end() {
     let stream = &TRAILING_GARBAGE[5..];
@@ -691,6 +714,10 @@ fn trailing_bytes_after_adler_report_stream_end() {
     );
 }
 
+// The fixture's zlib header has CINFO = 15 (an 8 MiB window), which RFC 1950
+// forbids and the `embed` decoder rejects as `Unsupported`; the standard one
+// ignores CINFO. tests/embed.rs covers trailing bytes with a valid header.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn trailing_bytes_do_not_stall_decompress_to_vec() {
     // Before the fix this call never returned.

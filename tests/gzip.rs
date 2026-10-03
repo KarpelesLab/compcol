@@ -267,6 +267,8 @@ fn level_9_no_worse_than_level_1_on_compressible_corpus() {
     assert_eq!(decode_chunked(&hi, 4096, 4096).unwrap(), input);
 }
 
+// Levels (and the XFL byte they set) are a knob of the standard encoder; the `embed` one ignores them.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn level_1_does_less_work_than_level_9() {
     // Same as deflate's canonical level-discrimination test: mixed_corpus
@@ -285,6 +287,8 @@ fn level_1_does_less_work_than_level_9() {
     assert_eq!(decode_chunked(&hi, 4096, 4096).unwrap(), input);
 }
 
+// Levels (and the XFL byte they set) are a knob of the standard encoder; the `embed` one ignores them.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn xfl_byte_reflects_level() {
     // RFC 1952 §2.3.1: XFL=2 means "max compression", XFL=4 means "fastest",
@@ -300,6 +304,8 @@ fn xfl_byte_reflects_level() {
 
 // ─── reset / reuse ──────────────────────────────────────────────────────
 
+// Levels (and the XFL byte they set) are a knob of the standard encoder; the `embed` one ignores them.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn reset_preserves_level_and_allows_reuse() {
     let input_a = b"alpha alpha alpha alpha alpha".as_slice();
@@ -500,6 +506,8 @@ fn unsupported_method_rejected() {
     assert_eq!(err, Error::Unsupported);
 }
 
+// The `embed` decoder reports this with a different `Error` variant (see tests/embed.rs).
+#[cfg(not(feature = "embed"))]
 #[test]
 fn reserved_flag_rejected() {
     // Top bit of FLG (0x80) is reserved; setting it must be rejected.
@@ -521,6 +529,8 @@ fn corrupted_crc_rejected() {
     assert_eq!(err, Error::ChecksumMismatch);
 }
 
+// The `embed` decoder reports this with a different `Error` variant (see tests/embed.rs).
+#[cfg(not(feature = "embed"))]
 #[test]
 fn corrupted_isize_rejected() {
     let input = b"some payload bytes";
@@ -583,6 +593,8 @@ fn algorithm_encoder_decoder_round_trip() {
     assert_eq!(decoded, input);
 }
 
+// Levels (and the XFL byte they set) are a knob of the standard encoder; the `embed` one ignores them.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn algorithm_encoder_with_uses_config() {
     let input = b"abcabcabcabcabcabc".repeat(100);
@@ -662,6 +674,8 @@ mod factory {
 
 // ─── multi-member streams (RFC 1952 §2.2) ───────────────────────────────
 
+// The `embed` decoder stops at the first gzip member.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn multi_member_stream_decodes_concatenated_members() {
     // Encode two separate payloads, concatenate, decode as one stream.
@@ -678,6 +692,8 @@ fn multi_member_stream_decodes_concatenated_members() {
     assert_eq!(decoded, b"hello, world!\n");
 }
 
+// The `embed` decoder stops at the first gzip member.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn multi_member_stream_with_three_members() {
     let mut all = Vec::new();
@@ -724,6 +740,8 @@ fn trailing_garbage_after_last_member_is_ignored() {
     assert_eq!(decoded, payload);
 }
 
+// The `embed` decoder stops at the first gzip member.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn second_member_with_corrupted_crc_errors() {
     let mut enc1 = Encoder::new();

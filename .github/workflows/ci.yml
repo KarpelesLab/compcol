@@ -36,10 +36,22 @@ jobs:
         if: runner.os == 'Linux' # formatting is platform-independent
         run: cargo fmt --all --check
 
+      # `--features all` is every algorithm in its standard build; `embed`
+      # is a mode that swaps the deflate family for its small variants, so
+      # it gets a run of its own below rather than hiding the standard
+      # codecs behind `--all-features`.
       - name: Clippy (all features, warnings denied)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --features all -- -D warnings
 
       - name: Test (all features)
+        run: cargo test --features all
+
+      - name: Clippy (all features + embed, warnings denied)
+        if: runner.os == 'Linux'
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test (all features + embed)
+        if: runner.os == 'Linux'
         run: cargo test --all-features
 
   no_std:
@@ -62,6 +74,17 @@ jobs:
 
       - name: Build no_std with every algorithm feature
         run: cargo build --no-default-features --features all
+
+      - name: Build no_std embed deflate family (no alloc)
+        run: cargo build --no-default-features --features embed,deflate,zlib,gzip
+
+      - name: Build no_std embed deflate family for Cortex-M
+        run: |
+          rustup target add thumbv7em-none-eabi
+          cargo build --target thumbv7em-none-eabi --no-default-features --features embed,deflate,zlib,gzip
+
+      - name: Test embed deflate family without alloc
+        run: cargo test --no-default-features --features embed,deflate,zlib,gzip --test embed
 
   narrow_clippy:
     # Catches dead-code lint regressions in the shared bits/checksum/huffman
@@ -87,6 +110,57 @@ jobs:
       - name: Clippy (zstd only, warnings denied)
         run: cargo clippy --no-default-features --features zstd --all-targets -- -D warnings
 
+      - name: Clippy (embed + gzip only, warnings denied)
+        run: cargo clippy --no-default-features --features embed,gzip --all-targets -- -D warnings
+
+      - name: Clippy (embed alone, warnings denied)
+        run: cargo clippy --no-default-features --features embed --all-targets -- -D warnings
+
+  embed_footprint:
+    # Guards the sizes `compcol::embed` documents: builds a bare-metal
+    # thumbv7em-none-eabi binary around each embed codec and fails if its
+    # code, stack or static RAM exceeds the ceiling, if any panic machinery
+    # gets linked, or if the codec `static` leaves `.bss`. The table lands
+    # in the job summary.
+    name: Embed footprint (code size, stack, no panics)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabi
+          components: llvm-tools
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/footprint
+
+      - name: Measure
+        run: tools/footprint/check.sh | tee -a "$GITHUB_STEP_SUMMARY"
+
+  embed_crosscheck:
+    # The embed and standard builds of the deflate family must read each
+    # other's streams: compress with one CLI build, decompress with the
+    # other, both ways, for gzip, zlib and raw deflate.
+    name: Embed cross-check against the standard codecs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: crosscheck
+
+      - name: Cross-check
+        run: tools/embed-crosscheck.sh | tee -a "$GITHUB_STEP_SUMMARY"
+
   docs:
     name: Docs build (warnings denied)
     runs-on: ubuntu-latest
@@ -101,7 +175,10 @@ jobs:
       - name: Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: cargo doc --no-deps --all-features
+      - name: cargo doc --no-deps --features all
+        run: cargo doc --no-deps --features all
+
+      - name: cargo doc --no-deps --all-features (embed)
         run: cargo doc --no-deps --all-features
 
   docsrs:
@@ -124,5 +201,5 @@ jobs:
       - name: Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: cargo doc --no-deps --all-features (docs.rs config)
-        run: cargo doc --no-deps --all-features
+      - name: cargo doc --no-deps --features all (docs.rs config)
+        run: cargo doc --no-deps --features all

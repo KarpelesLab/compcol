@@ -30,14 +30,22 @@
 //! ```
 
 /// Adler-32 checksum, used in the zlib trailer.
-#[cfg(any(feature = "zlib", feature = "checksum", test))]
+#[cfg(any(
+    all(feature = "zlib", not(feature = "embed")),
+    feature = "checksum",
+    test
+))]
 #[derive(Debug, Clone, Copy)]
 pub struct Adler32 {
     a: u32,
     b: u32,
 }
 
-#[cfg(any(feature = "zlib", feature = "checksum", test))]
+#[cfg(any(
+    all(feature = "zlib", not(feature = "embed")),
+    feature = "checksum",
+    test
+))]
 impl Adler32 {
     /// Initial state defined by RFC 1950 §9 (a = 1, b = 0).
     pub const fn new() -> Self {
@@ -69,12 +77,18 @@ impl Adler32 {
     }
 
     /// Re-arm for a fresh stream.
+    // Only the standard deflate-family codecs reset a checksum in place.
+    #[cfg_attr(not(feature = "checksum"), allow(dead_code))]
     pub fn reset(&mut self) {
         *self = Self::new();
     }
 }
 
-#[cfg(any(feature = "zlib", feature = "checksum", test))]
+#[cfg(any(
+    all(feature = "zlib", not(feature = "embed")),
+    feature = "checksum",
+    test
+))]
 impl Default for Adler32 {
     fn default() -> Self {
         Self::new()
@@ -85,13 +99,23 @@ impl Default for Adler32 {
 
 /// IEEE / gzip CRC-32. Polynomial `0xEDB88320` (reflected), initial value
 /// `0xFFFFFFFF`, final XOR `0xFFFFFFFF`.
-#[cfg(any(feature = "gzip", feature = "rar3", feature = "checksum", test))]
+#[cfg(any(
+    all(feature = "gzip", not(feature = "embed")),
+    feature = "rar3",
+    feature = "checksum",
+    test
+))]
 #[derive(Debug, Clone, Copy)]
 pub struct Crc32 {
     state: u32,
 }
 
-#[cfg(any(feature = "gzip", feature = "rar3", feature = "checksum", test))]
+#[cfg(any(
+    all(feature = "gzip", not(feature = "embed")),
+    feature = "rar3",
+    feature = "checksum",
+    test
+))]
 impl Crc32 {
     /// A fresh checksum over the empty input.
     pub const fn new() -> Self {
@@ -139,13 +163,24 @@ impl Crc32 {
     /// this mid-stream (rar3's filter recognition uses one-shot instances),
     /// but it is part of the public surface so a caller can reuse one
     /// instance across many members.
-    #[cfg(any(feature = "gzip", feature = "checksum", test))]
+    #[cfg(any(
+        all(feature = "gzip", not(feature = "embed")),
+        feature = "checksum",
+        test
+    ))]
+    // Only the standard deflate-family codecs reset a checksum in place.
+    #[cfg_attr(not(feature = "checksum"), allow(dead_code))]
     pub fn reset(&mut self) {
         *self = Self::new();
     }
 }
 
-#[cfg(any(feature = "gzip", feature = "rar3", feature = "checksum", test))]
+#[cfg(any(
+    all(feature = "gzip", not(feature = "embed")),
+    feature = "rar3",
+    feature = "checksum",
+    test
+))]
 impl Default for Crc32 {
     fn default() -> Self {
         Self::new()
@@ -156,7 +191,12 @@ impl Default for Crc32 {
 /// standard 256-entry CRC-32 table; `CRC32_TABLE8[n]` for `n >= 1` advances
 /// the CRC by an extra byte position, so eight bytes can be folded per
 /// iteration. See Intel's "Slicing-by-8" technique.
-#[cfg(any(feature = "gzip", feature = "rar3", feature = "checksum", test))]
+#[cfg(any(
+    all(feature = "gzip", not(feature = "embed")),
+    feature = "rar3",
+    feature = "checksum",
+    test
+))]
 const CRC32_TABLE8: [[u32; 256]; 8] = {
     let mut tables = [[0u32; 256]; 8];
 

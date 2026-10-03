@@ -13,19 +13,22 @@ readme        = "README.md"
 keywords      = ["compression", "no_std", "embedded"]
 categories    = ["compression", "no-std"]
 
-# Tell docs.rs to build the doc set with every feature on. Without this
-# the rendered docs only show the default-feature surface (rle/deflate/
+# Tell docs.rs to build the doc set with every algorithm feature on. Without
+# this the rendered docs only show the default-feature surface (rle/deflate/
 # zlib/gzip/factory) — two thirds of the crate's public API would be
-# invisible to anyone reading docs.rs.
+# invisible to anyone reading docs.rs. `all` rather than `all-features`:
+# `embed` is a mode, not an addition, and would swap the deflate-family docs
+# for their embedded variants.
 [package.metadata.docs.rs]
-all-features = true
+features = ["all"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["alloc", "rle", "deflate", "zlib", "gzip", "factory"]
-# Convenience meta-feature: every algorithm compiled in. Equivalent to
-# `cargo build --all-features` at the CLI level; useful in downstream
-# Cargo.toml entries (`features = ["all"]`) instead of a 20-item list.
+# Convenience meta-feature: every algorithm compiled in; useful in downstream
+# Cargo.toml entries (`features = ["all"]`) instead of a 20-item list. Not
+# `embed`, which is a mode rather than an algorithm: `--all-features` turns
+# it on as well and builds the embedded variants of the deflate family.
 all = [
     "alloc", "std", "tokio", "factory",
     "rle", "rle90", "deflate", "deflate64", "zlib", "gzip",
@@ -68,17 +71,37 @@ factory = ["alloc"]
 rle     = []
 # RLE90 — the 0x90/DLE run-length variant (ARC method 3, StuffIt method 1).
 rle90   = ["alloc"]
-# RFC 1951 raw deflate. Requires `alloc` for the 32 KiB sliding window and
-# the per-block symbol/bit buffers.
-deflate = ["alloc"]
+# Embedded-target mode: the algorithms below that have a small variant are
+# built as that variant — low stack, no heap, little code — under the same
+# names, so the same downstream code compiles either way. Today that is the
+# deflate family (`deflate`, `zlib`, `gzip`), backed by the `minizlib` crate
+# (same author, MIT): a puff-style push decoder keeping ~1.1 KiB of state and
+# a 32 KiB window, and a greedy fixed-Huffman encoder. See `compcol::embed`
+# for what differs (no preset dictionaries, no sync flush, a fixed ratio
+# regardless of `level`) and for the measured sizes CI holds the build to.
+# Does not pull `alloc`; combine with `--no-default-features`.
+embed = [
+    "dep:minizlib",
+    "minizlib/decompress",
+    "minizlib/compress",
+    "minizlib/checksum",
+    "minizlib/stored",
+    "minizlib/fixed",
+    "minizlib/dynamic",
+]
+# RFC 1951 raw deflate. The standard build needs `alloc` for the 32 KiB
+# sliding window and the per-block symbol/bit buffers (enable `alloc` or
+# `std` alongside; a build with neither fails with a message saying so);
+# the `embed` build needs no allocation at all.
+deflate = []
 # PKWARE deflate64 (zip method 9). Same framing as deflate but a 64 KiB
 # window and an extended length/distance alphabet. Standalone module —
 # does not depend on the `deflate` feature.
 deflate64 = ["alloc"]
 # RFC 1950 zlib (deflate + Adler-32 + 2-byte header / 4-byte trailer).
-zlib    = ["deflate"]
+zlib    = ["deflate", "minizlib?/zlib"]
 # RFC 1952 gzip (deflate + CRC-32 + 10-byte header / 8-byte trailer).
-gzip    = ["deflate"]
+gzip    = ["deflate", "minizlib?/gzip"]
 # LZMA (Lempel–Ziv–Markov chain). Range-coded, depends on alloc for the
 # probability tables and the LZ window.
 lzma    = ["alloc"]
@@ -288,6 +311,17 @@ unsafe_code = "forbid"
 # AsyncWrite traits, which live under the default-off `io-util` feature
 # in tokio's modular layout.
 tokio = { version = "1", default-features = false, optional = true }
+# Optional, pulled in only by the `embed` feature: the small deflate-family
+# codecs. Same author, no_std, no alloc, no unsafe, no dependencies. The
+# containers are enabled from this crate's `zlib` / `gzip` features.
+minizlib = { version = "0.1.1", default-features = false, optional = true }
+
+# TEMPORARY, until minizlib 0.1.2 is published: the `embed` wrappers need
+# the output accessors, owned tables and const constructors that landed on
+# minizlib's master in commit 6806b44. Drop this section and bump the
+# requirement above to "0.1.2" once that release is on crates.io.
+[patch.crates-io]
+minizlib = { git = "https://github.com/KarpelesLab/minizlib", rev = "6806b44ac1e0db68fa749afad1393dde9af48bc2" }
 
 [dev-dependencies]
 # Test-only: the async tests need a runtime + the AsyncReadExt /

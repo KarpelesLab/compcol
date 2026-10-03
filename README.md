@@ -521,13 +521,78 @@ checksum = []                  # publish compcol::checksum::{Crc32, Adler32}
 
 Dependencies between algorithm features are resolved for you: `zlib` and
 `gzip` pull `deflate`, `xz` and `lzma2` pull `lzma`, `rar3` pulls `ppmd`,
-`qpack` pulls `hpack`, and every codec except `rle` and `checksum` pulls
-`alloc`.
+`qpack` pulls `hpack`, and every codec except `rle`, `checksum` and the
+deflate family pulls `alloc`. The deflate family needs `alloc` in its
+standard build (enable `alloc` or `std` alongside, as the defaults do; a
+build with neither fails with a message saying so) and nothing at all in
+its `embed` build, below.
 
 A bare `--no-default-features` build produces a library with just the
 trait surface (plus `compcol::limit`) — useful for the most constrained
 embedded targets. Adding `rle` gives an algorithm that doesn't need
 `alloc`; `checksum` is likewise allocation-free.
+
+### Embedded targets: the `embed` feature
+
+```toml
+compcol = { version = "0.6", default-features = false, features = ["embed", "gzip"] }
+```
+
+`embed` is a mode rather than an algorithm: with it on, the algorithms
+that have a small variant are built as that variant **under their usual
+names** — `compcol::gzip::Gzip`, `compcol::zlib::Encoder`,
+`compcol::deflate::Decoder` keep their paths and their `Encoder` /
+`Decoder` contracts, so the same code compiles either way — with no heap,
+little stack and little code. Today that is the deflate family, backed by
+the [`minizlib`](https://crates.io/crates/minizlib) crate (same author,
+MIT, `no_std`, no `unsafe`): a push decoder in the manner of zlib's `puff`
+that keeps ~1.1 KiB of state and a 32 KiB window, and a greedy
+fixed-Huffman encoder. Everything else is unchanged by `embed`; the
+`alloc`-backed codecs stay available if you enable `alloc`.
+
+The codec structs own all their memory (a decoder is ≈ 34 KB, an encoder
+≈ 11 KB) and are `const`-constructible with an all-zero state, so they can
+live in a `static` in `.bss`:
+
+```rust
+use compcol::{gzip, Decoder, Status};
+
+static DECODER: Mutex<gzip::Decoder> = Mutex::new(gzip::Decoder::new()); // your platform's Mutex
+
+fn unpack(packed: &[u8], out: &mut [u8]) -> Result<usize, compcol::Error> {
+    let mut dec = DECODER.lock();
+    dec.reset();
+    let mut done = 0;
+    let (p, status) = dec.decode(packed, out)?;
+    done += p.written;
+    if status != Status::StreamEnd {
+        done += dec.finish(&mut out[done..])?.0.written;
+    }
+    Ok(done)
+}
+```
+
+What the `embed` deflate family gives up: ratio (fixed Huffman codes,
+matches within 4 KiB blocks: roughly 40–45 % on text where `gzip -6` gets
+20 %; `level` is accepted and ignored), speed (tens of MB/s), sync flush
+(`Error::Unsupported`), preset dictionaries, and concatenated gzip members.
+`compcol::embed` documents the details and the sizes CI holds the build
+to on a Cortex-M4 (`thumbv7em-none-eabi`, `opt-level = "z"`, LTO):
+
+| configuration           | code      | stack   |
+|-------------------------|----------:|--------:|
+| gzip / zlib decode      | ≤ 4.6 KB  | ≤ 256 B |
+| raw deflate decode      | ≤ 4.3 KB  | ≤ 256 B |
+| gzip / zlib encode      | ≤ 2.0 KB  | ≤ 256 B |
+| raw deflate encode      | ≤ 1.7 KB  | ≤ 256 B |
+| gzip encode + decode    | ≤ 6.5 KB  | ≤ 256 B |
+
+No panic machinery is linked, and no static RAM is needed beyond the codec
+struct itself. `tools/footprint/check.sh` reproduces the measurement;
+`tools/embed-crosscheck.sh` checks the embed and standard builds read each
+other's streams. Because Cargo features unify, enabling `embed` anywhere in
+a dependency graph switches every user of that graph to the small variants:
+it is meant for firmware, not for libraries.
 
 The `alloc` feature also enables `compcol::vec` (one-shot
 `compress_to_vec` / `decompress_to_vec` helpers and their `_capped`
@@ -538,7 +603,9 @@ adapters) plus `From<Error> for std::io::Error` so adapter code can use
 `features = ["all"]` enables every algorithm and is the most ergonomic
 choice when you don't know in advance which formats you'll see. Note
 that it includes `tokio`; list features explicitly if you need a
-dependency-free build.
+dependency-free build. It does not include `embed`, which is a mode, so
+`--all-features` (which does) builds the embedded deflate family instead
+of the standard one.
 
 The `compcol` binary is gated on `features = ["factory"]` so a
 `--no-default-features` library build doesn't try to compile it.
@@ -586,10 +653,14 @@ cargo build                                                      # builds lib + 
 cargo build --no-default-features                                # bare no_std lib
 cargo build --no-default-features --features rle                 # narrowest alloc-free build
 cargo build --no-default-features --features all                 # every algorithm, still no_std
+cargo build --no-default-features --features embed,gzip          # small gzip, no alloc
 
-cargo test --all-features                                        # full test suite
-cargo clippy --all-features --all-targets -- -D warnings         # lint clean
+cargo test --features all                                        # full test suite
+cargo test --all-features                                        # the same with `embed` on
+cargo clippy --features all --all-targets -- -D warnings         # lint clean
 cargo fmt --all --check                                          # format clean
+tools/footprint/check.sh                                         # embed sizes on Cortex-M (needs the thumbv7em-none-eabi target + llvm-tools)
+tools/embed-crosscheck.sh                                        # embed vs standard deflate family through the CLI
 ```
 
 The crate currently ships with **1,700+ tests** (unit tests plus 59

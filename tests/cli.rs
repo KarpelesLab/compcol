@@ -50,15 +50,23 @@ fn run_with_stdin(args: &[&str], stdin: &[u8]) -> (Vec<u8>, Vec<u8>, i32) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn compcol");
+    // Feed stdin from another thread: the child writes stdout as it goes,
+    // and once that pipe is full (a 64 KiB of output, which an `embed`
+    // build's weaker ratio reaches on the larger inputs here) it blocks
+    // until we read — which we must not wait to do until stdin is written.
+    //
     // The child can exit before we finish writing stdin (e.g. usage
     // errors that fail fast without consuming input). The kernel then
     // returns EPIPE; treat that as "child ate what it wanted, move on."
-    if let Err(e) = child.stdin.as_mut().unwrap().write_all(stdin)
-        && e.kind() != std::io::ErrorKind::BrokenPipe
-    {
-        panic!("write stdin: {e:?}");
-    }
-    drop(child.stdin.take());
+    let mut stdin_pipe = child.stdin.take().unwrap();
+    let stdin = stdin.to_vec();
+    let feeder = std::thread::spawn(move || {
+        if let Err(e) = stdin_pipe.write_all(&stdin)
+            && e.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            panic!("write stdin: {e:?}");
+        }
+    });
     let mut out = Vec::new();
     let mut err = Vec::new();
     child
@@ -73,6 +81,7 @@ fn run_with_stdin(args: &[&str], stdin: &[u8]) -> (Vec<u8>, Vec<u8>, i32) {
         .unwrap()
         .read_to_end(&mut err)
         .unwrap();
+    feeder.join().expect("stdin feeder");
     let status = child.wait().expect("wait");
     let code = status.code().unwrap_or(-1);
     (out, err, code)
