@@ -1,0 +1,26 @@
+# Bare-metal binary around compcol's `embed` codecs, to measure their code
+# size, static RAM and stack, and to prove that no panic machinery gets
+# linked. See check.sh; not published.
+[package]
+name = "footprint"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[features]
+gzip-decode = ["compcol/gzip"]
+zlib-decode = ["compcol/zlib"]
+deflate-decode = ["compcol/deflate"]
+gzip-encode = ["compcol/gzip"]
+zlib-encode = ["compcol/zlib"]
+deflate-encode = ["compcol/deflate"]
+gzip-both = ["compcol/gzip"]
+
+[dependencies]
+compcol = { path = "../..", default-features = false, features = ["embed"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

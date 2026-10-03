@@ -13,19 +13,22 @@ readme        = "README.md"
 keywords      = ["compression", "no_std", "embedded"]
 categories    = ["compression", "no-std"]
 
-# Tell docs.rs to build the doc set with every feature on. Without this
-# the rendered docs only show the default-feature surface (rle/deflate/
+# Tell docs.rs to build the doc set with every algorithm feature on. Without
+# this the rendered docs only show the default-feature surface (rle/deflate/
 # zlib/gzip/factory) — two thirds of the crate's public API would be
-# invisible to anyone reading docs.rs.
+# invisible to anyone reading docs.rs. `all` rather than `all-features`:
+# `embed` is a mode, not an addition, and would swap the deflate-family docs
+# for their embedded variants.
 [package.metadata.docs.rs]
-all-features = true
+features = ["all"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["alloc", "rle", "deflate", "zlib", "gzip", "factory"]
-# Convenience meta-feature: every algorithm compiled in. Equivalent to
-# `cargo build --all-features` at the CLI level; useful in downstream
-# Cargo.toml entries (`features = ["all"]`) instead of a 20-item list.
+# Convenience meta-feature: every algorithm compiled in; useful in downstream
+# Cargo.toml entries (`features = ["all"]`) instead of a 20-item list. Not
+# `embed`, which is a mode rather than an algorithm: `--all-features` turns
+# it on as well and builds the embedded variants of the deflate family.
 all = [
     "alloc", "std", "tokio", "factory",
     "rle", "rle90", "deflate", "deflate64", "zlib", "gzip",
@@ -68,9 +71,21 @@ factory = ["alloc"]
 rle     = []
 # RLE90 — the 0x90/DLE run-length variant (ARC method 3, StuffIt method 1).
 rle90   = ["alloc"]
-# RFC 1951 raw deflate. Requires `alloc` for the 32 KiB sliding window and
-# the per-block symbol/bit buffers.
-deflate = ["alloc"]
+# Embedded-target mode: the algorithms below that have a small variant are
+# built as that variant — low stack, no heap, little code — under the same
+# names, so the same downstream code compiles either way. Today that is the
+# deflate family (`deflate`, `zlib`, `gzip`): a puff-style push decoder
+# keeping ~1.1 KiB of state and a 32 KiB window, and a greedy fixed-Huffman
+# encoder. See `compcol::embed` for what differs (no preset dictionaries, no
+# sync flush, a fixed ratio regardless of `level`) and for the measured sizes
+# CI holds the build to. Does not pull `alloc`; combine with
+# `--no-default-features`.
+embed = []
+# RFC 1951 raw deflate. The standard build needs `alloc` for the 32 KiB
+# sliding window and the per-block symbol/bit buffers (enable `alloc` or
+# `std` alongside; a build with neither fails with a message saying so);
+# the `embed` build needs no allocation at all.
+deflate = []
 # PKWARE deflate64 (zip method 9). Same framing as deflate but a 64 KiB
 # window and an extended length/distance alphabet. Standalone module —
 # does not depend on the `deflate` feature.

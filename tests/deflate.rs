@@ -436,6 +436,8 @@ fn out_of_range_level_is_clamped() {
     assert_eq!(decode_chunked(&enc_hi_out, 4096, 4096).unwrap(), input);
 }
 
+// Levels are a knob of the standard encoder; the `embed` one ignores them.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn level_1_does_less_work_than_level_9() {
     // We don't directly time the encoders (flaky in CI). The level-1 vs
@@ -657,10 +659,12 @@ mod factory {
 
 // ─── Preset dictionary + cross-block window (#22) ─────────────────────────
 
+#[cfg(not(feature = "embed"))]
 use compcol::deflate::DecoderConfig;
 
 /// Drain a decoder over a single input slice. The decoder must reach
 /// StreamEnd within this slice (these tests give it a complete stream).
+#[cfg(not(feature = "embed"))]
 fn drain_full(mut dec: Decoder, encoded: &[u8]) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     let mut buf = vec![0u8; 4096];
@@ -697,6 +701,8 @@ fn drain_full(mut dec: Decoder, encoded: &[u8]) -> Result<Vec<u8>, Error> {
 /// with `Corrupt` (libmspack does, Python's zlib does, and ours has to
 /// as well or we'd silently corrupt MSZIP output). With the dictionary
 /// supplied via [`DecoderConfig`] the stream decodes cleanly.
+// Preset dictionaries need the heap-backed decoder; the `embed` build has none.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn deflate_decoder_preset_dictionary_decodes_cross_block_backref() {
     let dictionary: Vec<u8> = b"the quick brown fox jumps over the lazy dog. ".to_vec();
@@ -738,6 +744,8 @@ fn deflate_decoder_preset_dictionary_decodes_cross_block_backref() {
 /// `with_config(dictionary=DICT)` for the first round (decoding an empty
 /// stream is the cheapest way to get the window primed without exercising
 /// the encoder), then `reset_keep_window`, then decode the fixture.
+// Preset dictionaries need the heap-backed decoder; the `embed` build has none.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn deflate_decoder_reset_keep_window_preserves_history_for_mszip() {
     let dictionary: Vec<u8> = b"the quick brown fox jumps over the lazy dog. ".to_vec();
@@ -769,6 +777,8 @@ fn deflate_decoder_reset_keep_window_preserves_history_for_mszip() {
 /// fixture must NOT decode after a full reset even if the decoder was
 /// primed with the right dictionary beforehand. Documents the contract
 /// difference between `reset` and `reset_keep_window`.
+// Preset dictionaries need the heap-backed decoder; the `embed` build has none.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn deflate_decoder_full_reset_drops_dictionary() {
     let dictionary: Vec<u8> = b"the quick brown fox jumps over the lazy dog. ".to_vec();
@@ -795,6 +805,8 @@ fn deflate_decoder_full_reset_drops_dictionary() {
 /// last 32 KiB. The truncated bytes weren't reachable by any deflate
 /// back-reference anyway (distances cap at 32768), but the API contract
 /// is to accept the slice and not error.
+// Preset dictionaries need the heap-backed decoder; the `embed` build has none.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn deflate_decoder_preset_dictionary_long_is_truncated() {
     let huge = vec![0xAAu8; 48 * 1024]; // 48 KiB of one byte
@@ -817,6 +829,8 @@ fn deflate_decoder_preset_dictionary_long_is_truncated() {
 ///   2. the cap actually suppresses the far match — a repeat placed > 4 KiB
 ///      back is codable as a match with the full 32 KiB window but not with
 ///      the 4 KiB cap, so the capped stream is strictly larger.
+// `max_distance` is a knob of the standard encoder; the `embed` one has a fixed reach.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn max_distance_cap_suppresses_far_matches_and_round_trips() {
     // 64-byte distinctive marker, then ~8 KiB of incompressible filler, then
@@ -864,6 +878,8 @@ fn max_distance_cap_suppresses_far_matches_and_round_trips() {
 /// full-window encoding of the same far-repeat data is *rejected* by that
 /// decoder with `InvalidDistance` — exactly what zlib's `inflateInit2(-12)`
 /// does (Z_DATA_ERROR). A full-window decoder still reads the latter fine.
+// The capped stream comes from the standard encoder's `max_distance`.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn small_window_decoder_accepts_capped_and_rejects_far_refs() {
     let marker: Vec<u8> = (0..64u16)
@@ -947,6 +963,7 @@ fn trailing_bytes_after_final_block_report_stream_end() {
     );
 }
 
+#[cfg(feature = "alloc")]
 #[test]
 fn trailing_bytes_do_not_stall_decompress_to_vec() {
     // Before the fix this call never returned.

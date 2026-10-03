@@ -10,15 +10,31 @@
 //! Both directions are fully streaming: the caller owns the input/output
 //! buffers and the codec preserves its state across `encode`/`decode` calls.
 //! The decoder keeps the 32 KiB sliding window on the heap.
+//!
+//! With the `embed` feature, `Encoder`, `Decoder` and their configs are the
+//! allocation-free variants over `minizlib` instead; see `compcol::embed`
+//! for what differs.
 
+#[cfg(not(feature = "embed"))]
 mod tables;
 
+#[cfg(not(feature = "embed"))]
 pub mod decoder;
+#[cfg(not(feature = "embed"))]
 pub mod encoder;
+#[cfg(not(feature = "embed"))]
 pub mod lz77;
 
+#[cfg(not(feature = "embed"))]
 pub use decoder::{Decoder, DecoderConfig};
+#[cfg(not(feature = "embed"))]
 pub use encoder::{Encoder, EncoderConfig};
+
+// The `embed` build: the same names over `minizlib`. See `crate::embed`.
+#[cfg(feature = "embed")]
+mod embed;
+#[cfg(feature = "embed")]
+pub use embed::{Decoder, DecoderConfig, Encoder, EncoderConfig};
 
 use crate::traits::Algorithm;
 

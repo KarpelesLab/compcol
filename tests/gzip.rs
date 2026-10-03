@@ -267,6 +267,8 @@ fn level_9_no_worse_than_level_1_on_compressible_corpus() {
     assert_eq!(decode_chunked(&hi, 4096, 4096).unwrap(), input);
 }
 
+// Levels (and the XFL byte they set) are a knob of the standard encoder; the `embed` one ignores them.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn level_1_does_less_work_than_level_9() {
     // Same as deflate's canonical level-discrimination test: mixed_corpus
@@ -285,6 +287,8 @@ fn level_1_does_less_work_than_level_9() {
     assert_eq!(decode_chunked(&hi, 4096, 4096).unwrap(), input);
 }
 
+// Levels (and the XFL byte they set) are a knob of the standard encoder; the `embed` one ignores them.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn xfl_byte_reflects_level() {
     // RFC 1952 §2.3.1: XFL=2 means "max compression", XFL=4 means "fastest",
@@ -300,6 +304,8 @@ fn xfl_byte_reflects_level() {
 
 // ─── reset / reuse ──────────────────────────────────────────────────────
 
+// Levels (and the XFL byte they set) are a knob of the standard encoder; the `embed` one ignores them.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn reset_preserves_level_and_allows_reuse() {
     let input_a = b"alpha alpha alpha alpha alpha".as_slice();
@@ -583,6 +589,8 @@ fn algorithm_encoder_decoder_round_trip() {
     assert_eq!(decoded, input);
 }
 
+// Levels (and the XFL byte they set) are a knob of the standard encoder; the `embed` one ignores them.
+#[cfg(not(feature = "embed"))]
 #[test]
 fn algorithm_encoder_with_uses_config() {
     let input = b"abcabcabcabcabcabc".repeat(100);
