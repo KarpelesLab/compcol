@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3](https://github.com/KarpelesLab/compcol/compare/v0.7.2...v0.7.3) - 2026-10-18
+
+### Added
+
+- *(lzf)* LZF codec (liblzf raw format) ([#139](https://github.com/KarpelesLab/compcol/pull/139))
+
 ## [0.7.2](https://github.com/KarpelesLab/compcol/compare/v0.7.1...v0.7.2) - 2026-10-03
 
 ### Added
