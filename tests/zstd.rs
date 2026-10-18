@@ -549,10 +549,10 @@ fn encoder_emits_valid_frame_header() {
     let encoded = encode_chunked(&mut enc, b"x", 16, 16);
     // First 4 bytes are the magic.
     assert_eq!(&encoded[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
-    // FHD should be 0x00.
-    assert_eq!(encoded[4], 0x00);
-    // WD = 0x70 (Exp=14, Mant=0).
-    assert_eq!(encoded[5], 0x70);
+    // Single-block frame: FHD = Single_Segment_Flag, FCS_Flag 0 (1-byte FCS).
+    assert_eq!(encoded[4], 0x20);
+    // Frame_Content_Size = 1.
+    assert_eq!(encoded[5], 0x01);
     // Block_Header bytes 6..9 should encode Last=1, Type=0 (Raw), Size=1.
     let bh = (encoded[6] as u32) | ((encoded[7] as u32) << 8) | ((encoded[8] as u32) << 16);
     let last = bh & 1;
@@ -570,8 +570,9 @@ fn empty_encode_emits_empty_last_block() {
     let mut enc = Encoder::new();
     let encoded = encode_chunked(&mut enc, &[], 16, 16);
     assert_eq!(&encoded[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
-    assert_eq!(encoded[4], 0x00);
-    assert_eq!(encoded[5], 0x70);
+    // Single_Segment, 1-byte Frame_Content_Size = 0.
+    assert_eq!(encoded[4], 0x20);
+    assert_eq!(encoded[5], 0x00);
     // 3-byte block header: Last=1, Type=0, Size=0 → 01 00 00.
     assert_eq!(&encoded[6..9], &[0x01, 0x00, 0x00]);
     assert_eq!(encoded.len(), 9);
@@ -583,14 +584,20 @@ fn encoder_rle_block_for_long_run() {
     let mut enc = Encoder::new();
     let input = vec![b'a'; 5000];
     let encoded = encode_chunked(&mut enc, &input, 4096, 4096);
-    // Frame: magic(4) + FHD(1) + WD(1) + BH(3) + payload(1).
-    assert_eq!(encoded.len(), 10);
-    let bh = (encoded[6] as u32) | ((encoded[7] as u32) << 8) | ((encoded[8] as u32) << 16);
+    // Frame: magic(4) + FHD(1) + FCS(2) + BH(3) + payload(1).
+    assert_eq!(encoded.len(), 11);
+    // Single_Segment + 2-byte Frame_Content_Size (stored as size - 256).
+    assert_eq!(encoded[4], 0x60);
+    assert_eq!(
+        u16::from_le_bytes([encoded[5], encoded[6]]) as usize + 256,
+        input.len()
+    );
+    let bh = (encoded[7] as u32) | ((encoded[8] as u32) << 8) | ((encoded[9] as u32) << 16);
     let btype = (bh >> 1) & 0b11;
     let bsize = (bh >> 3) & 0x1F_FFFF;
     assert_eq!(btype, 1, "expected RLE_Block");
     assert_eq!(bsize, input.len() as u32);
-    assert_eq!(encoded[9], b'a');
+    assert_eq!(encoded[10], b'a');
     // Round-trips back through our decoder.
     let decoded = decode_chunked(&encoded, 1024, 1024).unwrap();
     assert_eq!(decoded, input);
@@ -615,7 +622,8 @@ fn encoder_compressed_block_round_trip() {
         input.len(),
         encoded.len()
     );
-    let bh = (encoded[6] as u32) | ((encoded[7] as u32) << 8) | ((encoded[8] as u32) << 16);
+    // magic(4) + FHD(1) + 2-byte FCS, then the block header.
+    let bh = (encoded[7] as u32) | ((encoded[8] as u32) << 8) | ((encoded[9] as u32) << 16);
     let btype = (bh >> 1) & 0b11;
     assert_eq!(btype, 2, "expected Compressed_Block for repeated text");
 
@@ -757,4 +765,225 @@ mod factory {
         assert!(matches!(status, Status::StreamEnd));
         assert_eq!(&decoded[..], input);
     }
+}
+
+// ─── reference-tool fixtures: Huffman implicit last weight ──────────────
+//
+// Generated with the reference `zstd` CLI as a black box (frames carry
+// Frame_Content_Size and a Content_Checksum):
+//
+//   python3 -c "import random; r=random.Random(12345); \
+//     open('ab.raw','wb').write(bytes(r.choice(b'ab') for _ in range(4000)))"
+//   zstd -19 ab.raw -o ab_19.zst
+//   python3 -c "import random; r=random.Random(99); \
+//     open('dlast.raw','wb').write(bytes(r.choices(b'abcd',weights=[4,2,2,8])[0] \
+//     for _ in range(6000)))"
+//   zstd -19 dlast.raw -o dlast_19.zst
+//
+// Both use Huffman-coded literals whose explicitly listed weights sum
+// (Σ 2^(W-1)) to an exact power of two. RFC 8878 §4.2.1.3: the last present
+// symbol always has a non-zero weight, obtained by completing the sum to the
+// *next* power of two — so Max_Number_of_Bits is one more than log2(sum). The
+// decoder used to treat such a sum as an already-complete tree, dropping the
+// last symbol: `ab_19` failed with `Corrupt`, `dlast_19` decoded to wrong
+// bytes caught only by the content checksum. Real-world frames from
+// `zstd -15..-22` hit this regularly.
+
+static AB_RAW: &[u8] = include_bytes!("fixtures/zstd/ab.raw");
+static AB_19: &[u8] = include_bytes!("fixtures/zstd/ab_19.zst");
+static DLAST_RAW: &[u8] = include_bytes!("fixtures/zstd/dlast.raw");
+static DLAST_19: &[u8] = include_bytes!("fixtures/zstd/dlast_19.zst");
+
+#[test]
+fn reference_two_symbol_huffman_literals() {
+    // Two literal symbols → a single explicit weight of 1 (sum = 1 = 2^0).
+    assert_eq!(decode_chunked(AB_19, 4096, 4096).unwrap(), AB_RAW);
+    assert_eq!(decode_chunked(AB_19, 1, 7).unwrap(), AB_RAW);
+    assert_eq!(
+        compcol::vec::decompress_to_vec::<Zstd>(AB_19).unwrap(),
+        AB_RAW
+    );
+}
+
+#[test]
+fn reference_power_of_two_weight_sum_last_symbol_most_frequent() {
+    // Weights a=2, b=1, c=1 (sum 4) — the implicit last symbol `d` takes the
+    // other half of the 8-leaf tree (a 1-bit code).
+    assert_eq!(decode_chunked(DLAST_19, 4096, 4096).unwrap(), DLAST_RAW);
+    assert_eq!(
+        compcol::vec::decompress_to_vec::<Zstd>(DLAST_19).unwrap(),
+        DLAST_RAW
+    );
+}
+
+// ─── window handling ────────────────────────────────────────────────────
+
+/// Deterministic word salad; `tests/fixtures/gen_words.py` produces the same
+/// bytes for the fixtures below.
+fn gen_words(n: usize) -> Vec<u8> {
+    const WORDS: [&[u8]; 8] = [
+        b"alpha ",
+        b"beta ",
+        b"gamma ",
+        b"delta ",
+        b"epsilon ",
+        b"zeta ",
+        b"eta ",
+        b"theta ",
+    ];
+    let mut x: u32 = 1;
+    let mut out = Vec::with_capacity(n + 8);
+    while out.len() < n {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        out.extend_from_slice(WORDS[((x >> 16) & 7) as usize]);
+    }
+    out.truncate(n);
+    out
+}
+
+/// `python3 tests/fixtures/gen_words.py 300000 > w.raw;
+///  zstd -19 --zstd=wlog=10 w.raw -o words300k_wlog10.zst` — a 1 KiB window
+/// (Window_Descriptor 0x00) over 300 KB of output, so the decoder must slide
+/// its retained history many times while back-references stay valid.
+static WORDS300K_WLOG10: &[u8] = include_bytes!("fixtures/zstd/words300k_wlog10.zst");
+
+#[test]
+fn reference_small_window_long_stream() {
+    let expected = gen_words(300_000);
+    assert_eq!(
+        decode_chunked(WORDS300K_WLOG10, 4096, 4096).unwrap(),
+        expected
+    );
+    assert_eq!(
+        compcol::vec::decompress_to_vec::<Zstd>(WORDS300K_WLOG10).unwrap(),
+        expected
+    );
+    // A 1 KiB window is within even the tightest configurable limit.
+    let mut dec = Decoder::with_config(compcol::zstd::DecoderConfig {
+        max_window_size: 1024,
+    });
+    assert_eq!(
+        decode_chunked_with(&mut dec, WORDS300K_WLOG10).unwrap(),
+        expected
+    );
+}
+
+/// Frame header with the given Window_Descriptor, then one empty last
+/// Raw_Block.
+fn frame_with_window_descriptor(wd: u8) -> Vec<u8> {
+    vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, wd, 0x01, 0x00, 0x00]
+}
+
+#[test]
+fn window_size_limit_is_enforced_and_configurable() {
+    use compcol::zstd::{DEFAULT_MAX_WINDOW_SIZE, DecoderConfig, RECOMMENDED_WINDOW_SIZE};
+    assert_eq!(DEFAULT_MAX_WINDOW_SIZE, 128 << 20);
+    assert_eq!(RECOMMENDED_WINDOW_SIZE, 8 << 20);
+
+    // Exponent 17 → 128 MiB: accepted by default.
+    let w128m = frame_with_window_descriptor(17 << 3);
+    assert_eq!(decode_chunked(&w128m, 64, 64).unwrap(), b"");
+    // 128 MiB + 1/8 (Mantissa 1): over the default cap.
+    let over = frame_with_window_descriptor((17 << 3) | 1);
+    assert_eq!(decode_chunked(&over, 64, 64), Err(Error::Unsupported));
+    // Largest expressible window (3.75 TB): rejected, no overflow / alloc.
+    let huge = frame_with_window_descriptor(0xFF);
+    assert_eq!(decode_chunked(&huge, 64, 64), Err(Error::Unsupported));
+
+    // A tighter limit (the RFC 8878 recommended 8 MiB) rejects 16 MiB...
+    let cfg = DecoderConfig {
+        max_window_size: RECOMMENDED_WINDOW_SIZE,
+    };
+    let w16m = frame_with_window_descriptor(14 << 3);
+    let mut dec = Decoder::with_config(cfg);
+    assert_eq!(
+        decode_chunked_with(&mut dec, &w16m),
+        Err(Error::Unsupported)
+    );
+    // ...and the limit survives `reset`.
+    dec.reset();
+    assert_eq!(
+        decode_chunked_with(&mut dec, &w16m),
+        Err(Error::Unsupported)
+    );
+    let w8m = frame_with_window_descriptor(13 << 3);
+    dec.reset();
+    assert_eq!(decode_chunked_with(&mut dec, &w8m).unwrap(), b"");
+
+    // Single-segment frames: Window_Size = Frame_Content_Size, same cap.
+    // FHD 0xE0 = FCS_Flag 3 (8 bytes) + Single_Segment.
+    let mut ss = vec![0x28, 0xB5, 0x2F, 0xFD, 0xE0];
+    ss.extend_from_slice(&(RECOMMENDED_WINDOW_SIZE + 1).to_le_bytes());
+    ss.extend_from_slice(&[0x01, 0x00, 0x00]);
+    let mut dec = Decoder::with_config(cfg);
+    assert_eq!(decode_chunked_with(&mut dec, &ss), Err(Error::Unsupported));
+}
+
+/// Hand-assembled frame: Window_Descriptor `wd`, two 1000-byte Raw_Blocks,
+/// then a last Compressed_Block holding one sequence (no literals,
+/// match_length 3, offset 1621) coded with RLE_Mode tables:
+///
+/// - literals: `00` (Raw_Literals_Block, Regenerated_Size 0)
+/// - sequences: count `01`, modes `54` (LL/OF/ML all RLE_Mode), RLE symbols
+///   LL=0, OF=10, ML=0
+/// - bitstream `58 06`: start marker + the 10 offset extra bits (600), so
+///   Offset_Value = (1 << 10) + 600 = 1624 → offset 1621.
+fn far_offset_frame(wd: u8) -> Vec<u8> {
+    let mut f = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, wd];
+    for _ in 0..2 {
+        let bh: u32 = 1000 << 3; // Raw_Block, not last
+        f.extend_from_slice(&bh.to_le_bytes()[..3]);
+        f.extend((0..1000u32).map(|i| (i % 251) as u8));
+    }
+    let body = [0x00, 0x01, 0x54, 0x00, 0x0A, 0x00, 0x58, 0x06];
+    let bh: u32 = ((body.len() as u32) << 3) | (2 << 1) | 1;
+    f.extend_from_slice(&bh.to_le_bytes()[..3]);
+    f.extend_from_slice(&body);
+    f
+}
+
+#[test]
+fn offset_beyond_window_is_rejected() {
+    // 2 KiB window (Exponent 1): offset 1621 is legal.
+    let ok = decode_chunked(&far_offset_frame(1 << 3), 4096, 4096).unwrap();
+    assert_eq!(ok.len(), 2003);
+    assert_eq!(&ok[2000..], &[128, 129, 130]);
+    // 1 KiB window: RFC 8878 §3.1.1.4 forbids reaching back 1621 bytes, even
+    // though that much output exists.
+    assert_eq!(
+        decode_chunked(&far_offset_frame(0x00), 4096, 4096),
+        Err(Error::Corrupt)
+    );
+}
+
+// ─── encoder: Frame_Content_Size ────────────────────────────────────────
+
+#[test]
+fn encoder_writes_frame_content_size_for_single_block_inputs() {
+    for n in [0usize, 1, 255, 256, 257, 65_791, 65_792, 100_000, 131_071] {
+        let input = gen_words(n);
+        let encoded = compcol::vec::compress_to_vec::<Zstd>(&input).unwrap();
+        let fhd = encoded[4];
+        assert_eq!(fhd & 0x20, 0x20, "n={n}: Single_Segment_Flag");
+        let fcs = match fhd >> 6 {
+            0 => encoded[5] as u64,
+            1 => u16::from_le_bytes([encoded[5], encoded[6]]) as u64 + 256,
+            2 => u32::from_le_bytes(encoded[5..9].try_into().unwrap()) as u64,
+            _ => u64::from_le_bytes(encoded[5..13].try_into().unwrap()),
+        };
+        assert_eq!(fcs, n as u64, "n={n}");
+        assert_eq!(
+            compcol::vec::decompress_to_vec::<Zstd>(&encoded).unwrap(),
+            input
+        );
+    }
+    // Multi-block inputs: size unknown when the first block is emitted, so
+    // the encoder keeps the windowed header (no FCS).
+    let input = gen_words(300_000);
+    let encoded = compcol::vec::compress_to_vec::<Zstd>(&input).unwrap();
+    assert_eq!(&encoded[4..6], &[0x00, 0x70]);
+    assert_eq!(
+        compcol::vec::decompress_to_vec::<Zstd>(&encoded).unwrap(),
+        input
+    );
 }

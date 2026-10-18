@@ -521,11 +521,15 @@ fn apply_offset(offset_value: u32, literal_length: u32, prev: &mut [u32; 3]) -> 
 /// drained-bytes metering in [`crate::limit::LimitedDecoder`]. We track the
 /// bytes this block appends (literals **and** match copies, plus the trailing
 /// literals) and abort as soon as the running total would exceed the bound.
+///
+/// `max_offset` is the frame's `Window_Size`: RFC 8878 §3.1.1.4 forbids
+/// back-references reaching further than that.
 pub fn execute_sequences(
     sequences: &[Sequence],
     literals: &[u8],
     history: &mut Vec<u8>,
     max_block_output: usize,
+    max_offset: usize,
 ) -> Result<(), Error> {
     // Bytes appended to `history` by *this* block so far. `history` itself
     // carries earlier blocks' output, so we meter against this running counter
@@ -550,7 +554,7 @@ pub fn execute_sequences(
         history.extend_from_slice(&literals[lit_pos..lit_pos + ll]);
         lit_pos += ll;
         let offset = seq.offset as usize;
-        if offset == 0 || offset > history.len() {
+        if offset == 0 || offset > history.len() || offset > max_offset {
             return Err(Error::Corrupt);
         }
         let start = history.len() - offset;

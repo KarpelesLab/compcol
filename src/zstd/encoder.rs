@@ -25,9 +25,14 @@
 //!
 //! Frame layout we emit:
 //! - 4 bytes magic (`0x28 0xB5 0x2F 0xFD`)
-//! - 1 byte Frame_Header_Descriptor = `0x00`
-//! - 1 byte Window_Descriptor = `0x70` (Window_Log = 24 → 16 MiB advertised
-//!   window). The actual block ceiling is 128 KiB (RFC 8478 cap).
+//! - Frame header, written when the first block is emitted:
+//!   - single-block frames (whole input ≤ 128 KiB, known at `finish`):
+//!     Frame_Header_Descriptor with `Single_Segment_Flag` set followed by
+//!     `Frame_Content_Size` (1, 2 or 4 bytes), so decoders know the exact
+//!     decompressed size;
+//!   - otherwise: Frame_Header_Descriptor = `0x00` and Window_Descriptor =
+//!     `0x70` (Window_Log = 24 → 16 MiB advertised window). The actual block
+//!     ceiling is 128 KiB (RFC 8478 cap).
 //! - One or more blocks; the last carries `Last_Block = 1`.
 
 use alloc::vec;
@@ -258,11 +263,43 @@ impl Encoder {
         }
     }
 
-    /// Append frame magic + FHD + WD to `out_buf`.
-    fn write_frame_header(&mut self) {
+    /// Append the frame header to `out_buf`.
+    ///
+    /// The header is deferred until the first block is emitted. When the
+    /// whole input is known by then — `finish` was reached before a single
+    /// block filled up, i.e. the frame is one block of at most 128 KiB —
+    /// `content_size` is `Some` and we write a Single_Segment frame carrying
+    /// Frame_Content_Size (RFC 8878 §3.1.1.1.4): decoders learn the exact
+    /// output size up front and Window_Size becomes that size. Otherwise the
+    /// size is unknown and we advertise the fixed [`WD`] window instead.
+    fn write_frame_header(&mut self, content_size: Option<u64>) {
         self.out_buf.extend_from_slice(&MAGIC);
-        self.out_buf.push(FHD);
-        self.out_buf.push(WD);
+        match content_size {
+            None => {
+                self.out_buf.push(FHD);
+                self.out_buf.push(WD);
+            }
+            Some(n) => {
+                // FHD: Single_Segment_Flag (bit 5) set, FCS_Flag in bits 7-6.
+                // With Single_Segment set, FCS_Flag 0 means a 1-byte field.
+                const SS: u8 = 1 << 5;
+                if n <= 0xFF {
+                    self.out_buf.push(SS);
+                    self.out_buf.push(n as u8);
+                } else if n <= 0xFFFF + 256 {
+                    // 2-byte field stores `size - 256`.
+                    self.out_buf.push(SS | (1 << 6));
+                    self.out_buf
+                        .extend_from_slice(&((n - 256) as u16).to_le_bytes());
+                } else if n <= u64::from(u32::MAX) {
+                    self.out_buf.push(SS | (2 << 6));
+                    self.out_buf.extend_from_slice(&(n as u32).to_le_bytes());
+                } else {
+                    self.out_buf.push(SS | (3 << 6));
+                    self.out_buf.extend_from_slice(&n.to_le_bytes());
+                }
+            }
+        }
     }
 
     /// Append a 3-byte block header for the given body size, type, and
@@ -1819,11 +1856,6 @@ impl RawEncoder for Encoder {
         loop {
             match self.state {
                 State::Accepting => {
-                    // Lazily emit the frame header.
-                    if !self.header_written {
-                        self.write_frame_header();
-                        self.header_written = true;
-                    }
                     // Accept input up to BLOCK_SIZE.
                     let space = BLOCK_SIZE - self.pending.len();
                     let take = core::cmp::min(space, input.len() - consumed);
@@ -1833,7 +1865,12 @@ impl RawEncoder for Encoder {
                         consumed += take;
                     }
                     if self.pending.len() == BLOCK_SIZE {
-                        // Flush a non-final block.
+                        // Flush a non-final block. More input may follow, so
+                        // the content size is unknown: plain windowed header.
+                        if !self.header_written {
+                            self.write_frame_header(None);
+                            self.header_written = true;
+                        }
                         self.flush_block(false);
                         self.state = State::Draining { last: false };
                     } else if !self.out_buf.is_empty() {
@@ -1880,7 +1917,9 @@ impl RawEncoder for Encoder {
             match self.state {
                 State::Accepting => {
                     if !self.header_written {
-                        self.write_frame_header();
+                        // No block emitted yet: `pending` is the entire input,
+                        // so the content size is known exactly.
+                        self.write_frame_header(Some(self.pending.len() as u64));
                         self.header_written = true;
                     }
                     // Emit the final block (carries Last_Block = 1).

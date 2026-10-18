@@ -18,12 +18,46 @@ use crate::zstd::xxhash::Xxh64;
 
 const MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
-/// Hard cap on the decoder window size (and, by extension, on RLE/compressed
-/// literal `Regenerated_Size` and the running `history` buffer). This is the
-/// zstd-conventional decoder maximum (`ZSTD_WINDOWLOG_LIMIT_DEFAULT` = 27, i.e.
-/// 128 MiB). A frame declaring a window above this is rejected to bound memory
-/// against decompression-bomb inputs (a few input bytes expanding to GiB).
-pub(crate) const MAX_WINDOW_SIZE: u64 = 128 * 1024 * 1024;
+/// Default cap on the frame's `Window_Size` (RFC 8878 §3.1.1.1.2): 128 MiB
+/// (`Window_Log` 27). RFC 8878 recommends decoders support *at least* 8 MiB and
+/// allows them to reject frames requesting more memory than they are willing
+/// to commit. 128 MiB keeps frames produced by `zstd --ultra -22` / `--long`
+/// on large inputs decodable; use [`DecoderConfig::max_window_size`] to lower
+/// (or raise) it.
+pub const DEFAULT_MAX_WINDOW_SIZE: u64 = 128 * 1024 * 1024;
+
+/// The RFC 8878 recommended minimum decoder window support (8 MiB). Handy as a
+/// tighter [`DecoderConfig::max_window_size`] for memory-constrained callers.
+pub const RECOMMENDED_WINDOW_SIZE: u64 = 8 * 1024 * 1024;
+
+/// Smallest `max_window_size` a [`DecoderConfig`] can express: the minimum
+/// `Window_Size` the format allows (1 KiB). Lower values are clamped up.
+const MIN_WINDOW_SIZE: u64 = 1024;
+
+/// Decoder tunables.
+///
+/// The decoder keeps at most `Window_Size` bytes of decoded history (plus a
+/// small amortisation slack and one block) in memory, so the window limit is
+/// effectively the decoder's memory budget. Frames declaring a larger window
+/// (via `Window_Descriptor`, or `Frame_Content_Size` for single-segment
+/// frames) are rejected with [`Error::Unsupported`] before any data is
+/// decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecoderConfig {
+    /// Largest `Window_Size` (in bytes) a frame may declare. Defaults to
+    /// [`DEFAULT_MAX_WINDOW_SIZE`] (128 MiB). Values below 1 KiB are treated
+    /// as 1 KiB.
+    pub max_window_size: u64,
+}
+
+impl Default for DecoderConfig {
+    fn default() -> Self {
+        Self {
+            max_window_size: DEFAULT_MAX_WINDOW_SIZE,
+        }
+    }
+}
+
 /// Skippable_Frame magic numbers occupy 0x184D2A50..=0x184D2A5F. We do not
 /// decode them; they're rejected as unsupported.
 const SKIPPABLE_MAGIC_HI3: [u8; 3] = [0x4D, 0x2A, 0x18];
@@ -79,10 +113,11 @@ pub struct Decoder {
     dict_id_field_size: u8, // 0, 1, 2, or 4
     has_content_checksum: bool,
 
-    /// Window size (informational; we don't enforce it for Raw/RLE blocks
-    /// since we don't need back-references).
-    #[allow(dead_code)]
+    /// Frame `Window_Size`: maximum back-reference distance and the amount of
+    /// history retained across blocks.
     window_size: u64,
+    /// Configured upper bound on `window_size`.
+    max_window_size: u64,
     /// Frame_Content_Size, if known (Single_Segment frames always report it).
     /// Currently unused — we don't validate against actual decoded length.
     #[allow(dead_code)]
@@ -124,7 +159,14 @@ pub struct Decoder {
 }
 
 impl Decoder {
+    /// Build a decoder with the default [`DecoderConfig`].
     pub fn new() -> Self {
+        Self::with_config(DecoderConfig::default())
+    }
+
+    /// Build a decoder with explicit configuration (e.g. a tighter window
+    /// limit for memory-constrained or untrusted-input use).
+    pub fn with_config(config: DecoderConfig) -> Self {
         Self {
             phase: DecPhase::Magic,
             poisoned: false,
@@ -136,6 +178,7 @@ impl Decoder {
             dict_id_field_size: 0,
             has_content_checksum: false,
             window_size: 0,
+            max_window_size: config.max_window_size.max(MIN_WINDOW_SIZE),
             frame_content_size: None,
             last_block: false,
             raw_remaining: 0,
@@ -228,13 +271,15 @@ impl Decoder {
         let wd = self.scratch[0];
         let exponent = ((wd >> 3) & 0x1F) as u32;
         let mantissa = (wd & 0x07) as u32;
-        // RFC 8478 §3.1.1.1.2: Window_Size = (1 << Exp) + (1 << Exp) / 8 * Mant
+        // RFC 8878 §3.1.1.1.2: windowLog = 10 + Exponent;
+        // Window_Size = (1 << windowLog) + ((1 << windowLog) / 8) * Mantissa.
+        // Max is (1 << 41) + 7 * (1 << 38), which fits a u64 comfortably.
         let base = 1u64 << (exponent + 10);
         let add = (base >> 3) * mantissa as u64;
         self.window_size = base + add;
-        // Reject windows above the conventional decoder maximum to bound
-        // memory against decompression-bomb frames.
-        if self.window_size > MAX_WINDOW_SIZE {
+        // RFC 8878 lets a decoder reject frames requesting more memory than it
+        // is willing to commit; do so before decoding any block.
+        if self.window_size > self.max_window_size {
             return Err(self.poison(Error::Unsupported));
         }
         Ok(())
@@ -273,7 +318,7 @@ impl Decoder {
         // Apply the same hard cap so a single-segment bomb is rejected too.
         if self.single_segment {
             self.window_size = v;
-            if self.window_size > MAX_WINDOW_SIZE {
+            if self.window_size > self.max_window_size {
                 return Err(self.poison(Error::Unsupported));
             }
         }
@@ -664,7 +709,10 @@ impl RawDecoder for Decoder {
     }
 
     fn raw_reset(&mut self) {
-        *self = Self::new();
+        // Configuration survives a reset.
+        *self = Self::with_config(DecoderConfig {
+            max_window_size: self.max_window_size,
+        });
     }
 }
 
@@ -697,17 +745,46 @@ impl Decoder {
         } else {
             core::cmp::min(self.window_size, 128 * 1024)
         } as usize;
-        execute_sequences(&seqs, &lit.literals, &mut self.history, block_max)?;
+        // RFC 8878 §3.1.1.4: offsets must stay within Window_Size. We only
+        // retain that much history (see `trim_history`), so enforce it
+        // uniformly rather than depending on when the history was last
+        // trimmed.
+        let max_offset = usize::try_from(self.window_size).unwrap_or(usize::MAX);
+        execute_sequences(
+            &seqs,
+            &lit.literals,
+            &mut self.history,
+            block_max,
+            max_offset,
+        )?;
         // Return ownership of comp_buf for reuse.
         self.comp_buf = block;
         self.comp_buf.clear();
         Ok(())
     }
 
+    /// Drop history older than `Window_Size` once every decoded byte has been
+    /// delivered, so memory stays bounded by the window rather than the total
+    /// decoded size. The prefix is only discarded once it exceeds a slack of
+    /// `max(window / 4, 256 KiB)`, amortising the memmove to O(1) per byte.
+    fn trim_history(&mut self) {
+        if self.history_emitted != self.history.len() {
+            return;
+        }
+        let window = usize::try_from(self.window_size).unwrap_or(usize::MAX);
+        let excess = self.history.len().saturating_sub(window);
+        let slack = core::cmp::max(window / 4, 256 * 1024);
+        if excess > slack {
+            self.history.drain(..excess);
+            self.history_emitted = self.history.len();
+        }
+    }
+
     /// Called after a block body has been fully consumed/emitted. Transitions
     /// either to the next block header, the optional content checksum, or
     /// `Done`.
     fn advance_after_block(&mut self) {
+        self.trim_history();
         if self.last_block {
             if self.has_content_checksum {
                 // Currently unreachable (FHD rejects this), kept honest.

@@ -50,6 +50,16 @@
 //!   RLE_Mode for sequence FSE tables, multi-frame output, content checksum,
 //!   or dictionaries.
 //!
+//! # Window size and memory
+//!
+//! The decoder retains only `Window_Size` bytes of history (plus a small
+//! amortisation slack), rejects back-references reaching beyond the window,
+//! and refuses frames whose declared window exceeds
+//! [`DecoderConfig::max_window_size`] (default [`DEFAULT_MAX_WINDOW_SIZE`],
+//! 128 MiB) with [`crate::Error::Unsupported`]. Use
+//! [`Decoder::with_config`] to pick a tighter limit such as the RFC 8878
+//! recommended [`RECOMMENDED_WINDOW_SIZE`] (8 MiB).
+//!
 //! # Content checksum
 //!
 //! Frames with `Content_Checksum_Flag` set (the `zstd` CLI writes one by
@@ -83,7 +93,7 @@ mod matcher;
 mod sequences;
 mod xxhash;
 
-pub use decoder::Decoder;
+pub use decoder::{DEFAULT_MAX_WINDOW_SIZE, Decoder, DecoderConfig, RECOMMENDED_WINDOW_SIZE};
 pub use encoder::{Encoder, EncoderConfig};
 
 /// Internal helpers exposed for integration tests only. Not part of the
@@ -105,7 +115,13 @@ pub mod _internal_test_api {
         let seqs = super::sequences::decode_sequences(seq_data, &mut seq_state)?;
         let mut out: Vec<u8> = Vec::new();
         // Block_Maximum_Size with an unknown window defaults to the 128 KiB cap.
-        super::sequences::execute_sequences(&seqs, &lit.literals, &mut out, 128 * 1024)?;
+        super::sequences::execute_sequences(
+            &seqs,
+            &lit.literals,
+            &mut out,
+            128 * 1024,
+            usize::MAX,
+        )?;
         Ok(out)
     }
 
