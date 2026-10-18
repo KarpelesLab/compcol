@@ -27,9 +27,9 @@ use crate::zstd::huffman::{HuffTable, decode_huffman_tree};
 /// 8478 §3.1.1.3.1.1 a block's literals decode to at most Block_Maximum_Size =
 /// min(Window_Size, 128 KiB) bytes, which is itself capped at 128 KiB. We don't
 /// thread the frame's window size into this module, so we use the unconditional
-/// 128 KiB ceiling — far tighter than MAX_WINDOW_SIZE (128 MiB) and enough to
-/// stop a few header bytes from eagerly allocating ~1 MiB (RLE) / large Huffman
-/// outputs.
+/// 128 KiB ceiling — far tighter than the default window cap (128 MiB) and
+/// enough to stop a few header bytes from eagerly allocating ~1 MiB (RLE) /
+/// large Huffman outputs.
 const MAX_BLOCK_REGEN_SIZE: u64 = 128 * 1024;
 
 /// State carried across blocks: the most recently seen Huffman tree (used by
