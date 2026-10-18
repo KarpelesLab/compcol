@@ -144,6 +144,13 @@ doc              = false
 bench            = false
 
 [[bin]]
+name             = "decoder_lzf"
+path             = "fuzz_targets/decoder_lzf.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
 name             = "decoder_packbits"
 path             = "fuzz_targets/decoder_packbits.rs"
 test             = false

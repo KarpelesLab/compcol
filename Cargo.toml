@@ -35,7 +35,7 @@ all = [
     "lzma", "xz", "lzma2",
     "zstd", "brotli", "lz4", "snappy", "lzw", "lzss", "bzip2",
     "zstd", "brotli", "lz4", "lz5", "snappy", "lzw", "bzip2",
-    "lzo", "lzx", "amiga_lzx", "quantum", "lzfse", "adc",
+    "lzo", "lzf", "lzx", "amiga_lzx", "quantum", "lzfse", "adc",
     "ppmd",
     "xpress_huffman",
     "lznt1",
@@ -135,6 +135,10 @@ lzss    = ["alloc"]
 bzip2   = ["alloc"]
 # LZO (Lempel–Ziv–Oberhumer), LZO1X-1 variant.
 lzo     = ["alloc"]
+# LZF (Marc Lehmann's liblzf raw format, as used by Redis RDB strings and
+# the PHP/Python `lzf` bindings). Byte-oriented LZ77 with an 8 KiB window,
+# no entropy coding and no header. Encoder and decoder both streaming.
+lzf     = ["alloc"]
 # LZX (Microsoft CAB / WIM compression).
 lzx     = ["alloc"]
 # Amiga LZX (the original 1995 Forbes LZX as used in Amiga `.lzx` archives).

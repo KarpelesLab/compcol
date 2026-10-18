@@ -1,0 +1,3 @@
+# Test fixtures are byte-exact inputs: never convert line endings (a CRLF
+# checkout on Windows would no longer match the compressed counterparts).
+tests/fixtures/** -text

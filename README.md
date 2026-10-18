@@ -9,7 +9,7 @@ A collection of compression algorithms in pure Rust.
 
 `compcol` puts every supported algorithm — RLE, deflate, Deflate64,
 zlib, gzip, LZMA, LZMA2, xz, Zstandard, Brotli, LZ4, LZ5/Lizard, Snappy,
-LZW, LZSS, LZO, LZX, Amiga LZX, Quantum, LZFSE, ADC, bzip2, Microsoft
+LZW, LZSS, LZO, LZF, LZX, Amiga LZX, Quantum, LZFSE, ADC, bzip2, Microsoft
 Xpress / Xpress Huffman, LZNT1, Stac LZS, PackBits, LHA, the legacy
 ARC / PKZIP / StuffIt methods, BCJ/Delta filters, plus decoders for
 RAR 2/3/5 and PPMd — behind one uniform streaming trait, with each
@@ -61,6 +61,7 @@ flag accept; *Ext* is what `factory::extension(name)` returns.
 | Zstandard (RFC 8478) | `zstd` | `zstd` | `.zst` | LZ77 + Huffman literals + FSE_Compressed_Mode sequences + repeat offsets + RLE blocks; optimal parse at high levels | full Compressed_Block + XXH64 content checksum | `zstd(1)` both directions |
 | Brotli (RFC 7932) | `brotli` | `brotli` | `.br` | LZ77 + length-limited Huffman + 704-symbol IC alphabet + static-dictionary refs; context modeling + optimal parse at q9+ | full (with 122 KiB static dictionary) | `brotli(1)` both directions |
 | LZO (LZO1X-1) | `lzo` | `lzo` | `.lzo` | LZ77 hash matcher | full | `python3 -c "import lzo"` |
+| LZF (liblzf raw format) | `lzf` | `lzf` | `.lzf` | streaming LZ77 hash matcher (8 KiB window); sync/full flush | full, streaming | liblzf 3.6 `lzf_compress` fixtures; liblzf decodes our output |
 | LZX (Microsoft CAB / WIM) | `lzx` | `lzx` | `.lzx` | uncompressed blocks only | full (verbatim + aligned-offset + uncompressed; E8 filter) | — |
 | Amiga LZX (original 1995 Forbes) | `amiga_lzx` | `amiga_lzx` | — | uncompressed blocks only | full (verbatim + aligned + uncompressed; fixed 64 KiB window, no chunk reset, no E8 filter) | — |
 | Quantum (Stac, old CAB) | `quantum` | `quantum` | `.q` | `Unsupported` (no public encoder exists) | full (libmspack-equivalent) | libmspack regression fixtures |

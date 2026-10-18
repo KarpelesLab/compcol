@@ -145,6 +145,9 @@ pub mod lzss;
 #[cfg(feature = "lzo")]
 pub mod lzo;
 
+#[cfg(feature = "lzf")]
+pub mod lzf;
+
 // The `amiga_lzx` codec reuses the `tables`/`bitreader`/`huffman` submodules
 // of `lzx`, so the lzx module is declared whenever either feature is enabled.
 // When `lzx` itself is disabled, only the shared internals are compiled in
