@@ -618,3 +618,110 @@ mod factory {
         assert_eq!(&decoded[..], input);
     }
 }
+
+// ─── decoded block larger than the caller's buffer ─────────────────────
+//
+// bzip2 decodes a whole block (up to 900 kB) at once. When a single
+// `decode` call hands it all remaining input, it can consume every byte
+// while still holding far more decoded output than the caller's buffer
+// takes. Fixtures generated with the reference `bzip2` CLI as a black box:
+//
+//   python3 tests/fixtures/gen_words.py 200000 | bzip2 -9 > words200k_9.bz2
+//   python3 tests/fixtures/gen_words.py 250000 | bzip2 -1 > words250k_1.bz2
+//
+// (one 200 kB block, and three blocks at the 100 kB level-1 block size).
+
+static WORDS200K_9: &[u8] = include_bytes!("fixtures/bzip2/words200k_9.bz2");
+static WORDS250K_1: &[u8] = include_bytes!("fixtures/bzip2/words250k_1.bz2");
+
+/// Same bytes as `tests/fixtures/gen_words.py`.
+fn gen_words(n: usize) -> Vec<u8> {
+    const WORDS: [&[u8]; 8] = [
+        b"alpha ",
+        b"beta ",
+        b"gamma ",
+        b"delta ",
+        b"epsilon ",
+        b"zeta ",
+        b"eta ",
+        b"theta ",
+    ];
+    let mut x: u32 = 1;
+    let mut out = Vec::with_capacity(n + 8);
+    while out.len() < n {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        out.extend_from_slice(WORDS[((x >> 16) & 7) as usize]);
+    }
+    out.truncate(n);
+    out
+}
+
+#[test]
+fn vec_helpers_decode_blocks_larger_than_scratch() {
+    // `vec::decompress_to_vec*` stage output through a 64 KiB buffer; both
+    // fixtures decode to blocks larger than that. They used to fail with
+    // `UnexpectedEnd`.
+    for (enc, n) in [(WORDS200K_9, 200_000), (WORDS250K_1, 250_000)] {
+        let expected = gen_words(n);
+        assert_eq!(
+            compcol::vec::decompress_to_vec::<Bzip2>(enc).unwrap(),
+            expected
+        );
+        assert_eq!(
+            compcol::vec::decompress_to_vec_capped::<Bzip2>(enc, 1 << 20).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn finish_drains_pending_block_output() {
+    // Feed the whole stream in one `decode` call with a small output buffer,
+    // then rely solely on `finish` to deliver the rest. Per the `Decoder`
+    // contract `finish` is called repeatedly until `StreamEnd`; it used to
+    // report `UnexpectedEnd` as soon as a decoded block was still pending.
+    for (enc, n) in [(WORDS200K_9, 200_000), (WORDS250K_1, 250_000)] {
+        let expected = gen_words(n);
+        let mut dec = Decoder::new();
+        let mut buf = vec![0u8; 4096];
+        let mut out = Vec::new();
+        let mut consumed = 0;
+        while consumed < enc.len() {
+            let (p, _) = dec.decode(&enc[consumed..], &mut buf).unwrap();
+            out.extend_from_slice(&buf[..p.written]);
+            consumed += p.consumed;
+        }
+        loop {
+            let (p, status) = dec.finish(&mut buf).unwrap();
+            out.extend_from_slice(&buf[..p.written]);
+            if status == Status::StreamEnd {
+                break;
+            }
+            assert!(p.written > 0, "finish stalled");
+        }
+        assert_eq!(out, expected);
+    }
+}
+
+#[test]
+fn finish_still_reports_truncation() {
+    // Draining must not mask a genuinely truncated stream.
+    let truncated = &WORDS250K_1[..WORDS250K_1.len() - 200];
+    let mut dec = Decoder::new();
+    let mut buf = vec![0u8; 4096];
+    let (_p, _) = dec.decode(truncated, &mut buf).unwrap();
+    let err = loop {
+        match dec.finish(&mut buf) {
+            Ok((p, status)) => {
+                assert_ne!(status, Status::StreamEnd);
+                assert!(p.written > 0, "finish stalled");
+            }
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(err, Error::UnexpectedEnd);
+    assert_eq!(
+        compcol::vec::decompress_to_vec::<Bzip2>(truncated),
+        Err(Error::UnexpectedEnd)
+    );
+}
