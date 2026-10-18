@@ -582,7 +582,7 @@ fn single_symbol(lens: &[u8]) -> Option<usize> {
 }
 
 /// Encode `data` into an lh5/6/7 payload (no length header — the caller
-/// prepends it). Produces a single block holding every token. Uses a
+/// prepends it), splitting the tokens into blocks of at most 65535. Uses a
 /// greedy hash-chain match finder over the method's window.
 pub fn encode_payload(data: &[u8], params: Params) -> Vec<u8> {
     let mut bw = BitWriter::new();
@@ -593,14 +593,34 @@ pub fn encode_payload(data: &[u8], params: Params) -> Vec<u8> {
     // The largest offset whose position symbol stays within the `np`
     // alphabet is `2^(np-1) - 1` (symbol `np-1` covers offsets
     // `2^(np-2)..2^(np-1)`). Cap match distance accordingly; this is the
-    // method's effective dictionary size (e.g. lh5 np=14 → 8 KiB).
-    let max_dist = (1usize << (params.np - 1)) - 1;
+    // method's effective dictionary size (e.g. lh5 np=14 → 8 KiB). The
+    // decoder's ring buffer bounds it too: lh4 shares lh5's 14-symbol
+    // position alphabet but only has a 4 KiB dictionary, so offsets must stay
+    // below `ring_size`.
+    let max_dist = ((1usize << (params.np - 1)) - 1).min(params.ring_size - 1);
     let tokens = lz_parse(data, max_dist);
 
+    // The block header's code count is a 16-bit field, so a block holds at
+    // most 65535 tokens; longer inputs are split into several blocks, each
+    // with its own tables (the decoder reads blocks until the stream ends).
+    for block in tokens.chunks(MAX_BLOCK_CODES) {
+        write_block(&mut bw, block, params);
+    }
+
+    bw.finish()
+}
+
+/// Largest token count a block header's 16-bit code-count field can hold.
+const MAX_BLOCK_CODES: usize = 0xFFFF;
+
+/// Write one block (16-bit code count, tables, coded tokens) for `tokens`,
+/// which must hold `1..=MAX_BLOCK_CODES` entries.
+fn write_block(bw: &mut BitWriter, tokens: &[Token], params: Params) {
+    debug_assert!(!tokens.is_empty() && tokens.len() <= MAX_BLOCK_CODES);
     // Build frequency histograms.
     let mut c_freq = vec![0u32; NC];
     let mut p_freq = vec![0u32; params.np];
-    for t in &tokens {
+    for t in tokens {
         match t {
             Token::Lit(b) => c_freq[*b as usize] += 1,
             Token::Match { len, offset } => {
@@ -643,7 +663,7 @@ pub fn encode_payload(data: &[u8], params: Params) -> Vec<u8> {
         }
         let t_lens = assign_lengths(&t_freq, super::huffman::MAX_BITS);
         let t_codes = lengths_to_codes(&t_lens);
-        write_temp_table(&mut bw, &t_lens);
+        write_temp_table(bw, &t_lens);
         bw.put_bits(CBIT, NC as u32);
         for ts in &temp_syms {
             let sym = ts.symbol();
@@ -662,11 +682,11 @@ pub fn encode_payload(data: &[u8], params: Params) -> Vec<u8> {
         bw.put_bits(params.pbit, 0);
         bw.put_bits(params.pbit, sym as u32);
     } else {
-        write_position_table(&mut bw, &p_lens, params.np, params.pbit);
+        write_position_table(bw, &p_lens, params.np, params.pbit);
     }
 
     // ── coded token stream ──────────────────────────────────────────
-    for t in &tokens {
+    for t in tokens {
         match t {
             Token::Lit(b) => {
                 let s = *b as usize;
@@ -687,8 +707,6 @@ pub fn encode_payload(data: &[u8], params: Params) -> Vec<u8> {
             }
         }
     }
-
-    bw.finish()
 }
 
 /// Greedy LZSS parser with a hash-chain match finder. `window` is the
