@@ -19,7 +19,7 @@ use libfuzzer_sys::fuzz_target;
 const CODECS: &[&str] = &[
     "deflate", "zlib", "gzip", "lz4", "snappy", "lzo", "lzw", "lzss", "lzs", "xpress", "adc",
     "rle", "rle90", "packbits", "bzip2", "zstd", "brotli", "xz", "lzma", "lzma2", "huffman",
-    "lznt1", "lz5", "mtf", "bwt", "delta",
+    "lznt1", "lz5", "mtf", "bwt", "delta", "lzf",
 ];
 
 /// Cap the input so a slow optimal-parse encoder (xz/lzma2) can't turn one

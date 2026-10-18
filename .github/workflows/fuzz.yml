@@ -40,6 +40,7 @@ jobs:
           - decoder_lznt1
           - decoder_xpress
           - decoder_packbits
+          - decoder_lzf
           - decoder_zip_shrink
           - decoder_zip_reduce
           - decoder_zip_implode
