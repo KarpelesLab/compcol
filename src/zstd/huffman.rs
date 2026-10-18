@@ -185,25 +185,21 @@ pub fn decode_huffman_tree(data: &[u8]) -> Result<(HuffTable, usize), Error> {
     if sum == 0 {
         return Err(Error::Corrupt);
     }
-    // max_num_bits = ceil(log2(sum)) and the "implicit last weight" closes
-    // the tree to 2^max_num_bits.
-    // If sum is already a power of two, we set max_num_bits = log2(sum) and
-    // emit an implicit "weight 0" (symbol absent) — i.e. no extra symbol.
-    let max_num_bits = if sum.is_power_of_two() {
-        sum.trailing_zeros() as u8
-    } else {
-        (64 - sum.leading_zeros()) as u8
-    };
+    // RFC 8878 §4.2.1.3: the last present symbol's weight is implicit and
+    // always non-zero. It is deduced by completing the sum to the next power
+    // of two *strictly above* `sum`; that power gives Max_Number_of_Bits.
+    // (If `sum` is itself a power of two, the tree is completed to `2 * sum`
+    // and the implicit symbol takes half of it.)
+    let max_num_bits = (64 - sum.leading_zeros()) as u8;
+    if max_num_bits > HUF_MAX_BITS {
+        return Err(Error::Corrupt);
+    }
     let left_over = (1u64 << max_num_bits) - sum;
-    // left_over must be a power of two (or zero, which we already handled).
-    let last_weight = if left_over == 0 {
-        0
-    } else {
-        if !left_over.is_power_of_two() {
-            return Err(Error::Corrupt);
-        }
-        (left_over.trailing_zeros() as u8) + 1
-    };
+    // left_over is non-zero by construction and must be a power of two.
+    if !left_over.is_power_of_two() {
+        return Err(Error::Corrupt);
+    }
+    let last_weight = (left_over.trailing_zeros() as u8) + 1;
     let mut all_weights = weights.clone();
     all_weights.push(last_weight);
 
