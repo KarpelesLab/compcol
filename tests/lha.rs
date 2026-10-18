@@ -315,3 +315,52 @@ fn names_registered() {
         }
     }
 }
+
+/// Deterministic, poorly compressible bytes.
+fn noise(n: usize, seed: u32) -> Vec<u8> {
+    let mut rng = seed;
+    (0..n)
+        .map(|_| {
+            rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+            (rng >> 16) as u8
+        })
+        .collect()
+}
+
+fn vec_roundtrip<A: Algorithm<DecoderConfig = DecoderConfig>>(data: &[u8]) {
+    let encoded = compcol::vec::compress_to_vec::<A>(data).unwrap();
+    let decoded = compcol::vec::decompress_to_vec::<A>(&encoded)
+        .unwrap_or_else(|e| panic!("{}: {e:?}", A::NAME));
+    assert!(decoded == data, "{}: round-trip mismatch", A::NAME);
+    let decoded =
+        compcol::vec::decompress_to_vec_with::<A>(&encoded, DecoderConfig::with_len(data.len()))
+            .unwrap();
+    assert!(
+        decoded == data,
+        "{}: round-trip mismatch (with_len)",
+        A::NAME
+    );
+}
+
+#[test]
+fn static_methods_split_more_than_65535_tokens_into_blocks() {
+    // ~100k literal tokens: a block's code count is a 16-bit field, so the
+    // encoder must start new blocks. It used to write one block with the count
+    // truncated mod 65536, which decoded as garbage / `InvalidHuffmanTree`.
+    let data = noise(100_000, 0xDEAD_BEEF);
+    vec_roundtrip::<Lh4>(&data);
+    vec_roundtrip::<Lh5>(&data);
+    vec_roundtrip::<Lh6>(&data);
+    vec_roundtrip::<Lh7>(&data);
+}
+
+#[test]
+fn lh4_matches_stay_within_its_4k_dictionary() {
+    // The only repeats are 5000 bytes apart: within lh5's 8 KiB reach but
+    // beyond lh4's 4 KiB dictionary, which the lh4 encoder used to ignore
+    // (it shares lh5's position alphabet), producing `InvalidDistance`.
+    let chunk = noise(5000, 42);
+    let data = chunk.repeat(3);
+    vec_roundtrip::<Lh4>(&data);
+    vec_roundtrip::<Lh5>(&data);
+}
