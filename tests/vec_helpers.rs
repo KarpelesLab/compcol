@@ -222,3 +222,133 @@ mod lha {
         assert_eq!(d, input);
     }
 }
+
+// ─── drain contract: `OutputFull` after all input was consumed ─────────
+
+/// A decoder that, like bzip2 (whole block) or zstd (whole Compressed_Block),
+/// absorbs all of its input in one call and then needs several calls to hand
+/// the decoded bytes out. Its `finish` is deliberately strict: it refuses to
+/// drain and reports `UnexpectedEnd` if bytes are still pending, so the
+/// one-shot helpers must keep calling `decode` while it says `OutputFull` —
+/// even after every input byte has been consumed — exactly as the
+/// [`compcol::Status::OutputFull`] contract says.
+mod drain_contract {
+    use compcol::{Algorithm, Decoder, Encoder, Error, Progress, Status};
+
+    #[derive(Default)]
+    struct BufferingDecoder {
+        pending: Vec<u8>,
+        pos: usize,
+    }
+
+    impl Decoder for BufferingDecoder {
+        fn decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<(Progress, Status), Error> {
+            self.pending.extend_from_slice(input);
+            let n = (self.pending.len() - self.pos).min(output.len());
+            output[..n].copy_from_slice(&self.pending[self.pos..self.pos + n]);
+            self.pos += n;
+            let status = if self.pos < self.pending.len() {
+                Status::OutputFull
+            } else {
+                Status::InputEmpty
+            };
+            Ok((
+                Progress {
+                    consumed: input.len(),
+                    written: n,
+                },
+                status,
+            ))
+        }
+
+        fn finish(&mut self, _output: &mut [u8]) -> Result<(Progress, Status), Error> {
+            if self.pos < self.pending.len() {
+                return Err(Error::UnexpectedEnd);
+            }
+            Ok((Progress::default(), Status::StreamEnd))
+        }
+
+        fn reset(&mut self) {
+            *self = Self::default();
+        }
+
+        fn discard_output(
+            &mut self,
+            _input: &[u8],
+            _n: usize,
+        ) -> Result<(Progress, Status), Error> {
+            Err(Error::Unsupported)
+        }
+    }
+
+    /// Identity encoder so the marker type satisfies `Algorithm`.
+    #[derive(Default)]
+    struct Identity;
+
+    impl Encoder for Identity {
+        fn encode(&mut self, input: &[u8], output: &mut [u8]) -> Result<(Progress, Status), Error> {
+            let n = input.len().min(output.len());
+            output[..n].copy_from_slice(&input[..n]);
+            let status = if n == input.len() {
+                Status::InputEmpty
+            } else {
+                Status::OutputFull
+            };
+            Ok((
+                Progress {
+                    consumed: n,
+                    written: n,
+                },
+                status,
+            ))
+        }
+
+        fn finish(&mut self, _output: &mut [u8]) -> Result<(Progress, Status), Error> {
+            Ok((Progress::default(), Status::StreamEnd))
+        }
+
+        fn reset(&mut self) {}
+    }
+
+    struct Buffering;
+
+    impl Algorithm for Buffering {
+        const NAME: &'static str = "buffering-test";
+        type Encoder = Identity;
+        type Decoder = BufferingDecoder;
+        type EncoderConfig = ();
+        type DecoderConfig = ();
+
+        fn encoder_with(_: ()) -> Identity {
+            Identity
+        }
+        fn decoder_with(_: ()) -> BufferingDecoder {
+            BufferingDecoder::default()
+        }
+    }
+
+    /// Larger than the helpers' 64 KiB scratch buffer, so the decoder still
+    /// holds pending output after swallowing the whole input.
+    fn big() -> Vec<u8> {
+        (0..300_000u32).map(|i| (i * 31 % 251) as u8).collect()
+    }
+
+    #[test]
+    fn decompress_to_vec_drains_after_input_exhausted() {
+        let data = big();
+        let out = compcol::vec::decompress_to_vec::<Buffering>(&data).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn decompress_to_vec_capped_drains_after_input_exhausted() {
+        let data = big();
+        let out = compcol::vec::decompress_to_vec_capped::<Buffering>(&data, 1 << 20).unwrap();
+        assert_eq!(out, data);
+        // The cap still applies on the drain-only calls.
+        assert_eq!(
+            compcol::vec::decompress_to_vec_capped::<Buffering>(&data, 100_000),
+            Err(Error::OutputLimitExceeded)
+        );
+    }
+}

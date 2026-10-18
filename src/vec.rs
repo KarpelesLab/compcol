@@ -112,13 +112,33 @@ pub fn decompress_to_vec_with<A: Algorithm>(
     let mut out: Vec<u8> = Vec::with_capacity(input.len().saturating_mul(2));
     let mut scratch: Vec<u8> = vec![0u8; SCRATCH];
 
+    drive_decoder(&mut dec, input, &mut out, &mut scratch)?;
+    Ok(out)
+}
+
+/// Shared decode loop for the one-shot helpers.
+///
+/// Keeps calling `decode` for as long as it reports [`Status::OutputFull`] —
+/// **including after every input byte has been consumed**. Decoders that
+/// buffer a whole block internally (bzip2 absorbs an entire block, zstd a
+/// whole Compressed_Block) can swallow all remaining input in one call while
+/// still holding more decoded bytes than fit in `scratch`; `OutputFull` then
+/// means "drain and call again" exactly as documented, and only `InputEmpty`
+/// means the decoder needs bytes we no longer have. `finish` is then called
+/// to validate end-of-stream (and drain anything it still owes).
+fn drive_decoder<D: Decoder>(
+    dec: &mut D,
+    input: &[u8],
+    out: &mut Vec<u8>,
+    scratch: &mut [u8],
+) -> Result<(), Error> {
     let mut consumed = 0usize;
-    while consumed < input.len() {
-        let (p, status) = dec.decode(&input[consumed..], &mut scratch)?;
+    loop {
+        let (p, status) = dec.decode(&input[consumed..], scratch)?;
         out.extend_from_slice(&scratch[..p.written]);
         consumed += p.consumed;
         match status {
-            Status::StreamEnd => return Ok(out),
+            Status::StreamEnd => return Ok(()),
             Status::InputEmpty => break,
             // `OutputFull` normally means "drain and call again", but a
             // decoder that reports it without consuming input or writing
@@ -135,16 +155,15 @@ pub fn decompress_to_vec_with<A: Algorithm>(
         }
     }
     loop {
-        let (p, status) = dec.finish(&mut scratch)?;
+        let (p, status) = dec.finish(scratch)?;
         out.extend_from_slice(&scratch[..p.written]);
         if matches!(status, Status::StreamEnd) {
-            break;
+            return Ok(());
         }
         if p.written == 0 {
             return Err(Error::Corrupt);
         }
     }
-    Ok(out)
 }
 
 /// Decompress `input` with `A`'s default decoder config, refusing to
@@ -184,33 +203,6 @@ pub fn decompress_to_vec_capped_with<A: Algorithm>(
     let mut out: Vec<u8> = Vec::with_capacity(hint);
     let mut scratch: Vec<u8> = vec![0u8; SCRATCH];
 
-    let mut consumed = 0usize;
-    while consumed < input.len() {
-        let (p, status) = dec.decode(&input[consumed..], &mut scratch)?;
-        out.extend_from_slice(&scratch[..p.written]);
-        consumed += p.consumed;
-        match status {
-            Status::StreamEnd => return Ok(out),
-            Status::InputEmpty => break,
-            // See `decompress_to_vec_with`: a stalled decoder reporting
-            // `OutputFull` with no progress would otherwise spin forever.
-            Status::OutputFull => {
-                if p.consumed == 0 && p.written == 0 {
-                    break;
-                }
-                continue;
-            }
-        }
-    }
-    loop {
-        let (p, status) = dec.finish(&mut scratch)?;
-        out.extend_from_slice(&scratch[..p.written]);
-        if matches!(status, Status::StreamEnd) {
-            break;
-        }
-        if p.written == 0 {
-            return Err(Error::Corrupt);
-        }
-    }
+    drive_decoder(&mut dec, input, &mut out, &mut scratch)?;
     Ok(out)
 }
