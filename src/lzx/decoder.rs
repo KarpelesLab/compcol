@@ -105,6 +105,10 @@ struct RunCtx {
     /// whole frame, and `output_so_far` must stay a multiple of the frame
     /// size so it locates the frame for the filter.
     frame_ready: bool,
+    /// `finish` has appended one zero word past the end of the input. A
+    /// Huffman decode looks ahead by the tree's longest code, which can run
+    /// past the last real bit; libmspack pads the input the same way.
+    eof_padded: bool,
 }
 
 enum BlockState {
@@ -297,6 +301,7 @@ impl RawDecoder for Decoder {
                         frame_buf: Vec::with_capacity(FRAME_SIZE),
                         frame_emitted: 0,
                         frame_ready: false,
+                        eof_padded: false,
                     };
                     // Trivially-empty streams (total == 0) skip straight to Done
                     // without parsing a single block.
@@ -385,6 +390,15 @@ impl RawDecoder for Decoder {
         }
         let mut written = 0usize;
         if let DecState::Running(ctx) = &mut self.state {
+            drain_frame(ctx, output, &mut written);
+            if !ctx.eof_padded && ctx.bit_reader.can_accept_word() {
+                ctx.bit_reader.feed(0);
+                ctx.bit_reader.feed(0);
+                ctx.eof_padded = true;
+            }
+            if let Err(e) = step(ctx) {
+                return Err(self.poison(e));
+            }
             drain_frame(ctx, output, &mut written);
             if ctx.output_so_far == ctx.output_total && ctx.frame_emitted == ctx.frame_buf.len() {
                 self.state = DecState::Done;
