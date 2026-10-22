@@ -578,3 +578,47 @@ fn trailing_bytes_after_completion_do_not_stall() {
         "trailing bytes after completion must not produce a no-progress OutputFull"
     );
 }
+
+// ─── unsized decoders and reset ──────────────────────────────────────────
+
+/// Drive `dec` over `comp` until `StreamEnd`, draining through an
+/// `out_chunk`-byte buffer, and return everything it produced.
+fn drive_to_end(dec: &mut Decoder, comp: &[u8], out_chunk: usize) -> Result<Vec<u8>, Error> {
+    let mut decoded = Vec::new();
+    let mut buf = vec![0u8; out_chunk];
+    let mut inp = comp;
+    loop {
+        let (p, status) = dec.decode(inp, &mut buf)?;
+        inp = &inp[p.consumed..];
+        decoded.extend_from_slice(&buf[..p.written]);
+        match status {
+            Status::StreamEnd => return Ok(decoded),
+            Status::InputEmpty => break,
+            Status::OutputFull => {}
+        }
+    }
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        decoded.extend_from_slice(&buf[..p.written]);
+        if matches!(status, Status::StreamEnd) {
+            return Ok(decoded);
+        }
+        assert!(p.written > 0, "finish stalled");
+    }
+}
+
+/// Regression: an unsized decoder (`Decoder::new`, which is what
+/// `Rar5::decoder()` builds) learns its total from the first stream's last
+/// block. `reset` kept that learned total, so the next stream was silently
+/// truncated to the first stream's length while reporting `StreamEnd`.
+#[test]
+fn reset_forgets_learned_unpack_size() {
+    let mut dec = Decoder::new();
+    let first = drive_to_end(&mut dec, FIXTURE_AAA, 64).unwrap();
+    assert_eq!(first.len() as u64, FIXTURE_AAA_UNPACK);
+    dec.reset();
+    let second = drive_to_end(&mut dec, FIXTURE_ABCABC, 64).unwrap();
+    let mut want = b"abc".repeat(100);
+    want.push(b'\n');
+    assert_eq!(second, want);
+}

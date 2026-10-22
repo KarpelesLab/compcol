@@ -86,6 +86,10 @@ pub struct Decoder {
     /// process blocks lazily.
     input: VecDeque<u8>,
     unpack_total: u64,
+    /// The unpack size the decoder was constructed with (`u64::MAX` when
+    /// unknown). `unpack_total` is overwritten with the real size once an
+    /// unsized stream's last block is seen; `reset` restores it from here.
+    declared_unpack: u64,
     unpack_so_far: u64,
     window_size: usize,
     /// Cached `window_size - 1`. `window_size` is always a power of two
@@ -170,6 +174,7 @@ impl Decoder {
             poisoned: false,
             input: VecDeque::new(),
             unpack_total: unpack,
+            declared_unpack: unpack,
             unpack_so_far: 0,
             window_size: ws,
             window_mask: ws - 1,
@@ -345,6 +350,9 @@ impl RawDecoder for Decoder {
         self.state = State::BlockHeader;
         self.poisoned = false;
         self.input.clear();
+        // An unsized decoder learns its total from the first stream's last
+        // block; carrying that over would silently truncate the next stream.
+        self.unpack_total = self.declared_unpack;
         self.unpack_so_far = 0;
         self.window.fill(0);
         self.window_pos = 0;
