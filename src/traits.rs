@@ -127,19 +127,23 @@ pub trait RawDecoder {
         let mut scratch = [0u8; 1024];
         let mut consumed = 0usize;
         let mut written = 0usize;
+        let mut done = false;
         while written < n {
             let want = (n - written).min(scratch.len());
             let p = self.raw_decode(&input[consumed..], &mut scratch[..want])?;
             consumed += p.consumed;
             written += p.written;
-            if p.consumed == 0 && p.written == 0 {
+            // Stop at the end of the stream and say so, rather than go on
+            // feeding the decoder whatever follows it.
+            done = p.done;
+            if done || (p.consumed == 0 && p.written == 0) {
                 break;
             }
         }
         Ok(RawProgress {
             consumed,
             written,
-            done: false,
+            done,
         })
     }
 }

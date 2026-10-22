@@ -598,3 +598,20 @@ fn reset_keeps_preset_dictionary() {
         dec.reset();
     }
 }
+
+/// `discard_output` past the end of the stream stops there and reports
+/// `StreamEnd`, as `decode` does, with or without bytes after the stream.
+/// (The default skip, which drives `decode`, used to drop the end-of-stream
+/// signal and report `InputEmpty` / `OutputFull` instead.)
+#[test]
+fn discard_output_reports_stream_end() {
+    let payload = b"hello hello hello world ".repeat(100);
+    let mut input = encode_all(&payload);
+    for trailing in [0, 20] {
+        input.resize(input.len() + trailing, 0xaa);
+        let mut dec = Decoder::new();
+        let (p, status) = dec.discard_output(&input, 1 << 20).unwrap();
+        assert_eq!(p.written, payload.len());
+        assert_eq!(status, Status::StreamEnd);
+    }
+}

@@ -956,6 +956,24 @@ fn trailing_bytes_after_final_block_report_stream_end() {
     );
 }
 
+/// `discard_output` past the end of the stream stops there and reports
+/// `StreamEnd`, as `decode` does, with or without bytes after the stream.
+/// (The default skip, which drives `decode`, used to drop the end-of-stream
+/// signal and report `InputEmpty` / `OutputFull` instead.)
+#[test]
+fn discard_output_reports_stream_end() {
+    let stream = &TRAILING_GARBAGE[7..];
+    let mut dec = <Deflate>::decoder();
+    let (p, _) = dec.decode(stream, &mut [0u8; 4096]).unwrap();
+    let end = p.consumed;
+    for input in [&stream[..end], stream] {
+        let mut dec = <Deflate>::decoder();
+        let (p, status) = dec.discard_output(input, 1 << 20).unwrap();
+        assert_eq!(p.written, TRAILING_GARBAGE_PLAIN.len());
+        assert_eq!(status, Status::StreamEnd);
+    }
+}
+
 #[cfg(feature = "alloc")]
 #[test]
 fn trailing_bytes_do_not_stall_decompress_to_vec() {
