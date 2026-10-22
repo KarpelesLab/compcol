@@ -18,24 +18,13 @@
 //!
 //! Pick a format, an input and an output, and go:
 //!
-//! | format                 | decompress        | length only            | compress         |
-//! |------------------------|-------------------|------------------------|------------------|
-//! | gzip (RFC 1952)        | [`gunzip`][g]     | [`gunzip_len`][gl]     | [`gzip`][cg]     |
-//! | zlib (RFC 1950)        | [`unzlib`][z]     | [`unzlib_len`][zl]     | [`zlib`][cz]     |
-//! | raw deflate (RFC 1951) | [`inflate`][i]    | [`inflate_len`][il]    | [`deflate`][cd]  |
-//! | gzip or zlib, detected | [`decompress`][d] | [`decompress_len`][dl] |                  |
+//! | format                 | decompress     | length only        | compress    |
+//! |------------------------|----------------|--------------------|-------------|
+//! | gzip (RFC 1952)        | [`gunzip`]     | [`gunzip_len`]     | [`gzip`]    |
+//! | zlib (RFC 1950)        | [`unzlib`]     | [`unzlib_len`]     | [`zlib`]    |
+//! | raw deflate (RFC 1951) | [`inflate`]    | [`inflate_len`]    | [`deflate`] |
+//! | gzip or zlib, detected | [`decompress`] | [`decompress_len`] |             |
 //!
-//! [g]: fn.gunzip.html
-//! [gl]: fn.gunzip_len.html
-//! [z]: fn.unzlib.html
-//! [zl]: fn.unzlib_len.html
-//! [i]: fn.inflate.html
-//! [il]: fn.inflate_len.html
-//! [d]: fn.decompress.html
-//! [dl]: fn.decompress_len.html
-//! [cg]: fn.gzip.html
-//! [cz]: fn.zlib.html
-//! [cd]: fn.deflate.html
 //! [c]: struct.Compressor.html
 //! [bc]: struct.BufferedCompressor.html
 //! [dc]: struct.Decompressor.html

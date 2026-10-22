@@ -255,7 +255,7 @@ impl HpackDecoder {
     /// New decoder with the protocol-default 4096-byte dynamic table and the
     /// [`DEFAULT_MAX_HEADER_LIST_SIZE`] cap.
     #[deprecated(
-        since = "0.6.12",
+        since = "0.7.4",
         note = "choose a decoded-size cap explicitly: use `HpackDecoder::with_limits`"
     )]
     pub fn new() -> Self {
@@ -265,7 +265,7 @@ impl HpackDecoder {
     /// New decoder whose dynamic table (and the size-update ceiling) is
     /// `max` bytes, with the [`DEFAULT_MAX_HEADER_LIST_SIZE`] cap.
     #[deprecated(
-        since = "0.6.12",
+        since = "0.7.4",
         note = "choose a decoded-size cap explicitly: use `HpackDecoder::with_limits`"
     )]
     pub fn with_max_table_size(max: usize) -> Self {
