@@ -240,10 +240,14 @@ impl Decoder {
     }
 }
 
-impl RawDecoder for Decoder {
-    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
+impl Decoder {
+    /// Undo the transform on `buf` in place, continuing the stream from the
+    /// previous call. The xz container runs this on LZMA2 output that is
+    /// already in its own buffer; [`RawDecoder::raw_decode`] copies into
+    /// the caller's output and runs it there.
+    pub(crate) fn decode_in_place(&mut self, buf: &mut [u8]) -> Result<(), Error> {
         self.hist.check()?;
-        let n = input.len().min(output.len());
+        let n = buf.len();
         let h = &mut self.hist;
         let dist = h.dist;
 
@@ -251,29 +255,29 @@ impl RawDecoder for Decoder {
         // from previous calls / the all-zero seed). Reconstruct them through
         // the ring exactly as before.
         let seed = dist.min(n);
-        for i in 0..seed {
+        for b in &mut buf[..seed] {
             let prev = h.buf[h.pos];
-            let orig = input[i].wrapping_add(prev);
-            output[i] = orig;
+            let orig = b.wrapping_add(prev);
+            *b = orig;
             h.buf[h.pos] = orig;
             h.pos += 1;
             if h.pos == dist {
                 h.pos = 0;
             }
         }
-        // Phase 2: once `i >= dist`, `output[i - dist]` is the original byte we
-        // need — read it straight from the output buffer. This drops both the
-        // ring modulo branch and the history load/store from the hot loop and
-        // exposes a simple `out[i] = in[i] + out[i-dist]` recurrence.
+        // Phase 2: once `i >= dist`, `buf[i - dist]` already holds the
+        // original byte we need. This drops both the ring modulo branch and
+        // the history load/store from the hot loop and exposes a simple
+        // `buf[i] += buf[i-dist]` recurrence.
         for i in dist..n {
-            output[i] = input[i].wrapping_add(output[i - dist]);
+            buf[i] = buf[i].wrapping_add(buf[i - dist]);
         }
         // Phase 3: refresh the ring from the last `dist` reconstructed bytes so
         // the next call continues seamlessly. (When `n < dist` the ring was
         // already fully advanced byte-by-byte in phase 1 and is correct.)
         //
         // After processing `n` bytes the byte-by-byte algorithm leaves
-        // `pos = (p0 + n) % dist` and `buf[(pos + k) % dist] = output[n-dist+k]`
+        // `pos = (p0 + n) % dist` and `buf[(pos + k) % dist] = out[n-dist+k]`
         // for k in 0..dist (each slot holds its most recent write). Reproduce
         // exactly that state. With `seed == dist` here, `h.pos` is back at `p0`,
         // so the final cursor is `(p0 + n) % dist == (h.pos + (n % dist)) %
@@ -281,10 +285,19 @@ impl RawDecoder for Decoder {
         if n >= dist {
             let pos_final = (h.pos + (n % dist)) % dist;
             for k in 0..dist {
-                h.buf[(pos_final + k) % dist] = output[n - dist + k];
+                h.buf[(pos_final + k) % dist] = buf[n - dist + k];
             }
             h.pos = pos_final;
         }
+        Ok(())
+    }
+}
+
+impl RawDecoder for Decoder {
+    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
+        let n = input.len().min(output.len());
+        output[..n].copy_from_slice(&input[..n]);
+        self.decode_in_place(&mut output[..n])?;
         Ok(RawProgress {
             consumed: n,
             written: n,

@@ -19,7 +19,16 @@
 //!  Streams, each followed by optional padding
 //! ```
 //!
-//! This implementation supports a single filter (LZMA2, filter ID 0x21).
+//! The encoder writes a single filter (LZMA2, filter ID 0x21). The decoder
+//! also accepts the filter chains the spec defines: up to three non-last
+//! filters before LZMA2 — Delta (`0x03`) and the BCJ branch converters x86
+//! (`0x04`), PowerPC (`0x05`), IA-64 (`0x06`), ARM (`0x07`), ARM-Thumb
+//! (`0x08`), SPARC (`0x09`), ARM64 (`0x0A`) and RISC-V (`0x0B`), with
+//! their start-offset properties — undone in the private `filters`
+//! submodule with this crate's `delta` and `bcj` transforms (the `xz`
+//! feature pulls both in). Other filter IDs fail with
+//! [`Error::Unsupported`].
+//!
 //! Decoding handles every LZMA2 chunk type: `0x00` (end marker), `0x01`
 //! (uncompressed + dictionary reset), `0x02` (uncompressed, no reset),
 //! and `0x80..=0xFF` (LZMA-compressed, with the spec's full matrix of
@@ -103,6 +112,9 @@ use crate::lzma2_internal::lzma2_decoder::{Lzma2Props, LzmaCore, lzma2_dict_size
 use crate::lzma2_internal::lzma2_encoder::{
     EncoderParams, LZMA2_PROPS_BYTE, Lzma2Chunk, Lzma2StreamEncoder,
 };
+
+mod filters;
+use filters::FilterChain;
 
 // ─── constants ─────────────────────────────────────────────────────────────
 
@@ -1331,6 +1343,11 @@ pub struct Decoder {
     /// required on subsequent reset chunks.
     last_props: u8,
 
+    /// The current Block's Delta/BCJ filters, undone on the LZMA2 output
+    /// before it reaches the caller; `None` for a plain LZMA2 Block. When
+    /// set, all of the Block's output goes through its buffer.
+    filters: Option<FilterChain>,
+
     /// Stream Padding bytes seen since the last Stream Footer, modulo 4.
     stream_padding: u8,
     /// Set by `finish`: no more input will arrive, so whatever follows the
@@ -1368,6 +1385,7 @@ impl Decoder {
             comp_decoded: Vec::new(),
             comp_decoded_pos: 0,
             last_props: 0,
+            filters: None,
             stream_padding: 0,
             finishing: false,
             poisoned: false,
@@ -1394,6 +1412,22 @@ impl Decoder {
         if let Some(core) = self.lzma_core.as_mut() {
             core.append_literals(src);
         }
+    }
+
+    /// Hand the filter chain's final bytes to `output`, updating the Block
+    /// Check and size. Returns `false` while some are left (output full).
+    fn drain_filtered(&mut self, output: &mut [u8], written: &mut usize) -> bool {
+        let Some(chain) = self.filters.as_mut() else {
+            return true;
+        };
+        let ready = chain.ready();
+        let take = ready.len().min(output.len() - *written);
+        output[*written..*written + take].copy_from_slice(&ready[..take]);
+        self.check.update(&ready[..take]);
+        chain.consume(take);
+        self.block_uncompressed_seen += take as u64;
+        *written += take;
+        chain.ready().is_empty()
     }
 
     fn poison(&mut self, e: Error) -> Error {
@@ -1486,25 +1520,48 @@ impl Decoder {
             varint_decode(&self.scratch[..body_end], &mut cur)?
                 .ok_or_else(|| self.poison(Error::Corrupt))?;
         }
-        if num_filters != 1 {
-            // We only support a single LZMA2 filter.
+        // Filter Flags: `(id varint, props size varint, props)` per filter,
+        // in encode order. Only LZMA2 may (and must) be last; the others
+        // are the Delta/BCJ filters `filters` undoes after it.
+        let mut chain: [(u64, &[u8]); 3] = [(0, &[]); 3];
+        let mut chain_len = 0;
+        let mut lzma2_props: &[u8] = &[];
+        for i in 0..num_filters {
+            let Some(id) = varint_decode(&self.scratch[..body_end], &mut cur)? else {
+                return Err(self.poison(Error::Corrupt));
+            };
+            let Some(size) = varint_decode(&self.scratch[..body_end], &mut cur)? else {
+                return Err(self.poison(Error::Corrupt));
+            };
+            if size > (body_end - cur) as u64 {
+                return Err(self.poison(Error::Corrupt));
+            }
+            let props = &self.scratch[cur..cur + size as usize];
+            cur += size as usize;
+            if i + 1 < num_filters {
+                if id == FILTER_ID_LZMA2 as u64 {
+                    return Err(self.poison(Error::Unsupported));
+                }
+                chain[chain_len] = (id, props);
+                chain_len += 1;
+            } else if id == FILTER_ID_LZMA2 as u64 {
+                lzma2_props = props;
+            } else {
+                return Err(self.poison(Error::Unsupported));
+            }
+        }
+        let filters = if chain_len > 0 {
+            Some(FilterChain::new(&chain[..chain_len]))
+        } else {
+            None
+        };
+        let [dict_flag] = *lzma2_props else {
             return Err(self.poison(Error::Unsupported));
-        }
-        let filter_id = varint_decode(&self.scratch[..body_end], &mut cur)?
-            .ok_or_else(|| self.poison(Error::Corrupt))?;
-        if filter_id != FILTER_ID_LZMA2 as u64 {
-            return Err(self.poison(Error::Unsupported));
-        }
-        let props_size = varint_decode(&self.scratch[..body_end], &mut cur)?
-            .ok_or_else(|| self.poison(Error::Corrupt))?;
-        if props_size != 1 {
-            return Err(self.poison(Error::Unsupported));
-        }
-        if cur >= body_end {
-            return Err(self.poison(Error::Corrupt));
-        }
-        let dict_flag = self.scratch[cur];
-        cur += 1;
+        };
+        self.filters = match filters.transpose() {
+            Ok(f) => f,
+            Err(e) => return Err(self.poison(e)),
+        };
         if dict_flag & 0xC0 != 0 {
             return Err(self.poison(Error::Unsupported));
         }
@@ -1544,6 +1601,17 @@ impl RawDecoder for Decoder {
             let init_c = consumed;
             let init_w = written;
             let init_phase = self.phase;
+
+            // Filtered Block output goes out before anything else, so every
+            // phase below runs with the chain's final bytes all handed over
+            // (in particular the Block Check covers all of them).
+            if !self.drain_filtered(output, &mut written) {
+                return Ok(RawProgress {
+                    consumed,
+                    written,
+                    done: false,
+                });
+            }
 
             match self.phase {
                 DecPhase::StreamHeader => {
@@ -1640,6 +1708,13 @@ impl RawDecoder for Decoder {
                             + self.check_size() as u64;
                         let pad = (4 - (unpadded_no_pad % 4) as usize) % 4;
                         self.scratch_want = pad;
+                        // The Block's data is complete: finalise the filters'
+                        // tails (drained before the Check is read).
+                        if let Some(chain) = self.filters.as_mut()
+                            && let Err(e) = chain.finish()
+                        {
+                            return Err(self.poison(e));
+                        }
                         // Free the (potentially MiB-sized) compressed-chunk
                         // working buffers now that the block has ended.
                         self.lzma_core = None;
@@ -1837,6 +1912,13 @@ impl RawDecoder for Decoder {
                 }
                 DecPhase::Lzma2CompDrain => {
                     let total = self.comp_decoded.len();
+                    if let Some(chain) = self.filters.as_mut() {
+                        // Through the filters; the top of the loop drains.
+                        if let Err(e) = chain.push(&self.comp_decoded[self.comp_decoded_pos..]) {
+                            return Err(self.poison(e));
+                        }
+                        self.comp_decoded_pos = total;
+                    }
                     while self.comp_decoded_pos < total && written < output.len() {
                         let take = (total - self.comp_decoded_pos).min(output.len() - written);
                         let src =
@@ -1861,6 +1943,22 @@ impl RawDecoder for Decoder {
                     }
                 }
                 DecPhase::Lzma2Data => {
+                    if self.filters.is_some() && self.chunk_remaining > 0 && consumed < input.len()
+                    {
+                        // Through the filters; the top of the loop drains.
+                        // A chunk is at most 64 KiB, so this stays bounded.
+                        let take = self.chunk_remaining.min(input.len() - consumed);
+                        let src = &input[consumed..consumed + take];
+                        self.feed_uncompressed_dict(src);
+                        if let Some(chain) = self.filters.as_mut()
+                            && let Err(e) = chain.push(src)
+                        {
+                            return Err(self.poison(e));
+                        }
+                        self.block_compressed_seen += take as u64;
+                        self.chunk_remaining -= take;
+                        consumed += take;
+                    }
                     while self.chunk_remaining > 0
                         && consumed < input.len()
                         && written < output.len()
@@ -1928,6 +2026,7 @@ impl RawDecoder for Decoder {
                             + self.check_size() as u64;
                         self.blocks
                             .push((unpadded_size, self.block_uncompressed_seen));
+                        self.filters = None;
                         self.scratch.clear();
                         self.scratch_want = 1;
                         self.phase = DecPhase::BlockOrIndex;
@@ -1940,6 +2039,7 @@ impl RawDecoder for Decoder {
                             + self.check_size() as u64;
                         self.blocks
                             .push((unpadded_size, self.block_uncompressed_seen));
+                        self.filters = None;
                         self.scratch.clear();
                         self.scratch_want = 1;
                         self.phase = DecPhase::BlockOrIndex;
