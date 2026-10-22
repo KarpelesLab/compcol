@@ -121,51 +121,41 @@ impl<'a> BitReader<'a> {
 /// MSB-first bit writer accumulating into an output `Vec<u8>`.
 pub(crate) struct BitWriter {
     out: Vec<u8>,
-    /// Bits-in-flight in the high portion of `cur`; `nbits` of them
-    /// are valid (left-aligned), with `8 - nbits` zero placeholders at
-    /// the low end.
-    cur: u8,
-    nbits: u8,
+    /// The `nbits` (0..=7) bits not yet in a whole byte, in the low end.
+    acc: u64,
+    nbits: u32,
+    /// Width of the most recent write; see [`take_settled`](Self::take_settled).
+    last_n: u32,
 }
 
 impl BitWriter {
     pub(crate) fn new() -> Self {
         Self {
             out: Vec::new(),
-            cur: 0,
+            acc: 0,
             nbits: 0,
-        }
-    }
-
-    pub(crate) fn with_capacity(cap: usize) -> Self {
-        Self {
-            out: Vec::with_capacity(cap),
-            cur: 0,
-            nbits: 0,
+            last_n: 0,
         }
     }
 
     /// Write a single bit (0 or 1).
     #[inline]
     pub(crate) fn write_bit(&mut self, b: u32) {
-        self.cur = (self.cur << 1) | ((b & 1) as u8);
-        self.nbits += 1;
-        if self.nbits == 8 {
-            self.out.push(self.cur);
-            self.cur = 0;
-            self.nbits = 0;
-        }
+        self.write_bits(1, b);
     }
 
     /// Write `n` bits (1..=32) of `v`, MSB-first.
+    #[inline]
     pub(crate) fn write_bits(&mut self, n: u32, v: u32) {
-        debug_assert!(n <= 32);
-        // Walk from MSB of the n-bit field down to bit 0.
-        let mut i = n;
-        while i > 0 {
-            i -= 1;
-            self.write_bit((v >> i) & 1);
+        debug_assert!((1..=32).contains(&n));
+        self.acc = (self.acc << n) | (v as u64 & ((1u64 << n) - 1));
+        self.nbits += n;
+        while self.nbits >= 8 {
+            self.nbits -= 8;
+            self.out.push((self.acc >> self.nbits) as u8);
         }
+        self.acc &= (1u64 << self.nbits) - 1;
+        self.last_n = n;
     }
 
     /// Write a 48-bit field (used for the bzip2 block and stream magic
@@ -182,49 +172,35 @@ impl BitWriter {
     /// the LSB end (as bzip2 specifies for its end-of-stream alignment).
     pub(crate) fn align_to_byte(&mut self) {
         if self.nbits > 0 {
-            // Shift the partial byte so the valid bits sit in the high
-            // positions, then push.
-            self.cur <<= 8 - self.nbits;
-            self.out.push(self.cur);
-            self.cur = 0;
+            self.out.push((self.acc << (8 - self.nbits)) as u8);
+            self.acc = 0;
             self.nbits = 0;
         }
     }
 
-    /// Consume the writer, returning the assembled bytes. The caller
-    /// should usually call `align_to_byte` first; if there are pending
-    /// bits, this will silently drop them.
+    /// Move to `dst` the bytes libbzip2 would have handed out by now,
+    /// keeping the rest. libbzip2's `bsW` drains whole bytes *before*
+    /// adding a write's bits, so the bits of the most recent write stay
+    /// buffered even where they complete a byte: of `T` bits written it
+    /// has output `(T - last_n) / 8` bytes. Holding back the same lets
+    /// each block and flush hand out exactly the bytes libbzip2 does.
+    pub(crate) fn take_settled(&mut self, dst: &mut Vec<u8>) {
+        let pending = self.out.len() * 8 + self.nbits as usize;
+        let settled = pending.saturating_sub(self.last_n as usize) / 8;
+        dst.extend(self.out.drain(..settled));
+    }
+
+    /// Move every whole byte to `dst` (after `align_to_byte`, all of them).
+    pub(crate) fn take_all(&mut self, dst: &mut Vec<u8>) {
+        dst.append(&mut self.out);
+    }
+
+    /// Consume the writer, returning the assembled bytes, the final
+    /// partial byte zero-padded.
+    #[cfg(test)]
     pub(crate) fn into_bytes(mut self) -> Vec<u8> {
-        // Defensive flush. Real call sites call align_to_byte() at the
-        // end of the stream footer; this just makes the writer
-        // accident-proof when used elsewhere.
-        if self.nbits > 0 {
-            self.cur <<= 8 - self.nbits;
-            self.out.push(self.cur);
-        }
+        self.align_to_byte();
         self.out
-    }
-
-    /// Bypass for the bzip2 encoder: split out the assembled whole-byte
-    /// buffer and the partial trailing byte (with its bit count) so the
-    /// encoder can periodically drain whole bytes without losing the
-    /// partial byte across calls. The partial byte is returned with the
-    /// valid bits **left-aligned** into the low end of the count — i.e.
-    /// the same internal representation the writer uses.
-    pub(crate) fn internals_for_encoder(self) -> (Vec<u8>, u8, u8) {
-        (self.out, self.cur, self.nbits)
-    }
-
-    /// Reverse of `internals_for_encoder` — start a writer with a
-    /// pre-existing partial byte. The output buffer starts empty; only
-    /// the partial-byte state is restored.
-    pub(crate) fn rehydrate(cur: u8, nbits: u8) -> Self {
-        debug_assert!(nbits < 8, "partial byte should hold fewer than 8 bits");
-        Self {
-            out: Vec::new(),
-            cur,
-            nbits,
-        }
     }
 }
 
