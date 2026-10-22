@@ -12,9 +12,10 @@
 //! - 5 bytes of range-coder flush.
 //!
 //! Header choices: `lc=3, lp=0, pb=2` (the standard preset, packed to 0x5d);
-//! dictionary size derived from [`EncoderConfig::level`] (clamped to the
-//! input length rounded up to a power of two, so a short input never forces
-//! the decoder to allocate a huge window); uncompressed size left as
+//! dictionary size derived from [`EncoderConfig::level`] (at least 4 KiB, and
+//! independent of the input length: the header is written before the input
+//! is seen, so even a short input advertises the level's full window — pick
+//! a lower level for small payloads); uncompressed size left as
 //! `u64::MAX` so the EOS marker terminates the stream — matches what
 //! Python's `lzma.compress(..., format=lzma.FORMAT_ALONE)` produces.
 //!

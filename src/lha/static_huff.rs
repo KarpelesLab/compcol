@@ -564,7 +564,8 @@ impl StaticDecoder {
 }
 
 /// Decode a complete `lh4`/`lh5`/`lh6`/`lh7` payload into a fresh `Vec<u8>`
-/// (see [`StaticDecoder`] for the meaning of `expected`). Never panics on
+/// (`expected`: `Some(n)` stops after exactly `n` bytes, `None` decodes
+/// whole blocks until the input ends). Never panics on
 /// crafted input; the output is only bounded by `expected`, so prefer the
 /// streaming [`Decoder`](super::Decoder) for untrusted input.
 pub fn decode_payload(
