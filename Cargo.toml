@@ -2,9 +2,9 @@
 name          = "compcol"
 version       = "0.6.11"
 edition       = "2024"
-# Edition 2024 stabilised in Rust 1.85. Code uses `let chains` (Rust 1.88)
-# inside the brotli encoder and the io adapters, so 1.88 is the real floor.
-rust-version  = "1.88"
+# Edition 2024 stabilised in Rust 1.85 and the code uses `let chains`
+# (Rust 1.88); 1.95 matches the MSRV of our other crates.
+rust-version  = "1.95"
 description   = "A no_std collection of compression algorithms behind a uniform streaming trait, gated per-algorithm by Cargo features."
 license       = "MIT"
 repository    = "https://github.com/KarpelesLab/compcol"
