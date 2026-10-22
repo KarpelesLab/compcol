@@ -267,3 +267,35 @@ mod factory {
         assert!(factory::names().contains(&"squeeze"));
     }
 }
+
+// `finish` used to report `UnexpectedEnd` whenever its output slice filled
+// exactly as the internal emit buffer ran dry while symbols were still
+// undecoded — i.e. depending only on the caller's buffer size.
+#[test]
+fn finish_drains_with_tiny_output_buffers() {
+    let input: Vec<u8> = (0..20_000u32)
+        .map(|i| b"squeeze me, arc!"[(i % 16) as usize] ^ (i / 97) as u8)
+        .collect();
+    let encoded = encode_chunked(&input, input.len(), 1 << 16);
+    for out_len in [1usize, 2, 3, 7] {
+        let mut dec = Decoder::new();
+        let mut buf = vec![0u8; out_len];
+        let mut out = Vec::new();
+        // Hand over all input, then drain only through `finish`.
+        let mut consumed = 0;
+        while consumed < encoded.len() {
+            let (p, _) = dec.decode(&encoded[consumed..], &mut buf).unwrap();
+            out.extend_from_slice(&buf[..p.written]);
+            consumed += p.consumed;
+        }
+        loop {
+            let (p, status) = dec.finish(&mut buf).unwrap();
+            out.extend_from_slice(&buf[..p.written]);
+            if status == Status::StreamEnd {
+                break;
+            }
+            assert!(p.written > 0, "finish stalled");
+        }
+        assert_eq!(out, input, "out_len {out_len}");
+    }
+}
