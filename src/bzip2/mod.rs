@@ -45,6 +45,19 @@
 //! the reference tool does. Because another stream may still arrive,
 //! `decode` reports the end only once it sees such bytes; `finish`
 //! settles it otherwise.
+//!
+//! [`DecoderConfig::with_multi_stream(false)`](DecoderConfig::with_multi_stream)
+//! decodes a single stream instead, like `BZ2_bzDecompress`: `decode`
+//! reports `StreamEnd` right after the trailer and leaves the bytes after
+//! it unconsumed.
+//!
+//! ## Where the stream ends
+//!
+//! `decode` hands back the bytes of its `input` that it has not parsed
+//! when it returns because the stream ended or the output is full, so
+//! the bytes after a stream are never reported consumed by the call that
+//! reaches the end. While waiting for more input it keeps everything it
+//! was given.
 
 #![cfg_attr(docsrs, doc(cfg(feature = "bzip2")))]
 
@@ -65,7 +78,7 @@ mod rle;
 #[allow(unused_imports)]
 use _Error as _;
 
-pub use decoder::Decoder;
+pub use decoder::{Decoder, DecoderConfig};
 pub use encoder::{Encoder, EncoderConfig};
 
 /// Zero-sized marker type implementing [`Algorithm`] for bzip2.
@@ -77,12 +90,12 @@ impl Algorithm for Bzip2 {
     type Encoder = Encoder;
     type Decoder = Decoder;
     type EncoderConfig = EncoderConfig;
-    type DecoderConfig = ();
+    type DecoderConfig = DecoderConfig;
 
     fn encoder_with(c: Self::EncoderConfig) -> Encoder {
         Encoder::with_config(c)
     }
-    fn decoder_with(_: ()) -> Decoder {
-        Decoder::new()
+    fn decoder_with(c: DecoderConfig) -> Decoder {
+        Decoder::with_config(c)
     }
 }
