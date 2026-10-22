@@ -141,9 +141,18 @@ impl<W: AsyncWrite + Unpin, E: Encoder + Unpin> AsyncWrite for EncoderWriter<W, 
         // Encode some of buf into scratch, stage in `out`. We don't
         // necessarily fully consume buf — a small encode call is fine,
         // tokio callers will simply re-poll.
-        let (p, _status) = me.enc.encode(buf, &mut me.scratch)?;
-        me.out.extend_from_slice(&me.scratch[..p.written]);
-        Poll::Ready(Ok(p.consumed))
+        loop {
+            let (p, _status) = me.enc.encode(buf, &mut me.scratch)?;
+            me.out.extend_from_slice(&me.scratch[..p.written]);
+            if p.consumed > 0 || p.written == 0 || buf.is_empty() {
+                return Poll::Ready(Ok(p.consumed));
+            }
+            // The encoder emitted buffered output without taking any of
+            // `buf` (e.g. a finished block larger than `scratch`).
+            // Returning Ok(0) here reads as `WriteZero` to callers, so push
+            // the output out and go again.
+            ready_poll!(me.drain_out(cx))?;
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -237,9 +246,18 @@ impl<W: AsyncWrite + Unpin, D: Decoder + Unpin> AsyncWrite for DecoderWriter<W, 
             return Poll::Ready(Err(io::Error::other("decoder writer already finished")));
         }
         ready_poll!(me.drain_out(cx))?;
-        let (p, _status) = me.dec.decode(buf, &mut me.scratch)?;
-        me.out.extend_from_slice(&me.scratch[..p.written]);
-        Poll::Ready(Ok(p.consumed))
+        loop {
+            let (p, _status) = me.dec.decode(buf, &mut me.scratch)?;
+            me.out.extend_from_slice(&me.scratch[..p.written]);
+            if p.consumed > 0 || p.written == 0 || buf.is_empty() {
+                return Poll::Ready(Ok(p.consumed));
+            }
+            // The decoder emitted pending output without taking any of
+            // `buf` (a long match / run expanding past `scratch`).
+            // Returning Ok(0) here reads as `WriteZero` to callers, so push
+            // the output out and go again.
+            ready_poll!(me.drain_out(cx))?;
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -252,6 +270,16 @@ impl<W: AsyncWrite + Unpin, D: Decoder + Unpin> AsyncWrite for DecoderWriter<W, 
         let me = Pin::into_inner(self);
         ready_poll!(me.drain_out(cx))?;
         while !me.finished {
+            // `poll_write` makes one `decode` call per write, so the decoder
+            // may still hold output for input it already consumed. Drain it
+            // with empty-input `decode` calls before `finish`, which some
+            // decoders only accept once that output is out.
+            let (p, _status) = me.dec.decode(&[], &mut me.scratch)?;
+            me.out.extend_from_slice(&me.scratch[..p.written]);
+            ready_poll!(me.drain_out(cx))?;
+            if p.written > 0 {
+                continue;
+            }
             let (p, status) = me.dec.finish(&mut me.scratch)?;
             me.out.extend_from_slice(&me.scratch[..p.written]);
             ready_poll!(me.drain_out(cx))?;
@@ -419,29 +447,34 @@ impl<R: AsyncRead + Unpin, D: Decoder + Unpin> AsyncRead for DecoderReader<R, D>
             if me.finished {
                 return Poll::Ready(Ok(()));
             }
+            let avail = buf.remaining();
+            if avail == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            // Call decode() even when `in_buf` is drained: decoders that
+            // absorb input ahead of their output (bzip2 blocks, deflate's
+            // bit reader, …) still hold decoded bytes that must reach the
+            // caller now, not only after the inner reader yields more input
+            // (which may never come while the peer waits for a reply).
+            let dst = buf.initialize_unfilled_to(avail);
+            let (p, status) = me
+                .dec
+                .decode(&me.in_buf[me.in_consumed..me.in_filled], dst)?;
+            me.in_consumed += p.consumed;
+            buf.advance(p.written);
+            if matches!(status, Status::StreamEnd) {
+                me.finished = true;
+            }
+            if p.written > 0 || me.finished {
+                return Poll::Ready(Ok(()));
+            }
             if me.in_consumed < me.in_filled {
-                let avail = buf.remaining();
-                if avail == 0 {
-                    return Poll::Ready(Ok(()));
+                // Input still pending but nothing came out. Returning
+                // Ready(Ok) with nothing filled would read as EOF.
+                if p.consumed > 0 {
+                    continue;
                 }
-                let dst = buf.initialize_unfilled_to(avail);
-                let (p, status) = me
-                    .dec
-                    .decode(&me.in_buf[me.in_consumed..me.in_filled], dst)?;
-                me.in_consumed += p.consumed;
-                buf.advance(p.written);
-                if matches!(status, Status::StreamEnd) {
-                    me.finished = true;
-                }
-                if p.written > 0 {
-                    return Poll::Ready(Ok(()));
-                }
-                if matches!(status, Status::OutputFull) {
-                    return Poll::Ready(Ok(()));
-                }
-                if me.finished {
-                    return Poll::Ready(Ok(()));
-                }
+                return Poll::Ready(Err(io::Error::other("decoder stalled with input pending")));
             }
             if !me.inner_eof {
                 let mut tmp = ReadBuf::new(&mut me.in_buf);
@@ -456,10 +489,6 @@ impl<R: AsyncRead + Unpin, D: Decoder + Unpin> AsyncRead for DecoderReader<R, D>
                 continue;
             }
             // EOF on inner — drain decoder tail.
-            let avail = buf.remaining();
-            if avail == 0 {
-                return Poll::Ready(Ok(()));
-            }
             let dst = buf.initialize_unfilled_to(avail);
             let (p, status) = me.dec.finish(dst)?;
             buf.advance(p.written);
