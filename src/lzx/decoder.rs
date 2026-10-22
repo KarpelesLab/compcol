@@ -99,6 +99,12 @@ struct RunCtx {
     frame_buf: Vec<u8>,
     /// Number of bytes from `frame_buf` already emitted to the caller.
     frame_emitted: usize,
+    /// The frame in `frame_buf` is complete (32 KiB, or the stream's final
+    /// partial frame) and has been through the E8 filter, so it may be
+    /// drained. A partial frame is held back: E8 translation needs the
+    /// whole frame, and `output_so_far` must stay a multiple of the frame
+    /// size so it locates the frame for the filter.
+    frame_ready: bool,
 }
 
 enum BlockState {
@@ -292,6 +298,7 @@ impl RawDecoder for Decoder {
                         aligned_tree: None,
                         frame_buf: Vec::with_capacity(FRAME_SIZE),
                         frame_emitted: 0,
+                        frame_ready: false,
                     };
                     // Trivially-empty streams (total == 0) skip straight to Done
                     // without parsing a single block.
@@ -431,6 +438,9 @@ impl RawDecoder for Decoder {
 /// the declared total uncompressed length. Returns `true` once the frame
 /// buffer is fully drained.
 fn drain_frame(ctx: &mut RunCtx, output: &mut [u8], written: &mut usize) -> bool {
+    if !ctx.frame_ready {
+        return ctx.frame_buf.is_empty();
+    }
     while ctx.frame_emitted < ctx.frame_buf.len() && *written < output.len() {
         let remaining_total = ctx.output_total.saturating_sub(ctx.output_so_far) as usize;
         if remaining_total == 0 {
@@ -451,9 +461,10 @@ fn drain_frame(ctx: &mut RunCtx, output: &mut [u8], written: &mut usize) -> bool
     if ctx.output_so_far >= ctx.output_total {
         ctx.frame_emitted = ctx.frame_buf.len();
     }
-    if ctx.frame_emitted == ctx.frame_buf.len() && !ctx.frame_buf.is_empty() {
+    if ctx.frame_emitted == ctx.frame_buf.len() {
         ctx.frame_buf.clear();
         ctx.frame_emitted = 0;
+        ctx.frame_ready = false;
         true
     } else {
         ctx.frame_buf.is_empty()
@@ -472,16 +483,22 @@ fn emit_window(ctx: &mut RunCtx, b: u8) {
 /// blocked on more input or the frame buffer is full (callers re-enter).
 fn step(ctx: &mut RunCtx) -> Result<(), Error> {
     loop {
+        // A finished frame must be drained before decoding continues.
+        if ctx.frame_ready {
+            return Ok(());
+        }
         // Enforce frame boundary — once frame_buf hits FRAME_SIZE we must
         // apply the E8 filter (if active) and yield to the caller for drain.
         if ctx.frame_buf.len() >= FRAME_SIZE {
             apply_e8_to_frame(ctx);
+            ctx.frame_ready = true;
             return Ok(());
         }
         if ctx.output_so_far + ctx.frame_buf.len() as u64 >= ctx.output_total {
             // Final partial frame — apply E8 (if active and large enough) and
             // hand back for drain.
             apply_e8_to_frame(ctx);
+            ctx.frame_ready = true;
             return Ok(());
         }
 
@@ -1295,8 +1312,9 @@ fn mod17(x: i16) -> u8 {
 ///   - the frame size is > 10 bytes.
 ///
 /// For each 0xE8 byte at index `i` (scanning `i = 0..frame_size-10`) the next
-/// four little-endian bytes hold a *relative* call offset which is rewritten
-/// into a different scheme. The transform is its own inverse.
+/// four little-endian bytes hold the translated (absolute) call target, which
+/// is turned back into a relative one against `curpos`, the absolute output
+/// position of the 0xE8 byte itself (as libmspack and wimlib do).
 fn apply_e8_to_frame(ctx: &mut RunCtx) {
     if !ctx.intel_started || ctx.intel_filesize == 0 {
         return;
@@ -1319,22 +1337,22 @@ fn apply_e8_to_frame(ctx: &mut RunCtx) {
             i += 1;
             continue;
         }
-        let abs_off = frame_start + i as i64 + 1; // byte after 0xE8
-        let rel = i32::from_le_bytes([
+        let curpos = frame_start + i as i64; // position of the 0xE8 byte
+        let abs = i32::from_le_bytes([
             ctx.frame_buf[i + 1],
             ctx.frame_buf[i + 2],
             ctx.frame_buf[i + 3],
             ctx.frame_buf[i + 4],
         ]) as i64;
-        // Decoding rule: if (-abs_off <= rel < filesize), rewrite
-        //   new = rel - abs_off   if rel >= 0
-        //   new = rel + filesize  if rel <  0
+        // Decoding rule: if (-curpos <= abs < filesize), rewrite
+        //   new = abs - curpos    if abs >= 0
+        //   new = abs + filesize  if abs <  0
         // The transform's inverse (used by the encoder) maps the opposite way.
-        if (-abs_off <= rel) && (rel < filesize) {
-            let new = if rel >= 0 {
-                rel - abs_off
+        if (-curpos <= abs) && (abs < filesize) {
+            let new = if abs >= 0 {
+                abs - curpos
             } else {
-                rel + filesize
+                abs + filesize
             };
             let bytes = (new as i32).to_le_bytes();
             ctx.frame_buf[i + 1] = bytes[0];
