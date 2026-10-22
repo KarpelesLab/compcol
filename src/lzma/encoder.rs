@@ -31,7 +31,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::traits::{RawEncoder, RawProgress};
+use crate::traits::{Flush, RawEncoder, RawProgress};
 
 use super::{
     ALIGN_BITS, ALIGN_SIZE, DIST_MODEL_END, DIST_MODEL_START, DIST_SLOT_BITS, DIST_SLOTS,
@@ -1436,6 +1436,23 @@ impl LzmaStreamEncoder {
         self.take_output()
     }
 
+    /// Encode every buffered byte now (no lookahead margin, no small-input
+    /// guard buffering) and return all output the range coder has settled,
+    /// without ending the stream. The range coder still holds its last few
+    /// undetermined bytes (`cache` + `low`); `.lzma` has no way to release
+    /// them short of the EOS marker, so see [`Encoder`]'s flush notes.
+    fn flush(&mut self) -> Vec<u8> {
+        if self.finished || self.appended == 0 {
+            return Vec::new();
+        }
+        self.committed = true;
+        if self.pos < self.appended {
+            self.encode_range(self.appended);
+            self.trim_window();
+        }
+        self.take_output()
+    }
+
     /// Encode the remaining tail, emit the EOS marker + flush, and return all
     /// remaining output bytes.
     fn finish(&mut self) -> Vec<u8> {
@@ -1999,6 +2016,21 @@ fn replay(
 /// it is produced (the header up front, then body bytes); `finish` emits the
 /// EOS marker + flush. Output the codec produces faster than the caller drains
 /// it is held in a small `pending` buffer (bounded by one push's worth).
+///
+/// # Flush
+///
+/// `.lzma` has no in-band sync point, so [`flush`](crate::Encoder::flush)
+/// **cannot** fully meet the trait's guarantee. It encodes every byte given
+/// so far (skipping the usual lookahead margin and small-input buffering) and
+/// emits every byte the range coder has settled, but the coder's last few
+/// bytes stay undetermined until [`finish`](crate::Encoder::finish) writes the
+/// EOS marker, which ends the stream. A decoder fed the flushed bytes outputs
+/// everything except the data those final bytes encode: a few bytes on
+/// incompressible input, but potentially several KiB on highly repetitive input,
+/// where a handful of range-coder bytes can stand for long matches (and more
+/// for decoders that keep extra input lookahead). [`Flush::Full`] behaves like
+/// [`Flush::Sync`]: the format has no dictionary reset. For a stream that
+/// supports real sync points, use `xz` or raw `lzma2`.
 pub struct Encoder {
     stream: Option<LzmaStreamEncoder>,
     /// Produced output bytes not yet handed to the caller.
@@ -2132,6 +2164,38 @@ impl RawEncoder for Encoder {
                     done: true,
                 });
             }
+        }
+    }
+
+    fn raw_flush(&mut self, output: &mut [u8], _mode: Flush) -> Result<RawProgress, Error> {
+        let mut written = 0usize;
+        loop {
+            if self.pending_idx < self.pending.len() {
+                if !self.drain_pending(output, &mut written) {
+                    return Ok(RawProgress {
+                        consumed: 0,
+                        written,
+                        done: false,
+                    });
+                }
+                continue;
+            }
+            // Encode what is buffered and stage the settled output. Once that
+            // has been drained, a second pass produces nothing and ends the
+            // loop. After `finish` the stream is already complete.
+            let produced = match self.stream.as_mut() {
+                Some(stream) if !self.stream_finished => stream.flush(),
+                _ => Vec::new(),
+            };
+            if produced.is_empty() {
+                return Ok(RawProgress {
+                    consumed: 0,
+                    written,
+                    done: true,
+                });
+            }
+            self.pending = produced;
+            self.pending_idx = 0;
         }
     }
 
