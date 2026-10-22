@@ -277,3 +277,82 @@ fn x86_is_actually_transforming() {
     let mut d = BcjX86::decoder();
     assert_eq!(drive_dec(&mut d, &enc, enc.len(), enc.len()), data);
 }
+
+// ─── conformance with xz-utils' reference filters ───────────────────────
+
+/// Branch-opcode-heavy pseudo-random bytes, so every converter's hot path
+/// (and x86's prev-mask logic) fires often.
+fn branchy_bytes(n: usize, seed: u64) -> Vec<u8> {
+    const ALPHA: [u8; 19] = [
+        0x00, 0xFF, 0xE8, 0xE9, 0xEB, 0xF0, 0xF8, 0x94, 0x97, 0x90, 0x48, 0x40, 0x7F, 0xC0, 0x6F,
+        0x17, 0xEF, 0x01, 0x12,
+    ];
+    let mut s = seed;
+    (0..n)
+        .map(|_| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let r = (s >> 33) as u32;
+            if r.is_multiple_of(3) {
+                (r >> 8) as u8
+            } else {
+                ALPHA[((r >> 8) as usize) % ALPHA.len()]
+            }
+        })
+        .collect()
+}
+
+fn fnv1a(d: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in d {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// Encode `branchy_bytes(4099, 7)` at `start` under several chunkings and
+/// compare against the FNV-1a hash of what `xz --format=raw --<arch>=start=N`
+/// produces for the same input; also check our decoder inverts it.
+fn check_xz_vector<A>(start: u32, xz_hash: u64)
+where
+    A: Algorithm<EncoderConfig = Config, DecoderConfig = Config>,
+{
+    let data = branchy_bytes(4099, 7);
+    assert_eq!(fnv1a(&data), 0x9fa0_caec_1acc_f932, "generator drifted");
+    for (ic, oc) in [(1usize, 1usize), (7, 3), (4099, 4099)] {
+        let mut e = A::encoder_with(Config {
+            start_offset: start,
+        });
+        let enc = drive(&mut e, &data, ic, oc);
+        assert_eq!(
+            fnv1a(&enc),
+            xz_hash,
+            "{} start={start:#x} ic={ic} oc={oc}",
+            A::NAME
+        );
+        let mut d = A::decoder_with(Config {
+            start_offset: start,
+        });
+        assert_eq!(drive_dec(&mut d, &enc, ic, oc), data);
+    }
+}
+
+#[test]
+fn x86_matches_xz() {
+    // An unconverted E8 (operand MSB 0x01) followed, 10 bytes later, by a
+    // convertible one: the stale prev-mask must have decayed by then, so xz
+    // converts the second call (0x10 + 15 = 0x1F).
+    let mut data = vec![0xE8, 0x00, 0x00, 0x00, 0x01];
+    data.extend_from_slice(&[0x90; 5]);
+    data.extend_from_slice(&[0xE8, 0x10, 0x00, 0x00, 0x00]);
+    data.extend_from_slice(&[0x90; 8]);
+    let mut want = data.clone();
+    want[11] = 0x1F;
+    let mut e = BcjX86::encoder();
+    assert_eq!(drive(&mut e, &data, 1, 1), want);
+
+    check_xz_vector::<BcjX86>(0, 0x0008_3d3d_31d9_c5e4);
+    check_xz_vector::<BcjX86>(0xFFFF_FFF0, 0xe741_7170_673b_fa34);
+}

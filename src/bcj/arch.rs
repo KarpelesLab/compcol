@@ -38,13 +38,16 @@ fn wr_be32(b: &mut [u8], v: u32) {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct X86;
 
-/// Running state for the x86 converter: the SDK's `prev_mask` plus the
-/// absolute position it was last updated at, so the mask window can be
-/// adjusted (or cleared) for gaps between converter calls.
+/// Running state for the x86 converter: xz's `prev_mask` plus `prev_pos`,
+/// the absolute position of the last `E8`/`E9` opcode seen, so the mask
+/// decays by the true distance between opcodes — including across converter
+/// calls.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct X86State {
     prev_mask: u32,
     prev_pos: u32,
+    /// `false` until the first call; xz initialises `prev_pos` to
+    /// `start - 5` (i.e. "no recent opcode").
     seen: bool,
 }
 
@@ -53,18 +56,15 @@ fn x86_test86(b: u8) -> bool {
     b == 0x00 || b == 0xFF
 }
 
-// SDK mask helper tables (kMaskToAllowedStatus / kMaskToBitNumber), indexed
-// by the 3-bit prev_mask. These are part of the public-domain documented
-// algorithm.
+// Mask helper tables, indexed by `prev_mask >> 1` (xz `simple/x86.c`).
 const X86_MASK_TO_ALLOWED: [bool; 8] = [true, true, true, false, true, false, false, false];
 const X86_MASK_TO_BIT_NUMBER: [u32; 8] = [0, 1, 2, 2, 3, 3, 3, 3];
 
 impl X86 {
-    /// Faithful clean-room implementation of the x86 BCJ converter. Returns
-    /// the number of bytes whose transform is final (the rest is an
-    /// incomplete-instruction tail the engine retains). `st` carries the
-    /// running mask across calls and is left describing exactly the
-    /// returned boundary so reprocessing the tail next round is consistent.
+    /// Port of xz's `x86_code` (`liblzma/simple/x86.c`). Returns the number
+    /// of bytes whose transform is final (the rest is an incomplete tail the
+    /// engine retains). `st` is left describing exactly the returned
+    /// boundary, so the result is independent of how the input is chunked.
     fn convert_inner(data: &mut [u8], ip: u32, encode: bool, st: &mut X86State) -> usize {
         let len = data.len();
         if len < 5 {
@@ -74,89 +74,82 @@ impl X86 {
             // operand-less tail is never converted.)
             return 0;
         }
-        // We may inspect data[bufferPos+4]; the last index where a full
-        // instruction (opcode + 4 operand bytes) fits is len - 5, so we scan
-        // bufferPos in 0..=len-5, i.e. while bufferPos + 4 < len.
         let mut prev_mask = st.prev_mask;
-        // Adjust the mask window for any gap since the last call.
-        if st.seen {
-            let d = ip.wrapping_sub(st.prev_pos);
-            if d > 3 {
-                prev_mask = 0;
-            } else if d > 0 {
-                prev_mask = (prev_mask << d) & 0x7;
-            }
+        let mut prev_pos = if st.seen {
+            st.prev_pos
+        } else {
+            ip.wrapping_sub(5)
+        };
+        if ip.wrapping_sub(prev_pos) > 5 {
+            prev_pos = ip.wrapping_sub(5);
         }
 
+        // Scan every opcode position whose 4-byte operand is buffered.
+        let limit = len - 5;
         let mut buffer_pos = 0usize;
-        // `done` marks the index up to which the output is final. We only
-        // advance it to a point where `prev_mask` is fully settled (i.e.
-        // right after a converted instruction or a definitively-skipped
-        // byte that is at least 5 bytes from the end).
-        let mut done = 0usize;
-        while buffer_pos + 4 < len {
-            if data[buffer_pos] & 0xFE != 0xE8 {
+        while buffer_pos <= limit {
+            let b = data[buffer_pos];
+            if b != 0xE8 && b != 0xE9 {
                 buffer_pos += 1;
-                done = buffer_pos;
                 continue;
             }
 
-            // The mask machinery only kicks in once a recent opcode left a
-            // mark (prev_mask != 0). It suppresses conversions that would be
-            // ambiguous with a recently-seen opcode, keeping the transform
-            // invertible.
-            if prev_mask != 0 {
-                let index = X86_MASK_TO_BIT_NUMBER[(prev_mask & 0x7) as usize] as usize;
-                let b = data[buffer_pos + 4 - index];
-                if !X86_MASK_TO_ALLOWED[(prev_mask & 0x7) as usize] || x86_test86(b) {
-                    prev_mask = ((prev_mask << 1) & 0x7) | 1;
-                    buffer_pos += 1;
-                    done = buffer_pos;
-                    continue;
+            // Decay the mask by the distance since the previous opcode.
+            let here = ip.wrapping_add(buffer_pos as u32);
+            let offset = here.wrapping_sub(prev_pos);
+            prev_pos = here;
+            if offset > 5 {
+                prev_mask = 0;
+            } else {
+                for _ in 0..offset {
+                    prev_mask &= 0x77;
+                    prev_mask <<= 1;
                 }
             }
 
-            if x86_test86(data[buffer_pos + 4]) {
-                let src = rd_le32(&data[buffer_pos + 1..]);
-                let pos = ip.wrapping_add(buffer_pos as u32).wrapping_add(5);
-                let mut cur = src;
-                let dest;
+            let b4 = data[buffer_pos + 4];
+            if x86_test86(b4)
+                && X86_MASK_TO_ALLOWED[((prev_mask >> 1) & 0x7) as usize]
+                && (prev_mask >> 1) < 0x10
+            {
+                let mut src = rd_le32(&data[buffer_pos + 1..]);
+                let pos = here.wrapping_add(5);
+                let mut dest;
                 loop {
-                    let d = if encode {
-                        cur.wrapping_add(pos)
+                    dest = if encode {
+                        src.wrapping_add(pos)
                     } else {
-                        cur.wrapping_sub(pos)
+                        src.wrapping_sub(pos)
                     };
                     if prev_mask == 0 {
-                        dest = d;
                         break;
                     }
-                    let idx = X86_MASK_TO_BIT_NUMBER[(prev_mask & 0x7) as usize] * 8;
-                    let b = (d >> (24 - idx)) as u8;
-                    if !x86_test86(b) {
-                        dest = d;
+                    let i = X86_MASK_TO_BIT_NUMBER[(prev_mask >> 1) as usize];
+                    let tb = (dest >> (24 - i * 8)) as u8;
+                    if !x86_test86(tb) {
                         break;
                     }
-                    cur = d ^ ((1u32 << (32 - idx)).wrapping_sub(1));
+                    src = dest ^ ((1u32 << (32 - i * 8)).wrapping_sub(1));
                 }
                 // MS byte is forced to 0x00/0xFF by sign-extending bit 24.
                 let top = if (dest >> 24) & 1 != 0 { 0xFFu32 } else { 0 };
                 let outv = (dest & 0x00FF_FFFF) | (top << 24);
                 wr_le32(&mut data[buffer_pos + 1..], outv);
                 buffer_pos += 5;
-                done = buffer_pos;
                 prev_mask = 0;
             } else {
-                prev_mask = ((prev_mask << 1) & 0x7) | 1;
                 buffer_pos += 1;
-                done = buffer_pos;
+                prev_mask |= 1;
+                if x86_test86(b4) {
+                    prev_mask |= 0x10;
+                }
             }
         }
 
         st.prev_mask = prev_mask;
-        st.prev_pos = ip.wrapping_add(done as u32);
+        st.prev_pos = prev_pos;
         st.seen = true;
-        done
+        buffer_pos
     }
 }
 
