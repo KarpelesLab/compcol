@@ -170,6 +170,16 @@ pub fn decode(
     rc: &[u8],
     out_len: usize,
 ) -> Result<Vec<u8>, Error> {
+    // Every output byte comes from `main` or from a 4-byte `call`/`jump`
+    // target, so a larger (header-supplied, untrusted) `out_len` can only
+    // be truncation; reject it before allocating.
+    let max_out = main
+        .len()
+        .saturating_add(call.len())
+        .saturating_add(jump.len());
+    if out_len > max_out {
+        return Err(Error::UnexpectedEnd);
+    }
     let mut out = vec![0u8; out_len];
     let mut probs = [PROB_INIT; NUM_PROBS];
     let mut rd = RangeDec::new(rc)?;
