@@ -209,8 +209,9 @@ impl Decoder {
     /// every filter is file-relative to offset 0, which is correct for the
     /// single-file (non-solid) case.
     ///
-    /// Like the unpack size, boundaries are treated as stream-shape
-    /// configuration: they survive [`reset`](crate::Decoder::reset).
+    /// Unlike the unpack size, boundaries describe one particular stream:
+    /// [`reset`](crate::Decoder::reset) clears them, so re-register them
+    /// before decoding the next solid group.
     pub fn add_file_boundary(&mut self, pos: u64) {
         if let Err(idx) = self.file_boundaries.binary_search(&pos) {
             self.file_boundaries.insert(idx, pos);
