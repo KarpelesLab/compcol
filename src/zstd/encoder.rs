@@ -34,12 +34,19 @@
 //!     `0x70` (Window_Log = 24 → 16 MiB advertised window). The actual block
 //!     ceiling is 128 KiB (RFC 8478 cap).
 //! - One or more blocks; the last carries `Last_Block = 1`.
+//!
+//! `flush` closes the current partial block as a non-last block, so the
+//! bytes emitted so far decode to everything given to the encoder. A frame
+//! that has been flushed before its first full block uses the windowed
+//! header (its size is no longer known when that header is written).
+//! `Flush::Full` also drops the match window so later blocks never reference
+//! pre-flush data.
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::traits::{RawEncoder, RawProgress};
+use crate::traits::{Flush, RawEncoder, RawProgress};
 use crate::zstd::encoder_bitwriter::RevBitWriter;
 use crate::zstd::encoder_fse::{
     DEFAULT_LL_ACCURACY_LOG, DEFAULT_LL_COUNTS, DEFAULT_ML_ACCURACY_LOG, DEFAULT_ML_COUNTS,
@@ -743,6 +750,16 @@ impl Encoder {
             // them. Trimming only happens past the 8 MiB window, so this is rare.
             self.matcher.resize_for(self.history.len().max(1));
         }
+    }
+
+    /// Forget the cross-block match window (a [`Flush::Full`] boundary): the
+    /// next block indexes only bytes given after this point, so none of its
+    /// matches can reach back across it. The cached Huffman table is dropped
+    /// too, so the next block carries its own literal tree.
+    fn drop_history(&mut self) {
+        self.history.clear();
+        self.matcher.resize_for(1);
+        self.prev_huff_lengths = None;
     }
 
     /// Copy as much of `out_buf[out_idx..]` into `output[*written..]` as fits.
@@ -1947,6 +1964,68 @@ impl RawEncoder for Encoder {
                     }
                 }
                 State::Done => {
+                    return Ok(RawProgress {
+                        consumed: 0,
+                        written,
+                        done: true,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Emit everything buffered in `pending` as a non-last block so a decoder
+    /// fed the bytes produced so far reconstructs all of the input given to
+    /// the encoder, without ending the frame.
+    ///
+    /// Zstd has no in-band sync marker: a complete block *is* the sync point,
+    /// because decoders emit a block's content as soon as the whole block has
+    /// arrived. The flush therefore closes the current partial block
+    /// (`Last_Block = 0`) and drains it. Once a block has been flushed the
+    /// frame can no longer be a known-size Single_Segment frame, so the
+    /// header (if not yet written) is the windowed form.
+    ///
+    /// [`Flush::Full`] additionally drops the match window, so no later block
+    /// back-references bytes before the flush point. The repeat-offset ring is
+    /// frame-level state shared with the decoder and cannot be reset in-band,
+    /// but with the window empty every candidate distance — fresh or repeat —
+    /// is bounds-checked against post-flush data only, so the ring can never
+    /// resolve to a pre-flush byte.
+    fn raw_flush(&mut self, output: &mut [u8], mode: Flush) -> Result<RawProgress, Error> {
+        let mut written = 0usize;
+        loop {
+            match self.state {
+                State::Accepting => {
+                    if self.pending.is_empty() {
+                        // Everything given so far is in emitted blocks.
+                        if mode == Flush::Full {
+                            self.drop_history();
+                        }
+                        return Ok(RawProgress {
+                            consumed: 0,
+                            written,
+                            done: true,
+                        });
+                    }
+                    if !self.header_written {
+                        self.write_frame_header(None);
+                        self.header_written = true;
+                    }
+                    self.flush_block(false);
+                    self.state = State::Draining { last: false };
+                }
+                State::Draining { last } => {
+                    if !self.drain_into(output, &mut written) {
+                        return Ok(RawProgress {
+                            consumed: 0,
+                            written,
+                            done: false,
+                        });
+                    }
+                    self.state = if last { State::Done } else { State::Accepting };
+                }
+                State::Done => {
+                    // The frame is already complete; nothing is pending.
                     return Ok(RawProgress {
                         consumed: 0,
                         written,
