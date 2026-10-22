@@ -145,12 +145,10 @@ impl<F: Format, const N: usize> Decoder<F, N> {
             match self.state {
                 State::Done => break,
                 // These produce output, a byte at least; the rest can go on
-                // with none.
-                State::Stored(1..) | State::Length | State::Copy(..)
-                    if inflate.sink.room() == 0 =>
-                {
-                    break;
-                }
+                // with none. A literal/length symbol is decoded even so, for
+                // it may end the block: if it is a literal, it gets dropped
+                // and its step taken back.
+                State::Stored(1..) | State::Copy(..) if inflate.sink.room() == 0 => break,
                 // Another member or not is decided by a byte that is only
                 // consumed if it starts one.
                 State::Next if F::GZIP => match inflate.input.first() {
@@ -161,6 +159,10 @@ impl<F: Format, const N: usize> Decoder<F, N> {
                 state => {
                     let saved = (inflate.bit_buf, inflate.bit_cnt, inflate.input);
                     let next = context.step(&mut inflate, state);
+                    if inflate.sink.full {
+                        (inflate.bit_buf, inflate.bit_cnt, inflate.input) = saved;
+                        break;
+                    }
                     if inflate.exhausted {
                         // The input ran out: whatever the step made of it is
                         // void. What it left is less than the 32 bits a step

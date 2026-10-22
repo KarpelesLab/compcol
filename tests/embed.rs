@@ -595,6 +595,36 @@ fn finish_before_the_stream_ends_is_unexpected_end() {
     assert_eq!(dec.finish(&mut buf).unwrap_err(), Error::UnexpectedEnd);
 }
 
+/// A buffer exactly the size of the data takes the whole stream: the end
+/// of the last block is reached without a byte of room to spare, and
+/// `finish` with an empty buffer then ends the stream, as with the standard
+/// build. (The decoder used to stop before the end-of-block code once the
+/// output was full, and `finish(&mut [])` failed with `UnexpectedEnd`.)
+#[test]
+fn an_exact_output_buffer_takes_the_whole_stream() {
+    fn check<A: Algorithm>(data: &[u8]) {
+        let encoded = encode_chunked(&mut A::encoder(), data, usize::MAX, 65536);
+        let mut dec = A::decoder();
+        let mut out = vec![0u8; data.len()];
+        let (p, status) = dec.decode(&encoded, &mut out).unwrap();
+        assert_eq!(p.written, data.len(), "{}", A::NAME);
+        assert_eq!(p.consumed, encoded.len(), "{}", A::NAME);
+        assert_ne!(status, Status::InputEmpty, "{}", A::NAME);
+        assert_eq!(out, data, "{}", A::NAME);
+        let (p, status) = dec.finish(&mut []).unwrap();
+        assert_eq!((p.written, status), (0, Status::StreamEnd), "{}", A::NAME);
+
+        // A literal that finds no room is taken again with some.
+        let mut dec = A::decoder();
+        let (back, _) = decode_chunked(&mut dec, &encoded, usize::MAX, 1).unwrap();
+        assert_eq!(back, data, "{}", A::NAME);
+    }
+    let data = text(5000);
+    check::<deflate::Deflate>(&data);
+    check::<zlib::Zlib>(&data);
+    check::<gzip::Gzip>(&data);
+}
+
 #[test]
 fn encode_after_finish_is_an_error() {
     let mut enc = zlib::Zlib::encoder();
