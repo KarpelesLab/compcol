@@ -615,3 +615,47 @@ fn discard_output_reports_stream_end() {
         assert_eq!(status, Status::StreamEnd);
     }
 }
+
+/// All the input handed to `decode` with a tiny output buffer, stopping as
+/// soon as it is consumed: `finish` then hands out what the decoder still
+/// holds, a buffer at a time, and ends the stream. (It used to fail with
+/// `UnexpectedEnd` while output was still pending.)
+#[test]
+fn finish_drains_pending_output_into_a_small_buffer() {
+    let plain = b"hello hello hello world ".repeat(200);
+    let mut enc = <Deflate64>::encoder();
+    let mut encoded = vec![0u8; plain.len() + 1024];
+    let (p, _) = enc.encode(&plain, &mut encoded).unwrap();
+    let mut len = p.written;
+    loop {
+        let (p, status) = enc.finish(&mut encoded[len..]).unwrap();
+        len += p.written;
+        if status == Status::StreamEnd {
+            break;
+        }
+    }
+    encoded.truncate(len);
+
+    let mut dec = <Deflate64>::decoder();
+    let mut small = [0u8; 4];
+    let mut out = Vec::new();
+    let mut consumed = 0;
+    let mut ended = false;
+    while consumed < encoded.len() && !ended {
+        let (p, status) = dec.decode(&encoded[consumed..], &mut small).unwrap();
+        out.extend_from_slice(&small[..p.written]);
+        consumed += p.consumed;
+        ended = status == Status::StreamEnd;
+    }
+    assert!(
+        out.len() < plain.len(),
+        "the decoder should still hold output"
+    );
+    while !ended {
+        let (p, status) = dec.finish(&mut small).unwrap();
+        out.extend_from_slice(&small[..p.written]);
+        ended = status == Status::StreamEnd;
+        assert!(ended || p.written > 0, "finish stalled");
+    }
+    assert_eq!(out, plain);
+}

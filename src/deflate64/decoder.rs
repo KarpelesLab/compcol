@@ -257,18 +257,23 @@ impl RawDecoder for Decoder {
         })
     }
 
-    fn raw_finish(&mut self, _output: &mut [u8]) -> Result<RawProgress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
-        match self.state {
-            DecState::Done => Ok(RawProgress {
+        // All the input is in, but the bit reader may still hold the end of
+        // the stream, and a match may be half copied, for want of output:
+        // hand that out first. Only a stream that stops short with nothing
+        // left to give is truncated.
+        let p = self.raw_decode(&[], output)?;
+        if matches!(self.state, DecState::Done) || p.written > 0 {
+            return Ok(RawProgress {
                 consumed: 0,
-                written: 0,
-                done: true,
-            }),
-            _ => Err(self.poison(Error::UnexpectedEnd)),
+                written: p.written,
+                done: matches!(self.state, DecState::Done),
+            });
         }
+        Err(self.poison(Error::UnexpectedEnd))
     }
 
     fn raw_reset(&mut self) {
