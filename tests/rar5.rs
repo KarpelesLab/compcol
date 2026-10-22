@@ -622,3 +622,129 @@ fn reset_forgets_learned_unpack_size() {
     want.push(b'\n');
     assert_eq!(second, want);
 }
+
+// ─── synthetic streams ───────────────────────────────────────────────────
+
+/// MSB-first bit writer for hand-built RAR5 blocks.
+#[derive(Default)]
+struct BitWriter {
+    out: Vec<u8>,
+    acc: u32,
+    n: u32,
+}
+
+impl BitWriter {
+    fn put(&mut self, v: u32, bits: u32) {
+        for i in (0..bits).rev() {
+            self.acc = (self.acc << 1) | ((v >> i) & 1);
+            self.n += 1;
+            if self.n == 8 {
+                self.out.push(self.acc as u8);
+                self.acc = 0;
+                self.n = 0;
+            }
+        }
+    }
+
+    /// Pad the final byte; returns the valid-bit count of that byte.
+    fn finish(&mut self) -> u8 {
+        if self.n == 0 {
+            return 8;
+        }
+        let n = self.n as u8;
+        self.out.push((self.acc << (8 - self.n)) as u8);
+        self.n = 0;
+        n
+    }
+}
+
+/// Write a table section: the pre-code gives symbols 0, 1, 2 and 19 2-bit
+/// codes (`00`, `01`, `10`, `11`), then the 430 code lengths (each 0, 1 or
+/// 2; `lens` lists the non-zero ones) follow with long zero runs as 19.
+fn write_tables(bw: &mut BitWriter, lens: &[(usize, u8)]) {
+    for i in 0..20 {
+        bw.put(if i <= 2 || i == 19 { 2 } else { 0 }, 4);
+    }
+    let mut table = [0u8; 430];
+    for &(i, l) in lens {
+        table[i] = l;
+    }
+    let mut i = 0;
+    while i < table.len() {
+        let run = table[i..].iter().take(138).take_while(|&&l| l == 0).count();
+        if run >= 11 {
+            bw.put(0b11, 2);
+            bw.put((run - 11) as u32, 7);
+            i += run;
+        } else {
+            bw.put(table[i] as u32, 2);
+            i += 1;
+        }
+    }
+}
+
+/// Frame `body` as a single last block carrying tables.
+fn last_block(body: &[u8], last_bits: u8) -> Vec<u8> {
+    let s = (body.len() as u32).to_le_bytes();
+    let flags = (last_bits - 1) | (2 << 3) | 0x40 | 0x80;
+    let mut v = vec![flags, 0x5A ^ flags ^ s[0] ^ s[1] ^ s[2], s[0], s[1], s[2]];
+    v.extend_from_slice(body);
+    v
+}
+
+/// Main code: literal 'A' and match-length symbol 305 get 1-bit codes;
+/// distance slot 0 (distance 1) gets the only distance code. Each match
+/// then costs 11 bits for 4097 bytes of output.
+fn rle_bomb(matches: usize) -> Vec<u8> {
+    let mut bw = BitWriter::default();
+    write_tables(&mut bw, &[(b'A' as usize, 1), (305, 1), (306, 1)]);
+    bw.put(0, 1);
+    for _ in 0..matches {
+        bw.put(1, 1);
+        bw.put(0x1FF, 9);
+        bw.put(0, 1);
+    }
+    let lb = bw.finish();
+    last_block(&bw.out, lb)
+}
+
+#[cfg(target_os = "linux")]
+fn peak_rss_mib() -> usize {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let line = status.lines().find(|l| l.starts_with("VmHWM:")).unwrap();
+    line.split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse::<usize>()
+        .unwrap()
+        / 1024
+}
+
+/// Synthetic streams decode correctly, independent of output chunking.
+#[test]
+fn synthetic_rle_block_decodes_in_any_chunking() {
+    let comp = rle_bomb(300);
+    let want = vec![b'A'; 1 + 300 * 4097];
+    for out_chunk in [1, 7, 4096, 1 << 20] {
+        let mut dec = Decoder::new();
+        assert_eq!(drive_to_end(&mut dec, &comp, out_chunk).unwrap(), want);
+    }
+}
+
+/// Regression: a whole block used to be decoded into the internal queue
+/// before any of it reached the caller. One 16 MiB block can expand to tens
+/// of GiB this way (here ~440 KiB of input → ~1.3 GiB), all of it buffered
+/// out of reach of `LimitedDecoder`/`decompress_to_vec_capped`.
+#[test]
+fn capped_decode_does_not_buffer_whole_block() {
+    let comp = rle_bomb(320_000);
+    #[cfg(target_os = "linux")]
+    let before = peak_rss_mib();
+    let r = compcol::vec::decompress_to_vec_capped::<Rar5>(&comp, 1 << 20);
+    assert_eq!(r.unwrap_err(), Error::OutputLimitExceeded);
+    #[cfg(target_os = "linux")]
+    {
+        let grown = peak_rss_mib().saturating_sub(before);
+        assert!(grown < 256, "peak RSS grew by {grown} MiB");
+    }
+}
