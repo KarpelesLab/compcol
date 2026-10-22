@@ -295,3 +295,89 @@ fn reader_adapters_survive_transient_inner_errors() {
         }
     }
 }
+
+// ─── writer adapters: a failed inner write must not lose or repeat bytes ─
+
+/// Accepts everything, except that every `period`-th call fails with
+/// `WouldBlock` and the call before it is a short write — the way a
+/// non-blocking socket behaves under back-pressure.
+struct BackPressure {
+    out: Vec<u8>,
+    calls: usize,
+    period: usize,
+}
+
+impl Write for BackPressure {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.calls += 1;
+        match self.calls % self.period {
+            0 => Err(std::io::ErrorKind::WouldBlock.into()),
+            1 => {
+                let n = buf.len().div_ceil(2);
+                self.out.extend_from_slice(&buf[..n]);
+                Ok(n)
+            }
+            _ => {
+                self.out.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `write_all`, but retrying on `WouldBlock` like an event-loop caller.
+fn write_all_retrying<W: Write>(w: &mut W, mut buf: &[u8]) {
+    while !buf.is_empty() {
+        match w.write(buf) {
+            Ok(0) => panic!("write returned 0"),
+            Ok(n) => buf = &buf[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("write failed: {e}"),
+        }
+    }
+}
+
+#[test]
+fn writer_adapters_survive_inner_wouldblock() {
+    let input = payload(400_000);
+    for period in [2, 3, 7] {
+        let sink = BackPressure {
+            out: Vec::new(),
+            calls: 0,
+            period,
+        };
+        let mut w = EncoderWriter::new(sink, Gzip::encoder());
+        for chunk in input.chunks(10_000) {
+            write_all_retrying(&mut w, chunk);
+        }
+        // `finish` consumes the writer, so it can't be retried: stop the
+        // back-pressure first (staged bytes from a failed write still have
+        // to go out ahead of the tail).
+        w.get_mut().period = usize::MAX;
+        let compressed = w.finish().unwrap().out;
+        assert_eq!(
+            compcol::vec::decompress_to_vec::<Gzip>(&compressed).unwrap(),
+            input,
+            "EncoderWriter period {period}"
+        );
+
+        let sink = BackPressure {
+            out: Vec::new(),
+            calls: 0,
+            period,
+        };
+        let mut w = DecoderWriter::new(sink, Gzip::decoder());
+        for chunk in compressed.chunks(1_000) {
+            write_all_retrying(&mut w, chunk);
+        }
+        w.get_mut().period = usize::MAX;
+        assert_eq!(
+            w.finish().unwrap().out,
+            input,
+            "DecoderWriter period {period}"
+        );
+    }
+}

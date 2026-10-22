@@ -43,6 +43,31 @@ use crate::{Decoder, Encoder, Error, Status};
 /// minimum-output sizes of every algorithm in this crate.
 const SCRATCH: usize = 64 * 1024;
 
+/// Write `scratch[*pos..len]` to `inner`, advancing `*pos` past whatever
+/// `inner` accepts so a failed call can be resumed without losing or
+/// repeating bytes.
+fn drain_pending<W: Write>(
+    inner: &mut W,
+    scratch: &[u8],
+    pos: &mut usize,
+    len: usize,
+) -> io::Result<()> {
+    while *pos < len {
+        match inner.write(&scratch[*pos..len]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
+            }
+            Ok(n) => *pos += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 // ─── EncoderWriter ──────────────────────────────────────────────────────
 
 /// Wraps a `W: Write`, exposing a `Write` impl that compresses every
@@ -60,6 +85,10 @@ pub struct EncoderWriter<W: Write, E: Encoder> {
     // "still owned, must finish".
     inner: Option<W>,
     scratch: Vec<u8>,
+    /// `scratch[out_pos..out_len]` is codec output not yet accepted by
+    /// `inner` (its write failed); it goes out before anything else.
+    out_pos: usize,
+    out_len: usize,
     finished: bool,
 }
 
@@ -70,6 +99,8 @@ impl<W: Write, E: Encoder> EncoderWriter<W, E> {
             enc,
             inner: Some(inner),
             scratch: vec![0u8; SCRATCH],
+            out_pos: 0,
+            out_len: 0,
             finished: false,
         }
     }
@@ -111,9 +142,12 @@ impl<W: Write, E: Encoder> EncoderWriter<W, E> {
             Some(w) => w,
             None => return Ok(()),
         };
+        drain_pending(inner, &self.scratch, &mut self.out_pos, self.out_len)?;
         loop {
             let (p, status) = self.enc.finish(&mut self.scratch)?;
-            inner.write_all(&self.scratch[..p.written])?;
+            self.out_pos = 0;
+            self.out_len = p.written;
+            drain_pending(inner, &self.scratch, &mut self.out_pos, self.out_len)?;
             if matches!(status, Status::StreamEnd) {
                 break;
             }
@@ -135,11 +169,24 @@ impl<W: Write, E: Encoder> Write for EncoderWriter<W, E> {
             .inner
             .as_mut()
             .ok_or_else(|| io::Error::other("encoder writer already finished"))?;
+        // Output left over from a write that failed goes first. On error
+        // nothing of `buf` has been taken, as `Write::write` requires.
+        drain_pending(inner, &self.scratch, &mut self.out_pos, self.out_len)?;
         let mut consumed = 0;
         while consumed < buf.len() {
             let (p, status) = self.enc.encode(&buf[consumed..], &mut self.scratch)?;
-            inner.write_all(&self.scratch[..p.written])?;
             consumed += p.consumed;
+            self.out_pos = 0;
+            self.out_len = p.written;
+            if let Err(e) = drain_pending(inner, &self.scratch, &mut self.out_pos, self.out_len) {
+                // The codec already took `consumed` bytes; report them so
+                // the caller doesn't feed them again. The unwritten output
+                // stays staged for the next call.
+                if consumed > 0 {
+                    return Ok(consumed);
+                }
+                return Err(e);
+            }
             match status {
                 Status::InputEmpty => break,
                 Status::OutputFull => continue,
@@ -151,7 +198,10 @@ impl<W: Write, E: Encoder> Write for EncoderWriter<W, E> {
 
     fn flush(&mut self) -> io::Result<()> {
         match self.inner.as_mut() {
-            Some(w) => w.flush(),
+            Some(w) => {
+                drain_pending(w, &self.scratch, &mut self.out_pos, self.out_len)?;
+                w.flush()
+            }
             None => Ok(()),
         }
     }
@@ -277,6 +327,10 @@ pub struct DecoderWriter<W: Write, D: Decoder> {
     dec: D,
     inner: Option<W>,
     scratch: Vec<u8>,
+    /// `scratch[out_pos..out_len]` is codec output not yet accepted by
+    /// `inner` (its write failed); it goes out before anything else.
+    out_pos: usize,
+    out_len: usize,
     finished: bool,
 }
 
@@ -286,6 +340,8 @@ impl<W: Write, D: Decoder> DecoderWriter<W, D> {
             dec,
             inner: Some(inner),
             scratch: vec![0u8; SCRATCH],
+            out_pos: 0,
+            out_len: 0,
             finished: false,
         }
     }
@@ -321,9 +377,12 @@ impl<W: Write, D: Decoder> DecoderWriter<W, D> {
             Some(w) => w,
             None => return Ok(()),
         };
+        drain_pending(inner, &self.scratch, &mut self.out_pos, self.out_len)?;
         loop {
             let (p, status) = self.dec.finish(&mut self.scratch)?;
-            inner.write_all(&self.scratch[..p.written])?;
+            self.out_pos = 0;
+            self.out_len = p.written;
+            drain_pending(inner, &self.scratch, &mut self.out_pos, self.out_len)?;
             if matches!(status, Status::StreamEnd) {
                 break;
             }
@@ -345,11 +404,24 @@ impl<W: Write, D: Decoder> Write for DecoderWriter<W, D> {
             .inner
             .as_mut()
             .ok_or_else(|| io::Error::other("decoder writer already finished"))?;
+        // Output left over from a write that failed goes first. On error
+        // nothing of `buf` has been taken, as `Write::write` requires.
+        drain_pending(inner, &self.scratch, &mut self.out_pos, self.out_len)?;
         let mut consumed = 0;
         while consumed < buf.len() {
             let (p, status) = self.dec.decode(&buf[consumed..], &mut self.scratch)?;
-            inner.write_all(&self.scratch[..p.written])?;
             consumed += p.consumed;
+            self.out_pos = 0;
+            self.out_len = p.written;
+            if let Err(e) = drain_pending(inner, &self.scratch, &mut self.out_pos, self.out_len) {
+                // The codec already took `consumed` bytes; report them so
+                // the caller doesn't feed them again. The unwritten output
+                // stays staged for the next call.
+                if consumed > 0 {
+                    return Ok(consumed);
+                }
+                return Err(e);
+            }
             match status {
                 Status::InputEmpty => break,
                 Status::OutputFull => continue,
@@ -361,7 +433,10 @@ impl<W: Write, D: Decoder> Write for DecoderWriter<W, D> {
 
     fn flush(&mut self) -> io::Result<()> {
         match self.inner.as_mut() {
-            Some(w) => w.flush(),
+            Some(w) => {
+                drain_pending(w, &self.scratch, &mut self.out_pos, self.out_len)?;
+                w.flush()
+            }
             None => Ok(()),
         }
     }
