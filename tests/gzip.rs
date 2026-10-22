@@ -733,6 +733,35 @@ fn trailing_garbage_after_last_member_is_ignored() {
 }
 
 #[test]
+fn trailing_garbage_reports_stream_end_at_member_end() {
+    // Once the byte after a trailer rules out another member, the stream
+    // is over: `decode` must say `StreamEnd` (it used to swallow the tail
+    // and ask for more input forever) and leave the tail unconsumed.
+    let payload = b"clean payload".repeat(100);
+    let mut enc = Encoder::new();
+    let member = encode_chunked(&mut enc, &payload, 64, 64);
+    let mut encoded = member.clone();
+    encoded.extend_from_slice(b"\0\0 garbage tail");
+
+    let mut dec = Decoder::new();
+    let mut out = vec![0u8; 1 << 20];
+    let (p, status) = dec.decode(&encoded, &mut out).unwrap();
+    assert_eq!(status, Status::StreamEnd);
+    assert_eq!(&out[..p.written], &payload[..]);
+    assert_eq!(p.consumed, member.len());
+
+    // Same when the tail arrives in a later call.
+    let mut dec = Decoder::new();
+    let (p, status) = dec.decode(&member, &mut out).unwrap();
+    assert_eq!(status, Status::InputEmpty);
+    assert_eq!(&out[..p.written], &payload[..]);
+    let (p, status) = dec.decode(b"junk", &mut out).unwrap();
+    assert_eq!((p.consumed, p.written, status), (0, 0, Status::StreamEnd));
+    let (_, status) = dec.finish(&mut out).unwrap();
+    assert_eq!(status, Status::StreamEnd);
+}
+
+#[test]
 fn second_member_with_corrupted_crc_errors() {
     let mut enc1 = Encoder::new();
     let a = encode_chunked(&mut enc1, b"ok\n", 32, 32);

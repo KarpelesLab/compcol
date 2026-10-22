@@ -19,12 +19,13 @@
 //!   doesn't expose the filename or comment.
 //! - Encoder always emits a minimal 10-byte header (FLG = 0); the XFL byte
 //!   is filled in from [`EncoderConfig::level`] per RFC 1952 §2.3.1.
-//! - Concatenated gzip members are not supported — decoder stops at the
-//!   first member's trailer. Multi-member streams (RFC 1952 §2.2,
-//!   produced by `gzip --concatenate`, `tar zcf` on partial files,
-//!   `logrotate`, etc.) are now decoded — the decoder restarts at the
-//!   header phase whenever it sees another `1F 8B` magic after a
-//!   trailer.
+//! - Multi-member streams (RFC 1952 §2.2, produced by `cat a.gz b.gz`,
+//!   `logrotate`, etc.) are decoded as one: the decoder restarts at the
+//!   header phase whenever another member follows a trailer. Any other
+//!   byte after a trailer ends the stream (`StreamEnd`), leaving the
+//!   trailing bytes unconsumed. Since only the next byte tells, `decode`
+//!   cannot report `StreamEnd` right at the end of the input; `finish`
+//!   does.
 //!
 //! With the `embed` feature, `Encoder` and `Decoder` are the allocation-free
 //! variants instead, alongside one-shot `decompress`, `decompressed_len` and

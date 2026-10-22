@@ -421,32 +421,28 @@ impl RawDecoder for Decoder {
                         continue;
                     }
                     // Anything other than the gzip magic means the
-                    // stream ended. Hand off to Done, which will
-                    // silently swallow the trailing bytes — gzip(1)
-                    // does the same (the input could be a concatenated
-                    // gzip+something-else file, and decoders are
-                    // expected to be permissive).
+                    // stream ended; the bytes are not ours (the input
+                    // could be a gzip+something-else file — gzip(1)
+                    // ignores such trailing garbage). Hand off to Done.
                     //
                     // `continue` is required: match arms do not fall
                     // through, so without it the no-progress check at the
                     // bottom of the loop returns first (this iteration
-                    // consumed nothing) and the Done arm never runs. That
-                    // left a caller holding trailing bytes getting
-                    // `OutputFull` with no progress forever — exactly the
-                    // spin the Done arm exists to prevent.
+                    // consumed nothing) and the Done arm never runs.
                     self.phase = DecPhase::Done;
                     continue;
                 }
                 DecPhase::Done => {
-                    // Swallow any trailing bytes the caller still has
-                    // in `input` so the bridge reports Status::InputEmpty
-                    // rather than spinning on Status::OutputFull. The
-                    // payload is finished; nothing here is meaningful.
-                    consumed = input.len();
+                    // The stream is complete, and the bytes after it are
+                    // known not to start another member: report the end so
+                    // the bridge answers `StreamEnd`, as the `Decoder`
+                    // contract requires once the trailer is consumed.
+                    // Trailing bytes stay unconsumed so the caller can see
+                    // where the gzip data stops.
                     return Ok(RawProgress {
                         consumed,
                         written,
-                        done: false,
+                        done: true,
                     });
                 }
             }
