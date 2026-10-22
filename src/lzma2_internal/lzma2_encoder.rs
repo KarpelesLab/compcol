@@ -1079,13 +1079,17 @@ impl HashChain {
         let mut cur = self.head[h];
         let mut steps = 0usize;
         while cur != NIL && steps < params.max_chain {
-            let cur_pos = cur as usize;
-            if cur_pos >= pos {
+            // Chain links hold positions truncated to 32 bits; recover the
+            // distance modulo 2^32 so matching keeps working past 4 GiB of
+            // input (`max_dist < 2^32`, so in-range distances are exact).
+            let dist = (pos as u32).wrapping_sub(cur) as usize;
+            let cur_pos = pos.wrapping_sub(dist);
+            if dist == 0 || dist > i32::MAX as usize {
+                // Not behind `pos`.
                 cur = self.prev[cur_pos & self.prev_mask];
                 steps += 1;
                 continue;
             }
-            let dist = pos - cur_pos;
             if dist > max_dist {
                 break;
             }
@@ -1141,13 +1145,17 @@ impl HashChain {
         let mut cur = self.head[h];
         let mut steps = 0usize;
         while cur != NIL && steps < params.max_chain {
-            let cur_pos = cur as usize;
-            if cur_pos >= pos {
+            // Chain links hold positions truncated to 32 bits; recover the
+            // distance modulo 2^32 so matching keeps working past 4 GiB of
+            // input (`max_dist < 2^32`, so in-range distances are exact).
+            let dist = (pos as u32).wrapping_sub(cur) as usize;
+            let cur_pos = pos.wrapping_sub(dist);
+            if dist == 0 || dist > i32::MAX as usize {
+                // Not behind `pos`.
                 cur = self.prev[cur_pos & self.prev_mask];
                 steps += 1;
                 continue;
             }
-            let dist = pos - cur_pos;
             if dist > max_dist {
                 break;
             }
@@ -2217,5 +2225,36 @@ fn replay(
                 pos += len as usize;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hash chain stores positions as `u32`; past 4 GiB of input the
+    /// truncated links used to look ~4 GiB away, so every probe broke out
+    /// as "beyond the dictionary" and the encoder stopped finding matches.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn match_finder_works_past_4gib() {
+        let base = (1usize << 32) - 100;
+        let mut win = Vec::new();
+        while win.len() < 400 {
+            win.extend_from_slice(b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN");
+        }
+        let params = EncoderParams::from_level(6);
+        let mut hc = HashChain::new(1 << 20, 1 << 12);
+        let probe = base + 200; // past the 4 GiB boundary
+        for p in base..probe {
+            hc.insert(&win, base, p);
+        }
+        let (len, dist) = hc
+            .find_longest(&win, base, probe, 1 << 20, params)
+            .expect("match");
+        assert!(len >= 50, "len {len}");
+        assert_eq!(dist, 49);
+        let mut out = Vec::new();
+        assert!(hc.find_matches(&win, base, probe, 1 << 20, params, &mut out) >= 50);
     }
 }
