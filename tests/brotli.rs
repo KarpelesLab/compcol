@@ -669,6 +669,44 @@ fn decoder_accepts_single_code_length_code() {
 }
 
 #[test]
+fn decode_reports_stream_end_and_leaves_trailing_bytes() {
+    let plain = b"stream end must be visible to decode, ".repeat(3000);
+    let mut enc = Encoder::new();
+    let stream = encode_chunked(&mut enc, &plain, 1 << 20, 1 << 20);
+    let mut input = stream.clone();
+    input.extend_from_slice(b"trailing bytes");
+
+    // One call, room for everything: StreamEnd, tail left unconsumed.
+    let mut dec = Decoder::new();
+    let mut out = vec![0u8; plain.len() + 100];
+    let (p, status) = dec.decode(&input, &mut out).unwrap();
+    assert_eq!(status, Status::StreamEnd);
+    assert_eq!(p.consumed, stream.len());
+    assert!(out[..p.written] == plain[..]);
+    let (p, status) = dec.decode(b"more", &mut out).unwrap();
+    assert_eq!((p.consumed, p.written, status), (0, 0, Status::StreamEnd));
+
+    // Small output buffer: drain until StreamEnd, then finish agrees.
+    let mut dec = Decoder::new();
+    let mut buf = [0u8; 1000];
+    let mut got = Vec::new();
+    let mut pos = 0;
+    loop {
+        let (p, status) = dec.decode(&input[pos..], &mut buf).unwrap();
+        got.extend_from_slice(&buf[..p.written]);
+        pos += p.consumed;
+        if status == Status::StreamEnd {
+            break;
+        }
+    }
+    assert!(got == plain);
+    // Input handed over before the end was found has been buffered (and
+    // reported consumed); only the call that finds the end can give back.
+    assert!(pos >= stream.len() && pos <= input.len());
+    assert_eq!(dec.finish(&mut buf).unwrap().1, Status::StreamEnd);
+}
+
+#[test]
 fn decoder_many_blocks_in_one_call() {
     // A whole multi-meta-block stream handed over in one `decode` call is
     // decoded in place (no per-meta-block copy of the remaining input) and
