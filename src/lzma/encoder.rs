@@ -1353,8 +1353,6 @@ struct LzmaStreamEncoder {
     pos: usize,
     /// Absolute count of bytes appended so far.
     appended: usize,
-    /// Range-coder output bytes already forwarded to the caller.
-    drained: usize,
     /// Set once the header has been emitted (prepended to the first push).
     header_done: bool,
     /// Set once the EOS marker + flush have been emitted.
@@ -1394,7 +1392,6 @@ impl LzmaStreamEncoder {
             win_base: 0,
             pos: 0,
             appended: 0,
-            drained: 0,
             header_done: false,
             finished: false,
             // Greedy-only levels (`opt_window == 0`) have no cold-start
@@ -1560,7 +1557,8 @@ impl LzmaStreamEncoder {
     }
 
     /// Pull any newly-produced output: the 13-byte header on first call, then
-    /// the range coder's freshly-flushed bytes.
+    /// the range coder's freshly-flushed bytes. The range coder's buffer is
+    /// emptied, so it never accumulates the whole compressed stream.
     fn take_output(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         if !self.header_done {
@@ -1569,11 +1567,7 @@ impl LzmaStreamEncoder {
             out.extend_from_slice(&u64::MAX.to_le_bytes());
             self.header_done = true;
         }
-        let body = &self.core.rc.out;
-        if self.drained < body.len() {
-            out.extend_from_slice(&body[self.drained..]);
-            self.drained = body.len();
-        }
+        out.append(&mut self.core.rc.out);
         out
     }
 }
@@ -2138,5 +2132,38 @@ impl RawEncoder for Encoder {
         self.pending_idx = 0;
         self.stream_finished = false;
         // Note: params is preserved per the trait contract.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The streaming encoder must hand its range-coder output over instead
+    /// of retaining it: `rc.out` used to keep every compressed byte ever
+    /// produced, so memory grew with the stream (≈ input size on
+    /// incompressible data) despite the bounded-window design.
+    #[test]
+    fn stream_encoder_does_not_retain_output() {
+        let mut enc = LzmaStreamEncoder::new(LevelParams::from_level(0));
+        let mut s = 0x1234_5678u64;
+        let mut chunk = vec![0u8; 1 << 16];
+        let mut produced = 0usize;
+        for _ in 0..64 {
+            for b in chunk.iter_mut() {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                *b = s as u8;
+            }
+            produced += enc.push(&chunk).len();
+            assert!(
+                enc.core.rc.out.len() <= 64,
+                "rc.out retained {}",
+                enc.core.rc.out.len()
+            );
+        }
+        produced += enc.finish().len();
+        assert!(produced > 64 << 16, "random data should not compress");
     }
 }
