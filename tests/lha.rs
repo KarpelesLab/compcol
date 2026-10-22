@@ -364,3 +364,65 @@ fn lh4_matches_stay_within_its_4k_dictionary() {
     vec_roundtrip::<Lh4>(&data);
     vec_roundtrip::<Lh5>(&data);
 }
+
+/// Hand-assemble MSB-first bits.
+fn pack_bits(fields: &[(u32, u32)]) -> Vec<u8> {
+    let (mut out, mut acc, mut n) = (Vec::new(), 0u64, 0u32);
+    for &(bits, v) in fields {
+        acc = (acc << bits) | (v as u64 & ((1 << bits) - 1));
+        n += bits;
+        while n >= 8 {
+            n -= 8;
+            out.push((acc >> n) as u8);
+        }
+    }
+    if n > 0 {
+        out.push((acc << (8 - n)) as u8);
+    }
+    out
+}
+
+#[test]
+fn static_decoder_streams_output_instead_of_materialising_it() {
+    // Each 52-bit block holds 65535 codes of a single-symbol C table (code
+    // 509 = 256-byte match) and a single-symbol position table (distance
+    // 1): zero bits per code, ~16.7 MB of output per block. 4096 blocks
+    // (~26 KB of input) expand to ~68 GB. The decoder used to decode the
+    // whole stream into a Vec at `finish()`, so even a `LimitedDecoder`
+    // capped at 1 MiB had to allocate it all (a 208-byte payload already
+    // cost 512 MiB) before seeing a byte.
+    let block = [
+        (16, 0xFFFF),
+        (5, 0),
+        (5, 0),
+        (9, 0),
+        (9, 509),
+        (4, 0),
+        (4, 0),
+    ];
+    let fields: Vec<(u32, u32)> = block
+        .iter()
+        .copied()
+        .cycle()
+        .take(block.len() * 4096)
+        .collect();
+    let payload = pack_bits(&fields);
+
+    let mut dec = compcol::limit::LimitedDecoder::new(Lh5::decoder(), 1 << 20);
+    let mut buf = vec![0u8; 64 * 1024];
+    let (p, _) = dec.decode(&payload, &mut buf).unwrap();
+    assert_eq!(p.consumed, payload.len());
+    let mut total = 0usize;
+    let err = loop {
+        match dec.finish(&mut buf) {
+            Ok((p, status)) => {
+                assert!(buf[..p.written].iter().all(|&b| b == b' '));
+                total += p.written;
+                assert_ne!(status, Status::StreamEnd);
+            }
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(err, Error::OutputLimitExceeded);
+    assert_eq!(total, 1 << 20);
+}

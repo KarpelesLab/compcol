@@ -272,23 +272,29 @@ impl RawEncoder for Encoder {
 
 /// Streaming LHA decoder.
 ///
-/// Buffers all input (a single bit-stream that can't be decoded
-/// incrementally without re-implementing the bit reader as a resumable
-/// state machine across every Huffman code), decodes it in one pass once
-/// the stream ends, then drains the decoded bytes into the caller's
-/// output across calls. Output size is bounded by the 4-byte length
-/// header, so a crafted small input cannot expand without limit.
+/// Buffers all input (a single bit-stream with no in-band end other than
+/// running out of bits), and starts decoding once `finish()` signals the
+/// stream is complete. The block-structured methods (`lh4`..`lh7`) then
+/// decode *incrementally* into the caller's output buffers, so a crafted
+/// high-ratio stream never materialises more than one buffer of output
+/// (wrap it in a [`LimitedDecoder`](crate::limit::LimitedDecoder) to cap
+/// the total). `lh1`/`lh2` decode in one pass, bounded by the declared
+/// [`DecoderConfig::with_len`] size, then drain across calls.
 #[derive(Debug)]
 pub struct Decoder {
     method: Method,
-    /// Uncompressed size supplied out of band; `None` selects the legacy
-    /// 4-byte-length-prefix framing (see [`DecoderConfig`]).
+    /// Uncompressed size supplied out of band, if known (see
+    /// [`DecoderConfig`]).
     expected_len: Option<usize>,
     input: Vec<u8>,
-    /// Decoded output buffer, produced lazily once enough input is
-    /// available (or at `raw_finish`).
+    /// Incremental `lh4`..`lh7` decoder, created by `raw_finish`.
+    stat: Option<static_huff::StaticDecoder>,
+    /// Sticky error from the incremental decoder.
+    failed: Option<Error>,
+    /// `lh1`/`lh2` decoded output, produced at `raw_finish`.
     output: Vec<u8>,
     out_cursor: usize,
+    /// Input is complete (`raw_finish` was called).
     decoded: bool,
 }
 
@@ -298,55 +304,78 @@ impl Decoder {
             method,
             expected_len: config.expected_len,
             input: Vec::new(),
+            stat: None,
+            failed: None,
             output: Vec::new(),
             out_cursor: 0,
             decoded: false,
         }
     }
 
-    /// Decode the buffered raw `-lh*-` payload into `self.output`. Idempotent.
-    fn decode_all(&mut self) -> Result<(), Error> {
+    /// Mark the input complete and set up decoding. Idempotent.
+    fn start(&mut self) -> Result<(), Error> {
         if self.decoded {
             return Ok(());
         }
-        let payload = &self.input[..];
-
-        self.output = if self.method.is_static() {
-            // lh4/5/6/7 are block-structured: each block declares its code
-            // count, so the decoder self-terminates when the bitstream ends
-            // at a block boundary. `expected_len`, when supplied, just stops
-            // it earlier (and avoids touching trailing padding).
-            let params = Params::for_method(self.method.name());
-            static_huff::decode_payload(payload, self.expected_len, params)?
-        } else {
-            // lh1 (LZHUF) and lh2 are continuous, size-terminated code streams
-            // with no in-band end marker — the uncompressed length must be
-            // supplied out of band via `DecoderConfig::with_len`. Without it
-            // we cannot know where the data ends (the trailing bits are
-            // padding), so we refuse rather than emit garbage.
-            match self.expected_len {
-                Some(n) => match self.method {
-                    Method::Lh2 => dynamic_huff::decode_payload(payload, n)?,
-                    _ => lzhuf::decode_payload(payload, n)?,
-                },
-                None if payload.is_empty() => Vec::new(),
-                None => return Err(Error::Unsupported),
+        // Empty stream (no input at all): zero-length output.
+        if !self.input.is_empty() {
+            if self.method.is_static() {
+                // lh4/5/6/7 are block-structured: each block declares its
+                // code count, so the decoder self-terminates when the
+                // bitstream ends at a block boundary. `expected_len`, when
+                // supplied, just stops it earlier (and avoids touching
+                // trailing padding).
+                let params = Params::for_method(self.method.name());
+                self.stat = Some(static_huff::StaticDecoder::new(params, self.expected_len));
+            } else {
+                // lh1 (LZHUF) and lh2 are continuous, size-terminated code
+                // streams with no in-band end marker — the uncompressed
+                // length must be supplied out of band via
+                // `DecoderConfig::with_len`. Without it we cannot know where
+                // the data ends (the trailing bits are padding), so we refuse
+                // rather than emit garbage.
+                let payload = &self.input[..];
+                self.output = match self.expected_len {
+                    Some(n) => match self.method {
+                        Method::Lh2 => dynamic_huff::decode_payload(payload, n)?,
+                        _ => lzhuf::decode_payload(payload, n)?,
+                    },
+                    None => return Err(Error::Unsupported),
+                };
             }
-        };
+        }
         self.decoded = true;
         Ok(())
     }
 
-    fn drain(&mut self, output: &mut [u8]) -> RawProgress {
+    /// Emit decoded bytes into `output` (only after [`start`](Self::start)).
+    fn emit(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
+        if let Some(e) = self.failed {
+            return Err(e);
+        }
+        if let Some(stat) = self.stat.as_mut() {
+            let written = match stat.decode(&self.input, output) {
+                Ok(n) => n,
+                Err(e) => {
+                    self.failed = Some(e);
+                    return Err(e);
+                }
+            };
+            return Ok(RawProgress {
+                consumed: 0,
+                written,
+                done: stat.is_done(),
+            });
+        }
         let remaining = self.output.len() - self.out_cursor;
         let take = remaining.min(output.len());
         output[..take].copy_from_slice(&self.output[self.out_cursor..self.out_cursor + take]);
         self.out_cursor += take;
-        RawProgress {
+        Ok(RawProgress {
             consumed: 0,
             written: take,
             done: self.out_cursor >= self.output.len(),
-        }
+        })
     }
 }
 
@@ -363,27 +392,20 @@ impl RawDecoder for Decoder {
                 done: false,
             });
         }
-        // Already decoded: drain. (Input after decode is unexpected; we
-        // ignore it, consuming nothing.)
-        let p = self.drain(output);
-        Ok(RawProgress {
-            consumed: 0,
-            written: p.written,
-            done: p.done,
-        })
+        // Input already complete: keep emitting. (Input after `finish` is
+        // unexpected; we ignore it, consuming nothing.)
+        self.emit(output)
     }
 
     fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
-        // Empty stream (no input at all): treat as zero-length output.
-        if !self.decoded && self.input.is_empty() {
-            self.decoded = true;
-        }
-        self.decode_all()?;
-        Ok(self.drain(output))
+        self.start()?;
+        self.emit(output)
     }
 
     fn raw_reset(&mut self) {
         self.input.clear();
+        self.stat = None;
+        self.failed = None;
         self.output.clear();
         self.out_cursor = 0;
         self.decoded = false;
