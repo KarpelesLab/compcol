@@ -36,6 +36,25 @@
 //! `src/lzma/` adapted to emit a raw range-coded body (no header, no
 //! EOS marker).
 //!
+//! ## Flush
+//!
+//! [`Encoder::flush`](crate::Encoder::flush) encodes every byte given so far
+//! into complete LZMA2 chunks and emits them. The xz Block stays open (its
+//! end marker, Check, Index and Stream Footer are written only by `finish`),
+//! so the bytes emitted up to a flush are a truncated `.xz` file: a streaming
+//! decoder fed them outputs all the data given before the flush and then
+//! waits for more input (this crate's decoder returns `InputEmpty`;
+//! `xz -dc` writes the data and then reports "Unexpected end of input").
+//! What the truncated stream cannot provide yet is *verification*: the Block
+//! Check (CRC32) and the Index only arrive with `finish`, so flushed data is
+//! decoded but not yet integrity-checked.
+//!
+//! [`Flush::Sync`] keeps the dictionary and the adaptive
+//! model; the next chunk continues them. [`Flush::Full`]
+//! makes the next chunk a dictionary reset (control `0xE0`, or `0x01` if it
+//! is stored uncompressed), so nothing after the flush references data
+//! before it. Both stay within the single xz Block.
+//!
 //! No dependency on the sibling `lzma` module: the small amount of LZMA2
 //! framing we need (control byte, big-endian 16-bit size) and the CRC-32 we
 //! use for the Block Check, Stream Header CRC, and Index CRC are all defined
@@ -51,7 +70,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
+use crate::traits::{Algorithm, Flush, RawDecoder, RawEncoder, RawProgress};
 
 // The LZMA2 chunk codec lives in a crate-internal shared module
 // (`crate::lzma2_internal`) so it can also back the public raw LZMA2
@@ -838,6 +857,92 @@ impl RawEncoder for Encoder {
                     written,
                     done: false,
                 });
+            }
+        }
+    }
+
+    /// Emit every byte given so far as complete LZMA2 chunks inside the
+    /// still-open Block, so a decoder fed the bytes produced so far outputs
+    /// all of it (it only waits for the Block trailer, Index and Footer to
+    /// *verify* the data, and decoders, ours and liblzma's, stream chunk
+    /// contents out as they decode them).
+    ///
+    /// [`Flush::Full`] additionally starts a new LZMA2 dictionary: the next
+    /// chunk is a dictionary-reset chunk, so nothing after the flush
+    /// references data before it. Everything stays within one xz Block.
+    fn raw_flush(&mut self, output: &mut [u8], mode: Flush) -> Result<RawProgress, Error> {
+        let mut written = 0usize;
+        loop {
+            match self.phase {
+                EncPhase::StreamHeader | EncPhase::BlockHeader => {
+                    if self.stream.is_none() {
+                        // No input yet: nothing to make decodable.
+                        return Ok(RawProgress {
+                            consumed: 0,
+                            written,
+                            done: true,
+                        });
+                    }
+                    // Unreachable in practice (input implies the headers were
+                    // drained by `encode`), but drain them the same way.
+                    if !self.drain_pending(output, &mut written) {
+                        return Ok(RawProgress {
+                            consumed: 0,
+                            written,
+                            done: false,
+                        });
+                    }
+                    if self.phase == EncPhase::StreamHeader {
+                        self.pending.extend_from_slice(&build_block_header());
+                        self.pending_idx = 0;
+                        self.phase = EncPhase::BlockHeader;
+                    } else {
+                        self.phase = EncPhase::Body;
+                    }
+                }
+                EncPhase::Body => {
+                    if self.pending_idx < self.pending.len() {
+                        self.phase = EncPhase::DrainPending;
+                        continue;
+                    }
+                    // Encode whatever the stream encoder still buffers. Once it
+                    // has been drained this is a no-op, which ends the loop.
+                    if let Some(stream) = self.stream.as_mut() {
+                        let chunks = stream.flush();
+                        if mode == Flush::Full {
+                            stream.reset_dict();
+                        }
+                        self.stage_chunks(chunks);
+                    }
+                    if self.pending_idx < self.pending.len() {
+                        self.phase = EncPhase::DrainPending;
+                    } else {
+                        return Ok(RawProgress {
+                            consumed: 0,
+                            written,
+                            done: true,
+                        });
+                    }
+                }
+                EncPhase::DrainPending => {
+                    if !self.drain_pending(output, &mut written) {
+                        return Ok(RawProgress {
+                            consumed: 0,
+                            written,
+                            done: false,
+                        });
+                    }
+                    self.phase = EncPhase::Body;
+                }
+                EncPhase::BlockTrailer | EncPhase::Tail | EncPhase::Done => {
+                    // `finish` has started: the stream is being closed and
+                    // everything is already on its way out.
+                    return Ok(RawProgress {
+                        consumed: 0,
+                        written,
+                        done: true,
+                    });
+                }
             }
         }
     }
