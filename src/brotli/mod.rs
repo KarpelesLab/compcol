@@ -427,8 +427,13 @@ impl Encoder {
         }
         if self.out_pos >= self.out.len() {
             self.out.clear();
-        } else {
+        } else if self.out_pos * 2 >= self.out.len() {
+            // Only shift once at least half the queue has been drained:
+            // shifting on every call is quadratic when one `encode` call
+            // queued megabytes and the caller drains it in small slices.
             self.out.drain(..self.out_pos);
+        } else {
+            return;
         }
         self.out_pos = 0;
     }
@@ -450,11 +455,13 @@ impl Encoder {
         }
     }
 
-    /// Emit one compressed meta-block. `is_last` controls the ISLAST
-    /// bit; when set, ISLASTEMPTY=0 and ISUNCOMPRESSED is omitted.
-    fn emit_compressed_block(&mut self, mlen: usize, is_last: bool) {
+    /// Emit one compressed meta-block from `pending[start..start + mlen]`.
+    /// `is_last` controls the ISLAST bit; when set, ISLASTEMPTY=0 and
+    /// ISUNCOMPRESSED is omitted. The caller removes the bytes from
+    /// `pending` (once per batch of blocks, not once per block).
+    fn emit_compressed_block(&mut self, start: usize, mlen: usize, is_last: bool) {
         debug_assert!((1..=MAX_BLOCK).contains(&mlen));
-        debug_assert!(mlen <= self.pending.len());
+        debug_assert!(start + mlen <= self.pending.len());
         // Only pay the (~80 KiB) dictionary-index build cost on
         // quality tiers that actually consult the dictionary.
         if self.params.use_dict {
@@ -467,16 +474,15 @@ impl Encoder {
         let id_transforms = self.id_transforms.clone();
         let scratch = self.scratch.as_mut().expect("scratch initialised above");
         scratch.prepare();
-        // We treat `pending[..mlen]` as the payload in place — no need
-        // to allocate a separate Vec and drain. The drain happens after
-        // we've finished encoding so the borrow doesn't conflict.
-        let pending_view = &self.pending[..mlen];
+        // We treat `pending[start..start + mlen]` as the payload in place —
+        // no need to allocate a separate Vec.
+        let block = &self.pending[start..start + mlen];
         let prev_out1 = self.prev_out1;
         let prev_out2 = self.prev_out2;
         encode_meta_block(
             &mut self.bw,
             &mut self.out,
-            pending_view,
+            block,
             is_last,
             &mut self.ring,
             self.prev_total_out,
@@ -489,14 +495,14 @@ impl Encoder {
         );
         // Carry the last two output bytes of this block into the next
         // block's literal-context state (mirrors the decoder's p1/p2).
+        let end = start + mlen;
         if mlen >= 2 {
-            self.prev_out2 = self.pending[mlen - 2];
-            self.prev_out1 = self.pending[mlen - 1];
-        } else if mlen == 1 {
+            self.prev_out2 = self.pending[end - 2];
+            self.prev_out1 = self.pending[end - 1];
+        } else {
             self.prev_out2 = self.prev_out1;
-            self.prev_out1 = self.pending[0];
+            self.prev_out1 = self.pending[start];
         }
-        self.pending.drain(..mlen);
         self.prev_total_out += mlen as u64;
     }
 
@@ -505,9 +511,15 @@ impl Encoder {
     /// ISLAST=1, avoiding an extra empty terminator block when input
     /// size is an exact multiple of MAX_BLOCK.
     fn flush_full_blocks(&mut self) {
-        while self.pending.len() > MAX_BLOCK {
-            self.emit_compressed_block(MAX_BLOCK, false);
+        // Walk the blocks by offset and drop them from `pending` in one
+        // go: draining each block off the front is quadratic when a single
+        // `encode` call hands over many megabytes.
+        let mut start = 0;
+        while self.pending.len() - start > MAX_BLOCK {
+            self.emit_compressed_block(start, MAX_BLOCK, false);
+            start += MAX_BLOCK;
         }
+        self.pending.drain(..start);
     }
 
     /// Emit the stream tail. Three cases:
@@ -525,7 +537,8 @@ impl Encoder {
         }
         let n = self.pending.len();
         debug_assert!(n <= MAX_BLOCK);
-        self.emit_compressed_block(n, true);
+        self.emit_compressed_block(0, n, true);
+        self.pending.clear();
         debug_assert_eq!(self.bw.pending_bits(), 0);
     }
 }
