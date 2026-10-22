@@ -575,3 +575,26 @@ mod factory {
         assert_eq!(&decoded[..], input);
     }
 }
+
+/// `reset` keeps the configuration, preset dictionary included: a decoder
+/// built with one decodes a stream that reaches into it again after a reset.
+/// (It used to come back with an empty window and fail with
+/// `InvalidDistance`.) The stream is plain deflate from python3 zlib with
+/// `zdict`, which deflate64 decodes the same.
+#[test]
+fn reset_keeps_preset_dictionary() {
+    let dictionary = b"the quick brown fox jumps over the lazy dog. ".to_vec();
+    let expected: &[u8] = b"the quick brown fox is quicker than the lazy dog!";
+    let encoded = [
+        0x2b, 0xc1, 0xa2, 0x38, 0xb3, 0x18, 0x22, 0x04, 0x56, 0x9c, 0x98, 0x87, 0xa2, 0x43, 0x11,
+        0x00,
+    ];
+    let mut dec = Decoder::with_config(DecoderConfig { dictionary });
+    for round in 0..3 {
+        let mut buf = [0u8; 256];
+        let (p, status) = dec.decode(&encoded, &mut buf).unwrap();
+        assert_eq!(status, Status::StreamEnd, "round {round}");
+        assert_eq!(&buf[..p.written], expected, "round {round}");
+        dec.reset();
+    }
+}

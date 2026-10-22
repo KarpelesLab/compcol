@@ -162,6 +162,9 @@ pub struct Decoder {
     state: DecState,
     last_block: bool,
     poisoned: bool,
+    /// The configured preset dictionary (its last `win_cap` bytes), kept so
+    /// that `reset` can seed the window with it again.
+    dictionary: Box<[u8]>,
 }
 
 impl Decoder {
@@ -209,6 +212,7 @@ impl Decoder {
             state: DecState::BlockHeader,
             last_block: false,
             poisoned: false,
+            dictionary: Box::default(),
         }
     }
 
@@ -219,7 +223,10 @@ impl Decoder {
     /// output.
     pub fn with_config(config: DecoderConfig) -> Self {
         let mut d = Self::with_window_capacity(config.window_size);
-        d.load_dictionary(&config.dictionary);
+        let start = config.dictionary.len().saturating_sub(d.win_cap);
+        let dictionary: Box<[u8]> = config.dictionary[start..].into();
+        d.load_dictionary(&dictionary);
+        d.dictionary = dictionary;
         d
     }
 
@@ -259,7 +266,8 @@ impl Decoder {
     ///
     /// For the more common "throw everything away" reset, use the
     /// [`Decoder::reset`](crate::Decoder::reset) method from the
-    /// `Decoder` trait, which clears the window too.
+    /// `Decoder` trait, which clears the window too (back to the configured
+    /// preset dictionary, if any).
     pub fn reset_keep_window(&mut self) {
         self.bit_reader.reset();
         self.state = DecState::BlockHeader;
@@ -376,8 +384,11 @@ impl RawDecoder for Decoder {
 
     fn raw_reset(&mut self) {
         self.bit_reader.reset();
-        self.window_pos = 0;
-        self.window_size = 0;
+        // Configuration survives a reset: seed the window with the preset
+        // dictionary again (this also rewinds `window_pos`/`window_size`).
+        let dictionary = core::mem::take(&mut self.dictionary);
+        self.load_dictionary(&dictionary);
+        self.dictionary = dictionary;
         self.state = DecState::BlockHeader;
         self.last_block = false;
         self.poisoned = false;
