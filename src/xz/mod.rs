@@ -11,7 +11,7 @@
 //!    (chunk: 01 hi lo <up-to-65536 bytes>)+
 //!    00 end marker
 //!  Block Padding (0..3 zero bytes, total Block size to 4 B alignment)
-//!  Check (4 B CRC32 of uncompressed Block data)
+//!  Check (of the uncompressed Block data: none, CRC32, CRC64 or SHA-256)
 //!  Index (Index Indicator 00 | NumRecords varint | (UnpaddedSize varint,
 //!         UncompressedSize varint)+ | 0..3 zero pad | CRC32 of all the above)
 //!  Stream Footer (12 B)
@@ -55,10 +55,19 @@
 //! is stored uncompressed), so nothing after the flush references data
 //! before it. Both stay within the single xz Block.
 //!
+//! ## Integrity checks
+//!
+//! The encoder writes a CRC32 Block Check. The decoder verifies every check
+//! type the format defines — CRC32 (`0x01`), CRC64 (`0x04`, the `xz` CLI
+//! default) and SHA-256 (`0x0A`) — and fails with
+//! [`Error::ChecksumMismatch`] on a mismatch. A reserved check ID still
+//! fixes the Check field's size, so, like liblzma by default, such a Stream
+//! decodes with its Check skipped unverified.
+//!
 //! No dependency on the sibling `lzma` module: the small amount of LZMA2
-//! framing we need (control byte, big-endian 16-bit size) and the CRC-32 we
-//! use for the Block Check, Stream Header CRC, and Index CRC are all defined
-//! inline below.
+//! framing we need (control byte, big-endian 16-bit size), the CRC-32 used
+//! for the Stream Header, Block Header and Index CRCs, and the CRC-64 and
+//! SHA-256 Block Checks are all defined inline below.
 
 // The state machines in this file are written as a series of `match` arms
 // each containing an `if`/`else` that either makes progress or returns; the
@@ -171,6 +180,235 @@ fn crc32(data: &[u8]) -> u32 {
     let mut c = Crc32::new();
     c.update(data);
     c.finalize()
+}
+
+// ─── inline CRC-64 ─────────────────────────────────────────────────────────
+//
+// CRC-64/XZ (ECMA-182 polynomial, reflected 0xC96C5795D7870F42), initial
+// and final XOR all ones: the Block Check of a Stream whose check ID is 0x04
+// (`xz --check=crc64`, the CLI default).
+
+#[derive(Clone, Copy)]
+struct Crc64 {
+    state: u64,
+}
+
+impl Crc64 {
+    const fn new() -> Self {
+        Self { state: !0 }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        let mut s = self.state;
+        for &b in data {
+            let idx = ((s ^ b as u64) & 0xFF) as usize;
+            s = (s >> 8) ^ CRC64_TABLE[idx];
+        }
+        self.state = s;
+    }
+
+    const fn finalize(self) -> u64 {
+        !self.state
+    }
+}
+
+const CRC64_TABLE: [u64; 256] = {
+    let mut table = [0u64; 256];
+    let mut i = 0u64;
+    while i < 256 {
+        let mut c = i;
+        let mut k = 0;
+        while k < 8 {
+            c = if c & 1 != 0 {
+                0xC96C_5795_D787_0F42 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+            k += 1;
+        }
+        table[i as usize] = c;
+        i += 1;
+    }
+    table
+};
+
+// ─── inline SHA-256 ────────────────────────────────────────────────────────
+//
+// FIPS 180-4 SHA-256: the Block Check of a Stream whose check ID is 0x0A
+// (`xz --check=sha256`). Only the decoder needs it, to verify; a plain
+// one-block-at-a-time compression function is plenty.
+
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+#[derive(Clone)]
+struct Sha256 {
+    h: [u32; 8],
+    /// Partial 64-byte message block awaiting compression.
+    buf: [u8; 64],
+    buf_len: usize,
+    /// Message length so far, in bytes.
+    total: u64,
+}
+
+impl Sha256 {
+    const fn new() -> Self {
+        Self {
+            h: [
+                0x6a09_e667,
+                0xbb67_ae85,
+                0x3c6e_f372,
+                0xa54f_f53a,
+                0x510e_527f,
+                0x9b05_688c,
+                0x1f83_d9ab,
+                0x5be0_cd19,
+            ],
+            buf: [0; 64],
+            buf_len: 0,
+            total: 0,
+        }
+    }
+
+    fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
+        let mut w = [0u32; 64];
+        for (i, word) in block.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*word);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(SHA256_K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (x, v) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *x = x.wrapping_add(v);
+        }
+    }
+
+    fn update(&mut self, mut data: &[u8]) {
+        self.total = self.total.wrapping_add(data.len() as u64);
+        if self.buf_len > 0 {
+            let take = (64 - self.buf_len).min(data.len());
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
+            self.buf_len += take;
+            data = &data[take..];
+            if self.buf_len < 64 {
+                return;
+            }
+            Self::compress(&mut self.h, &self.buf);
+            self.buf_len = 0;
+        }
+        let (blocks, rest) = data.as_chunks::<64>();
+        for block in blocks {
+            Self::compress(&mut self.h, block);
+        }
+        self.buf[..rest.len()].copy_from_slice(rest);
+        self.buf_len = rest.len();
+    }
+
+    fn finalize(mut self) -> [u8; 32] {
+        let bit_len = self.total.wrapping_mul(8);
+        // 0x80 terminator, zero fill, then the 64-bit big-endian bit length
+        // ending a block (spilling into a second block if it does not fit).
+        let mut pad = [0u8; 72];
+        pad[0] = 0x80;
+        let zeros = (55usize.wrapping_sub(self.buf_len)) % 64;
+        pad[1 + zeros..9 + zeros].copy_from_slice(&bit_len.to_be_bytes());
+        self.update(&pad[..9 + zeros]);
+        debug_assert_eq!(self.buf_len, 0);
+        let mut out = [0u8; 32];
+        for (o, v) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.h) {
+            o.copy_from_slice(&v.to_be_bytes());
+        }
+        out
+    }
+}
+
+/// Running Block Check, selected by the Stream Flags' check ID.
+#[derive(Clone)]
+enum BlockCheck {
+    /// Check ID 0x00 (no check), or a reserved ID this build does not
+    /// implement: the Check field is skipped unverified, as liblzma does.
+    Unverified,
+    Crc32(Crc32),
+    Crc64(Crc64),
+    Sha256(Box<Sha256>),
+}
+
+impl BlockCheck {
+    fn new(check_id: u8) -> Self {
+        match check_id {
+            0x01 => Self::Crc32(Crc32::new()),
+            0x04 => Self::Crc64(Crc64::new()),
+            0x0A => Self::Sha256(Box::new(Sha256::new())),
+            _ => Self::Unverified,
+        }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            Self::Unverified => {}
+            Self::Crc32(c) => c.update(data),
+            Self::Crc64(c) => c.update(data),
+            Self::Sha256(s) => s.update(data),
+        }
+    }
+
+    /// Compare against the stored Check field (whose length the caller
+    /// sized from the check ID).
+    fn matches(&self, stored: &[u8]) -> bool {
+        match self {
+            Self::Unverified => true,
+            Self::Crc32(c) => stored == c.finalize().to_le_bytes(),
+            Self::Crc64(c) => stored == c.finalize().to_le_bytes(),
+            Self::Sha256(s) => stored == s.as_ref().clone().finalize(),
+        }
+    }
+}
+
+/// Size of the Check field for a check ID (xz-file-format.txt §3.4: IDs
+/// come in groups of three sharing a size, reserved ones included).
+const fn check_size_for(check_id: u8) -> usize {
+    match check_id {
+        0x00 => 0,
+        0x01..=0x03 => 4,
+        0x04..=0x06 => 8,
+        0x07..=0x09 => 16,
+        0x0A..=0x0C => 32,
+        _ => 64,
+    }
 }
 
 // ─── varint (multibyte integer) ────────────────────────────────────────────
@@ -1026,8 +1264,9 @@ pub struct Decoder {
     block_compressed_seen: u64,
     block_uncompressed_seen: u64,
 
-    /// Block check (CRC32 of all uncompressed bytes in the block).
-    check: Crc32,
+    /// Running Block Check over the uncompressed bytes of the block, of
+    /// the kind the Stream Header's check ID selects.
+    check: BlockCheck,
 
     /// Collected blocks for index cross-check: (unpadded_size, uncompressed).
     blocks: Vec<(u64, u64)>,
@@ -1088,7 +1327,7 @@ impl Decoder {
             block_header_size_seen: 0,
             block_compressed_seen: 0,
             block_uncompressed_seen: 0,
-            check: Crc32::new(),
+            check: BlockCheck::Unverified,
             blocks: Vec::new(),
             index_buf: Vec::new(),
             index_records_remaining: 0,
@@ -1160,16 +1399,11 @@ impl Decoder {
         if check_id & 0xF0 != 0 {
             return Err(self.poison(Error::Unsupported));
         }
-        // Accept the spec's standard check types. We verify CRC32 (0x01)
-        // bit-for-bit; for CRC64 (0x04) and SHA-256 (0x0A) we simply
-        // consume the trailing bytes without validating them, since the
-        // CRC64 polynomial and SHA-256 hash function aren't built into
-        // this crate. Reserved values are rejected.
-        match check_id & 0x0F {
-            0x00 | 0x01 | 0x04 | 0x0A => {}
-            _ => return Err(self.poison(Error::Unsupported)),
-        }
-        self.check_id = check_id & 0x0F;
+        // CRC32 (0x01), CRC64 (0x04) and SHA-256 (0x0A) are verified. The
+        // reserved IDs still define the Check field's size (spec §2.1.1.2),
+        // so, like liblzma by default, accept them and skip the field
+        // unverified.
+        self.check_id = check_id;
 
         let stored_crc = u32::from_le_bytes([
             self.scratch[8],
@@ -1184,13 +1418,7 @@ impl Decoder {
     }
 
     fn check_size(&self) -> usize {
-        match self.check_id {
-            0x00 => 0,
-            0x01 => 4,
-            0x04 => 8,
-            0x0A => 32,
-            _ => 0, // unreachable: parse_stream_header rejects others
-        }
+        check_size_for(self.check_id)
     }
 
     fn parse_block_header(&mut self) -> Result<(), Error> {
@@ -1333,7 +1561,7 @@ impl RawDecoder for Decoder {
                             self.block_header_size_seen = self.block_header_size as u64;
                             self.block_compressed_seen = 0;
                             self.block_uncompressed_seen = 0;
-                            self.check = Crc32::new();
+                            self.check = BlockCheck::new(self.check_id);
                             self.lzma_core = None;
                             self.expecting_block_first_chunk = true;
                             self.phase = DecPhase::BlockHeader;
@@ -1677,16 +1905,8 @@ impl RawDecoder for Decoder {
                         self.scratch_want = 1;
                         self.phase = DecPhase::BlockOrIndex;
                     } else if self.fill_scratch(input, &mut consumed) {
-                        if self.check_id == 0x01 {
-                            let got = u32::from_le_bytes([
-                                self.scratch[0],
-                                self.scratch[1],
-                                self.scratch[2],
-                                self.scratch[3],
-                            ]);
-                            if got != self.check.finalize() {
-                                return Err(self.poison(Error::ChecksumMismatch));
-                            }
+                        if !self.check.matches(&self.scratch) {
+                            return Err(self.poison(Error::ChecksumMismatch));
                         }
                         let unpadded_size = self.block_header_size_seen
                             + self.block_compressed_seen
@@ -1838,7 +2058,7 @@ impl RawDecoder for Decoder {
                         if back != want_back {
                             return Err(self.poison(Error::TrailerMismatch));
                         }
-                        if s[8] != STREAM_FLAGS[0] || (s[9] & 0x0F) != self.check_id {
+                        if s[8] != STREAM_FLAGS[0] || s[9] != self.check_id {
                             return Err(self.poison(Error::Corrupt));
                         }
                         if s[10] != FOOTER_MAGIC[0] || s[11] != FOOTER_MAGIC[1] {
