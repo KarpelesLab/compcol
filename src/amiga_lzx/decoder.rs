@@ -113,13 +113,7 @@ enum BlockState {
     },
     UncompressedData {
         remaining: u32,
-        /// Whether `remaining` was originally odd → must consume a pad byte
-        /// after the data is exhausted.
-        original_was_odd: bool,
     },
-    /// After an uncompressed block with odd `block_length`, swallow one pad
-    /// byte.
-    UncompressedPad,
 }
 
 /// Sub-state for verbatim / aligned-offset blocks while reading the headers
@@ -544,18 +538,13 @@ fn step(ctx: &mut RunCtx) -> Result<(), Error> {
                 ctx.r0 = r0;
                 ctx.r1 = r1;
                 ctx.r2 = r2;
-                let original_was_odd = remaining & 1 == 1;
-                ctx.block = BlockState::UncompressedData {
-                    remaining,
-                    original_was_odd,
-                };
+                ctx.block = BlockState::UncompressedData { remaining };
             }
 
-            BlockState::UncompressedData {
-                mut remaining,
-                original_was_odd,
-            } => {
+            BlockState::UncompressedData { mut remaining } => {
                 // Drain pre-buffered words byte-by-byte (low byte of word first).
+                // An odd-sized block's pad byte is the high half of its last
+                // word, dropped by the `remaining == 0` break below.
                 while remaining > 0 && ctx.bit_reader.bits_available() >= 16 {
                     let word = ctx.bit_reader.peek(16);
                     ctx.bit_reader.drop_bits(16);
@@ -575,26 +564,10 @@ fn step(ctx: &mut RunCtx) -> Result<(), Error> {
                     }
                 }
                 if remaining > 0 {
-                    ctx.block = BlockState::UncompressedData {
-                        remaining,
-                        original_was_odd,
-                    };
+                    ctx.block = BlockState::UncompressedData { remaining };
                     return Ok(());
                 }
-                if original_was_odd {
-                    ctx.block = BlockState::UncompressedPad;
-                } else {
-                    ctx.block = BlockState::AwaitBlockHeader;
-                }
-            }
-
-            BlockState::UncompressedPad => {
-                // Odd-length uncompressed blocks aren't producible by our
-                // encoder; supporting them on decode would require expanding
-                // the bit reader with a "drop low bits" primitive. Reject for
-                // now.
-                ctx.block = BlockState::UncompressedPad;
-                return Err(Error::Unsupported);
+                ctx.block = BlockState::AwaitBlockHeader;
             }
 
             BlockState::Verbatim { remaining, ph } => {

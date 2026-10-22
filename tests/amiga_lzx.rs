@@ -277,6 +277,33 @@ fn truncated_stream_after_header() {
     assert_eq!(err, Error::UnexpectedEnd);
 }
 
+/// The documented block format pads an odd-sized uncompressed block with
+/// one zero byte; another block may follow. The decoder used to return
+/// `Unsupported` on reaching that pad.
+#[test]
+fn odd_uncompressed_block_followed_by_another() {
+    fn block(bytes: &mut Vec<u8>, data: &[u8]) {
+        // 27-bit header (BLOCKTYPE=3, BLOCK_SIZE) + 5 pad bits = two words.
+        let padded32 = ((3u32 << 24) | data.len() as u32) << 5;
+        for w in [(padded32 >> 16) as u16, padded32 as u16] {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        for _ in 0..3 {
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+        }
+        bytes.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            bytes.push(0);
+        }
+    }
+    let data: Vec<u8> = (0..301u32).map(|i| (i * 7) as u8).collect();
+    let mut bytes = (data.len() as u32).to_le_bytes().to_vec();
+    block(&mut bytes, &data[..101]);
+    block(&mut bytes, &data[101..]);
+    assert_eq!(decode_chunked(&bytes, bytes.len(), 4096), data);
+    assert_eq!(decode_chunked(&bytes, 1, 1), data);
+}
+
 #[test]
 fn truncated_block_payload() {
     // 4-byte header (total=4), then a block declaring BLOCK_SIZE=4 but
