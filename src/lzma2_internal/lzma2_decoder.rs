@@ -830,14 +830,35 @@ impl LzmaCore {
     /// the chunk's `comp_size` already bounds how many bytes we read, and
     /// any trailing slack just stays in `buf`.
     pub fn decode_chunk(&mut self, buf: &[u8], out: &mut [u8]) -> Result<(), Error> {
-        let target = out.len();
         let mut written = 0usize;
-        while written < target {
+        self.decode_partial(buf, out, &mut written, 0)
+    }
+
+    /// Continue decoding a chunk whose compressed bytes may not all be in
+    /// `buf` yet. `out` is the whole chunk's output, `*written` how much of
+    /// it is already decoded. Packets are decoded only while at least
+    /// `margin` bytes of `buf` are unread, so with `margin` =
+    /// [`IN_REQUIRED`] a packet never runs out of input partway — which
+    /// would leave the probabilities and range coder half-updated — and
+    /// decoding can resume when more bytes arrive. `margin` 0 decodes to
+    /// the end of `out` (the whole chunk is in `buf`, or nothing more will
+    /// come: then an `UnexpectedEnd` leaves `*written` covering every
+    /// packet that completed, since a packet writes nothing until it has
+    /// been fully read).
+    pub fn decode_partial(
+        &mut self,
+        buf: &[u8],
+        out: &mut [u8],
+        written: &mut usize,
+        margin: usize,
+    ) -> Result<(), Error> {
+        let target = out.len();
+        while *written < target && buf.len().saturating_sub(self.range.pos) >= margin {
             match self.step(buf)? {
                 PacketOutcome::Literal(b) => {
                     self.dict_put(b);
-                    out[written] = b;
-                    written += 1;
+                    out[*written] = b;
+                    *written += 1;
                 }
                 PacketOutcome::Match { length } => {
                     let mut remaining = length as usize;
@@ -847,7 +868,7 @@ impl LzmaCore {
                     }
                     // A match that would write past the chunk's declared
                     // output size is malformed.
-                    if remaining > target - written {
+                    if remaining > target - *written {
                         return Err(Error::Corrupt);
                     }
                     // Fast path: when the match is non-overlapping
@@ -859,13 +880,12 @@ impl LzmaCore {
                     // returns the count; the per-byte loop handles any
                     // wrapped remainder and the overlapping case.
                     if distance as usize + 1 >= remaining {
-                        let did = self.dict_copy_match_bulk(distance, remaining, out, &mut written);
+                        let did = self.dict_copy_match_bulk(distance, remaining, out, written);
                         remaining -= did;
                     } else {
                         // Overlapping run (e.g. RLE-style fills): replicate
                         // the source window forward in bulk.
-                        let did =
-                            self.dict_copy_match_overlap(distance, remaining, out, &mut written);
+                        let did = self.dict_copy_match_overlap(distance, remaining, out, written);
                         remaining -= did;
                     }
                     while remaining > 0 {
@@ -874,8 +894,8 @@ impl LzmaCore {
                         }
                         let b = self.dict_get(distance);
                         self.dict_put(b);
-                        out[written] = b;
-                        written += 1;
+                        out[*written] = b;
+                        *written += 1;
                         remaining -= 1;
                     }
                 }
@@ -884,6 +904,13 @@ impl LzmaCore {
         Ok(())
     }
 }
+
+/// Most input bytes one LZMA packet can read (liblzma's
+/// `LZMA_IN_REQUIRED`): at most 22 probability-coded bits, each shrinking
+/// the range by at most ~6.05 bits, plus 26 direct bits of 1 bit each, so
+/// 159 bits; the range coder reads one byte per 8 bits of shrink, plus
+/// one.
+pub const IN_REQUIRED: usize = 21;
 
 /// Decode the LZMA2 dictionary-size byte from the xz filter properties.
 ///

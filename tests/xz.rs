@@ -1589,6 +1589,124 @@ fn finish_drains_pending_output_through_a_small_buffer() {
     assert_eq!(dec.finish(&mut buf).unwrap_err(), Error::UnexpectedEnd);
 }
 
+/// Offset and compressed size of the first LZMA2 chunk in a one-filter
+/// stream: after the 12-byte Stream Header and the Block Header, a
+/// compressed chunk's header is control, 2 bytes of size, then 2 bytes of
+/// compressed size - 1 (and a props byte).
+fn first_compressed_chunk(stream: &[u8]) -> (usize, usize) {
+    let hdr = (stream[12] as usize + 1) * 4;
+    let at = 12 + hdr;
+    assert!(stream[at] >= 0x80, "first chunk is not compressed");
+    let comp = ((stream[at + 3] as usize) << 8 | stream[at + 4] as usize) + 1;
+    let header = if stream[at] >= 0xC0 { 6 } else { 5 };
+    (at + header, comp)
+}
+
+/// Decoding starts while a compressed chunk is still arriving, as in
+/// liblzma: half of the first chunk's bytes already give output. It used
+/// to wait for the whole chunk (up to 64 KiB of input, 2 MiB of output).
+#[test]
+fn compressed_chunk_decodes_as_it_arrives() {
+    let plain = mixed_corpus();
+    let stream = encode_all(&plain);
+    let (start, comp) = first_compressed_chunk(&stream);
+    let half = &stream[..start + comp / 2];
+    for in_chunk in [1usize, 100, half.len()] {
+        let mut dec = Decoder::new();
+        let mut buf = vec![0u8; 1 << 17];
+        let mut got = Vec::new();
+        for piece in half.chunks(in_chunk) {
+            let (p, _) = dec.decode(piece, &mut buf).unwrap();
+            assert_eq!(p.consumed, piece.len());
+            got.extend_from_slice(&buf[..p.written]);
+        }
+        assert!(
+            !got.is_empty(),
+            "in_chunk {in_chunk}: no output from half a chunk"
+        );
+        assert!(plain.starts_with(&got));
+    }
+    // And the rest of the stream, fed in odd pieces, completes it.
+    assert_eq!(decode_chunked(&stream, 333, 1000).unwrap(), plain);
+}
+
+/// A stream cut inside a compressed chunk yields every byte the cut-off
+/// chunk's complete packets hold, then `UnexpectedEnd` — like `xz -d`,
+/// and checked against it when the tool is installed. It used to lose
+/// the whole chunk.
+#[test]
+fn truncated_chunk_yields_what_it_holds() {
+    fn decode_cut(cut: &[u8], out_chunk: usize) -> Vec<u8> {
+        let mut dec = Decoder::new();
+        let mut buf = vec![0u8; out_chunk];
+        let mut got = Vec::new();
+        let mut pos = 0;
+        while pos < cut.len() {
+            let (p, _) = dec.decode(&cut[pos..], &mut buf).unwrap();
+            got.extend_from_slice(&buf[..p.written]);
+            pos += p.consumed;
+        }
+        loop {
+            match dec.finish(&mut buf) {
+                Ok((p, status)) => {
+                    assert_ne!(status, Status::StreamEnd);
+                    got.extend_from_slice(&buf[..p.written]);
+                }
+                Err(e) => {
+                    assert_eq!(e, Error::UnexpectedEnd);
+                    return got;
+                }
+            }
+        }
+    }
+
+    let plain = mixed_corpus();
+    let stream = encode_all(&plain);
+    let (start, comp) = first_compressed_chunk(&stream);
+    for cut_len in [
+        start + 30,
+        start + comp / 2,
+        start + comp - 1,
+        stream.len() / 2,
+    ] {
+        let cut = &stream[..cut_len];
+        let got = decode_cut(cut, 1 << 20);
+        assert!(plain.starts_with(&got), "cut {cut_len}");
+        // More than the whole chunks before the cut (our encoder's chunks
+        // hold 64 KiB each).
+        assert!(
+            !got.len().is_multiple_of(65536),
+            "cut {cut_len}: {} bytes",
+            got.len()
+        );
+        for out_chunk in [1usize, 4096] {
+            assert!(
+                decode_cut(cut, out_chunk) == got,
+                "cut {cut_len}/{out_chunk}"
+            );
+        }
+        if let Ok(mut child) = Command::new("xz")
+            .args(["-dc"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            let data = cut.to_vec();
+            let writer = std::thread::spawn(move || stdin.write_all(&data));
+            let out = child.wait_with_output().unwrap();
+            let _ = writer.join().unwrap();
+            assert!(
+                out.stdout == got,
+                "cut {cut_len}: xz -d {} vs {}",
+                out.stdout.len(),
+                got.len()
+            );
+        }
+    }
+}
+
 /// A truncated stream still ends in `UnexpectedEnd`, but only after
 /// `finish` has handed over everything already decoded, whatever the
 /// buffer size. It used to fail on the first call, dropping the decoded

@@ -108,7 +108,7 @@ use crate::traits::{Algorithm, Flush, RawDecoder, RawEncoder, RawProgress};
 // (`crate::lzma2_internal`) so it can also back the public raw LZMA2
 // decoder exposed under the `lzma2` feature without pulling in this xz
 // container. See `lib.rs`.
-use crate::lzma2_internal::lzma2_decoder::{Lzma2Props, LzmaCore, lzma2_dict_size};
+use crate::lzma2_internal::lzma2_decoder::{IN_REQUIRED, Lzma2Props, LzmaCore, lzma2_dict_size};
 use crate::lzma2_internal::lzma2_encoder::{
     EncoderParams, LZMA2_PROPS_BYTE, Lzma2Chunk, Lzma2StreamEncoder,
 };
@@ -1253,9 +1253,10 @@ enum DecPhase {
     /// Buffering the remaining bytes of a compressed-LZMA2 chunk header
     /// (4 or 5 more bytes after the control byte).
     Lzma2CompHeader,
-    /// Buffering the compressed payload for the current chunk.
+    /// Buffering the compressed payload for the current chunk and
+    /// decoding as much of it as is safe (see `LzmaCore::decode_partial`).
     Lzma2CompBuffer,
-    /// Streaming the decoded chunk bytes out to the caller.
+    /// Streaming the chunk bytes decoded so far out to the caller.
     Lzma2CompDrain,
     /// After the LZMA2 end marker: skip 0..=3 padding zeros and read the
     /// 4-byte Check.
@@ -1334,10 +1335,18 @@ pub struct Decoder {
     comp_size: u32,
     /// Buffer for the compressed payload of the current chunk.
     comp_buf: Vec<u8>,
-    /// Decoded output of the current compressed chunk, drained byte-by-byte.
+    /// Decoded output of the current compressed chunk (sized to the whole
+    /// chunk), filled as the compressed bytes arrive.
     comp_decoded: Vec<u8>,
+    /// How much of `comp_decoded` is decoded so far.
+    comp_produced: usize,
     /// Read cursor within `comp_decoded` during streaming drain.
     comp_decoded_pos: usize,
+    /// The range coder has been initialised from the chunk's first 5 bytes.
+    comp_range_ready: bool,
+    /// `finish` found the chunk cut short and decoded what it could; the
+    /// core is mid-packet now, so nothing more may be decoded.
+    comp_truncated: bool,
     /// Properties byte from the most recent reset chunk; only valid when
     /// `lzma_core` is `Some`. Used to detect whether `replace_props` is
     /// required on subsequent reset chunks.
@@ -1383,7 +1392,10 @@ impl Decoder {
             comp_size: 0,
             comp_buf: Vec::new(),
             comp_decoded: Vec::new(),
+            comp_produced: 0,
             comp_decoded_pos: 0,
+            comp_range_ready: false,
+            comp_truncated: false,
             last_props: 0,
             filters: None,
             stream_padding: 0,
@@ -1868,6 +1880,12 @@ impl RawDecoder for Decoder {
                     self.expecting_block_first_chunk = false;
                     self.scratch.clear();
                     self.comp_buf.clear();
+                    self.comp_decoded.clear();
+                    self.comp_decoded
+                        .resize(self.comp_uncomp_size as usize, 0u8);
+                    self.comp_produced = 0;
+                    self.comp_decoded_pos = 0;
+                    self.comp_range_ready = false;
                     self.scratch_want = 0;
                     self.phase = DecPhase::Lzma2CompBuffer;
                 }
@@ -1880,41 +1898,64 @@ impl RawDecoder for Decoder {
                             .extend_from_slice(&input[consumed..consumed + take]);
                         consumed += take;
                     }
-                    if self.comp_buf.len() < self.comp_size as usize {
+                    let complete = self.comp_buf.len() == self.comp_size as usize;
+                    // Decode as the bytes arrive, like liblzma, rather than
+                    // waiting for the whole chunk: only packets that cannot
+                    // run out of input partway, until the chunk is complete.
+                    // At `finish` with the chunk cut short, decode what the
+                    // bytes hold, so a truncated stream still yields every
+                    // byte before the cut (as `xz -d` does).
+                    let cut_short = !complete && self.finishing && consumed == input.len();
+                    let margin = if complete || cut_short {
+                        0
+                    } else {
+                        IN_REQUIRED
+                    };
+                    let before = self.comp_produced;
+                    if !self.comp_truncated {
+                        let Some(core) = self.lzma_core.as_mut() else {
+                            return Err(self.poison(Error::Corrupt));
+                        };
+                        if !self.comp_range_ready && (complete || self.comp_buf.len() >= 5) {
+                            if let Err(e) = core.init_range(&self.comp_buf) {
+                                return Err(self.poison(e));
+                            }
+                            self.comp_range_ready = true;
+                        }
+                        if self.comp_range_ready {
+                            match core.decode_partial(
+                                &self.comp_buf,
+                                &mut self.comp_decoded,
+                                &mut self.comp_produced,
+                                margin,
+                            ) {
+                                Ok(()) => {}
+                                Err(Error::UnexpectedEnd) if cut_short => {}
+                                Err(e) => return Err(self.poison(e)),
+                            }
+                        }
+                        if cut_short {
+                            self.comp_truncated = true;
+                        }
+                    }
+                    if complete && self.comp_produced == self.comp_decoded.len() {
+                        self.block_compressed_seen += self.comp_size as u64;
+                    } else if self.comp_produced == before {
+                        // Nothing new to hand out: wait for more input.
                         return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
                         });
                     }
-                    self.block_compressed_seen += self.comp_size as u64;
-                    // Decode the entire chunk into comp_decoded.
-                    self.comp_decoded.clear();
-                    self.comp_decoded
-                        .resize(self.comp_uncomp_size as usize, 0u8);
-                    if self.lzma_core.is_none() {
-                        return Err(self.poison(Error::Corrupt));
-                    }
-                    let init_res = self.lzma_core.as_mut().unwrap().init_range(&self.comp_buf);
-                    if let Err(e) = init_res {
-                        return Err(self.poison(e));
-                    }
-                    let dec_res = self
-                        .lzma_core
-                        .as_mut()
-                        .unwrap()
-                        .decode_chunk(&self.comp_buf, &mut self.comp_decoded);
-                    if let Err(e) = dec_res {
-                        return Err(self.poison(e));
-                    }
-                    self.comp_decoded_pos = 0;
                     self.phase = DecPhase::Lzma2CompDrain;
                 }
                 DecPhase::Lzma2CompDrain => {
-                    let total = self.comp_decoded.len();
+                    let total = self.comp_produced;
                     if let Some(chain) = self.filters.as_mut() {
                         // Through the filters; the top of the loop drains.
-                        if let Err(e) = chain.push(&self.comp_decoded[self.comp_decoded_pos..]) {
+                        if let Err(e) = chain.push(&self.comp_decoded[self.comp_decoded_pos..total])
+                        {
                             return Err(self.poison(e));
                         }
                         self.comp_decoded_pos = total;
@@ -1929,17 +1970,23 @@ impl RawDecoder for Decoder {
                         self.comp_decoded_pos += take;
                         written += take;
                     }
-                    if self.comp_decoded_pos >= total {
-                        // Chunk drained; back to control byte parsing.
-                        self.scratch.clear();
-                        self.scratch_want = 1;
-                        self.phase = DecPhase::Lzma2Control;
-                    } else {
+                    if self.comp_decoded_pos < total {
                         return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
                         });
+                    }
+                    if total == self.comp_decoded.len()
+                        && self.comp_buf.len() == self.comp_size as usize
+                    {
+                        // Chunk done; back to control byte parsing.
+                        self.scratch.clear();
+                        self.scratch_want = 1;
+                        self.phase = DecPhase::Lzma2Control;
+                    } else {
+                        // Decoded so far is out; more of the chunk to come.
+                        self.phase = DecPhase::Lzma2CompBuffer;
                     }
                 }
                 DecPhase::Lzma2Data => {
