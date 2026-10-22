@@ -58,7 +58,7 @@
 //! the Required Insert Count encoding) is derived from the capacity passed to
 //! [`with_dynamic_table`](QpackEncoder::with_dynamic_table), which must equal
 //! the decoder's `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (see
-//! [`QpackDecoder::with_max_table_capacity`]).
+//! [`QpackDecoder::with_limits`]).
 //!
 //! ```
 //! use compcol::qpack::{QpackEncoder, QpackDecoder};
@@ -70,7 +70,7 @@
 //!     HeaderField::new(b":path", b"/index.html"),
 //!     HeaderField::new(b"custom", b"value"),
 //! ]);
-//! let mut dec = QpackDecoder::new();
+//! let mut dec = QpackDecoder::with_limits(4096, 64 * 1024);
 //! let out = dec.decode_field_section(&block).unwrap();
 //! assert_eq!(out[0].name, b":path");
 //! assert_eq!(out[1].value, b"value");
@@ -78,7 +78,7 @@
 //! // Dynamic: build the table on the encoder stream, reference it from the
 //! // field section. Feed the encoder stream first, then decode.
 //! let mut enc = QpackEncoder::with_dynamic_table(4096);
-//! let mut dec = QpackDecoder::with_max_table_capacity(4096);
+//! let mut dec = QpackDecoder::with_limits(4096, 64 * 1024);
 //! let fields = [HeaderField::new(b"custom-key", b"custom-value")];
 //! let first = enc.encode(&fields);
 //! dec.feed_encoder_stream(&first.encoder_stream).unwrap();
@@ -102,7 +102,7 @@ use alloc::vec::Vec;
 
 use crate::error::Error;
 use crate::hpack::HeaderField;
-use crate::hpack::huffman;
+use crate::hpack::{charge_field, huffman};
 
 mod dynamic_table;
 mod integer;
@@ -111,11 +111,18 @@ mod static_table;
 use dynamic_table::DynamicTable;
 use integer::{decode_int, encode_int};
 
-/// QPACK's default maximum dynamic-table capacity used by [`QpackDecoder::new`]
-/// when no explicit bound is given. A peer's `SETTINGS_QPACK_MAX_TABLE_CAPACITY`
+/// QPACK's default maximum dynamic-table capacity used by
+/// [`QpackDecoder::default`] when no explicit bound is given. A peer's `SETTINGS_QPACK_MAX_TABLE_CAPACITY`
 /// would normally set this; 4096 mirrors the HPACK default and is a safe
 /// general-purpose ceiling.
 pub const DEFAULT_MAX_TABLE_CAPACITY: usize = 4096;
+
+/// Default cap on one decoded field section, in RFC 9204 §3.2.1 field-size
+/// units (name + value + 32 bytes per field). Applied by the constructors that
+/// don't take a cap ([`QpackDecoder::default`] and the deprecated
+/// [`QpackDecoder::new`] / [`QpackDecoder::with_max_table_capacity`]). See
+/// [`QpackDecoder::with_limits`] for why the decoder enforces this itself.
+pub const DEFAULT_MAX_FIELD_SECTION_SIZE: usize = 64 * 1024;
 
 // ─── encoder ───────────────────────────────────────────────────────────────
 
@@ -207,8 +214,8 @@ impl QpackEncoder {
     /// `max_table_capacity` is both the capacity this encoder will request (via
     /// Set Dynamic Table Capacity) and the basis for its `MaxEntries`, so it
     /// **must equal** the peer decoder's `SETTINGS_QPACK_MAX_TABLE_CAPACITY`
-    /// (the value passed to [`QpackDecoder::with_max_table_capacity`], or
-    /// [`DEFAULT_MAX_TABLE_CAPACITY`] for [`QpackDecoder::new`]). Passing 0
+    /// (the first value passed to [`QpackDecoder::with_limits`], or
+    /// [`DEFAULT_MAX_TABLE_CAPACITY`] for [`QpackDecoder::default`]). Passing 0
     /// yields a static-only encoder.
     pub fn with_dynamic_table(max_table_capacity: usize) -> Self {
         let mut table = DynamicTable::new();
@@ -523,29 +530,68 @@ pub struct QpackDecoder {
     /// (`SETTINGS_QPACK_MAX_TABLE_CAPACITY`, §3.2.3). A Set Dynamic Table
     /// Capacity instruction may not exceed this.
     max_capacity: usize,
+    /// Cap on one decoded field section, in §3.2.1 field-size units.
+    max_field_section_size: usize,
 }
 
+/// [`DEFAULT_MAX_TABLE_CAPACITY`] with the [`DEFAULT_MAX_FIELD_SECTION_SIZE`]
+/// cap.
 impl Default for QpackDecoder {
     fn default() -> Self {
-        Self::new()
+        Self::with_limits(DEFAULT_MAX_TABLE_CAPACITY, DEFAULT_MAX_FIELD_SECTION_SIZE)
     }
 }
 
 impl QpackDecoder {
     /// New decoder allowing a dynamic table up to
-    /// [`DEFAULT_MAX_TABLE_CAPACITY`] bytes.
+    /// [`DEFAULT_MAX_TABLE_CAPACITY`] bytes, with the
+    /// [`DEFAULT_MAX_FIELD_SECTION_SIZE`] cap.
+    #[deprecated(
+        since = "0.6.12",
+        note = "choose a decoded-size cap explicitly: use `QpackDecoder::with_limits`"
+    )]
     pub fn new() -> Self {
-        Self::with_max_table_capacity(DEFAULT_MAX_TABLE_CAPACITY)
+        Self::default()
     }
 
-    /// New decoder whose dynamic-table capacity ceiling is `max` bytes (the
-    /// value it would advertise as `SETTINGS_QPACK_MAX_TABLE_CAPACITY`). The
-    /// table starts empty at capacity 0 until the encoder stream raises it.
+    /// New decoder whose dynamic-table capacity ceiling is `max` bytes, with
+    /// the [`DEFAULT_MAX_FIELD_SECTION_SIZE`] cap.
+    #[deprecated(
+        since = "0.6.12",
+        note = "choose a decoded-size cap explicitly: use `QpackDecoder::with_limits`"
+    )]
     pub fn with_max_table_capacity(max: usize) -> Self {
+        Self::with_limits(max, DEFAULT_MAX_FIELD_SECTION_SIZE)
+    }
+
+    /// New decoder whose dynamic-table capacity ceiling is
+    /// `max_table_capacity` bytes (the value it advertises as
+    /// `SETTINGS_QPACK_MAX_TABLE_CAPACITY`), and which rejects any field
+    /// section decoding to more than `max_field_section_size` bytes, counted
+    /// as in RFC 9204 §3.2.1 (name + value + 32 per field), the same unit as
+    /// HTTP/3 `SETTINGS_MAX_FIELD_SECTION_SIZE`. `usize::MAX` disables the
+    /// cap. The table starts empty at capacity 0 until the encoder stream
+    /// raises it.
+    ///
+    /// The decoder enforces the cap itself because a one-byte indexed field
+    /// line can expand to a whole dynamic-table entry (~4 KiB), so a small
+    /// field section can decode to gigabytes before the caller sees the
+    /// result. The budget is charged as each field is decoded, and decoding
+    /// stops early. It applies per
+    /// [`decode_field_section`](Self::decode_field_section) call; a caller
+    /// that accepts several HEADERS frames on one stream must sum the sizes
+    /// itself.
+    pub fn with_limits(max_table_capacity: usize, max_field_section_size: usize) -> Self {
         QpackDecoder {
             table: DynamicTable::new(),
-            max_capacity: max,
+            max_capacity: max_table_capacity,
+            max_field_section_size,
         }
+    }
+
+    /// Change the decoded-size cap set by [`with_limits`](Self::with_limits).
+    pub fn set_max_field_section_size(&mut self, max: usize) {
+        self.max_field_section_size = max;
     }
 
     /// Process encoder-stream instructions (§4.3), mutating the dynamic table:
@@ -624,7 +670,10 @@ impl QpackDecoder {
     /// [`Error::Corrupt`] on a malformed representation, a bad table reference,
     /// or a Required Insert Count that exceeds what has been inserted so far
     /// (a blocked reference this synchronous API cannot wait on);
-    /// [`Error::UnexpectedEnd`] on truncation.
+    /// [`Error::UnexpectedEnd`] on truncation; [`Error::OutputLimitExceeded`]
+    /// if the decoded fields would exceed the
+    /// [field section size cap](Self::set_max_field_section_size) (map this to
+    /// HTTP 431 or a stream reset).
     pub fn decode_field_section(&mut self, block: &[u8]) -> Result<Vec<HeaderField>, Error> {
         // §4.5.1 prefix.
         let (req_insert_count, mut pos) = self.decode_required_insert_count(block)?;
@@ -637,6 +686,8 @@ impl QpackDecoder {
             return Err(Error::Corrupt);
         }
 
+        let max = self.max_field_section_size;
+        let mut used = 0usize;
         let mut fields = Vec::new();
         while pos < block.len() {
             let b = block[pos];
@@ -646,7 +697,9 @@ impl QpackDecoder {
                 let (idx, np) = decode_int(block, pos, 6)?;
                 pos = np;
                 let (n, v) = self.lookup_indexed(idx, t_static, base, req_insert_count)?;
-                fields.push(HeaderField::new(n.as_slice(), v.as_slice()));
+                // Charge before copying: this is the amplifying case.
+                charge_field(&mut used, max, n, v)?;
+                fields.push(HeaderField::new(n, v));
             } else if b & 0b0100_0000 != 0 {
                 // §4.5.4 Literal Field Line with Name Reference: 0 1 N T idx(4+).
                 let sensitive = b & 0b0010_0000 != 0;
@@ -656,8 +709,9 @@ impl QpackDecoder {
                 let name = self.lookup_name_ref(idx, t_static, base, req_insert_count)?;
                 let (value, np) = read_string(block, pos, 7)?;
                 pos = np;
+                charge_field(&mut used, max, name, &value)?;
                 fields.push(HeaderField {
-                    name,
+                    name: name.to_vec(),
                     value,
                     sensitive,
                 });
@@ -668,6 +722,7 @@ impl QpackDecoder {
                 pos = np;
                 let (value, np) = read_string(block, pos, 7)?;
                 pos = np;
+                charge_field(&mut used, max, &name, &value)?;
                 fields.push(HeaderField {
                     name,
                     value,
@@ -679,7 +734,8 @@ impl QpackDecoder {
                 pos = np;
                 let abs = DynamicTable::post_base_to_absolute(base, idx).ok_or(Error::Corrupt)?;
                 let (n, v) = self.lookup_dynamic_abs(abs, req_insert_count)?;
-                fields.push(HeaderField::new(n.as_slice(), v.as_slice()));
+                charge_field(&mut used, max, n, v)?;
+                fields.push(HeaderField::new(n, v));
             } else {
                 // §4.5.5 Literal Field Line with Post-Base Name Reference:
                 // 0 0 0 0 N idx(3+).
@@ -690,8 +746,9 @@ impl QpackDecoder {
                 let (n, _) = self.lookup_dynamic_abs(abs, req_insert_count)?;
                 let (value, np) = read_string(block, pos, 7)?;
                 pos = np;
+                charge_field(&mut used, max, n, &value)?;
                 fields.push(HeaderField {
-                    name: n,
+                    name: n.to_vec(),
                     value,
                     sensitive,
                 });
@@ -756,10 +813,9 @@ impl QpackDecoder {
         t_static: bool,
         base: usize,
         req_insert_count: usize,
-    ) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    ) -> Result<(&[u8], &[u8]), Error> {
         if t_static {
-            let (n, v) = static_table::get(idx).ok_or(Error::Corrupt)?;
-            Ok((n.to_vec(), v.to_vec()))
+            static_table::get(idx).ok_or(Error::Corrupt)
         } else {
             let abs = DynamicTable::field_relative_to_absolute(base, idx).ok_or(Error::Corrupt)?;
             self.lookup_dynamic_abs(abs, req_insert_count)
@@ -773,10 +829,10 @@ impl QpackDecoder {
         t_static: bool,
         base: usize,
         req_insert_count: usize,
-    ) -> Result<Vec<u8>, Error> {
+    ) -> Result<&[u8], Error> {
         if t_static {
             let (n, _) = static_table::get(idx).ok_or(Error::Corrupt)?;
-            Ok(n.to_vec())
+            Ok(n)
         } else {
             let abs = DynamicTable::field_relative_to_absolute(base, idx).ok_or(Error::Corrupt)?;
             Ok(self.lookup_dynamic_abs(abs, req_insert_count)?.0)
@@ -790,12 +846,11 @@ impl QpackDecoder {
         &self,
         abs: usize,
         req_insert_count: usize,
-    ) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    ) -> Result<(&[u8], &[u8]), Error> {
         if abs >= req_insert_count {
             return Err(Error::Corrupt);
         }
-        let (n, v) = self.table.get_absolute(abs).ok_or(Error::Corrupt)?;
-        Ok((n.to_vec(), v.to_vec()))
+        self.table.get_absolute(abs).ok_or(Error::Corrupt)
     }
 
     /// Current Insert Count (entries inserted via the encoder stream).

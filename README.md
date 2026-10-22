@@ -104,7 +104,10 @@ HPACK and QPACK are HTTP header-compression codecs, not byte-stream codecs:
 they operate on `(name, value)` header lists with per-connection dynamic-table
 state, so they live behind their own `compcol::hpack` / `compcol::qpack` APIs.
 The §5.2 string Huffman primitive is also exposed as the `Http2Huffman` codec
-(name `h2-huffman`) through the uniform trait surface; QPACK reuses it. The
+(name `h2-huffman`) through the uniform trait surface; QPACK reuses it. Both
+decoders cap the decoded size of each header block (`with_limits`, in the
+RFC's name + value + 32 units) and stop with `Error::OutputLimitExceeded`, so
+a block of one-byte dynamic-table references can't expand ~4000× in memory. The
 `huffman` / `rangecoder` / `mtf` / `bwt` features expose standalone
 building-block codecs (entropy coding and reversible transforms) that can be
 composed into a custom pipeline.

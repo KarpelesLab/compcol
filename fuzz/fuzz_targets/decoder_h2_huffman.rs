@@ -12,7 +12,7 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     // HPACK header block: bounded table so a hostile size update can't grow
     // state without limit.
-    let mut dec = HpackDecoder::with_max_table_size(4096);
+    let mut dec = HpackDecoder::with_limits(4096, 64 * 1024);
     let _ = dec.decode(data);
 
     // The §5.2 Huffman string primitive on its own.
