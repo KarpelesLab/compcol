@@ -172,6 +172,15 @@ fn pipe_round_trip_gzip() {
 }
 
 #[test]
+#[cfg(all(
+    feature = "bzip2",
+    feature = "gzip",
+    feature = "xz",
+    feature = "zstd",
+    feature = "lzma",
+    feature = "lz4",
+    feature = "brotli"
+))]
 fn pipe_decode_drains_internal_block_buffer() {
     // Regression: a highly-compressible large input decodes to far more than
     // one output-buffer's worth. Block-buffering decoders (notably bzip2)
