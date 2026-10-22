@@ -11,6 +11,15 @@
 extern crate alloc;
 use alloc::vec::Vec;
 
+/// Saved [`BitReader`] position (see [`BitReader::save`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BitState {
+    byte_pos: usize,
+    acc: u32,
+    nbits: u32,
+    consumed_bits: u64,
+}
+
 /// MSB-first bit reader over a fully-buffered input slice.
 pub struct BitReader<'a> {
     data: &'a [u8],
@@ -35,6 +44,30 @@ impl<'a> BitReader<'a> {
             nbits: 0,
             avail_bits: (data.len() as u64) * 8,
             consumed_bits: 0,
+        }
+    }
+
+    /// Re-create a reader over `data` positioned where [`save`](Self::save)
+    /// left a previous reader over the same `data`. Lets a decoder suspend
+    /// mid-stream without holding a borrow of its own input buffer.
+    pub fn resume(data: &'a [u8], st: BitState) -> Self {
+        Self {
+            data,
+            byte_pos: st.byte_pos,
+            acc: st.acc,
+            nbits: st.nbits,
+            avail_bits: (data.len() as u64) * 8,
+            consumed_bits: st.consumed_bits,
+        }
+    }
+
+    /// Snapshot the read position, for [`resume`](Self::resume).
+    pub fn save(&self) -> BitState {
+        BitState {
+            byte_pos: self.byte_pos,
+            acc: self.acc,
+            nbits: self.nbits,
+            consumed_bits: self.consumed_bits,
         }
     }
 

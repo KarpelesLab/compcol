@@ -25,7 +25,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::lha::bits::{BitReader, BitWriter};
+use crate::lha::bits::{BitReader, BitState, BitWriter};
 use crate::lha::huffman::{HuffTable, assign_lengths, lengths_to_codes};
 
 // ─── format constants ──────────────────────────────────────────────────
@@ -389,154 +389,196 @@ fn read_offset_code(br: &mut BitReader<'_>, table: &HuffTable) -> Result<usize, 
 
 // ─── decoder ─────────────────────────────────────────────────────────────
 
-/// Decode an lh4/5/6/7 stream (after the 4-byte length header has been
-/// stripped) of declared length `expected` into a fresh `Vec<u8>`.
+/// Resumable `lh4`/`lh5`/`lh6`/`lh7` decoder over a fully buffered payload.
 ///
-/// Bounds output to `expected` bytes (decompression-bomb safe) and never
-/// panics on crafted input.
-/// Decode an `lh4`/`lh5`/`lh6`/`lh7` payload.
+/// The input must be complete before decoding starts (the stream has no
+/// end marker other than running out of bits at a block boundary), but the
+/// *output* is produced incrementally into caller buffers: a block can
+/// expand ~2.5 million-fold (65535 zero-bit codes of 256-byte matches), so
+/// materialising it would let a few hundred input bytes allocate gigabytes
+/// before the caller (or a [`LimitedDecoder`](crate::limit::LimitedDecoder))
+/// sees a single byte.
 ///
 /// `expected` is the uncompressed length if known out of band:
 /// - `Some(n)`: stop after exactly `n` bytes (never reads trailing padding).
 /// - `None`: stream-terminated — decode whole blocks until the input is
 ///   exhausted at a block boundary (the next 16-bit block header can't be
-///   read). Each block is self-counted, so this reproduces the input without
-///   a declared length.
-pub fn decode_payload(
-    payload: &[u8],
-    expected: Option<usize>,
+///   read).
+pub(crate) struct StaticDecoder {
     params: Params,
-) -> Result<Vec<u8>, Error> {
-    let mut out: Vec<u8> = Vec::with_capacity(expected.unwrap_or(0).min(1 << 20));
-    if expected == Some(0) {
-        return Ok(out);
+    expected: Option<usize>,
+    /// Bytes produced so far.
+    produced: usize,
+    ring: Vec<u8>,
+    ring_pos: usize,
+    /// Saved bit-reader position into the payload.
+    bits: BitState,
+    /// Codes still to decode in the current block (0 = read a block header).
+    block_left: usize,
+    /// Current block's C (literal/length) and position tables.
+    tables: Option<(HuffTable, HuffTable)>,
+    /// Bytes of the current match not yet emitted, and their ring source.
+    copy_left: usize,
+    copy_src: usize,
+    done: bool,
+}
+
+impl core::fmt::Debug for StaticDecoder {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StaticDecoder")
+            .field("expected", &self.expected)
+            .field("produced", &self.produced)
+            .field("done", &self.done)
+            .finish_non_exhaustive()
     }
-    let ring_size = params.ring_size;
-    let mut ring = vec![b' '; ring_size];
-    let mut ring_pos = 0usize;
+}
 
-    let mut br = BitReader::new(payload);
-
-    loop {
-        if let Some(n) = expected
-            && out.len() >= n
-        {
-            break;
+impl StaticDecoder {
+    pub(crate) fn new(params: Params, expected: Option<usize>) -> Self {
+        Self {
+            params,
+            expected,
+            produced: 0,
+            ring: vec![b' '; params.ring_size],
+            ring_pos: 0,
+            bits: BitState::default(),
+            block_left: 0,
+            tables: None,
+            copy_left: 0,
+            copy_src: 0,
+            done: expected == Some(0),
         }
+    }
 
-        // Start a new block.
-        let block_codes = br.get_bits(16) as usize;
-        if br.overran() {
-            // Ran out of input at a block boundary. With a declared length
-            // that means the stream was truncated; without one it's the clean
-            // end of a stream-terminated payload.
-            return match expected {
-                Some(_) => Err(Error::UnexpectedEnd),
-                None => Ok(out),
-            };
-        }
-        if block_codes == 0 {
-            // A zero-length block makes no progress; the stream is malformed.
-            return Err(Error::Corrupt);
-        }
+    /// True once the whole stream has been decoded and emitted.
+    pub(crate) fn is_done(&self) -> bool {
+        self.done
+    }
 
-        let temp = read_temp_table(&mut br)?;
-        let c_lens = read_c_lengths(&mut br, &temp)?;
-        let c_table = build_c_table(&c_lens)?;
-        let p_table = read_position_table(&mut br, params.np, params.pbit)?;
+    /// Decode the next bytes of `payload` (the same complete buffer on every
+    /// call) into `out`. Returns the byte count written; fewer than
+    /// `out.len()` only once [`is_done`](Self::is_done).
+    pub(crate) fn decode(&mut self, payload: &[u8], out: &mut [u8]) -> Result<usize, Error> {
+        let mut br = BitReader::resume(payload, self.bits);
+        let r = self.run(&mut br, out);
+        self.bits = br.save();
+        r
+    }
 
-        let mut remaining = block_codes;
-        while remaining > 0 {
-            if let Some(n) = expected
-                && out.len() >= n
-            {
-                break;
+    fn run(&mut self, br: &mut BitReader<'_>, out: &mut [u8]) -> Result<usize, Error> {
+        let ring_size = self.params.ring_size;
+        let mask = ring_size - 1;
+        let mut w = 0usize;
+        loop {
+            if self.copy_left > 0 {
+                let n = self.copy_left.min(out.len() - w);
+                for slot in &mut out[w..w + n] {
+                    let b = self.ring[self.copy_src];
+                    *slot = b;
+                    self.ring[self.ring_pos] = b;
+                    self.ring_pos = (self.ring_pos + 1) & mask;
+                    self.copy_src = (self.copy_src + 1) & mask;
+                }
+                w += n;
+                self.produced += n;
+                self.copy_left -= n;
+                if self.copy_left > 0 {
+                    return Ok(w);
+                }
             }
-            let code = c_table.decode(&mut br)? as usize;
+            if self.done {
+                return Ok(w);
+            }
+            if let Some(n) = self.expected
+                && self.produced >= n
+            {
+                self.done = true;
+                return Ok(w);
+            }
+            if w == out.len() {
+                return Ok(w);
+            }
+
+            if self.block_left == 0 {
+                // Start a new block.
+                let block_codes = br.get_bits(16) as usize;
+                if br.overran() {
+                    // Ran out of input at a block boundary. With a declared
+                    // length that means the stream was truncated; without one
+                    // it's the clean end of a stream-terminated payload.
+                    return match self.expected {
+                        Some(_) => Err(Error::UnexpectedEnd),
+                        None => {
+                            self.done = true;
+                            Ok(w)
+                        }
+                    };
+                }
+                if block_codes == 0 {
+                    // A zero-length block makes no progress; malformed.
+                    return Err(Error::Corrupt);
+                }
+                let temp = read_temp_table(br)?;
+                let c_lens = read_c_lengths(br, &temp)?;
+                let c_table = build_c_table(&c_lens)?;
+                let p_table = read_position_table(br, self.params.np, self.params.pbit)?;
+                self.tables = Some((c_table, p_table));
+                self.block_left = block_codes;
+            }
+
+            let (c_table, p_table) = self.tables.as_ref().ok_or(Error::Corrupt)?;
+            let code = c_table.decode(br)? as usize;
             if br.overran() {
                 return Err(Error::UnexpectedEnd);
             }
+            self.block_left -= 1;
             if code < 256 {
                 // Literal.
-                out.push(code as u8);
-                ring[ring_pos] = code as u8;
-                ring_pos += 1;
-                if ring_pos == ring_size {
-                    ring_pos = 0;
-                }
+                out[w] = code as u8;
+                w += 1;
+                self.produced += 1;
+                self.ring[self.ring_pos] = code as u8;
+                self.ring_pos = (self.ring_pos + 1) & mask;
             } else {
                 let count = code - 256 + MIN_MATCH;
                 if count > MAX_MATCH {
                     return Err(Error::Corrupt);
                 }
-                let offset = read_offset_code(&mut br, &p_table)?;
+                let offset = read_offset_code(br, p_table)?;
                 if br.overran() {
                     return Err(Error::UnexpectedEnd);
                 }
                 if offset >= ring_size {
                     return Err(Error::InvalidDistance);
                 }
-                let limit = expected.unwrap_or(usize::MAX);
-                // Clamp the run to the declared output length.
-                let count = count.min(limit.saturating_sub(out.len()));
-                let mut src = (ring_pos + ring_size - offset - 1) % ring_size;
-                // Reserve output once so the per-byte push can't reallocate.
-                out.reserve(count);
-                if offset + 1 >= count {
-                    // Non-overlapping match: source and destination regions are
-                    // disjoint, so copy in at most two contiguous ring segments
-                    // (split only where src or dst wraps the ring). Each segment
-                    // is a straight-line memcpy-style loop with no per-byte
-                    // wrap test.
-                    let mut done = 0usize;
-                    while done < count {
-                        let run = (count - done)
-                            .min(ring_size - src)
-                            .min(ring_size - ring_pos);
-                        // Copy `run` bytes ring[src..] -> out and -> ring[dst..].
-                        for k in 0..run {
-                            let b = ring[src + k];
-                            out.push(b);
-                            ring[ring_pos + k] = b;
-                        }
-                        src += run;
-                        if src == ring_size {
-                            src = 0;
-                        }
-                        ring_pos += run;
-                        if ring_pos == ring_size {
-                            ring_pos = 0;
-                        }
-                        done += run;
-                    }
-                } else if offset == 0 {
-                    // Single-byte run (distance 1): the whole match is one
-                    // repeated byte. Fill directly instead of chasing the ring.
-                    let b = ring[src];
-                    for _ in 0..count {
-                        out.push(b);
-                        ring[ring_pos] = b;
-                        ring_pos += 1;
-                        if ring_pos == ring_size {
-                            ring_pos = 0;
-                        }
-                    }
-                } else {
-                    // Overlapping match (offset+1 < count): each written byte
-                    // feeds a later read, so walk byte-by-byte.
-                    for _ in 0..count {
-                        let b = ring[src];
-                        out.push(b);
-                        ring[ring_pos] = b;
-                        src = (src + 1) % ring_size;
-                        ring_pos = (ring_pos + 1) % ring_size;
-                    }
-                }
+                // Clamp the run to the declared output length; the copy
+                // itself happens at the top of the loop, byte by byte (each
+                // written byte may feed a later read when the match
+                // overlaps itself).
+                let limit = self.expected.unwrap_or(usize::MAX);
+                self.copy_left = count.min(limit.saturating_sub(self.produced));
+                self.copy_src = (self.ring_pos + ring_size - offset - 1) & mask;
             }
-            remaining -= 1;
         }
     }
+}
 
+/// Decode a complete `lh4`/`lh5`/`lh6`/`lh7` payload into a fresh `Vec<u8>`
+/// (see [`StaticDecoder`] for the meaning of `expected`). Never panics on
+/// crafted input; the output is only bounded by `expected`, so prefer the
+/// streaming [`Decoder`](super::Decoder) for untrusted input.
+pub fn decode_payload(
+    payload: &[u8],
+    expected: Option<usize>,
+    params: Params,
+) -> Result<Vec<u8>, Error> {
+    let mut out: Vec<u8> = Vec::with_capacity(expected.unwrap_or(0).min(1 << 20));
+    let mut dec = StaticDecoder::new(params, expected);
+    let mut buf = vec![0u8; 64 * 1024];
+    while !dec.is_done() {
+        let n = dec.decode(payload, &mut buf)?;
+        out.extend_from_slice(&buf[..n]);
+    }
     Ok(out)
 }
 
