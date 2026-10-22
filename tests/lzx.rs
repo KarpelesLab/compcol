@@ -609,6 +609,90 @@ fn cab_frame_boundary_inside_uncompressed_word() {
     assert_eq!(decode_all_ways(&w.framed(16, total)), want);
 }
 
+/// Verbatim block coding `data` as literals with the given literal code
+/// lengths (first block, so every pretree delta is taken from 0). Pretree:
+/// delta symbol 0 at 1 bit, symbols 1..=16 at 5 bits.
+fn put_verbatim_with_lens(w: &mut BitW, window_bits: u8, lens: &[u8; 256], data: &[u8]) {
+    let slots = [30u32, 32, 34, 36, 38, 42, 50][(window_bits - 15) as usize];
+    w.put(3, 1);
+    w.put(24, data.len() as u32);
+    let pretree = |w: &mut BitW| {
+        for sym in 0..20 {
+            w.put(
+                4,
+                [1, 5][usize::from((1..=16).contains(&sym))] * u32::from(sym <= 16),
+            );
+        }
+    };
+    // Canonical pretree codes: sym 0 = "0", sym k (1..=16) = "1" + (k-1) in 4 bits.
+    let delta = |w: &mut BitW, len: u8| {
+        let sym = (17 - u32::from(len)) % 17;
+        if sym == 0 {
+            w.put(1, 0);
+        } else {
+            w.put(5, 0b10000 | (sym - 1));
+        }
+    };
+    pretree(w);
+    for &l in lens {
+        delta(w, l);
+    }
+    pretree(w);
+    for _ in 0..slots * 8 {
+        delta(w, 0);
+    }
+    pretree(w);
+    for _ in 0..249 {
+        delta(w, 0);
+    }
+    // Canonical literal codes.
+    let mut count = [0u32; 17];
+    for &l in lens {
+        count[usize::from(l)] += 1;
+    }
+    count[0] = 0;
+    let mut next = [0u32; 17];
+    let mut code = 0;
+    for l in 1..17 {
+        code = (code + count[l - 1]) << 1;
+        next[l] = code;
+    }
+    let mut codes = [0u32; 256];
+    for (s, &l) in lens.iter().enumerate() {
+        if l > 0 {
+            codes[s] = next[usize::from(l)];
+            next[usize::from(l)] += 1;
+        }
+    }
+    for &b in data {
+        w.put(u32::from(lens[usize::from(b)]), codes[usize::from(b)]);
+    }
+}
+
+/// A tree's longest code can exceed the bits left in the stream: the final
+/// symbols here are 1-bit codes but the tree's max length is 16, so near the
+/// end fewer than 16 bits remain. The decoder used to wait for bits that
+/// never come and `finish` failed with `UnexpectedEnd`; libmspack pads the
+/// end of input with zeros, as the decoder now does on `finish`.
+#[test]
+fn cab_long_max_code_near_end_of_stream() {
+    let mut lens = [0u8; 256];
+    for (k, l) in lens.iter_mut().enumerate().take(16) {
+        *l = k as u8 + 1;
+    }
+    lens[16] = 16;
+    for n in [1usize, 5, 11, 100, 1003] {
+        let data: Vec<u8> = (0..n).map(|i| if i % 7 == 3 { 5 } else { 0 }).collect();
+        let mut w = BitW::new();
+        w.put(1, 0);
+        put_verbatim_with_lens(&mut w, 16, &lens, &data);
+        if w.n != 0 {
+            w.put(16 - w.n, 0);
+        }
+        assert_eq!(decode_all_ways(&w.framed(16, n)), data, "n={n}");
+    }
+}
+
 // ─── factory ─────────────────────────────────────────────────────────────
 
 #[cfg(feature = "factory")]
