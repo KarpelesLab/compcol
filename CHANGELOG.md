@@ -7,6 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.4](https://github.com/KarpelesLab/compcol/compare/v0.7.3...v0.7.4) - 2026-10-22
+
+### Added
+
+- *(zstd)* accept libzstd's negative "fast" levels
+- *(zstd)* configurable window limit, bounded history, Frame_Content_Size
+
+### Fixed
+
+- *(xz,bzip2)* let finish drain decoded bytes before reporting truncation
+- *(xz)* decode Delta and BCJ filter chains before LZMA2
+- *(xz)* decode concatenated Streams and Stream Padding
+- *(xz)* verify CRC64 and SHA-256 Block Checks
+- *(bzip2)* decoder stops at the stream end and accepts what libbzip2 does
+- *(bzip2)* make encoder output byte-identical to libbzip2, add flush
+- *(brotli)* report StreamEnd from decode and hand back trailing bytes
+- *(brotli)* accept a complex prefix code with a single code-length code
+- *(brotli)* decode a whole stream handed over in one call in linear time
+- *(brotli)* stop quadratic memmoves when one encode call holds many blocks
+- *(gzip)* report StreamEnd when non-gzip bytes follow a member
+- *(brotli)* build without std (replace std-only f32::log2)
+- *(lzma)* make flush encode buffered input and emit settled bytes
+- *(lzma2)* make flush emit pending input as complete chunks
+- *(xz)* make flush emit pending input as complete LZMA2 chunks
+- *(zstd)* make flush emit pending input
+- *(quantum)* keep an odd final input byte when padding at EOF
+- *(amiga_lzx)* accept an odd-sized uncompressed block before another block
+- *(lzx)* close the frame when a match ends exactly on its boundary
+- *(quantum)* allow >16-bit runs in read_many_bits' peek
+- *(lzx)* zero-pad past end of input so the last symbols decode
+- *(lzx)* accept odd-sized uncompressed blocks; split words at frame ends
+- *(lzx)* skip a full pad word before a word-aligned uncompressed block
+- *(lzx)* realign the bitstream to 16 bits at each 32 KiB frame boundary
+- *(lzx)* measure E8 curpos at the 0xE8 byte and translate whole frames
+- *(bzip2)* space out speculative block re-parses to stop quadratic decode
+- *(bzip2)* decode concatenated streams and ignore trailing garbage
+- *(huffman)* bound declared length by payload bits before allocating
+- *(lzma,lzma2)* keep the match finder working past 4 GiB of input
+- *(lzma)* stop the .lzma encoder retaining all compressed output
+- *(bcj2)* reject out_len larger than the input streams before allocating
+- *(bcj)* implement the real xz/7-Zip RISC-V filter
+- *(bcj)* convert ARM64 ADRP like xz (+/-512 MiB only, sign-extended)
+- *(bcj)* make the x86 filter match xz's prev-mask handling
+- *(deflate,deflate64,zlib)* drain pending output through finish
+- *(lzss)* let finish drain a literal or match paused on a full buffer
+- *(lznt1)* use the MS-XCA offset/length split, not its mirror image
+- *(xpress_huffman)* reject streams longer than the u32 length header
+- *(xpress_huffman)* let a match run past the 64 KiB block end
+- *(lzs)* cap match distance at 2047 so it fits the 11-bit offset field
+- *(arc_squeeze)* finish no longer fails when output fills exactly
+- *(io,tokio_io)* make EncoderWriter flush sync-flush the encoder
+- *(io)* keep writer output staged when the inner write fails
+- *(tokio_io)* no WriteZero on zero-input writes; deliver pending decoder output
+- *(io)* don't replay buffered input when the inner reader errors
+- *(lha)* stream lh4-lh7 decoder output instead of materialising it
+- *(lha)* send an unused position table in single-symbol form
+- *(lha)* use the reference lh6/lh7 dictionary sizes and position alphabets
+- *(rar5)* document that reset clears registered file boundaries
+- *(rar5)* drop a filter that starts inside already-emitted output
+- *(rar5)* yield decoded output instead of buffering a whole block
+- *(rar5)* restore the declared unpack size on reset
+- *(rar2)* cap the output preallocation taken from the unpack size
+- *(rar2)* push the repeat-last-match distance into the old-offset ring
+- *(lzfse)* do not consume bytes past the end-of-stream marker
+- *(xz)* do not consume bytes past the Stream Footer
+- *(lzfse)* cap bvx2 commands and literals per block
+- *(lzfse)* decode real bvx2 streams
+- *(zstd)* recognise Skippable_Frame magics
+- *(traits)* default discard_output stops at and reports the stream end
+- *(embed)* decode to the end of the stream into an exact-size buffer
+- *(deflate,deflate64)* keep the preset dictionary across reset
+- *(docs)* deprecations ship in 0.7.4; drop redundant embed::flate link targets
+- *(hpack,qpack)* cap decoded header size to stop reference amplification
+- *(lha)* split static-Huffman blocks at 65535 tokens; cap lh4 distances
+- *(bzip2, vec)* drain pending decoded output after all input is consumed
+- *(zstd)* implicit last Huffman weight when explicit weights sum to a power of two
+
+### Other
+
+- derive the alloc-only build's feature list from `all`
+- *(lzma,lha)* fix the .lzma dictionary note and a private doc link
+- *(cli)* gate the block-buffer drain test on the codecs it drives
+- add an MSRV job that checks on the rust-version toolchain
+- raise MSRV to Rust 1.95
+
 ## [0.7.3](https://github.com/KarpelesLab/compcol/compare/v0.7.2...v0.7.3) - 2026-10-18
 
 ### Added
