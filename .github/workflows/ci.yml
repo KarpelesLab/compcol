@@ -86,6 +86,34 @@ jobs:
       - name: Test embed deflate family without alloc
         run: cargo test --no-default-features --features embed,deflate,zlib,gzip --test embed
 
+  msrv:
+    # Builds on the oldest supported toolchain, read from `rust-version` in
+    # Cargo.toml so the job follows MSRV bumps without editing this file.
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Read MSRV
+        id: msrv
+        run: echo "version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: Check (all features, all targets)
+        run: cargo check --all-targets --all-features
+
+      - name: Check bare no_std (no default features, no alloc)
+        run: cargo check --no-default-features
+
   narrow_clippy:
     # Catches dead-code lint regressions in the shared bits/checksum/huffman
     # modules when only a non-deflate-family feature is enabled. (We hit this
