@@ -594,6 +594,80 @@ fn encoder_many_blocks_in_one_call_matches_chunked() {
     }
 }
 
+/// Hand-built stream whose literal prefix code uses a single non-zero
+/// code-length code (RFC 7932 §3.5: that code then has zero bits, so every
+/// literal gets length 8). The reference encoder emits this for meta-blocks
+/// whose literals are spread evenly over all 256 values; the decoder used
+/// to reject it as an incomplete code-length code.
+fn single_code_length_code_stream(text: &[u8]) -> Vec<u8> {
+    struct W {
+        out: Vec<u8>,
+        acc: u64,
+        n: u32,
+    }
+    impl W {
+        fn put(&mut self, v: u32, bits: u32) {
+            self.acc |= (v as u64) << self.n;
+            self.n += bits;
+            while self.n >= 8 {
+                self.out.push(self.acc as u8);
+                self.acc >>= 8;
+                self.n -= 8;
+            }
+        }
+    }
+    assert!((1..=5).contains(&text.len()));
+    let mut w = W {
+        out: Vec::new(),
+        acc: 0,
+        n: 0,
+    };
+    w.put(0, 1); // WBITS = 16
+    w.put(1, 1); // ISLAST
+    w.put(0, 1); // ISLASTEMPTY = 0
+    w.put(0, 2); // MNIBBLES = 4
+    w.put(text.len() as u32 - 1, 16); // MLEN - 1
+    w.put(0, 3); // NBLTYPESL/I/D = 1
+    w.put(0, 2); // NPOSTFIX
+    w.put(0, 4); // NDIRECT
+    w.put(0, 2); // CMODE = LSB6
+    w.put(0, 2); // NTREESL = 1, NTREESD = 1
+    // Literal code: complex, HSKIP = 0. Code-length code lengths in the
+    // order 1,2,3,4,0,5,17,6,16,7,8,9..15 — only symbol 8 is non-zero.
+    w.put(0, 2);
+    for i in 0..18 {
+        if i == 10 {
+            w.put(0b10, 2); // value 3 (fixed code `2`, 2 bits)
+        } else {
+            w.put(0, 2); // value 0
+        }
+    }
+    // Insert-and-copy code: simple, one symbol: insert len, copy 2.
+    w.put(1, 2);
+    w.put(0, 2);
+    w.put((text.len() as u32) << 3, 10);
+    // Distance code: simple, one symbol (0).
+    w.put(1, 2);
+    w.put(0, 2);
+    w.put(0, 6);
+    // The command, then the literals: all codes are 8 bits long, so a
+    // literal's code is its value, sent most-significant bit first.
+    for &b in text {
+        w.put(b.reverse_bits() as u32, 8);
+    }
+    if w.n > 0 {
+        w.put(0, 8 - w.n);
+    }
+    w.out
+}
+
+#[test]
+fn decoder_accepts_single_code_length_code() {
+    let stream = single_code_length_code_stream(b"abc");
+    assert_eq!(decode_chunked(&stream, 1 << 10, 1 << 10).unwrap(), b"abc");
+    assert_eq!(decode_chunked(&stream, 1, 1).unwrap(), b"abc");
+}
+
 #[test]
 fn decoder_many_blocks_in_one_call() {
     // A whole multi-meta-block stream handed over in one `decode` call is
