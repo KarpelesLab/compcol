@@ -2308,7 +2308,21 @@ impl RawDecoder for Decoder {
                 written: p.written,
                 done: true,
             })
+        } else if output.is_empty() || p.written > 0 {
+            // Decoded bytes may still be waiting (a whole LZMA2 chunk can
+            // be up to 2 MiB): `finish` must stay drainable, so report "not
+            // done" and let the caller drain and call again. Failing here
+            // threw away bytes already written to `output` this call; the
+            // truncation is reported by the first call with nothing left
+            // to hand over.
+            Ok(RawProgress {
+                consumed: 0,
+                written: p.written,
+                done: false,
+            })
         } else {
+            // Not done, nothing left to hand over, and no input to advance
+            // with: the stream is truncated.
             Err(self.poison(Error::UnexpectedEnd))
         }
     }

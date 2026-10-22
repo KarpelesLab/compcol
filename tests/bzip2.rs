@@ -1204,3 +1204,44 @@ fn accepts_incomplete_and_oversubscribed_code_tables() {
         }
     }
 }
+
+/// `finish` on a truncated stream hands over every decoded byte before
+/// reporting `UnexpectedEnd`. The call that drained the last few bytes
+/// used to fail instead (its buffer was not full), dropping them.
+#[test]
+fn finish_hands_over_all_decoded_bytes_before_truncation() {
+    let plain = gen_words(250_000);
+    let stream = encode_level(&plain, 1);
+    // The first block is complete; the second is cut short.
+    let cut = &stream[..stream.len() - 200];
+    let mut lengths = Vec::new();
+    // Buffers smaller than a block: the one `decode` call below fills
+    // its buffer and leaves the rest of the first block pending.
+    for out_chunk in [1usize, 7, 4096] {
+        let mut dec = Decoder::new();
+        let mut buf = vec![0u8; out_chunk];
+        // One `decode` call, then `finish`, which must drain the first
+        // block in full before reporting the truncation.
+        let (p, _) = dec.decode(cut, &mut buf).unwrap();
+        let mut got = buf[..p.written].to_vec();
+        let err = loop {
+            match dec.finish(&mut buf) {
+                Ok((p, status)) => {
+                    assert_ne!(status, Status::StreamEnd);
+                    assert!(p.written > 0, "finish stalled");
+                    got.extend_from_slice(&buf[..p.written]);
+                }
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(err, Error::UnexpectedEnd);
+        assert!(
+            !got.is_empty() && plain.starts_with(&got),
+            "out_chunk {out_chunk}"
+        );
+        lengths.push(got.len());
+    }
+    // The first block, all of it, for every buffer size.
+    assert!(lengths.iter().all(|&l| l == lengths[0]), "{lengths:?}");
+    assert_eq!(lengths[0], 99_981);
+}
