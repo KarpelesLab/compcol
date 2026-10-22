@@ -590,7 +590,6 @@ fn encode_stream(input: &[u8]) -> Vec<u8> {
 /// Decode a self-delimiting Huffman stream back into the original bytes.
 fn decode_stream(input: &[u8]) -> Result<Vec<u8>, Error> {
     let (orig_len, vlen) = read_varint(input)?;
-    let orig_len = orig_len as usize;
     let mut rest = &input[vlen..];
 
     if orig_len == 0 {
@@ -601,6 +600,15 @@ fn decode_stream(input: &[u8]) -> Result<Vec<u8>, Error> {
     rest = &rest[consumed..];
 
     let table = CanonicalTable::from_lengths(&lengths)?;
+    // Every symbol costs at least one payload bit (the single-symbol case
+    // too: the encoder writes `ceil(len/8)` payload bytes), so a declared
+    // length beyond the payload's bit count is corrupt. Checked before
+    // allocating so a hostile header can't demand a huge buffer (or trip
+    // `capacity overflow`) from a few input bytes.
+    if orig_len > (rest.len() as u64).saturating_mul(8) {
+        return Err(Error::UnexpectedEnd);
+    }
+    let orig_len = orig_len as usize;
     let mut out = Vec::with_capacity(orig_len);
 
     // Degenerate single-symbol stream: every code is one bit, the symbol is
