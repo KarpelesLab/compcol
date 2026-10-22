@@ -762,6 +762,12 @@ impl RawDecoder for Decoder {
             }
             written += self.drain_emit(&mut output[written..]);
         }
+        // `output` may have filled exactly as `emit_buf` ran dry, with
+        // symbols still undecoded: decode ahead before judging the stream
+        // short of its EOS symbol.
+        if self.emit_head >= self.emit_buf.len() && !self.eos {
+            self.pump()?;
+        }
 
         if self.emit_head < self.emit_buf.len() {
             // More output owed; caller must drain and call again.
