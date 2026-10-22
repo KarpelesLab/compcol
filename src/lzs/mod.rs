@@ -39,7 +39,7 @@
 //!
 //! ### Sliding window
 //!
-//! The decompression history covers the last 2048 bytes (matching the
+//! The decompression history covers the last 2047 bytes (matching the
 //! 11-bit long-offset field). Minimum match length is 2; maximum is
 //! unbounded thanks to the chained-`1111` length code.
 //!
@@ -73,8 +73,8 @@ pub use decoder::Decoder;
 pub use encoder::Encoder;
 
 /// Maximum back-reference distance, in bytes. The 11-bit long-offset
-/// field caps it at 2 KiB.
-pub const MAX_DISTANCE: usize = 2048;
+/// field caps it at 2047 (offset 0 is not a valid distance).
+pub const MAX_DISTANCE: usize = 2047;
 
 /// Minimum match length the encoder will emit.
 pub const MIN_MATCH: usize = 2;
