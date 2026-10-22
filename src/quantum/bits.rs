@@ -93,9 +93,10 @@ impl BitReader {
     }
 
     /// Look at the top `nbits` bits without removing them. Requires
-    /// `bits_left >= nbits`. `nbits` must be 1..=16.
+    /// `bits_left >= nbits`. `nbits` must be 1..=32 (`read_many_bits` peeks
+    /// up to 19 at once for the 17..=19-bit offset footers).
     pub(crate) fn peek_bits(&self, nbits: u32) -> u32 {
-        debug_assert!((1..=16).contains(&nbits));
+        debug_assert!((1..=BITBUF_WIDTH).contains(&nbits));
         self.bit_buffer >> (BITBUF_WIDTH - nbits)
     }
 
@@ -133,8 +134,8 @@ impl BitReader {
                 self.read_bytes(buf)?;
             }
             let bitrun = self.bits_left.min(needed);
-            // Safe: bitrun is in 1..=16 (because bits_left was just topped up
-            // by 16 if it was ≤ 16, and we never request more than 32 total).
+            // bitrun is in 1..=32: bits_left was just topped up by 16 if it
+            // was ≤ 16, so a 17..=19-bit footer can be taken in one run.
             // Edge case: if bitrun == 0 we would loop forever. The top-up
             // above guarantees bits_left ≥ 1 going in.
             debug_assert!(bitrun >= 1);
@@ -192,6 +193,23 @@ mod tests {
         let mut br = BitReader::new();
         let v = br.read_many_bits(24, &buf).unwrap();
         assert_eq!(v, 0xAA_BB_CC);
+    }
+
+    /// A 17..=19-bit offset footer (window_bits 19..=21) read with 15..=16
+    /// bits already buffered is taken in one run of more than 16 bits. That
+    /// tripped `peek_bits`' old 1..=16 debug assertion, panicking debug
+    /// builds on valid large-window streams.
+    #[test]
+    fn read_many_takes_a_19_bit_run() {
+        let buf = [0b1101_0110, 0b0011_1001, 0b1010_0101, 0b1111_0000];
+        let mut br = BitReader::new();
+        assert_eq!(br.read_bits(1, &buf).unwrap(), 1);
+        // Next 19 bits: 101_0110 0011_1001 1010 (MSB-first).
+        assert_eq!(
+            br.read_many_bits(19, &buf).unwrap(),
+            0b101_0110_0011_1001_1010
+        );
+        assert_eq!(br.read_bits(4, &buf).unwrap(), 0b0101);
     }
 
     #[test]
