@@ -78,7 +78,7 @@ flag accept; *Ext* is what `factory::extension(name)` returns.
 | PKZIP Shrink (ZIP method 1) | `zip_shrink` | `zip-shrink` | `.shrunk` | `Unsupported` (decode-only) | full (dynamic LZW + partial clear; 4-byte length header) | reference-encoder fixtures, validated with Info-ZIP `unzip` |
 | PKZIP Reduce (ZIP methods 2–5) | `zip_reduce` | `zip-reduce` | `.reduce` | `Unsupported` (decode-only) | full (all four factors; 5-byte factor + length header) | hwzip reference fixtures |
 | PKZIP Implode (ZIP method 6) | `zip_implode` | `zip-implode` | `.implode` | `Unsupported` (decode-only) | full (4/8 KiB window × 2/3 Shannon–Fano trees; 5-byte flag + length header) | in-test fixture builder + golden fixture |
-| LHA / LZH (`-lh1-`/`-lh2-`/`-lh4-`/`-lh5-`/`-lh6-`/`-lh7-`) | `lha` | `lh1` … `lh7` | `.lzh` | full (lh1/lh2 adaptive Huffman; lh4/5/6/7 static Huffman) | full (clean-room from Okumura LZHUF / ar002) | own round-trip (no reference fixture) |
+| LHA / LZH (`-lh1-`/`-lh2-`/`-lh4-`/`-lh5-`/`-lh6-`/`-lh7-`) | `lha` | `lh1` … `lh7` | `.lzh` | full (lh1/lh2 adaptive Huffman; lh4/5/6/7 static Huffman) | full (clean-room from Okumura LZHUF / ar002) | encoder output verified by the `lha` CLI (LHa for UNIX) for every method; lh2 fixture |
 | BCJ branch filters (x86, ARM, ARMT, ARM64, PPC, SPARC, IA-64, RISC-V) | `bcj` | `bcj-<arch>` | `bcj-<arch>` | full (reversible filter) | full | round-trip identity (public-domain LZMA SDK transform) |
 | BCJ2 (7z 4-stream x86 filter) | `bcj2` | — | — | `bcj2::encode` (fn API) | `bcj2::decode` (fn API) | round-trip identity (LZMA SDK algorithm) |
 | Delta filter (distance 1..=256) | `delta` | `delta` | `delta` | full (reversible filter) | full | round-trip identity |
