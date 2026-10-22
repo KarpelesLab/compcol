@@ -108,6 +108,9 @@ pub struct Decoder {
     state: DecState,
     last_block: bool,
     poisoned: bool,
+    /// The configured preset dictionary (its last 64 KiB), kept so that
+    /// `reset` can seed the window with it again.
+    dictionary: Box<[u8]>,
 }
 
 impl Decoder {
@@ -140,13 +143,17 @@ impl Decoder {
             state: DecState::BlockHeader,
             last_block: false,
             poisoned: false,
+            dictionary: Box::default(),
         }
     }
 
     /// Build a decoder with the given [`DecoderConfig`].
     pub fn with_config(config: DecoderConfig) -> Self {
         let mut d = Self::new();
-        d.load_dictionary(&config.dictionary);
+        let start = config.dictionary.len().saturating_sub(WINDOW_SIZE);
+        let dictionary: Box<[u8]> = config.dictionary[start..].into();
+        d.load_dictionary(&dictionary);
+        d.dictionary = dictionary;
         d
     }
 
@@ -266,8 +273,11 @@ impl RawDecoder for Decoder {
 
     fn raw_reset(&mut self) {
         self.bit_reader.reset();
-        self.window_pos = 0;
-        self.window_size = 0;
+        // Configuration survives a reset: seed the window with the preset
+        // dictionary again (this also rewinds `window_pos`/`window_size`).
+        let dictionary = core::mem::take(&mut self.dictionary);
+        self.load_dictionary(&dictionary);
+        self.dictionary = dictionary;
         self.state = DecState::BlockHeader;
         self.last_block = false;
         self.poisoned = false;

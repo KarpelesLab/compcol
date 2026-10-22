@@ -734,6 +734,27 @@ fn deflate_decoder_preset_dictionary_decodes_cross_block_backref() {
     assert_eq!(out, expected);
 }
 
+/// `reset` keeps the configuration, preset dictionary included: a decoder
+/// built with one decodes the dictionary-referencing fixture again after a
+/// reset. (It used to come back with an empty window and fail with
+/// `InvalidDistance`.)
+#[cfg(not(feature = "embed"))]
+#[test]
+fn deflate_decoder_reset_keeps_preset_dictionary() {
+    let dictionary: Vec<u8> = b"the quick brown fox jumps over the lazy dog. ".to_vec();
+    let expected: &[u8] = b"the quick brown fox is quicker than the lazy dog!";
+    let encoded = hex("2bc1a238b3182204569c9887a2431100");
+
+    let mut dec = Decoder::with_config(DecoderConfig::default().with_dictionary(dictionary));
+    for round in 0..3 {
+        let mut buf = [0u8; 256];
+        let (p, status) = dec.decode(&encoded, &mut buf).unwrap();
+        assert_eq!(status, Status::StreamEnd, "round {round}");
+        assert_eq!(&buf[..p.written], expected, "round {round}");
+        dec.reset();
+    }
+}
+
 /// `reset_keep_window` re-arms the decoder for a fresh deflate stream
 /// while keeping the sliding window contents. Concretely: decode any
 /// stream that fills the window, then `reset_keep_window`, then decode
@@ -771,34 +792,6 @@ fn deflate_decoder_reset_keep_window_preserves_history_for_mszip() {
     dec.reset_keep_window();
     let out = drain_full(dec, &encoded).unwrap();
     assert_eq!(out, expected);
-}
-
-/// `reset` (the trait method) wipes the window; the same cross-block
-/// fixture must NOT decode after a full reset even if the decoder was
-/// primed with the right dictionary beforehand. Documents the contract
-/// difference between `reset` and `reset_keep_window`.
-// Preset dictionaries need the heap-backed decoder; the `embed` build has none.
-#[cfg(not(feature = "embed"))]
-#[test]
-fn deflate_decoder_full_reset_drops_dictionary() {
-    let dictionary: Vec<u8> = b"the quick brown fox jumps over the lazy dog. ".to_vec();
-    let encoded = hex("2bc1a238b3182204569c9887a2431100");
-
-    let mut dec =
-        Decoder::with_config(DecoderConfig::default().with_dictionary(dictionary.clone()));
-    let empty_block = [0x03u8, 0x00];
-    let mut buf = vec![0u8; 64];
-    let (_, _) = dec.decode(&empty_block, &mut buf).unwrap();
-    let (_, _) = dec.finish(&mut buf).unwrap();
-
-    // Full reset wipes the window. Subsequent decode of the fixture must
-    // fail because the back-refs go nowhere.
-    <Decoder as compcol::Decoder>::reset(&mut dec);
-    let err = drain_full(dec, &encoded).unwrap_err();
-    assert!(matches!(
-        err,
-        Error::Corrupt | Error::UnexpectedEnd | Error::InvalidDistance
-    ));
 }
 
 /// A preset dictionary longer than 32 KiB is silently truncated to its
