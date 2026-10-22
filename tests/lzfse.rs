@@ -510,6 +510,11 @@ fn lzfse_sample(n: usize) -> Vec<u8> {
 
 /// Decode with `in_chunk`-byte input slices and an `out_chunk`-byte buffer.
 fn decode_chunked(input: &[u8], in_chunk: usize, out_chunk: usize) -> Vec<u8> {
+    decode_chunked_consumed(input, in_chunk, out_chunk).0
+}
+
+/// [`decode_chunked`], also returning the total input reported consumed.
+fn decode_chunked_consumed(input: &[u8], in_chunk: usize, out_chunk: usize) -> (Vec<u8>, usize) {
     let mut dec = Lzfse::decoder();
     let mut out = Vec::new();
     let mut buf = vec![0u8; out_chunk];
@@ -520,9 +525,32 @@ fn decode_chunked(input: &[u8], in_chunk: usize, out_chunk: usize) -> Vec<u8> {
         pos += p.consumed;
         out.extend_from_slice(&buf[..p.written]);
         if status == Status::StreamEnd {
-            return out;
+            return (out, pos);
         }
         assert!(p.consumed > 0 || p.written > 0, "decoder stalled at {pos}");
+    }
+}
+
+/// Bytes after the `bvx$` end-of-stream marker belong to the caller:
+/// `decode` must not report them as consumed, whatever the chunking.
+#[test]
+fn trailing_bytes_after_eos_are_not_consumed() {
+    let fixture = include_bytes!("fixtures/lzfse/sample_400000.lzfse");
+    let mut stream = fixture.to_vec();
+    stream.extend_from_slice(b"NEXT-FILE-DATA");
+    for (in_chunk, out_chunk) in [
+        (1, 1 << 20),
+        (7, 333),
+        (stream.len(), 1 << 20),
+        (stream.len(), 1000),
+    ] {
+        let (out, consumed) = decode_chunked_consumed(&stream, in_chunk, out_chunk);
+        assert_eq!(out, lzfse_sample(400_000));
+        assert_eq!(
+            consumed,
+            fixture.len(),
+            "in_chunk={in_chunk} out_chunk={out_chunk}"
+        );
     }
 }
 
