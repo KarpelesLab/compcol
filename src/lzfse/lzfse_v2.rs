@@ -7,37 +7,22 @@
 //! so the `lzfse` decoder handles real compressed payloads here rather than
 //! only the `bvx-` (uncompressed) and `bvxn` (LZVN) block kinds.
 //!
-//! ## Validation & interop caveat
+//! ## Validation & interop
 //!
-//! There is **no Apple `lzfse` reference tool and no captured `bvx2`
-//! fixtures available in this build environment**, so correctness is gated
-//! by **round-trip against this crate's own spec-conformant v2 encoder**
-//! ([`encode_block`], `#[cfg(test)]`): we assert `decode(encode(x)) == x`
-//! over empty / small / text / repetitive / random / multi-block inputs,
-//! including inputs large enough to force a genuine FSE-coded block. The
-//! encoder builds FSE frequency tables from the L/M/D/LIT histograms with the
-//! standard quantized (nearest) normalization — producing **general,
-//! non-power-of-two frequencies** — FSE-encodes the interleaved literal and
-//! LMD streams in reverse, and packs the v2 header exactly per the documented
-//! wire layout. Round-trip tests deliberately include skewed, non-dyadic
-//! literal distributions and small (singleton) match-count histograms, plus
-//! one hand-frozen non-dyadic block decoded independently of the encoder, so
-//! a regression to a single bit-width per symbol would fail.
+//! The decoder follows Apple's reference decoder (`lzfse_decode_base.c`,
+//! `lzfse_fse.h`): FSE decode tables are filled **contiguously** per symbol
+//! with the general k/k-1 split (`fse_init_decoder_table`), the payload
+//! bit streams are read most-significant-bit first from the end, an L/M/D
+//! field is the state bits followed by the value's extra bits, every output
+//! literal is emitted by some command's `L` (the literal stream is padded to
+//! a multiple of four), and match distances may reach into earlier blocks.
 //!
-//! The FSE table construction ([`super::fse`]) now matches Apple's general
-//! `fse_init_decoder_table` (the **k/k-1 split**: a symbol's `f` spread slots
-//! are partitioned into a `k`-bit prefix and a `(k-1)`-bit suffix at the
-//! boundary `j0 = (2·n_states >> k) − f`), so arbitrary per-symbol
-//! frequencies are handled — not just power-of-two normalizations. The table
-//! *size* is always `2^L`; only the per-symbol frequencies are general.
-//!
-//! Interop with Apple-produced `bvx2` is therefore **best-effort but follows
-//! the real table-construction algorithm**: the decoder mirrors the
-//! documented format precisely (the same header layout, the same L/M/D
-//! base/extra-bit tables, the same frequency-table encoding, the same reverse
-//! FSE bit convention, and now the same general FSE table construction). It
-//! has still not been cross-checked against an actual Apple-produced stream
-//! in this environment, so full Apple-stream interop remains unverified here.
+//! `tests/lzfse.rs` decodes multi-block `bvx2` fixtures produced by an
+//! independent encoder (`lzfse_rust`, which is validated against Apple's
+//! reference library). Within the crate, the `#[cfg(test)]` encoder
+//! ([`encode_block`]) emits the same format and is used for round-trip
+//! tests over empty / small / text / repetitive / random / multi-block
+//! inputs with skewed, non-dyadic frequency tables.
 //!
 //! ## Wire format reference (v2 header, authoritative)
 //!
@@ -49,15 +34,15 @@
 //!   - `[0..20)`  `n_literals`
 //!   - `[20..40)` `n_literal_payload_bytes`
 //!   - `[40..60)` `n_matches`
-//!   - `[60..63)` `literal_bits` (FSE final-byte stub width for the literal
-//!     stream)
+//!   - `[60..63)` `literal_bits` (`7 -` the number of unused high bits in
+//!     the literal stream's last byte)
 //! - `packed_fields[1]: u64`
 //!   - `[0..10)`  `literal_state[0]`
 //!   - `[10..20)` `literal_state[1]`
 //!   - `[20..30)` `literal_state[2]`
 //!   - `[30..40)` `literal_state[3]`
 //!   - `[40..60)` `n_lmd_payload_bytes`
-//!   - `[60..63)` `lmd_bits` (FSE stub width for the LMD stream)
+//!   - `[60..63)` `lmd_bits` (same, for the LMD stream)
 //! - `packed_fields[2]: u64`
 //!   - `[0..32)`  `header_size` (bytes, magic..end of freq tables)
 //!   - `[32..42)` `l_state`
@@ -344,6 +329,9 @@ fn decode_freq_at(
 /// Decoded output is appended to `out`. Returns the number of bytes consumed
 /// from `block` (header + payload).
 ///
+/// Bytes already in `out` are the stream's earlier output: as in Apple's
+/// decoder, a match distance may reach back into previous blocks.
+///
 /// `out_cap_hint` bounds the up-front output reservation against a hostile
 /// `n_raw_bytes`; the real `n_raw_bytes` bound is still enforced exactly.
 pub(crate) fn decode_block(
@@ -424,7 +412,9 @@ pub(crate) fn decode_block(
         if d_val != 0 {
             prev_d = d_val;
         }
-        if l_val < 0 || m_val < 0 || d <= 0 {
+        // A literal-only command (M == 0, e.g. a block's final one) need not
+        // carry a usable distance.
+        if l_val < 0 || m_val < 0 || (m_val > 0 && d <= 0) {
             return Err(Error::Corrupt);
         }
         let l = l_val as usize;
@@ -441,9 +431,13 @@ pub(crate) fn decode_block(
         out.extend_from_slice(&literals[lit_pos..lit_pos + l]);
         lit_pos += l;
 
-        // Copy an M-byte match at distance d (may overlap).
-        let cur = out.len() - start_len;
-        if d > cur {
+        // Copy an M-byte match at distance d (may overlap). As in Apple's
+        // decoder the distance may reach back into earlier blocks' output,
+        // which the caller supplies ahead of `start_len`.
+        if m == 0 {
+            continue;
+        }
+        if d > out.len() {
             return Err(Error::Corrupt);
         }
         if out.len() + m > start_len + n_raw {
@@ -472,15 +466,9 @@ pub(crate) fn decode_block(
         }
     }
 
-    // Trailing literals after the last match.
-    let remaining = n_literals - lit_pos;
-    if remaining > 0 {
-        if out.len() + remaining > start_len + n_raw {
-            return Err(Error::Corrupt);
-        }
-        out.extend_from_slice(&literals[lit_pos..]);
-    }
-
+    // Every output literal is emitted by some command's L. Apple's encoder
+    // pads the literal stream to a multiple of four, so literals left past
+    // `lit_pos` are padding, not output.
     if out.len() - start_len != n_raw {
         return Err(Error::Corrupt);
     }
@@ -526,10 +514,7 @@ mod test_encoder {
     /// matching the decode table exactly.
     fn build_enc_slots(freq: &[u16], n_states: usize) -> Vec<Vec<EncSlot>> {
         let mut slots: Vec<Vec<EncSlot>> = (0..freq.len()).map(|_| Vec::new()).collect();
-        let mut occ = vec![false; n_states];
         let mut t = 0usize;
-        let step = (n_states >> 1) + (n_states >> 3) + 3;
-        let mask = n_states - 1;
         let log2 = n_states.trailing_zeros() as i32;
         for (s, &f) in freq.iter().enumerate() {
             let f = f as usize;
@@ -540,9 +525,6 @@ mod test_encoder {
             let k = log2 - floor_log2;
             let j0 = (((2 * n_states) >> k) as i32) - f as i32;
             for i in 0..f {
-                while occ[t] {
-                    t = (t + step) & mask;
-                }
                 let (ek, delta) = if (i as i32) < j0 {
                     (k, ((f as i32 + i as i32) << k) - n_states as i32)
                 } else {
@@ -554,8 +536,7 @@ mod test_encoder {
                     lo: delta,
                     hi: delta + (1i32 << ek) - 1,
                 });
-                occ[t] = true;
-                t = (t + step) & mask;
+                t += 1;
             }
         }
         for sl in slots.iter_mut() {
@@ -570,12 +551,10 @@ mod test_encoder {
     /// The FSE encoder must walk symbols **in reverse** to chain states
     /// correctly (each symbol's emitted state is determined by the following
     /// symbol in the same lane). The caller therefore [`push`](Self::push)es
-    /// `(value, n_bits)` chunks in reverse-of-pull order. [`finish`] reverses
-    /// the chunk list back to forward pull order, then packs the resulting
-    /// bit string into bytes laid out so [`FseBits`] (which pulls from the end
-    /// of the payload backward) reads them back in exactly pull order. One
-    /// stub byte always trails so the decoder's init-byte consumption lands on
-    /// it.
+    /// `(value, n_bits)` chunks in reverse-of-pull order. [`finish`] packs
+    /// them upward from the bottom of the payload (the first pushed chunk is
+    /// the last one [`FseBits`] pulls, so it sits lowest), behind Apple's
+    /// 8 zero padding bytes, and returns the header's 3-bit field.
     struct FseSink {
         /// Each entry is one symbol's `(value, n_bits)`, recorded in
         /// reverse-of-pull order.
@@ -592,41 +571,21 @@ mod test_encoder {
             self.chunks.push((value, n));
         }
 
-        /// Serialize to `(payload_bytes, stub_bits)`.
+        /// Serialize to `(payload_bytes, bits_field)`.
         fn finish(&self) -> (Vec<u8>, u32) {
-            // Reverse chunks to forward pull order, then flatten to a bit
-            // vector (LSB-first within each chunk).
-            let mut bits: Vec<u8> = Vec::new();
-            for &(value, n) in self.chunks.iter().rev() {
-                for i in 0..n {
-                    bits.push(((value >> i) & 1) as u8);
+            // Apple's encoder starts every payload with 8 zero bytes so its
+            // decoder's 8-byte initial load stays in bounds.
+            let mut pos = 64usize;
+            let total: usize = pos + self.chunks.iter().map(|&(_, n)| n as usize).sum::<usize>();
+            let mut payload = vec![0u8; total.div_ceil(8)];
+            for &(value, n) in &self.chunks {
+                for i in 0..n as usize {
+                    payload[pos / 8] |= (((value >> i) & 1) as u8) << (pos % 8);
+                    pos += 1;
                 }
             }
-            let total = bits.len();
-            let stub = (total % 8) as u32;
-            let full = total / 8;
-            let plen = full + 1;
-            let mut payload = vec![0u8; plen];
-            let mut bi = 0usize;
-            let mut sb = 0u8;
-            for i in 0..stub {
-                sb |= bits[bi] << i;
-                bi += 1;
-            }
-            payload[plen - 1] = sb;
-            let mut idx = plen as i32 - 2;
-            while idx >= 0 {
-                let mut b = 0u8;
-                for i in 0..8 {
-                    if bi < total {
-                        b |= bits[bi] << i;
-                        bi += 1;
-                    }
-                }
-                payload[idx as usize] = b;
-                idx -= 1;
-            }
-            (payload, stub)
+            let unused = payload.len() * 8 - total;
+            (payload, 7 - unused as u32)
         }
     }
 
@@ -733,6 +692,7 @@ mod test_encoder {
         const MIN_MATCH: usize = 4;
         const MAX_MATCH: usize = 2359; // M max encodable
         const MAX_DIST: usize = 262_139; // D max encodable
+        const MAX_L: usize = 315; // L max encodable
         let mut literals = Vec::new();
         let mut cmds = Vec::new();
         let n = data.len();
@@ -777,6 +737,16 @@ mod test_encoder {
 
             if best_len >= MIN_MATCH {
                 let end = i + best_len;
+                // L is capped at its largest encodable value; split longer
+                // literal runs with literal-only (M == 0) commands.
+                while pending_lit > MAX_L {
+                    cmds.push(Cmd {
+                        l: MAX_L,
+                        m: 0,
+                        d: 0,
+                    });
+                    pending_lit -= MAX_L;
+                }
                 cmds.push(Cmd {
                     l: pending_lit,
                     m: best_len,
@@ -802,9 +772,13 @@ mod test_encoder {
                 i += 1;
             }
         }
-        // Remaining `pending_lit` literals are trailing literals (no command);
-        // the decoder appends them after the last match.
-        let _ = pending_lit;
+        // Every literal is emitted by a command's L, so trailing literals get
+        // literal-only (M == 0) commands, like Apple's encoder.
+        while pending_lit > 0 {
+            let l = pending_lit.min(MAX_L);
+            cmds.push(Cmd { l, m: 0, d: 0 });
+            pending_lit -= l;
+        }
         (literals, cmds)
     }
 
@@ -891,7 +865,7 @@ mod test_encoder {
                 .iter()
                 .find(|s| d_st >= s.lo && d_st <= s.hi)
                 .expect("d slot");
-            let raw = (d_st - d_slot.lo) as u64 | ((mc.d_extra as u64) << d_slot.k);
+            let raw = (((d_st - d_slot.lo) as u64) << D_EXTRA_BITS[mc.d_sym]) | mc.d_extra as u64;
             lmd_sink.push(raw, d_slot.k + D_EXTRA_BITS[mc.d_sym]);
             d_st = d_slot.t as i32;
 
@@ -899,7 +873,7 @@ mod test_encoder {
                 .iter()
                 .find(|s| m_st >= s.lo && m_st <= s.hi)
                 .expect("m slot");
-            let raw = (m_st - m_slot.lo) as u64 | ((mc.m_extra as u64) << m_slot.k);
+            let raw = (((m_st - m_slot.lo) as u64) << M_EXTRA_BITS[mc.m_sym]) | mc.m_extra as u64;
             lmd_sink.push(raw, m_slot.k + M_EXTRA_BITS[mc.m_sym]);
             m_st = m_slot.t as i32;
 
@@ -907,7 +881,7 @@ mod test_encoder {
                 .iter()
                 .find(|s| l_st >= s.lo && l_st <= s.hi)
                 .expect("l slot");
-            let raw = (l_st - l_slot.lo) as u64 | ((mc.l_extra as u64) << l_slot.k);
+            let raw = (((l_st - l_slot.lo) as u64) << L_EXTRA_BITS[mc.l_sym]) | mc.l_extra as u64;
             lmd_sink.push(raw, l_slot.k + L_EXTRA_BITS[mc.l_sym]);
             l_st = l_slot.t as i32;
         }
@@ -1222,63 +1196,6 @@ mod tests {
             }
         }
         assert_eq!(out, data);
-    }
-
-    /// A hand-frozen `bvx2` stream, independent of this crate's encoder.
-    ///
-    /// It is a literals-only block (`n_matches == 0`) whose **literal
-    /// frequency table is deliberately non-dyadic**: the high-frequency
-    /// literal symbol `0x3d` (`=`) has frequency 1000 and the rare symbol
-    /// `0x3e` (`>`) has 24 (sum 1024 = LIT_STATES). Neither is a power of two,
-    /// so decoding correctly *requires* the general k/k-1 FSE table
-    /// construction — a single-`k` decoder cannot build a table that tiles
-    /// `[0,1024)` for these frequencies and mis-decodes the literals.
-    ///
-    /// The bytes (post-magic header + freq tables + literal FSE payload, then
-    /// the `bvx$` EOS) were generated once and frozen here; this test does not
-    /// call the encoder, so it guards against the encoder and decoder sharing
-    /// the same table-construction bug. The four literals decode to the exact
-    /// ASCII string `=>==`.
-    const HAND_VECTOR: &[u8] = &[
-        0x62, 0x76, 0x78, 0x32, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
-        0x50, 0x48, 0x40, 0x8f, 0x04, 0x12, 0x00, 0x00, 0x00, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x8f, 0x02, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x8f, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0xc0, 0x43, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0x76, 0x78, 0x24,
-    ];
-
-    #[test]
-    fn hand_vector_non_dyadic_decodes_to_known_string() {
-        // Decode the frozen, encoder-independent vector through the public
-        // streaming decoder and assert the exact output.
-        let mut dec = Decoder::new();
-        let mut out = Vec::new();
-        let mut buf = vec![0u8; 64];
-        let mut pos = 0usize;
-        loop {
-            let RawProgress {
-                consumed,
-                written,
-                done,
-            } = dec.raw_decode(&HAND_VECTOR[pos..], &mut buf).unwrap();
-            pos += consumed;
-            out.extend_from_slice(&buf[..written]);
-            if done {
-                break;
-            }
-            if consumed == 0 && written == 0 {
-                let RawProgress { written, done, .. } = dec.raw_finish(&mut buf).unwrap();
-                out.extend_from_slice(&buf[..written]);
-                if done || written == 0 {
-                    break;
-                }
-            }
-        }
-        assert_eq!(out, b"=>==", "hand vector decoded to {out:?}");
     }
 
     #[test]
