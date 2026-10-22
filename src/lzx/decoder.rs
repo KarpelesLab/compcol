@@ -994,6 +994,12 @@ fn step_huff(ctx: &mut RunCtx) -> Result<bool, Error> {
                         return Ok(true);
                     }
                 }
+                // A match that ends exactly on the frame boundary must hand
+                // back to `step` (E8 pass + bitstream realign) before the
+                // next symbol is read, just like a literal does.
+                if ctx.frame_buf.len() >= FRAME_SIZE {
+                    yield_progress!(HuffPhase::NextMain);
+                }
                 ph = HuffPhase::NextMain;
             }
             HuffPhase::PendingLiteral { byte } => {
