@@ -3057,7 +3057,7 @@ impl RawDecoder for Decoder {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
-        let consumed = input.len();
+        let mut consumed = input.len();
         self.raw.extend_from_slice(input);
 
         let mut written = 0usize;
@@ -3102,10 +3102,23 @@ impl RawDecoder for Decoder {
             }
         }
         self.compact_out();
+        if self.state == DecState::Done {
+            // Bytes after the last meta-block are not part of the stream:
+            // hand back the ones that came from this call so the caller
+            // can see where the brotli data stops, and drop the rest.
+            let end = self.bit_pos.div_ceil(8);
+            if self.raw.len() > end {
+                consumed -= (self.raw.len() - end).min(consumed);
+                self.raw.truncate(end);
+            }
+        }
         Ok(RawProgress {
             consumed,
             written,
-            done: false,
+            // Report the end once every decoded byte has been handed out,
+            // so `decode` answers `StreamEnd` as the contract requires
+            // (it used to leave that to `finish`).
+            done: self.state == DecState::Done && self.out_pos == self.out.len(),
         })
     }
 
