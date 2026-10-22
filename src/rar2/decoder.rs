@@ -331,6 +331,10 @@ impl RunCtx {
                     if len == 0 || off == 0 {
                         return Err(Error::Corrupt);
                     }
+                    // Like every RAR 2.x match (unrar's `CopyString20`), the
+                    // repeat pushes its distance into the old-offset ring;
+                    // skipping this shifts every later 257..=260 reference.
+                    self.commit_match_offset(off);
                     self.emit_match(off, len, output)?;
                 } else if sym <= SYM_OLD_OFFSET_END {
                     let slot = (self
