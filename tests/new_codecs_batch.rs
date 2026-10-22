@@ -96,7 +96,7 @@ fn qpack_module_round_trips() {
     use compcol::qpack::{QpackDecoder, QpackEncoder};
 
     let mut enc = QpackEncoder::new();
-    let mut dec = QpackDecoder::new();
+    let mut dec = QpackDecoder::with_limits(4096, 64 * 1024);
     let fields = [
         HeaderField::new(b":method", b"GET"),
         HeaderField::new(b":path", b"/"),

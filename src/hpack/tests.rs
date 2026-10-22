@@ -14,7 +14,7 @@ fn f(name: &[u8], value: &[u8]) -> HeaderField {
 fn rfc_c3_request_sequence_raw() {
     let mut enc = HpackEncoder::new();
     enc.set_huffman(false);
-    let mut dec = HpackDecoder::new();
+    let mut dec = HpackDecoder::with_limits(DEFAULT_TABLE_SIZE, DEFAULT_MAX_HEADER_LIST_SIZE);
 
     // C.3.1
     let req1 = [
@@ -74,7 +74,7 @@ fn rfc_c3_request_sequence_raw() {
 #[test]
 fn rfc_c4_request_sequence_huffman() {
     let mut enc = HpackEncoder::new(); // Huffman on by default
-    let mut dec = HpackDecoder::new();
+    let mut dec = HpackDecoder::with_limits(DEFAULT_TABLE_SIZE, DEFAULT_MAX_HEADER_LIST_SIZE);
 
     let req1 = [
         f(b":method", b"GET"),
@@ -132,7 +132,7 @@ fn rfc_c4_request_sequence_huffman() {
 #[test]
 fn eviction_at_table_size_256() {
     let mut enc = HpackEncoder::with_max_table_size(256);
-    let mut dec = HpackDecoder::with_max_table_size(256);
+    let mut dec = HpackDecoder::with_limits(256, DEFAULT_MAX_HEADER_LIST_SIZE);
 
     let resp = [
         f(b":status", b"302"),
@@ -156,7 +156,7 @@ fn eviction_at_table_size_256() {
 #[test]
 fn round_trip_many_fields() {
     let mut enc = HpackEncoder::new();
-    let mut dec = HpackDecoder::new();
+    let mut dec = HpackDecoder::with_limits(DEFAULT_TABLE_SIZE, DEFAULT_MAX_HEADER_LIST_SIZE);
     let fields: vec::Vec<HeaderField> = (0..50)
         .map(|i| {
             let name = alloc::format!("x-header-{i}");
@@ -171,7 +171,7 @@ fn round_trip_many_fields() {
 #[test]
 fn sensitive_field_never_indexed() {
     let mut enc = HpackEncoder::new();
-    let mut dec = HpackDecoder::new();
+    let mut dec = HpackDecoder::with_limits(DEFAULT_TABLE_SIZE, DEFAULT_MAX_HEADER_LIST_SIZE);
     let fields = [HeaderField::sensitive(b"authorization", b"secret-token")];
     let block = enc.encode(&fields);
     // 0001 pattern with name index 23 (authorization) → 0x10 | 23 = 0x1f...
@@ -184,7 +184,7 @@ fn sensitive_field_never_indexed() {
 
 #[test]
 fn decode_rejects_bad_index() {
-    let mut dec = HpackDecoder::new();
+    let mut dec = HpackDecoder::with_limits(DEFAULT_TABLE_SIZE, DEFAULT_MAX_HEADER_LIST_SIZE);
     // Indexed header field, index 0 → invalid.
     assert!(matches!(dec.decode(&[0x80]), Err(Error::Corrupt)));
     // Indexed header field, index 99 (no such dynamic entry) → invalid.
@@ -193,7 +193,7 @@ fn decode_rejects_bad_index() {
 
 #[test]
 fn decode_rejects_oversized_size_update() {
-    let mut dec = HpackDecoder::with_max_table_size(256);
+    let mut dec = HpackDecoder::with_limits(256, DEFAULT_MAX_HEADER_LIST_SIZE);
     // Size update to 4096 (> 256 connection limit): 0x3f 0xe1 0x1f.
     assert!(matches!(
         dec.decode(&[0x3f, 0xe1, 0x1f]),
@@ -203,10 +203,70 @@ fn decode_rejects_oversized_size_update() {
 
 #[test]
 fn decode_rejects_truncated_string() {
-    let mut dec = HpackDecoder::new();
+    let mut dec = HpackDecoder::with_limits(DEFAULT_TABLE_SIZE, DEFAULT_MAX_HEADER_LIST_SIZE);
     // Literal, new name, length 5 but only 2 bytes follow.
     assert!(matches!(
         dec.decode(&[0x40, 0x05, b'a', b'b']),
         Err(Error::UnexpectedEnd)
     ));
+}
+
+// ─── decoded-size budget (header-list amplification) ─────────────────────
+
+/// A header block that inserts one entry of RFC 7541 §4.1 size 4096 (name
+/// "a", 4063-byte value) and then references it `refs` times with one-byte
+/// indexed fields (dynamic index 62).
+fn amplifying_block(refs: usize) -> Vec<u8> {
+    let vlen = 4096 - 32 - 1;
+    let mut b = vec![0x40, 0x01, b'a'];
+    encode_int(&mut b, vlen, 7, 0x00);
+    b.extend(core::iter::repeat_n(b'x', vlen));
+    b.extend(core::iter::repeat_n(0x80 | 62, refs));
+    b
+}
+
+#[test]
+fn decode_rejects_indexed_amplification() {
+    let mut dec = HpackDecoder::with_limits(DEFAULT_TABLE_SIZE, DEFAULT_MAX_HEADER_LIST_SIZE);
+    // ~1 KB on the wire would decode to ~4 MB: stopped at the default cap.
+    assert!(matches!(
+        dec.decode(&amplifying_block(1000)),
+        Err(Error::OutputLimitExceeded)
+    ));
+}
+
+#[test]
+fn decode_rejects_literal_name_ref_amplification() {
+    // Insert an entry with a 4063-byte name, then literals (without
+    // indexing) that reuse that name with an empty value: three wire bytes
+    // per 4 KiB name copy.
+    let nlen = 4096 - 32 - 1;
+    let mut b = vec![0x40];
+    encode_int(&mut b, nlen, 7, 0x00);
+    b.extend(core::iter::repeat_n(b'n', nlen));
+    b.push(0x00);
+    // 0000 idx(4+): index 62 = 15 + 47.
+    b.extend((0..1000).flat_map(|_| [0x0f, 47, 0x00]));
+    let mut dec = HpackDecoder::with_limits(DEFAULT_TABLE_SIZE, DEFAULT_MAX_HEADER_LIST_SIZE);
+    assert!(matches!(dec.decode(&b), Err(Error::OutputLimitExceeded)));
+}
+
+#[test]
+fn header_list_size_cap_is_inclusive_and_configurable() {
+    // Insert (4096) + 3 refs (3 × 4096) = 16384 exactly.
+    let block = amplifying_block(3);
+    let mut dec = HpackDecoder::with_limits(DEFAULT_TABLE_SIZE, DEFAULT_MAX_HEADER_LIST_SIZE);
+    dec.set_max_header_list_size(16384);
+    assert_eq!(dec.decode(&block).unwrap().len(), 4);
+
+    let mut dec = HpackDecoder::with_limits(DEFAULT_TABLE_SIZE, DEFAULT_MAX_HEADER_LIST_SIZE);
+    dec.set_max_header_list_size(16383);
+    assert!(matches!(
+        dec.decode(&block),
+        Err(Error::OutputLimitExceeded)
+    ));
+
+    let mut dec = HpackDecoder::with_limits(DEFAULT_TABLE_SIZE, DEFAULT_MAX_HEADER_LIST_SIZE);
+    dec.set_max_header_list_size(usize::MAX);
+    assert_eq!(dec.decode(&amplifying_block(100)).unwrap().len(), 101);
 }

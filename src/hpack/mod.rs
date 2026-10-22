@@ -16,7 +16,7 @@
 //! use compcol::hpack::{HpackEncoder, HpackDecoder, HeaderField};
 //!
 //! let mut enc = HpackEncoder::new();
-//! let mut dec = HpackDecoder::new();
+//! let mut dec = HpackDecoder::with_limits(4096, 64 * 1024);
 //! let block = enc.encode(&[
 //!     HeaderField::new(b":method", b"GET"),
 //!     HeaderField::new(b"custom", b"value"),
@@ -50,6 +50,33 @@ use table::DynamicTable;
 /// HTTP/2's protocol-default dynamic table size
 /// (`SETTINGS_HEADER_TABLE_SIZE`, RFC 7540 §6.5.2).
 pub const DEFAULT_TABLE_SIZE: usize = 4096;
+
+/// Default cap on one decoded header list, in RFC 7541 §4.1 field-size units
+/// (name + value + 32 bytes per field). Applied by the constructors that
+/// don't take a cap ([`HpackDecoder::default`] and the deprecated
+/// [`HpackDecoder::new`] / [`HpackDecoder::with_max_table_size`]). See
+/// [`HpackDecoder::with_limits`] for why the decoder enforces this itself.
+pub const DEFAULT_MAX_HEADER_LIST_SIZE: usize = 64 * 1024;
+
+/// Add one field's RFC 7541 §4.1 size (name + value + 32 bytes of overhead,
+/// the unit of HTTP/2 `SETTINGS_MAX_HEADER_LIST_SIZE` and HTTP/3
+/// `SETTINGS_MAX_FIELD_SECTION_SIZE`) to `used`, failing with
+/// [`Error::OutputLimitExceeded`] if the running total passes `max`.
+pub(crate) fn charge_field(
+    used: &mut usize,
+    max: usize,
+    name: &[u8],
+    value: &[u8],
+) -> Result<(), Error> {
+    *used = used
+        .saturating_add(name.len())
+        .saturating_add(value.len())
+        .saturating_add(32);
+    if *used > max {
+        return Err(Error::OutputLimitExceeded);
+    }
+    Ok(())
+}
 
 /// A decoded/encodable header field.
 ///
@@ -213,33 +240,75 @@ pub struct HpackDecoder {
     /// Connection limit on the dynamic table size: a peer size-update may not
     /// exceed this (§6.3).
     size_limit: usize,
+    /// Cap on one decoded header list, in §4.1 field-size units.
+    max_header_list_size: usize,
 }
 
+/// Protocol-default table size with the [`DEFAULT_MAX_HEADER_LIST_SIZE`] cap.
 impl Default for HpackDecoder {
     fn default() -> Self {
-        Self::new()
+        Self::with_limits(DEFAULT_TABLE_SIZE, DEFAULT_MAX_HEADER_LIST_SIZE)
     }
 }
 
 impl HpackDecoder {
-    /// New decoder with the protocol-default 4096-byte dynamic table.
+    /// New decoder with the protocol-default 4096-byte dynamic table and the
+    /// [`DEFAULT_MAX_HEADER_LIST_SIZE`] cap.
+    #[deprecated(
+        since = "0.6.12",
+        note = "choose a decoded-size cap explicitly: use `HpackDecoder::with_limits`"
+    )]
     pub fn new() -> Self {
-        Self::with_max_table_size(DEFAULT_TABLE_SIZE)
+        Self::default()
     }
 
     /// New decoder whose dynamic table (and the size-update ceiling) is
-    /// `max` bytes.
+    /// `max` bytes, with the [`DEFAULT_MAX_HEADER_LIST_SIZE`] cap.
+    #[deprecated(
+        since = "0.6.12",
+        note = "choose a decoded-size cap explicitly: use `HpackDecoder::with_limits`"
+    )]
     pub fn with_max_table_size(max: usize) -> Self {
+        Self::with_limits(max, DEFAULT_MAX_HEADER_LIST_SIZE)
+    }
+
+    /// New decoder whose dynamic table (and the size-update ceiling) is
+    /// `max_table_size` bytes ([`DEFAULT_TABLE_SIZE`] unless you advertised
+    /// another `SETTINGS_HEADER_TABLE_SIZE`), and which rejects any header
+    /// block decoding to more than `max_header_list_size` bytes, counted as in
+    /// RFC 7541 §4.1 (name + value + 32 per field), the same unit as HTTP/2
+    /// `SETTINGS_MAX_HEADER_LIST_SIZE`. `usize::MAX` disables the cap.
+    ///
+    /// The decoder enforces the cap itself because a one-byte indexed field
+    /// can expand to a whole dynamic-table entry (~4 KiB), so a small block
+    /// can decode to gigabytes before the caller sees the result. The budget
+    /// is charged as each field is decoded, and decoding stops early. It
+    /// applies per [`decode`](Self::decode) call; a caller that splits one
+    /// header list across several calls must sum the sizes itself.
+    pub fn with_limits(max_table_size: usize, max_header_list_size: usize) -> Self {
         HpackDecoder {
-            table: DynamicTable::new(max),
-            size_limit: max,
+            table: DynamicTable::new(max_table_size),
+            size_limit: max_table_size,
+            max_header_list_size,
         }
+    }
+
+    /// Change the decoded-size cap set by [`with_limits`](Self::with_limits).
+    pub fn set_max_header_list_size(&mut self, max: usize) {
+        self.max_header_list_size = max;
     }
 
     /// Decode one header block into its field list. Returns [`Error::Corrupt`]
     /// on any malformed representation, bad table index, or an over-limit
-    /// size update; [`Error::UnexpectedEnd`] on truncation.
+    /// size update; [`Error::UnexpectedEnd`] on truncation;
+    /// [`Error::OutputLimitExceeded`] if the decoded list would exceed the
+    /// [header list size cap](Self::set_max_header_list_size) (map this to
+    /// HTTP 431 or a stream reset). The dynamic table may already reflect
+    /// insertions from the rejected block, as with any decode error, so treat
+    /// an error as fatal to the connection's compression context.
     pub fn decode(&mut self, block: &[u8]) -> Result<Vec<HeaderField>, Error> {
+        let max = self.max_header_list_size;
+        let mut used = 0usize;
         let mut fields = Vec::new();
         let mut pos = 0;
         while pos < block.len() {
@@ -252,17 +321,21 @@ impl HpackDecoder {
                     return Err(Error::Corrupt);
                 }
                 let (n, v) = self.table.get(idx).ok_or(Error::Corrupt)?;
+                // Charge before copying: this is the amplifying case.
+                charge_field(&mut used, max, n, v)?;
                 fields.push(HeaderField::new(n, v));
             } else if b & 0x40 != 0 {
                 // §6.2.1 literal with incremental indexing.
                 let (name, value, np) = self.read_literal(block, pos, 6)?;
                 pos = np;
-                self.table.insert(&name, &value);
-                fields.push(HeaderField {
+                let f = HeaderField {
                     name,
                     value,
                     sensitive: false,
-                });
+                };
+                charge_field(&mut used, max, &f.name, &f.value)?;
+                self.table.insert(&f.name, &f.value);
+                fields.push(f);
             } else if b & 0x20 != 0 {
                 // §6.3 dynamic table size update.
                 let (new_max, np) = decode_int(block, pos, 5)?;
@@ -277,11 +350,13 @@ impl HpackDecoder {
                 let sensitive = b & 0x10 != 0;
                 let (name, value, np) = self.read_literal(block, pos, 4)?;
                 pos = np;
-                fields.push(HeaderField {
+                let f = HeaderField {
                     name,
                     value,
                     sensitive,
-                });
+                };
+                charge_field(&mut used, max, &f.name, &f.value)?;
+                fields.push(f);
             }
         }
         Ok(fields)

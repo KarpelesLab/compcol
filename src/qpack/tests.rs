@@ -37,7 +37,8 @@ fn rfc_b1_literal_field_line_static_name_ref() {
     let block = enc.encode_field_section(&[f(b":path", b"/index.html")]);
     assert_eq!(block, expected);
 
-    let mut dec = QpackDecoder::new();
+    let mut dec =
+        QpackDecoder::with_limits(DEFAULT_MAX_TABLE_CAPACITY, DEFAULT_MAX_FIELD_SECTION_SIZE);
     let out = dec.decode_field_section(expected).unwrap();
     assert_eq!(out, vec![f(b":path", b"/index.html")]);
     // No dynamic-table activity.
@@ -49,7 +50,8 @@ fn rfc_b1_literal_field_line_static_name_ref() {
 
 #[test]
 fn rfc_b2_dynamic_table_inserts_and_post_base() {
-    let mut dec = QpackDecoder::new();
+    let mut dec =
+        QpackDecoder::with_limits(DEFAULT_MAX_TABLE_CAPACITY, DEFAULT_MAX_FIELD_SECTION_SIZE);
 
     // Encoder stream:
     //   3f bd 01                 Set Dynamic Table Capacity = 220
@@ -88,7 +90,8 @@ fn rfc_b2_dynamic_table_inserts_and_post_base() {
 
 #[test]
 fn rfc_b3_speculative_insert_literal_name() {
-    let mut dec = QpackDecoder::new();
+    let mut dec =
+        QpackDecoder::with_limits(DEFAULT_MAX_TABLE_CAPACITY, DEFAULT_MAX_FIELD_SECTION_SIZE);
 
     // Set capacity first (the example continues B.2's table; here we make it
     // self-contained by raising capacity, then perform the literal insert).
@@ -116,7 +119,8 @@ fn rfc_b3_speculative_insert_literal_name() {
 
 #[test]
 fn rfc_b4_duplicate_and_dynamic_field_section() {
-    let mut dec = QpackDecoder::new();
+    let mut dec =
+        QpackDecoder::with_limits(DEFAULT_MAX_TABLE_CAPACITY, DEFAULT_MAX_FIELD_SECTION_SIZE);
 
     // Build B.2 + B.3 table state.
     let mut estream: Vec<u8> = vec![0x3f, 0xbd, 0x01, 0xc0, 0x0f];
@@ -160,7 +164,8 @@ fn rfc_b4_duplicate_and_dynamic_field_section() {
 
 #[test]
 fn rfc_b5_dynamic_name_ref_insert_with_eviction() {
-    let mut dec = QpackDecoder::new();
+    let mut dec =
+        QpackDecoder::with_limits(DEFAULT_MAX_TABLE_CAPACITY, DEFAULT_MAX_FIELD_SECTION_SIZE);
 
     // Build through B.4 (4 entries, size 217, capacity 220).
     let mut estream: Vec<u8> = vec![0x3f, 0xbd, 0x01, 0xc0, 0x0f];
@@ -209,7 +214,8 @@ fn encode_indexed_static_full_match() {
     let block = enc.encode_field_section(&[f(b":path", b"/")]);
     assert_eq!(block, &[0x00, 0x00, 0xc1]); // prefix + (1 T=1 idx=1)
 
-    let mut dec = QpackDecoder::new();
+    let mut dec =
+        QpackDecoder::with_limits(DEFAULT_MAX_TABLE_CAPACITY, DEFAULT_MAX_FIELD_SECTION_SIZE);
     assert_eq!(
         dec.decode_field_section(&block).unwrap(),
         vec![f(b":path", b"/")]
@@ -219,7 +225,8 @@ fn encode_indexed_static_full_match() {
 #[test]
 fn round_trip_static_and_literal_huffman() {
     let mut enc = QpackEncoder::new(); // Huffman on
-    let mut dec = QpackDecoder::new();
+    let mut dec =
+        QpackDecoder::with_limits(DEFAULT_MAX_TABLE_CAPACITY, DEFAULT_MAX_FIELD_SECTION_SIZE);
     let fields = vec![
         f(b":method", b"GET"),
         f(b":scheme", b"https"),
@@ -236,7 +243,8 @@ fn round_trip_static_and_literal_huffman() {
 fn round_trip_many_fields_no_huffman() {
     let mut enc = QpackEncoder::new();
     enc.set_huffman(false);
-    let mut dec = QpackDecoder::new();
+    let mut dec =
+        QpackDecoder::with_limits(DEFAULT_MAX_TABLE_CAPACITY, DEFAULT_MAX_FIELD_SECTION_SIZE);
     let fields: Vec<HeaderField> = (0..40)
         .map(|i| {
             let name = alloc::format!("x-header-{i}");
@@ -252,7 +260,8 @@ fn round_trip_many_fields_no_huffman() {
 fn sensitive_field_sets_never_index_bit() {
     let mut enc = QpackEncoder::new();
     enc.set_huffman(false);
-    let mut dec = QpackDecoder::new();
+    let mut dec =
+        QpackDecoder::with_limits(DEFAULT_MAX_TABLE_CAPACITY, DEFAULT_MAX_FIELD_SECTION_SIZE);
     // authorization is static index 84 (name match only) → Literal w/ Name Ref,
     // N bit set.
     let fields = vec![HeaderField::sensitive(b"authorization", b"secret")];
@@ -300,7 +309,7 @@ fn encode_static_only_matches_encode_field_section() {
 #[test]
 fn dynamic_inserts_literal_name_and_round_trips() {
     let mut enc = QpackEncoder::with_dynamic_table(4096);
-    let mut dec = QpackDecoder::with_max_table_capacity(4096);
+    let mut dec = QpackDecoder::with_limits(4096, DEFAULT_MAX_FIELD_SECTION_SIZE);
 
     let fields = vec![f(b"custom-key", b"custom-value")];
     let e = enc.encode(&fields);
@@ -316,7 +325,7 @@ fn dynamic_inserts_literal_name_and_round_trips() {
 #[test]
 fn dynamic_reuses_entry_without_new_inserts() {
     let mut enc = QpackEncoder::with_dynamic_table(4096);
-    let mut dec = QpackDecoder::with_max_table_capacity(4096);
+    let mut dec = QpackDecoder::with_limits(4096, DEFAULT_MAX_FIELD_SECTION_SIZE);
 
     let fields = vec![f(b"x-custom", b"hello")];
     let first = enc.encode(&fields);
@@ -336,7 +345,7 @@ fn dynamic_static_name_reference_insert() {
     // :authority has a static name (index 0) but no value match → the insert
     // uses a static Insert with Name Reference.
     let mut enc = QpackEncoder::with_dynamic_table(4096);
-    let mut dec = QpackDecoder::with_max_table_capacity(4096);
+    let mut dec = QpackDecoder::with_limits(4096, DEFAULT_MAX_FIELD_SECTION_SIZE);
 
     let fields = vec![f(b":authority", b"www.example.com")];
     let e = enc.encode(&fields);
@@ -349,7 +358,7 @@ fn dynamic_name_reference_reuse_for_new_value() {
     // First insert custom-key=v1 (literal name); a later field with the same
     // name but a new value inserts via a *dynamic* name reference.
     let mut enc = QpackEncoder::with_dynamic_table(4096);
-    let mut dec = QpackDecoder::with_max_table_capacity(4096);
+    let mut dec = QpackDecoder::with_limits(4096, DEFAULT_MAX_FIELD_SECTION_SIZE);
 
     let e1 = enc.encode(&[f(b"custom-key", b"v1")]);
     assert_eq!(rt(&mut dec, &e1), vec![f(b"custom-key", b"v1")]);
@@ -363,7 +372,7 @@ fn dynamic_name_reference_reuse_for_new_value() {
 #[test]
 fn dynamic_mixed_static_dynamic_literal_round_trip() {
     let mut enc = QpackEncoder::with_dynamic_table(4096);
-    let mut dec = QpackDecoder::with_max_table_capacity(4096);
+    let mut dec = QpackDecoder::with_limits(4096, DEFAULT_MAX_FIELD_SECTION_SIZE);
 
     let fields = vec![
         f(b":method", b"GET"),            // static full match
@@ -379,7 +388,7 @@ fn dynamic_mixed_static_dynamic_literal_round_trip() {
 #[test]
 fn dynamic_huffman_round_trip_many_fields() {
     let mut enc = QpackEncoder::with_dynamic_table(8192); // Huffman on
-    let mut dec = QpackDecoder::with_max_table_capacity(8192);
+    let mut dec = QpackDecoder::with_limits(8192, DEFAULT_MAX_FIELD_SECTION_SIZE);
 
     let mut fields: Vec<HeaderField> = (0..30)
         .map(|i| {
@@ -401,7 +410,7 @@ fn dynamic_eviction_safety_within_section() {
     // encoder falls back to literals once the table is full — and the section
     // still round-trips exactly.
     let mut enc = QpackEncoder::with_dynamic_table(128);
-    let mut dec = QpackDecoder::with_max_table_capacity(128);
+    let mut dec = QpackDecoder::with_limits(128, DEFAULT_MAX_FIELD_SECTION_SIZE);
 
     let fields = vec![
         f(b"aaaaaaaaaa", b"00000000000000000000"), // size 10+20+32 = 62
@@ -418,7 +427,7 @@ fn dynamic_eviction_safety_within_section() {
 #[test]
 fn dynamic_sensitive_field_not_inserted() {
     let mut enc = QpackEncoder::with_dynamic_table(4096);
-    let mut dec = QpackDecoder::with_max_table_capacity(4096);
+    let mut dec = QpackDecoder::with_limits(4096, DEFAULT_MAX_FIELD_SECTION_SIZE);
 
     let fields = vec![
         HeaderField::sensitive(b"authorization", b"Bearer secret"), // static name
@@ -439,7 +448,7 @@ fn dynamic_cross_section_reference_with_eviction() {
     // Encode three sections; the third reuses an entry inserted in the first
     // while later inserts have advanced (and possibly evicted) the table.
     let mut enc = QpackEncoder::with_dynamic_table(256);
-    let mut dec = QpackDecoder::with_max_table_capacity(256);
+    let mut dec = QpackDecoder::with_limits(256, DEFAULT_MAX_FIELD_SECTION_SIZE);
 
     let a = vec![f(b"k1", b"reusable-value")];
     let ea = enc.encode(&a);
@@ -456,7 +465,8 @@ fn dynamic_cross_section_reference_with_eviction() {
 #[test]
 fn blocked_reference_rejected() {
     // Field section claims Required Insert Count = 2 but nothing inserted.
-    let mut dec = QpackDecoder::new();
+    let mut dec =
+        QpackDecoder::with_limits(DEFAULT_MAX_TABLE_CAPACITY, DEFAULT_MAX_FIELD_SECTION_SIZE);
     // enc=3 → RIC=2 (TotalInserts=0, MaxEntries=128, FullRange=256). Base 0.
     let block: &[u8] = &[0x03, 0x81, 0x10];
     assert!(matches!(
@@ -467,7 +477,7 @@ fn blocked_reference_rejected() {
 
 #[test]
 fn over_limit_capacity_rejected() {
-    let mut dec = QpackDecoder::with_max_table_capacity(100);
+    let mut dec = QpackDecoder::with_limits(100, DEFAULT_MAX_FIELD_SECTION_SIZE);
     // Set Dynamic Table Capacity = 220 (> 100) → 0x3f 0xbd 0x01.
     assert!(matches!(
         dec.feed_encoder_stream(&[0x3f, 0xbd, 0x01]),
@@ -477,7 +487,8 @@ fn over_limit_capacity_rejected() {
 
 #[test]
 fn insert_without_capacity_rejected() {
-    let mut dec = QpackDecoder::new();
+    let mut dec =
+        QpackDecoder::with_limits(DEFAULT_MAX_TABLE_CAPACITY, DEFAULT_MAX_FIELD_SECTION_SIZE);
     // Insert with Name Reference at capacity 0 → cannot fit → Corrupt.
     let mut ins: Vec<u8> = vec![0xc0, 0x0f];
     ins.extend_from_slice(b"www.example.com");
@@ -486,7 +497,8 @@ fn insert_without_capacity_rejected() {
 
 #[test]
 fn bad_static_index_rejected() {
-    let mut dec = QpackDecoder::new();
+    let mut dec =
+        QpackDecoder::with_limits(DEFAULT_MAX_TABLE_CAPACITY, DEFAULT_MAX_FIELD_SECTION_SIZE);
     // Indexed static index 99 (out of range): 1 T=1 idx=99.
     // 0xc0 | 63 prefix + continuation for 99-63=36 → 0xff 0x24.
     let block: &[u8] = &[0x00, 0x00, 0xff, 0x24];
@@ -498,7 +510,8 @@ fn bad_static_index_rejected() {
 
 #[test]
 fn truncated_value_string_rejected() {
-    let mut dec = QpackDecoder::new();
+    let mut dec =
+        QpackDecoder::with_limits(DEFAULT_MAX_TABLE_CAPACITY, DEFAULT_MAX_FIELD_SECTION_SIZE);
     // Literal w/ literal name, name len 1 "x", value length 5 but truncated.
     // prefix 0x00 0x00, then 0x21 (0 0 1 0 0 len=1) 'x', 0x05 'a' 'b'
     let block: &[u8] = &[0x00, 0x00, 0x21, b'x', 0x05, b'a', b'b'];
@@ -510,11 +523,111 @@ fn truncated_value_string_rejected() {
 
 #[test]
 fn duplicate_bad_index_rejected() {
-    let mut dec = QpackDecoder::new();
+    let mut dec =
+        QpackDecoder::with_limits(DEFAULT_MAX_TABLE_CAPACITY, DEFAULT_MAX_FIELD_SECTION_SIZE);
     // Raise capacity, then Duplicate(relative 0) with an empty table → Corrupt.
     dec.feed_encoder_stream(&[0x3f, 0xbd, 0x01]).unwrap();
     assert!(matches!(
         dec.feed_encoder_stream(&[0x00]),
         Err(Error::Corrupt)
     ));
+}
+
+// ─── decoded-size budget (field-section amplification) ───────────────────
+
+/// Decoder whose dynamic table holds one entry of RFC 9204 §3.2.1 size 4096:
+/// a `nlen`-byte name and a value filling the rest.
+fn decoder_with_big_entry(nlen: usize) -> QpackDecoder {
+    let vlen = 4096 - 32 - nlen;
+    let mut es = vec![];
+    encode_int(&mut es, 4096, 5, 0b0010_0000); // Set Dynamic Table Capacity
+    encode_int(&mut es, nlen, 5, 0b0100_0000); // Insert with Literal Name
+    es.extend(core::iter::repeat_n(b'n', nlen));
+    encode_int(&mut es, vlen, 7, 0x00);
+    es.extend(core::iter::repeat_n(b'v', vlen));
+    let mut dec =
+        QpackDecoder::with_limits(DEFAULT_MAX_TABLE_CAPACITY, DEFAULT_MAX_FIELD_SECTION_SIZE);
+    dec.feed_encoder_stream(&es).unwrap();
+    dec
+}
+
+/// Field section with Required Insert Count 1 and the given Base sign/delta
+/// byte, followed by `rep` repeated `count` times.
+fn section(base_byte: u8, rep: &[u8], count: usize) -> Vec<u8> {
+    // EncInsertCount = 1 % (2 * 128) + 1 = 2.
+    let mut b = vec![0x02, base_byte];
+    for _ in 0..count {
+        b.extend_from_slice(rep);
+    }
+    b
+}
+
+#[test]
+fn indexed_amplification_rejected() {
+    // Indexed Field Line, dynamic relative 0 (Base 1): one byte → 4 KiB.
+    let mut dec = decoder_with_big_entry(1);
+    assert!(matches!(
+        dec.decode_field_section(&section(0x00, &[0x80], 1000)),
+        Err(Error::OutputLimitExceeded)
+    ));
+}
+
+#[test]
+fn post_base_indexed_amplification_rejected() {
+    // Base = 1 - 0 - 1 = 0; Indexed Field Line with Post-Base Index 0.
+    let mut dec = decoder_with_big_entry(1);
+    assert!(matches!(
+        dec.decode_field_section(&section(0x80, &[0x10], 1000)),
+        Err(Error::OutputLimitExceeded)
+    ));
+}
+
+#[test]
+fn name_ref_amplification_rejected() {
+    // A 4 KiB name reused by literals with an empty value, via both the
+    // relative (0 1 N T=0 idx) and post-base (0000 N idx) name references.
+    let mut dec = decoder_with_big_entry(4000);
+    assert!(matches!(
+        dec.decode_field_section(&section(0x00, &[0x40, 0x00], 1000)),
+        Err(Error::OutputLimitExceeded)
+    ));
+    assert!(matches!(
+        dec.decode_field_section(&section(0x80, &[0x00, 0x00], 1000)),
+        Err(Error::OutputLimitExceeded)
+    ));
+}
+
+#[test]
+fn many_small_literals_count_overhead() {
+    // 3000 literal-name fields "x: " are 3 KB of name+value but 99 KB with
+    // the 32-byte per-field overhead, which must be counted.
+    let mut dec =
+        QpackDecoder::with_limits(DEFAULT_MAX_TABLE_CAPACITY, DEFAULT_MAX_FIELD_SECTION_SIZE);
+    let mut block = vec![0x00, 0x00];
+    block.extend((0..3000).flat_map(|_| [0x21, b'x', 0x00]));
+    assert!(matches!(
+        dec.decode_field_section(&block),
+        Err(Error::OutputLimitExceeded)
+    ));
+}
+
+#[test]
+fn field_section_size_cap_is_inclusive_and_configurable() {
+    // Four 4096-unit references = 16384 exactly.
+    let block = section(0x00, &[0x80], 4);
+    let mut dec = decoder_with_big_entry(1);
+    dec.set_max_field_section_size(16384);
+    assert_eq!(dec.decode_field_section(&block).unwrap().len(), 4);
+
+    dec.set_max_field_section_size(16383);
+    assert!(matches!(
+        dec.decode_field_section(&block),
+        Err(Error::OutputLimitExceeded)
+    ));
+
+    dec.set_max_field_section_size(usize::MAX);
+    let out = dec
+        .decode_field_section(&section(0x00, &[0x80], 100))
+        .unwrap();
+    assert_eq!(out.len(), 100);
 }

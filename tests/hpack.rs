@@ -91,7 +91,7 @@ fn full_hpack_round_trip_across_blocks() {
     // A single encoder/decoder pair carrying dynamic-table state across two
     // header blocks (a realistic HTTP/2 connection).
     let mut enc = HpackEncoder::new();
-    let mut dec = HpackDecoder::new();
+    let mut dec = HpackDecoder::with_limits(4096, 64 * 1024);
 
     let block_a = [
         HeaderField::new(b":method", b"GET"),
@@ -118,7 +118,7 @@ fn full_hpack_round_trip_across_blocks() {
 fn raw_mode_matches_decoder() {
     let mut enc = HpackEncoder::new();
     enc.set_huffman(false);
-    let mut dec = HpackDecoder::new();
+    let mut dec = HpackDecoder::with_limits(4096, 64 * 1024);
     let fields = [
         HeaderField::new(b"x-custom-header", b"some long-ish value 123456"),
         HeaderField::new(b"another", b"\x00\x01\x02 binary-ish"),
