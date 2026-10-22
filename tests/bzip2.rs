@@ -725,3 +725,56 @@ fn finish_still_reports_truncation() {
         Err(Error::UnexpectedEnd)
     );
 }
+
+/// `cat a.bz2 b.bz2` (and pbzip2/lbzip2 output) is a valid multi-stream
+/// file that `bzip2 -d` decodes in full. The decoder used to stop at the
+/// first stream's trailer and silently drop the rest — while reporting the
+/// whole input as consumed.
+#[test]
+fn concatenated_streams_decode_in_full() {
+    let a = encode_all(b"hello ");
+    let mut enc = Encoder::with_config(EncoderConfig { level: 1 });
+    let b = encode_chunked(&mut enc, &[b'w'; 300_000], 300_000, 4096);
+    let c = encode_all(b"");
+    let mut cat = a.clone();
+    cat.extend_from_slice(&b);
+    cat.extend_from_slice(&c);
+    cat.extend_from_slice(&a);
+    let mut want = b"hello ".to_vec();
+    want.extend_from_slice(&[b'w'; 300_000]);
+    want.extend_from_slice(b"hello ");
+    for (in_chunk, out_chunk) in [(cat.len(), 65536), (1, 7), (3, 1), (4096, 1)] {
+        assert_eq!(
+            decode_chunked(&cat, in_chunk, out_chunk).unwrap(),
+            want,
+            "{in_chunk}/{out_chunk}"
+        );
+        assert_eq!(decode_documented_loop(&cat, out_chunk).unwrap(), want);
+    }
+    assert_eq!(
+        compcol::vec::decompress_to_vec::<Bzip2>(&cat).unwrap(),
+        want
+    );
+
+    // A corrupt second stream is reported, not ignored.
+    let mut bad = a.clone();
+    bad.extend_from_slice(&a[..a.len() - 2]);
+    assert!(compcol::vec::decompress_to_vec::<Bzip2>(&bad).is_err());
+}
+
+/// Bytes after the final trailer that don't start a new `BZh` stream are
+/// trailing garbage; `bzip2 -d` ignores them (with a warning) and so do we.
+#[test]
+fn trailing_garbage_after_stream_is_ignored() {
+    let a = encode_all(b"payload");
+    for tail in [&b"\0\0\0\0"[..], b"B", b"BZ", b"BZh", b"BZhX", b"junk data"] {
+        let mut s = a.clone();
+        s.extend_from_slice(tail);
+        assert_eq!(decode_chunked(&s, 1, 1).unwrap(), b"payload", "{tail:?}");
+        assert_eq!(
+            compcol::vec::decompress_to_vec::<Bzip2>(&s).unwrap(),
+            b"payload",
+            "{tail:?}"
+        );
+    }
+}

@@ -37,10 +37,13 @@
 //!
 //! ## Concatenated streams
 //!
-//! Single-stream only in this build. Concatenated bzip2 streams
-//! (`cat a.bz2 b.bz2`) are not yet supported on the decode side; the
-//! decoder treats the second stream's header magic as garbage and
-//! stops at the first stream's end-of-stream trailer.
+//! Concatenated bzip2 streams (`cat a.bz2 b.bz2`, and the multi-stream
+//! output of pbzip2/lbzip2) decode as one output, like `bzip2 -d`: after a
+//! stream's trailer, another `BZh<level>` header starts the next stream.
+//! Anything else after a trailer is trailing garbage and is ignored, as
+//! the reference tool does. Because another stream may still arrive,
+//! `decode` reports the end only once it sees such bytes; `finish`
+//! settles it otherwise.
 
 #![cfg_attr(docsrs, doc(cfg(feature = "bzip2")))]
 
