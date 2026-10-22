@@ -552,7 +552,22 @@ impl RawDecoder for Decoder {
         }
     }
 
-    fn raw_finish(&mut self, _output: &mut [u8]) -> Result<RawProgress, Error> {
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
+        // A literal or match paused on a full output buffer needs no more
+        // input: hand it out here. Once it is emitted, either the declared
+        // length is reached (done) or the decoder wants input it will never
+        // get (truncated stream).
+        if matches!(self.phase, DecPhase::PendingLiteral | DecPhase::EmitMatch) {
+            let p = self.raw_decode(&[], output)?;
+            if p.done || matches!(self.phase, DecPhase::PendingLiteral | DecPhase::EmitMatch) {
+                return Ok(RawProgress {
+                    consumed: 0,
+                    written: p.written,
+                    done: p.done,
+                });
+            }
+            return Err(Error::UnexpectedEnd);
+        }
         match self.phase {
             DecPhase::Done => Ok(RawProgress {
                 consumed: 0,
