@@ -439,55 +439,169 @@ impl BcjArch for Ia64 {
 
 // ─── RISC-V ──────────────────────────────────────────────────────────────
 
-/// RISC-V converter: JAL with rd=x1 (ra), 4-byte aligned.
+/// RISC-V converter (xz `simple/riscv.c`, filter ID `0x0B`).
 ///
-/// This implements the JAL-call subset of the transform: a JAL whose
-/// destination register is the return address register `ra` (x1) has its
-/// 20-bit immediate rewritten relative→absolute. The 16-byte buffer
-/// minimum and 4-byte stride keep it chunk-safe.
+/// Converts `JAL` with `rd` = `x1`/`x5` (the absolute target is stored in a
+/// byte order that compresses well) and `AUIPC` + `inst2` pairs (rewritten
+/// into a "special" `AUIPC` with `rd` = `x0`/`x2` followed by the big-endian
+/// absolute address). Instructions are 2-byte aligned (compressed ISA).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RiscV;
+
+/// True when `auipc` + `inst2` is *not* a pair whose `inst2` is a 32-bit
+/// instruction using the `AUIPC`'s `rd` as `rs1`.
+#[inline]
+fn riscv_not_auipc_pair(auipc: u32, inst2: u32) -> bool {
+    ((auipc << 8) ^ inst2.wrapping_sub(3)) & 0xF8003 != 0
+}
+
+/// True when an `AUIPC` with `rd` = `x0`/`x2` is *not* one the encoder
+/// could have produced as a "special" (converted) `AUIPC`.
+#[inline]
+fn riscv_not_special_auipc(auipc: u32, rs1: u32) -> bool {
+    (auipc.wrapping_sub(0x3117) << 18) >= (rs1 & 0x1D)
+}
+
+impl RiscV {
+    fn encode(data: &mut [u8], now_pos: u32) -> usize {
+        if data.len() < 8 {
+            return 0;
+        }
+        let size = data.len() - 8;
+        let mut i = 0usize;
+        while i <= size {
+            let b0 = data[i] as u32;
+            if b0 == 0xEF {
+                // JAL
+                let b1 = data[i + 1] as u32;
+                if b1 & 0x0D != 0 {
+                    i += 2;
+                    continue;
+                }
+                let b2 = data[i + 2] as u32;
+                let b3 = data[i + 3] as u32;
+                let pc = now_pos.wrapping_add(i as u32);
+                let addr = (((b1 & 0xF0) << 8)
+                    | ((b2 & 0x0F) << 16)
+                    | ((b2 & 0x10) << 7)
+                    | ((b2 & 0xE0) >> 4)
+                    | ((b3 & 0x7F) << 4)
+                    | ((b3 & 0x80) << 13))
+                    .wrapping_add(pc);
+                data[i + 1] = ((b1 & 0x0F) | ((addr >> 13) & 0xF0)) as u8;
+                data[i + 2] = (addr >> 9) as u8;
+                data[i + 3] = (addr >> 1) as u8;
+                i += 4;
+            } else if b0 & 0x7F == 0x17 {
+                // AUIPC
+                let inst = rd_le32(&data[i..]);
+                if inst & 0xE80 != 0 {
+                    // rd is neither x0 nor x2.
+                    let inst2 = rd_le32(&data[i + 4..]);
+                    if riscv_not_auipc_pair(inst, inst2) {
+                        i += 6;
+                        continue;
+                    }
+                    let addr = (inst & 0xFFFF_F000)
+                        .wrapping_add(inst2 >> 20)
+                        .wrapping_sub((inst2 >> 19) & 0x1000)
+                        .wrapping_add(now_pos.wrapping_add(i as u32));
+                    wr_le32(&mut data[i..], 0x17 | (2 << 7) | (inst2 << 12));
+                    wr_be32(&mut data[i + 4..], addr);
+                } else {
+                    // rd is x0 or x2: swap a "fake" pair so the decoder can
+                    // tell it apart from a converted one.
+                    let fake_rs1 = inst >> 27;
+                    if riscv_not_special_auipc(inst, fake_rs1) {
+                        i += 4;
+                        continue;
+                    }
+                    let fake_addr = rd_le32(&data[i + 4..]);
+                    let fake_inst2 = (inst >> 12) | (fake_addr << 20);
+                    wr_le32(
+                        &mut data[i..],
+                        0x17 | (fake_rs1 << 7) | (fake_addr & 0xFFFF_F000),
+                    );
+                    wr_le32(&mut data[i + 4..], fake_inst2);
+                }
+                i += 8;
+            } else {
+                i += 2;
+            }
+        }
+        i
+    }
+
+    fn decode(data: &mut [u8], now_pos: u32) -> usize {
+        if data.len() < 8 {
+            return 0;
+        }
+        let size = data.len() - 8;
+        let mut i = 0usize;
+        while i <= size {
+            let b0 = data[i] as u32;
+            if b0 == 0xEF {
+                // JAL
+                let b1 = data[i + 1] as u32;
+                if b1 & 0x0D != 0 {
+                    i += 2;
+                    continue;
+                }
+                let b2 = data[i + 2] as u32;
+                let b3 = data[i + 3] as u32;
+                let pc = now_pos.wrapping_add(i as u32);
+                let addr = (((b1 & 0xF0) << 13) | (b2 << 9) | (b3 << 1)).wrapping_sub(pc);
+                data[i + 1] = ((b1 & 0x0F) | ((addr >> 8) & 0xF0)) as u8;
+                data[i + 2] =
+                    (((addr >> 16) & 0x0F) | ((addr >> 7) & 0x10) | ((addr << 4) & 0xE0)) as u8;
+                data[i + 3] = (((addr >> 4) & 0x7F) | ((addr >> 13) & 0x80)) as u8;
+                i += 4;
+            } else if b0 & 0x7F == 0x17 {
+                // AUIPC
+                let mut inst = rd_le32(&data[i..]);
+                let inst2;
+                if inst & 0xE80 != 0 {
+                    // rd is neither x0 nor x2: a "fake" pair the encoder
+                    // swapped; swap it back.
+                    let fake = rd_le32(&data[i + 4..]);
+                    if riscv_not_auipc_pair(inst, fake) {
+                        i += 6;
+                        continue;
+                    }
+                    inst2 = (inst & 0xFFFF_F000).wrapping_add(fake >> 20);
+                    inst = 0x17 | (2 << 7) | (fake << 12);
+                } else {
+                    // rd is x0 or x2: a converted pair.
+                    let inst2_rs1 = inst >> 27;
+                    if riscv_not_special_auipc(inst, inst2_rs1) {
+                        i += 4;
+                        continue;
+                    }
+                    let addr = rd_be32(&data[i + 4..]).wrapping_sub(now_pos.wrapping_add(i as u32));
+                    inst2 = (inst >> 12) | (addr << 20);
+                    inst = 0x17 | (inst2_rs1 << 7) | (addr.wrapping_add(0x800) & 0xFFFF_F000);
+                }
+                wr_le32(&mut data[i..], inst);
+                wr_le32(&mut data[i + 4..], inst2);
+                i += 8;
+            } else {
+                i += 2;
+            }
+        }
+        i
+    }
+}
 
 impl BcjArch for RiscV {
     const NAME: &'static str = "bcj-riscv";
     const EXT: &'static str = "bcj-riscv";
-    const ALIGN: usize = 4;
+    const ALIGN: usize = 2;
     type State = NoState;
     fn convert(data: &mut [u8], ip: u32, encode: bool, _: &mut NoState) -> usize {
-        let mut i = 0usize;
-        while i + 4 <= data.len() {
-            let instr = rd_le32(&data[i..]);
-            // JAL: opcode (bits 0..6) == 0x6F. rd in bits 7..11.
-            if (instr & 0x7F) == 0x6F {
-                let rd = (instr >> 7) & 0x1F;
-                if rd == 1 {
-                    // Decode the J-immediate (bits scrambled per the ISA).
-                    let imm20 = (instr >> 31) & 0x1;
-                    let imm10_1 = (instr >> 21) & 0x3FF;
-                    let imm11 = (instr >> 20) & 0x1;
-                    let imm19_12 = (instr >> 12) & 0xFF;
-                    let off = (imm20 << 20) | (imm19_12 << 12) | (imm11 << 11) | (imm10_1 << 1);
-                    let pos = ip.wrapping_add(i as u32);
-                    let dest = if encode {
-                        off.wrapping_add(pos)
-                    } else {
-                        off.wrapping_sub(pos)
-                    } & 0x001F_FFFF; // keep 21-bit signed range (bit20..0)
-                    // Re-scramble back into the J-immediate fields.
-                    let n_imm20 = (dest >> 20) & 0x1;
-                    let n_imm10_1 = (dest >> 1) & 0x3FF;
-                    let n_imm11 = (dest >> 11) & 0x1;
-                    let n_imm19_12 = (dest >> 12) & 0xFF;
-                    let out = (instr & 0x0000_0FFF) // opcode + rd
-                        | (n_imm19_12 << 12)
-                        | (n_imm11 << 20)
-                        | (n_imm10_1 << 21)
-                        | (n_imm20 << 31);
-                    wr_le32(&mut data[i..], out);
-                }
-            }
-            i += 4;
+        if encode {
+            RiscV::encode(data, ip)
+        } else {
+            RiscV::decode(data, ip)
         }
-        i
     }
 }

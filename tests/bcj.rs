@@ -367,3 +367,29 @@ fn arm64_matches_xz() {
     check_xz_vector::<BcjArm64>(0, 0xd3b2_5211_4914_fa97);
     check_xz_vector::<BcjArm64>(4096, 0xf013_81aa_a90c_d814);
 }
+
+#[test]
+fn riscv_matches_xz() {
+    // `jal ra, +0x100` at address 0 (vector from `xz --riscv`).
+    let mut data = vec![0xEF, 0x00, 0x00, 0x10];
+    data.extend_from_slice(&[0u8; 12]);
+    let mut want = data.clone();
+    want[3] = 0x80;
+    let mut e = BcjRiscV::encoder();
+    assert_eq!(drive(&mut e, &data, 1, 1), want);
+
+    // `auipc ra, 0x12345` + `jalr ra, 0x10(ra)` at 4096: rewritten to a
+    // special `auipc x2` plus the big-endian absolute target 0x12346010.
+    let mut data = vec![0x97, 0x50, 0x34, 0x12, 0xE7, 0x80, 0x00, 0x01];
+    data.extend_from_slice(&[0u8; 8]);
+    let mut want = vec![0x17, 0x71, 0x0E, 0x08, 0x12, 0x34, 0x60, 0x10];
+    want.extend_from_slice(&[0u8; 8]);
+    let cfg = Config { start_offset: 4096 };
+    let mut e = BcjRiscV::encoder_with(cfg);
+    assert_eq!(drive(&mut e, &data, 1, 1), want);
+    let mut d = BcjRiscV::decoder_with(cfg);
+    assert_eq!(drive_dec(&mut d, &want, 3, 2), data);
+
+    check_xz_vector::<BcjRiscV>(0, 0xa043_2373_6418_78f3);
+    check_xz_vector::<BcjRiscV>(4096, 0x9cb6_8b91_7cc4_202b);
+}
