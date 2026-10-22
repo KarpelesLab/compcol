@@ -990,3 +990,134 @@ fn full_flush_at_greedy_and_optimal_levels() {
         }
     }
 }
+
+// ─── Block Check kinds ──────────────────────────────────────────────────
+
+/// `printf 'hello xz check\n' | xz --check=crc64` (xz-utils 5.8).
+const HELLO_CRC64_XZ: [u8; 80] = [
+    0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x04, 0xe6, 0xd6, 0xb4, 0x46, 0x04, 0xc0, 0x13, 0x0f,
+    0x21, 0x01, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6e, 0xf9, 0xff, 0xe9,
+    0x01, 0x00, 0x0e, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x78, 0x7a, 0x20, 0x63, 0x68, 0x65, 0x63,
+    0x6b, 0x0a, 0x00, 0x00, 0x41, 0xd7, 0x58, 0x5c, 0x59, 0x9c, 0xfc, 0x20, 0x00, 0x01, 0x2f, 0x0f,
+    0xd7, 0x90, 0x25, 0xa2, 0x1f, 0xb6, 0xf3, 0x7d, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x59, 0x5a,
+];
+
+/// `printf 'hello xz check\n' | xz --check=sha256` (xz-utils 5.8).
+const HELLO_SHA256_XZ: [u8; 104] = [
+    0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x0a, 0xe1, 0xfb, 0x0c, 0xa1, 0x04, 0xc0, 0x13, 0x0f,
+    0x21, 0x01, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6e, 0xf9, 0xff, 0xe9,
+    0x01, 0x00, 0x0e, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x78, 0x7a, 0x20, 0x63, 0x68, 0x65, 0x63,
+    0x6b, 0x0a, 0x00, 0x00, 0xa8, 0xcd, 0x89, 0x31, 0x65, 0xd1, 0xe1, 0x9e, 0x28, 0x68, 0x2f, 0x7d,
+    0xb4, 0x9a, 0x1a, 0xfd, 0x77, 0x64, 0xb7, 0xed, 0xac, 0x93, 0x22, 0x09, 0xa4, 0xe5, 0xed, 0x05,
+    0x45, 0x1c, 0xf2, 0x8d, 0x00, 0x01, 0x47, 0x0f, 0x78, 0x71, 0x01, 0x0f, 0x18, 0x9b, 0x4b, 0x9a,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x59, 0x5a,
+];
+
+/// Offset of the 8-byte CRC64 / 32-byte SHA-256 Check in the fixtures above.
+const HELLO_CHECK_OFFSET: usize = 52;
+
+#[test]
+fn crc64_and_sha256_checks_verified() {
+    for (label, fixture, check_len) in [
+        ("crc64", &HELLO_CRC64_XZ[..], 8),
+        ("sha256", &HELLO_SHA256_XZ[..], 32),
+    ] {
+        for chunk in [1, 7, fixture.len()] {
+            let out = decode_chunked(fixture, chunk, 3).unwrap();
+            assert_eq!(out, b"hello xz check\n", "{label} chunk {chunk}");
+        }
+        // Flip one bit in each byte of the Check field in turn.
+        for i in 0..check_len {
+            let mut bad = fixture.to_vec();
+            bad[HELLO_CHECK_OFFSET + i] ^= 0x10;
+            assert_eq!(
+                decode_chunked(&bad, 4096, 4096).unwrap_err(),
+                Error::ChecksumMismatch,
+                "{label} check byte {i}"
+            );
+        }
+        // Corrupt the payload of the stored LZMA2 chunk: the container is
+        // still well-formed, only the Check catches it.
+        let mut bad = fixture.to_vec();
+        bad[40] ^= 0x01;
+        assert_eq!(
+            decode_chunked(&bad, 4096, 4096).unwrap_err(),
+            Error::ChecksumMismatch,
+            "{label} payload"
+        );
+    }
+}
+
+/// Bitwise CRC-32, for patching the fixtures' header/footer CRCs.
+fn test_crc32(data: &[u8]) -> u32 {
+    let mut c = !0u32;
+    for &b in data {
+        c ^= b as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 {
+                (c >> 1) ^ 0xEDB8_8320
+            } else {
+                c >> 1
+            };
+        }
+    }
+    !c
+}
+
+/// Rewrite the check ID in a Stream's header and footer flags, fixing both
+/// CRCs. The Check field size must stay the same.
+fn set_check_id(stream: &mut [u8], id: u8) {
+    stream[7] = id;
+    let crc = test_crc32(&stream[6..8]);
+    stream[8..12].copy_from_slice(&crc.to_le_bytes());
+    let n = stream.len();
+    stream[n - 3] = id;
+    let crc = test_crc32(&stream[n - 8..n - 2]);
+    stream[n - 12..n - 8].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// Reserved check IDs still define the Check field size; like liblzma by
+/// default (and `xz -d`, which only warns), decode and skip the field.
+#[test]
+fn reserved_check_id_is_skipped_unverified() {
+    let input = b"reserved check id ".repeat(30);
+    let mut stream = encode_all(&input);
+    // Our encoder writes CRC32 (4 bytes); 0x02 and 0x03 share that size.
+    for id in [0x02, 0x03] {
+        set_check_id(&mut stream, id);
+        assert_eq!(decode_chunked(&stream, 4096, 4096).unwrap(), input);
+        if tool_available("xz") {
+            let out = run_tool("xz", &["-d", "-c", "-q", "-q"], &stream);
+            assert_eq!(out.stdout, input, "xz -d check id {id:#x}");
+        }
+    }
+    // A non-zero reserved bit in the Stream Flags is still unsupported.
+    set_check_id(&mut stream, 0x11);
+    assert_eq!(
+        decode_chunked(&stream, 4096, 4096).unwrap_err(),
+        Error::Unsupported
+    );
+}
+
+#[test]
+fn system_xz_checks_decode() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    let input = mixed_corpus();
+    for check in ["none", "crc32", "crc64", "sha256"] {
+        let arg = format!("--check={check}");
+        // A small block size makes several Blocks, so the Check is verified
+        // (and restarted) per Block.
+        let encoded =
+            pipe_through("xz", &["-c", "-z", &arg, "--block-size=50000"], &input).unwrap();
+        for chunk in [997, encoded.len()] {
+            assert_eq!(
+                decode_chunked(&encoded, chunk, 4096).unwrap(),
+                input,
+                "{check} chunk {chunk}"
+            );
+        }
+    }
+}
