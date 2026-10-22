@@ -76,3 +76,14 @@ fn errors_on_truncation() {
     // A too-short rc stream must error.
     assert!(bcj2::decode(&main, &call, &jump, &[0u8; 2], 5).is_err());
 }
+
+#[test]
+fn huge_out_len_errors_without_allocating() {
+    // `out_len` comes from an archive header (the 7z unpack size) and is
+    // attacker-controlled. Output can never exceed the summed stream
+    // lengths, so a larger claim must be rejected before allocating
+    // (`usize::MAX` used to panic with a capacity overflow).
+    let rc = [0u8; 5];
+    assert!(bcj2::decode(b"abc", &[], &[], &rc, usize::MAX).is_err());
+    assert!(bcj2::decode(b"abc", &[], &[], &rc, 1 << 40).is_err());
+}
