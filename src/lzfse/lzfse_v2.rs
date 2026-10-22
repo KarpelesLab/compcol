@@ -84,6 +84,12 @@ const M_STATES: usize = 64;
 const D_STATES: usize = 256;
 const LIT_STATES: usize = 1024;
 
+/// Apple's per-block limits (`LZFSE_MATCHES_PER_BLOCK`, `LZFSE_LITERALS_PER_BLOCK`).
+/// Its encoder never exceeds them and its decoder holds a block's literals in
+/// a fixed `LZFSE_LITERALS_PER_BLOCK` buffer.
+const MATCHES_PER_BLOCK: usize = 10_000;
+const LITERALS_PER_BLOCK: usize = 4 * MATCHES_PER_BLOCK;
+
 /// L/M/D extra-bit widths and base values (Apple's `lzfse_internal.h`).
 const L_EXTRA_BITS: [u8; N_L_SYMBOLS] =
     [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 3, 5, 8];
@@ -213,6 +219,12 @@ fn parse_header(bytes: &[u8]) -> Result<V2Header, Error> {
     let d_state = bits64(w2, 52, 10) as u32;
 
     if literal_bits > 7 || lmd_bits > 7 {
+        return Err(Error::Corrupt);
+    }
+    // A block is decoded whole before any of it is drained, so bound it by
+    // Apple's per-block limits: at most ~23.6 MiB of output instead of the
+    // ~2.4 GiB the 20-bit `n_matches` field could otherwise claim.
+    if n_literals as usize > LITERALS_PER_BLOCK || n_matches as usize > MATCHES_PER_BLOCK {
         return Err(Error::Corrupt);
     }
 
@@ -591,7 +603,7 @@ mod test_encoder {
 
     /// Encode a frequency value with the LZFSE Huffman-style fixed encoding
     /// (inverse of `fse::decode_freq_table`).
-    fn encode_freq_value(v: u16) -> (u32, u32) {
+    pub(super) fn encode_freq_value(v: u16) -> (u32, u32) {
         match v {
             0 => (0b00, 2),
             1 => (0b10, 2),
@@ -1196,6 +1208,65 @@ mod tests {
             }
         }
         assert_eq!(out, data);
+    }
+
+    /// A ~100-byte block whose single-symbol FSE tables cost zero bits per
+    /// command: `n_matches` commands of `L = 0, M = 15, D = 1` expand to
+    /// `15 * n_matches` bytes, all materialised before any output drains.
+    fn zero_bit_match_block(n_matches: u32) -> Vec<u8> {
+        use super::test_encoder::encode_freq_value;
+        let single = |n_symbols: usize, sym: usize, states: u16| {
+            let mut f = vec![0u16; n_symbols];
+            f[sym] = states;
+            f
+        };
+        let mut freq_bits: Vec<u8> = Vec::new();
+        for table in [
+            single(N_L_SYMBOLS, 0, L_STATES as u16),
+            single(N_M_SYMBOLS, 15, M_STATES as u16),
+            single(N_D_SYMBOLS, 1, D_STATES as u16),
+            single(N_LIT_SYMBOLS, 0, LIT_STATES as u16),
+        ] {
+            for f in table {
+                let (code, len) = encode_freq_value(f);
+                for i in 0..len {
+                    freq_bits.push(((code >> i) & 1) as u8);
+                }
+            }
+        }
+        let mut freq_bytes = vec![0u8; freq_bits.len().div_ceil(8)];
+        for (i, &b) in freq_bits.iter().enumerate() {
+            freq_bytes[i / 8] |= b << (i % 8);
+        }
+        let header_size = (4 + V2_HEADER_FIXED_BYTES + freq_bytes.len()) as u64;
+        let w0 = ((n_matches as u64) << 40) | (7 << 60);
+        let w1 = 7u64 << 60;
+        let mut b = Vec::new();
+        b.extend_from_slice(&(15 * n_matches).to_le_bytes());
+        b.extend_from_slice(&w0.to_le_bytes());
+        b.extend_from_slice(&w1.to_le_bytes());
+        b.extend_from_slice(&header_size.to_le_bytes());
+        b.extend_from_slice(&freq_bytes);
+        b
+    }
+
+    #[test]
+    fn match_count_is_capped_per_block() {
+        // At Apple's per-block command limit the block still decodes...
+        let mut out = vec![0u8];
+        let block = zero_bit_match_block(MATCHES_PER_BLOCK as u32);
+        assert_eq!(
+            decode_block(&block, &mut out, 1 << 16).unwrap(),
+            block.len()
+        );
+        assert_eq!(out.len(), 1 + 15 * MATCHES_PER_BLOCK);
+        // ...but a header claiming up to 2^20 - 1 commands no longer lets a
+        // ~100-byte block allocate 15 MiB (or, with 11-bit M extras, GiBs)
+        // in one go, beyond the reach of `LimitedDecoder`.
+        let mut out = vec![0u8];
+        let block = zero_bit_match_block((1 << 20) - 1);
+        assert_eq!(decode_block(&block, &mut out, 1 << 16), Err(Error::Corrupt));
+        assert!(out.len() <= 1, "bomb block produced {} bytes", out.len());
     }
 
     #[test]
