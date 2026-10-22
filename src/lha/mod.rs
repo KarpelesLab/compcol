@@ -11,9 +11,9 @@
 //! - `lh2`: 8 KiB dictionary, **adaptive** Huffman for both literals/lengths
 //!   *and* positions (see [`dynamic_huff`]).
 //! - `lh4`: 4 KiB dictionary, static Huffman.
-//! - `lh5`: 16 KiB dictionary, static Huffman — the dominant method.
-//! - `lh6`: 64 KiB dictionary, static Huffman.
-//! - `lh7`: 128 KiB dictionary, static Huffman.
+//! - `lh5`: 8 KiB dictionary, static Huffman — the dominant method.
+//! - `lh6`: 32 KiB dictionary, static Huffman.
+//! - `lh7`: 64 KiB dictionary, static Huffman.
 //!
 //! `lh4`/`lh5`/`lh6`/`lh7` share the static-Huffman block structure
 //! (Okumura's public-domain ar002 layout — see [`static_huff`]) and differ
@@ -178,19 +178,19 @@ define_method!(
     Lh5,
     Lh5,
     "lh5",
-    "LHA `-lh5-`: 16 KiB dictionary, static Huffman."
+    "LHA `-lh5-`: 8 KiB dictionary, static Huffman."
 );
 define_method!(
     Lh6,
     Lh6,
     "lh6",
-    "LHA `-lh6-`: 64 KiB dictionary, static Huffman."
+    "LHA `-lh6-`: 32 KiB dictionary, static Huffman."
 );
 define_method!(
     Lh7,
     Lh7,
     "lh7",
-    "LHA `-lh7-`: 128 KiB dictionary, static Huffman."
+    "LHA `-lh7-`: 64 KiB dictionary, static Huffman."
 );
 
 // ─── encoder ─────────────────────────────────────────────────────────────

@@ -63,9 +63,13 @@ pub struct Params {
 
 impl Params {
     pub const fn for_method(name: &str) -> Params {
-        // Values follow the de-facto LHA decoders (lhasa): lh4 4 KiB,
-        // lh5 16 KiB, lh6 64 KiB, lh7 128 KiB. `np` is the number of
-        // distinct offset-bit-count symbols (== HISTORY_BITS + 1).
+        // Values follow the de-facto LHA implementations (LHa for UNIX,
+        // lhasa, 7-Zip): dictionary bits lh4 12 (4 KiB), lh5 13 (8 KiB),
+        // lh6 15 (32 KiB), lh7 16 (64 KiB). `np` is the number of distinct
+        // offset-bit-count symbols, `dicbit + 1` (lh4 shares lh5's 14).
+        // An `np` larger than the reference lets the encoder emit position
+        // symbols the other decoders don't have, so their position table
+        // comes out incomplete ("Bad table" / "Data Error").
         match name.as_bytes() {
             b"lh4" => Params {
                 ring_size: 1 << 12,
@@ -73,18 +77,18 @@ impl Params {
                 np: 14,
             },
             b"lh6" => Params {
+                ring_size: 1 << 15,
+                pbit: 5,
+                np: 16,
+            },
+            b"lh7" => Params {
                 ring_size: 1 << 16,
                 pbit: 5,
                 np: 17,
             },
-            b"lh7" => Params {
-                ring_size: 1 << 17,
-                pbit: 5,
-                np: 18,
-            },
             // lh5 (default).
             _ => Params {
-                ring_size: 1 << 14,
+                ring_size: 1 << 13,
                 pbit: 4,
                 np: 14,
             },
@@ -784,4 +788,57 @@ fn lz_parse(data: &[u8], window: usize) -> Vec<Token> {
     }
 
     tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse the first block's tables and return the position-table count
+    /// field (`n` in Okumura's `read_pt_len`).
+    fn first_block_p_count(payload: &[u8], params: Params) -> usize {
+        let mut br = BitReader::new(payload);
+        assert_ne!(br.get_bits(16), 0);
+        let temp = read_temp_table(&mut br).unwrap();
+        let c_lens = read_c_lengths(&mut br, &temp).unwrap();
+        assert!(build_c_table(&c_lens).is_ok());
+        br.get_bits(params.pbit) as usize
+    }
+
+    fn noise(n: usize, seed: u32) -> Vec<u8> {
+        let mut rng = seed;
+        (0..n)
+            .map(|_| {
+                rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+                (rng >> 16) as u8
+            })
+            .collect()
+    }
+
+    /// The reference implementations (LHa for UNIX, lhasa, 7-Zip) use
+    /// dictionary bits 12/13/15/16 for lh4/5/6/7 and `np = dicbit + 1`
+    /// position symbols (lh4 shares lh5's 14). lh6/lh7 used to be 64/128 KiB
+    /// with np 17/18, so the encoder emitted position symbols LHa and 7-Zip
+    /// don't have ("make_table(): Bad table" / "Data Error").
+    #[test]
+    fn method_params_match_reference_lha() {
+        for (name, ring, np, pbit) in [
+            ("lh4", 1 << 12, 14, 4),
+            ("lh5", 1 << 13, 14, 4),
+            ("lh6", 1 << 15, 16, 5),
+            ("lh7", 1 << 16, 17, 5),
+        ] {
+            let p = Params::for_method(name);
+            assert_eq!((p.ring_size, p.np, p.pbit), (ring, np, pbit), "{name}");
+        }
+        // A repeat 40000 bytes back (beyond lh6's 32 KiB, within lh7's
+        // 64 KiB): the transmitted position table must stay within np.
+        let data = noise(40_000, 3).repeat(2);
+        for name in ["lh6", "lh7"] {
+            let params = Params::for_method(name);
+            let enc = encode_payload(&data, params);
+            assert!(first_block_p_count(&enc, params) <= params.np, "{name}");
+            assert_eq!(decode_payload(&enc, None, params).unwrap(), data);
+        }
+    }
 }

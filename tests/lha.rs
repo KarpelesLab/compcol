@@ -220,7 +220,7 @@ fn large_window_match_lh2() {
 
 #[test]
 fn large_window_match_lh7() {
-    // A match at a distance only reachable with the 128 KiB lh7 window.
+    // A match at a distance only reachable with lh7's large (64 KiB) window.
     let mut data = vec![0u8; 100_000];
     for (i, b) in data.iter_mut().enumerate() {
         *b = (i % 251) as u8;
