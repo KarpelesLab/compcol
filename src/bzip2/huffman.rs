@@ -64,8 +64,13 @@ pub(crate) struct DecodeTable {
 impl DecodeTable {
     /// Build a decode table from a per-symbol code-length array.
     ///
-    /// Returns `Err(Error::InvalidHuffmanTree)` if the lengths don't
-    /// describe a valid prefix code (Kraft–McMillan check).
+    /// Like libbzip2 (`BZ2_hbCreateDecodeTables`), any lengths in
+    /// 1..=20 are accepted, whether or not they form a complete prefix
+    /// code: codes are handed out in canonical order, those that no
+    /// longer fit their length are unreachable, and a bit pattern no
+    /// symbol owns is an error only if the stream actually contains it
+    /// (see [`decode_symbol`](Self::decode_symbol)). Rejecting such
+    /// tables up front would refuse streams libbzip2 decodes.
     pub(crate) fn from_lengths(lengths: &[u8]) -> Result<Self, Error> {
         let n = lengths.len();
         if n == 0 {
@@ -93,25 +98,6 @@ impl DecodeTable {
         let mut count = [0i32; MAX_CODE_LEN + 2];
         for &l in lengths {
             count[l as usize] += 1;
-        }
-
-        // Kraft–McMillan validity check. A canonical prefix code is valid
-        // iff, accumulating `left = (left << 1) + count[len]` from len 1
-        // upward, `left` never exceeds the code space `1 << len` (no
-        // over-subscription) and exactly fills it at the end
-        // (`left == 1 << max_len`, no under-subscription). This matches the
-        // discipline in `src/huffman.rs` and rejects malformed tables here
-        // rather than deferring detection to the block CRC.
-        let mut left: i64 = 0;
-        for (i, &c) in count[1..=(max_len as usize)].iter().enumerate() {
-            let len = i + 1;
-            left = (left << 1) + c as i64;
-            if left > (1i64 << len) {
-                return Err(Error::InvalidHuffmanTree);
-            }
-        }
-        if left != (1i64 << max_len) {
-            return Err(Error::InvalidHuffmanTree);
         }
 
         // Build base/limit tables in the bzip2 / RFC1951 canonical style.
@@ -487,8 +473,9 @@ mod tests {
                 lens.iter().all(|&l| (1..=17).contains(&l)),
                 "length out of 1..=17: {lens:?}"
             );
-            // Must round-trip through the decode-table builder.
-            DecodeTable::from_lengths(&lens).expect("builder produced a non-Kraft-valid table");
+            // Must be a complete prefix code (Kraft sum exactly 1).
+            let kraft: u64 = lens.iter().map(|&l| 1u64 << (17 - l)).sum();
+            assert_eq!(kraft, 1 << 17, "not a complete prefix code: {lens:?}");
         }
     }
 }

@@ -5,7 +5,7 @@
 
 #![cfg(feature = "bzip2")]
 
-use compcol::bzip2::{Bzip2, Decoder, Encoder, EncoderConfig};
+use compcol::bzip2::{Bzip2, Decoder, DecoderConfig, Encoder, EncoderConfig};
 use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Flush, Status};
 
 /// Drive an encoder to completion, feeding `input` in `in_chunk`-sized
@@ -939,5 +939,268 @@ fn flush_matches_libbzip2() {
         }
         assert_eq!(after_flush, [3, 31, 31], "out_chunk {out_chunk}");
         assert_eq!(out, REF, "out_chunk {out_chunk}");
+    }
+}
+
+// ─── decoder: where the stream ends ────────────────────────────────────
+
+/// With `multi_stream` off, `decode` stops at the trailer and never
+/// reports the bytes after it consumed, however the input is chunked.
+#[test]
+fn single_stream_decode_leaves_bytes_after_the_stream() {
+    let plain = gen_words(150_000);
+    let stream = encode_level(&plain, 1);
+    let mut input = stream.clone();
+    input.extend_from_slice(b"BZh9 and more trailing bytes");
+    let config = DecoderConfig::default().with_multi_stream(false);
+
+    for (in_chunk, out_chunk) in [
+        (input.len(), 1 << 20),
+        (input.len(), 1000),
+        (1, 1 << 20),
+        (7, 3),
+    ] {
+        let mut dec = Bzip2::decoder_with(config);
+        let mut buf = vec![0u8; out_chunk];
+        let mut got = Vec::new();
+        let mut pos = 0;
+        loop {
+            let end = (pos + in_chunk).min(input.len());
+            let (p, status) = dec.decode(&input[pos..end], &mut buf).unwrap();
+            got.extend_from_slice(&buf[..p.written]);
+            pos += p.consumed;
+            if status == Status::StreamEnd {
+                break;
+            }
+            assert!(pos < input.len(), "ran out of input before StreamEnd");
+        }
+        assert!(got == plain, "{in_chunk}/{out_chunk}");
+        assert_eq!(pos, stream.len(), "{in_chunk}/{out_chunk}");
+        let (p, status) = dec.decode(&input[pos..], &mut buf).unwrap();
+        assert_eq!((p.consumed, p.written, status), (0, 0, Status::StreamEnd));
+        assert_eq!(dec.finish(&mut buf).unwrap().1, Status::StreamEnd);
+    }
+}
+
+/// In the default multi-stream mode, the call that finds the end hands
+/// back the trailing bytes it was given.
+#[test]
+fn multi_stream_decode_hands_back_trailing_garbage() {
+    let a = encode_all(b"first ");
+    let b = encode_all(b"second");
+    let mut input = a.clone();
+    input.extend_from_slice(&b);
+    input.extend_from_slice(b"garbage");
+    let mut dec = Decoder::new();
+    let mut out = vec![0u8; 100];
+    let (p, status) = dec.decode(&input, &mut out).unwrap();
+    assert_eq!(status, Status::StreamEnd);
+    assert_eq!(&out[..p.written], b"first second");
+    assert_eq!(p.consumed, a.len() + b.len());
+}
+
+/// A full output buffer leaves the input past the decoded block for the
+/// next call instead of swallowing it.
+#[test]
+fn decode_with_full_output_does_not_take_unparsed_input() {
+    let plain = gen_words(250_000);
+    let stream = encode_level(&plain, 1);
+    let mut input = stream.clone();
+    input.extend_from_slice(b"tail");
+    let mut dec = Decoder::with_config(DecoderConfig::default().with_multi_stream(false));
+    let mut buf = [0u8; 4096];
+    let (p, status) = dec.decode(&input, &mut buf).unwrap();
+    assert_eq!(status, Status::OutputFull);
+    assert!(
+        p.consumed < stream.len(),
+        "{} of {}",
+        p.consumed,
+        stream.len()
+    );
+    let mut got = buf[..p.written].to_vec();
+    let mut pos = p.consumed;
+    loop {
+        let (p, status) = dec.decode(&input[pos..], &mut buf).unwrap();
+        got.extend_from_slice(&buf[..p.written]);
+        pos += p.consumed;
+        if status == Status::StreamEnd {
+            break;
+        }
+    }
+    assert!(got == plain);
+    assert_eq!(&input[pos..], b"tail");
+}
+
+// ─── decoder: what libbzip2 accepts ────────────────────────────────────
+
+/// Blocks with the "randomised" bit set, as bzip2 0.9.0/0.9.5 wrote for
+/// repetitive data. The fixtures were made by randomising blocks the way
+/// those versions did and checked with libbzip2 1.0.8 (`bunzip2 -t`);
+/// the second has several blocks at level 1.
+#[test]
+fn decodes_randomised_blocks() {
+    let mut small = Vec::new();
+    let mut x: u32 = 12345;
+    while small.len() < 6000 {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
+        let byte = b'a' + ((x >> 16) % 6) as u8;
+        let n = if (x >> 4).is_multiple_of(7) {
+            1 + (x >> 8) % 6
+        } else {
+            1
+        };
+        small.extend(std::iter::repeat_n(byte, n as usize));
+    }
+    small.truncate(6000);
+    let mut big = b"abcd".repeat(30_000);
+    big.extend((0..=255u8).cycle().take(128_000));
+    big.resize(300_000, 0);
+
+    for (stream, want) in [
+        (
+            &include_bytes!("fixtures/bzip2/randomised_small.bz2")[..],
+            small,
+        ),
+        (
+            &include_bytes!("fixtures/bzip2/randomised_multiblock.bz2")[..],
+            big,
+        ),
+    ] {
+        assert!(decode_chunked(stream, stream.len(), 1 << 20).unwrap() == want);
+        assert!(decode_chunked(stream, 1, 777).unwrap() == want);
+    }
+}
+
+/// MSB-first bit writer for hand-built streams.
+#[derive(Default)]
+struct Bits {
+    out: Vec<u8>,
+    acc: u64,
+    n: u32,
+}
+
+impl Bits {
+    fn put(&mut self, n: u32, v: u64) {
+        for i in (0..n).rev() {
+            self.acc = (self.acc << 1) | ((v >> i) & 1);
+            self.n += 1;
+            if self.n == 8 {
+                self.out.push(self.acc as u8);
+                self.acc = 0;
+                self.n = 0;
+            }
+        }
+    }
+    fn finish(mut self) -> Vec<u8> {
+        if self.n > 0 {
+            self.put(8 - self.n, 0);
+        }
+        self.out
+    }
+}
+
+fn crc32_mpeg2(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in data {
+        crc ^= (b as u32) << 24;
+        for _ in 0..8 {
+            crc = if crc & 0x8000_0000 != 0 {
+                (crc << 1) ^ 0x04C1_1DB7
+            } else {
+                crc << 1
+            };
+        }
+    }
+    !crc
+}
+
+/// A one-block stream of the single byte "a" (MTF symbols: RUNA, EOB;
+/// alphabet RUNA/RUNB/EOB) with the given code lengths for both tables,
+/// `num_selectors` selectors, and the symbols' codes given as bit
+/// strings.
+fn hand_built_stream(lengths: [u32; 3], num_selectors: u32, codes: &[(u32, u64)]) -> Vec<u8> {
+    let crc = crc32_mpeg2(b"a");
+    let mut w = Bits::default();
+    for &b in b"BZh1" {
+        w.put(8, b as u64);
+    }
+    w.put(48, 0x3141_5926_5359);
+    w.put(32, crc as u64);
+    w.put(1, 0); // not randomised
+    w.put(24, 0); // origin
+    w.put(16, 1 << (15 - 6)); // stripe 0x60..0x6F
+    w.put(16, 1 << (15 - 1)); // 'a' = 0x61
+    w.put(3, 2); // two tables
+    w.put(15, num_selectors as u64);
+    for _ in 0..num_selectors {
+        w.put(1, 0); // table 0
+    }
+    for _ in 0..2 {
+        let mut cur = lengths[0];
+        w.put(5, cur as u64);
+        for &l in &lengths {
+            while cur < l {
+                w.put(2, 0b10);
+                cur += 1;
+            }
+            while cur > l {
+                w.put(2, 0b11);
+                cur -= 1;
+            }
+            w.put(1, 0);
+        }
+    }
+    for &(n, v) in codes {
+        w.put(n, v);
+    }
+    w.put(48, 0x1772_4538_5090);
+    w.put(32, crc as u64);
+    w.finish()
+}
+
+/// libbzip2 builds its decode tables from any code lengths in 1..=20
+/// without checking they form a complete prefix code; only a code that
+/// the stream uses has to decode. We used to reject such tables.
+#[test]
+fn accepts_incomplete_and_oversubscribed_code_tables() {
+    let cases = [
+        // Incomplete (Kraft sum 3/4): RUNA = 00, RUNB = 01, EOB = 10.
+        hand_built_stream([2, 2, 2], 1, &[(2, 0b00), (2, 0b10)]),
+        // Over-subscribed: RUNA = 0, EOB = 1, and RUNB (length 2) gets
+        // a code that cannot exist.
+        hand_built_stream([1, 2, 1], 1, &[(1, 0), (1, 1)]),
+        // A complete code, but 20 000 selectors: libbzip2 reads and
+        // ignores those past the 18 002 that can ever be used.
+        hand_built_stream([1, 2, 2], 20_000, &[(1, 0), (2, 0b11)]),
+    ];
+    for stream in &cases {
+        assert_eq!(decode_chunked(stream, stream.len(), 64).unwrap(), b"a");
+        assert_eq!(decode_chunked(stream, 1, 1).unwrap(), b"a");
+    }
+    // An unused code in an incomplete table is still an error when the
+    // stream contains it (11 is nobody's code).
+    let bad = hand_built_stream([2, 2, 2], 1, &[(2, 0b00), (2, 0b11)]);
+    assert!(decode_chunked(&bad, bad.len(), 64).is_err());
+
+    #[cfg(feature = "std")]
+    if std::process::Command::new("bunzip2")
+        .arg("--help")
+        .output()
+        .is_ok()
+    {
+        use std::io::Write;
+        for stream in &cases {
+            let mut child = std::process::Command::new("bunzip2")
+                .arg("-c")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.as_mut().unwrap().write_all(stream).unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "libbzip2 rejects a case: {:?}", out);
+            assert_eq!(out.stdout, b"a");
+        }
     }
 }
