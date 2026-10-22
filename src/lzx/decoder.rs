@@ -598,6 +598,16 @@ fn step(ctx: &mut RunCtx) -> Result<(), Error> {
             }
 
             BlockState::UncompressedAlign { remaining } => {
+                // 1..=16 bits of padding, not 0..=15: a header that ends
+                // exactly on a word boundary is followed by a whole zero
+                // word (MS-CAB compressors emit it; libmspack skips it).
+                if ctx.bit_reader.bits_available().is_multiple_of(16) {
+                    if ctx.bit_reader.bits_available() < 16 {
+                        ctx.block = BlockState::UncompressedAlign { remaining };
+                        return Ok(());
+                    }
+                    ctx.bit_reader.drop_bits(16);
+                }
                 ctx.bit_reader.align_to_word();
                 ctx.block = BlockState::UncompressedRRR {
                     remaining,

@@ -552,6 +552,20 @@ fn cab_frame_boundary_realigns_bitstream() {
     assert_eq!(decode_all_ways(&w.framed(16, data.len())), data);
 }
 
+/// An uncompressed block whose 27-bit header ends exactly on a word
+/// boundary is followed by a whole 16-bit padding word (the rule is 1..=16
+/// bits, not 0..=15). The decoder used to treat the padding as R0.
+#[test]
+fn cab_word_aligned_uncompressed_header_skips_full_pad_word() {
+    let data: Vec<u8> = (0..110u32).map(|i| (i * 13) as u8).collect();
+    let mut w = BitW::new();
+    w.put(1, 0);
+    put_verbatim_literals(&mut w, 16, &data[..100], false);
+    assert_eq!((w.n + 27) % 16, 0, "next header must end word-aligned");
+    put_uncompressed_block(&mut w, &data[100..]);
+    assert_eq!(decode_all_ways(&w.framed(16, data.len())), data);
+}
+
 // ─── factory ─────────────────────────────────────────────────────────────
 
 #[cfg(feature = "factory")]
