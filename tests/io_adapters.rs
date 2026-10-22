@@ -381,3 +381,30 @@ fn writer_adapters_survive_inner_wouldblock() {
         );
     }
 }
+
+// ─── Write::flush makes everything written so far decodable ─────────────
+
+// The `embed` deflate encoder cannot byte-align mid-stream, so its flush
+// is a no-op.
+#[cfg(not(feature = "embed"))]
+#[test]
+fn encoder_writer_flush_emits_sync_point() {
+    use compcol::{Decoder, Status};
+    let mut w = EncoderWriter::new(Vec::<u8>::new(), Gzip::encoder());
+    w.write_all(b"request one\n").unwrap();
+    w.flush().unwrap();
+
+    // The peer can decode the first message without the end of stream.
+    let mut dec = Gzip::decoder();
+    let mut buf = [0u8; 64];
+    let (p, status) = dec.decode(w.get_ref(), &mut buf).unwrap();
+    assert_eq!(&buf[..p.written], b"request one\n");
+    assert_eq!(status, Status::InputEmpty);
+
+    w.write_all(b"request two\n").unwrap();
+    let compressed = w.finish().unwrap();
+    assert_eq!(
+        compcol::vec::decompress_to_vec::<Gzip>(&compressed).unwrap(),
+        b"request one\nrequest two\n"
+    );
+}

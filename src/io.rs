@@ -36,7 +36,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use std::io::{self, Read, Write};
 
-use crate::{Decoder, Encoder, Error, Status};
+use crate::{Decoder, Encoder, Error, Flush, Status};
 
 /// Per-call scratch buffer size. 64 KiB matches the CLI streaming
 /// loop in `src/bin/compcol.rs` and is comfortably above the
@@ -196,14 +196,35 @@ impl<W: Write, E: Encoder> Write for EncoderWriter<W, E> {
         Ok(consumed)
     }
 
+    /// Sync-flushes the encoder ([`Flush::Sync`]) so everything written so
+    /// far is decodable by the peer, then flushes the inner writer. Formats
+    /// without an in-band sync marker flush nothing extra.
     fn flush(&mut self) -> io::Result<()> {
-        match self.inner.as_mut() {
-            Some(w) => {
+        let Some(w) = self.inner.as_mut() else {
+            return Ok(());
+        };
+        drain_pending(w, &self.scratch, &mut self.out_pos, self.out_len)?;
+        if !self.finished {
+            loop {
+                let (p, status) = match self.enc.flush(&mut self.scratch, Flush::Sync) {
+                    Ok(r) => r,
+                    // A build that cannot byte-align mid-stream (`embed`)
+                    // has nothing it can flush; that's not a write error.
+                    Err(Error::Unsupported) => break,
+                    Err(e) => return Err(e.into()),
+                };
+                self.out_pos = 0;
+                self.out_len = p.written;
                 drain_pending(w, &self.scratch, &mut self.out_pos, self.out_len)?;
-                w.flush()
+                if !matches!(status, Status::OutputFull) {
+                    break;
+                }
+                if p.written == 0 {
+                    return Err(io::Error::other("encoder stalled in flush"));
+                }
             }
-            None => Ok(()),
         }
+        w.flush()
     }
 }
 
