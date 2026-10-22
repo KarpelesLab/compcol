@@ -778,3 +778,24 @@ fn trailing_garbage_after_stream_is_ignored() {
         );
     }
 }
+
+/// Feeding a large block one byte at a time used to re-parse the whole
+/// buffered block on every byte (quadratic: ~150 s for a 200 KB block in
+/// release, far longer in debug). Retries are now spaced geometrically.
+#[test]
+fn one_byte_input_on_large_block_is_not_quadratic() {
+    let mut s = 0x9E37_79B9_7F4A_7C15u64;
+    let input: Vec<u8> = (0..200_000)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s as u8
+        })
+        .collect();
+    let encoded = encode_all(&input);
+    let start = std::time::Instant::now();
+    assert_eq!(decode_chunked(&encoded, 1, 65536).unwrap(), input);
+    // Generous bound for slow debug CI; the quadratic path took minutes.
+    assert!(start.elapsed().as_secs() < 60, "{:?}", start.elapsed());
+}

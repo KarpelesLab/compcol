@@ -80,8 +80,16 @@ pub struct Decoder {
     poisoned: bool,
 
     /// Set by `finish`: no more input will arrive, so a partial
-    /// `BZh` prefix after a stream is trailing garbage.
+    /// `BZh` prefix after a stream is trailing garbage and a gated block
+    /// decode must be attempted now.
     finishing: bool,
+    /// `in_buf.len()` that must be reached before the speculative block
+    /// decode is retried after it ran out of input. Each failed attempt
+    /// re-parses the whole buffered block, so retrying on every new byte
+    /// is quadratic (minutes for one 200 KB block fed a byte at a time);
+    /// requiring 1/8 more input per retry bounds the total work at a
+    /// constant multiple of the block size.
+    retry_at: usize,
 }
 
 impl Decoder {
@@ -97,6 +105,7 @@ impl Decoder {
             phase: Phase::Header,
             poisoned: false,
             finishing: false,
+            retry_at: 0,
         }
     }
 
@@ -156,6 +165,10 @@ impl Decoder {
         let mut br = BitReader::new_at(&self.in_buf, self.bit_pos);
         let magic = br.read_bits_48()?;
         if magic == BLOCK_MAGIC {
+            if !self.finishing && self.in_buf.len() < self.retry_at {
+                // Not enough new input since the last failed attempt.
+                return Ok(false);
+            }
             // Block payload begins right after the magic. We need to
             // decode the rest of the block now; if anything in the
             // block tries to read past the buffered input we rewind
@@ -165,12 +178,15 @@ impl Decoder {
             // we rewind to before the magic.
             match self.decode_block_payload() {
                 Ok(()) => {
+                    self.retry_at = 0;
                     self.phase = Phase::DrainDecoded;
                     Ok(true)
                 }
                 Err(Error::UnexpectedEnd) => {
                     // Roll back to before the magic.
                     self.bit_pos = snapshot;
+                    let parsed = self.in_buf.len() - snapshot / 8;
+                    self.retry_at = self.in_buf.len() + (parsed / 8).max(1);
                     Ok(false)
                 }
                 Err(e) => Err(self.poison(e)),
@@ -527,6 +543,7 @@ impl RawDecoder for Decoder {
                 self.in_buf.drain(..off);
                 self.bit_pos -= off * 8;
                 self.in_committed_bytes = 0;
+                self.retry_at = self.retry_at.saturating_sub(off);
             }
 
             if matches!(self.phase, Phase::Done) {
@@ -613,5 +630,6 @@ impl RawDecoder for Decoder {
         self.phase = Phase::Header;
         self.poisoned = false;
         self.finishing = false;
+        self.retry_at = 0;
     }
 }
