@@ -255,6 +255,13 @@ impl RawEncoder for Encoder {
             Phase::Buffering => {}
         }
 
+        // The framing header stores the total length as a `u32`; above
+        // that it would be silently truncated and the decoder would stop
+        // early. Reject the stream with a clean error instead.
+        if self.total_input + input.len() as u64 > u32::MAX as u64 {
+            return Err(Error::Unsupported);
+        }
+
         if !input.is_empty() {
             self.in_buf.extend_from_slice(input);
             self.total_input += input.len() as u64;
@@ -649,5 +656,25 @@ impl BlockWriter {
         // codes — which is fine because the decoder stops on
         // `output_emitted == total_output` (our framing header).
         self.slots.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 4-byte framing header cannot carry a length above `u32::MAX`;
+    /// a stream that grows past it must be rejected, not silently framed
+    /// with a truncated length (which made the decoder stop after
+    /// `len mod 2^32` bytes).
+    #[test]
+    fn rejects_input_past_u32_length_header() {
+        let mut enc = Encoder::new();
+        let mut out = [0u8; 16];
+        enc.raw_encode(b"abc", &mut out).unwrap();
+        // Pretend the first 4 GiB - 1 bytes were already consumed.
+        enc.total_input = u32::MAX as u64 - 1;
+        assert!(enc.raw_encode(b"x", &mut out).is_ok());
+        assert_eq!(enc.raw_encode(b"y", &mut out), Err(Error::Unsupported));
     }
 }
