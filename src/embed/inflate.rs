@@ -164,8 +164,8 @@ pub(super) fn build_codes(
 /// Where the decoded bytes go: the push decoder's [`Windowed`] sink, or one
 /// of the one-shot outputs in `oneshot`.
 pub(crate) trait Out {
-    /// Appends a byte. The push decoder has made sure there is room; the
-    /// one-shot outputs fail when there is none.
+    /// Appends a byte. The push decoder's output drops it and says so when
+    /// there is no room; the one-shot outputs fail.
     fn put(&mut self, byte: u8) -> Result<(), Error>;
     /// Fails unless a back-reference `dist` bytes back can be followed.
     fn check_dist(&self, dist: u32) -> Result<(), Error>;
@@ -264,6 +264,9 @@ pub(super) struct Windowed<'a, F, const N: usize> {
     pub(super) len: usize,
     /// Bytes of `dst` fed to the checksum so far.
     flushed: usize,
+    /// Whether a literal found no room in the slice, and was dropped: the
+    /// push decoder then takes the step that decoded it back.
+    pub(super) full: bool,
 }
 
 impl<'a, F: Format, const N: usize> Windowed<'a, F, N> {
@@ -274,6 +277,7 @@ impl<'a, F: Format, const N: usize> Windowed<'a, F, N> {
             dst,
             len: 0,
             flushed: 0,
+            full: false,
         }
     }
 
@@ -314,7 +318,11 @@ impl<'a, F: Format, const N: usize> Windowed<'a, F, N> {
 impl<F: Format, const N: usize> Out for Windowed<'_, F, N> {
     #[inline]
     fn put(&mut self, byte: u8) -> Result<(), Error> {
-        self.push(byte);
+        if self.room() == 0 {
+            self.full = true;
+        } else {
+            self.push(byte);
+        }
         Ok(())
     }
 
