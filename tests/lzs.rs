@@ -116,6 +116,36 @@ fn round_trip(input: &[u8]) {
     assert_eq!(decoded, input, "round-trip mismatch len {}", input.len());
 }
 
+/// A match exactly 2048 bytes back does not fit the 11-bit long-offset
+/// field (it wraps to offset 0); the encoder used to emit it anyway,
+/// producing a stream its own decoder rejects with `InvalidDistance`.
+#[test]
+fn round_trip_match_at_distance_2048() {
+    let mut block = Vec::with_capacity(2048);
+    let mut s = 1u32;
+    for _ in 0..2048 {
+        s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        block.push((s >> 16) as u8);
+    }
+    let mut input = block.clone();
+    input.extend_from_slice(&block[..16]);
+    let decoded = decode_chunked(&encode_all(&input), 4096, 4096).unwrap();
+    assert!(decoded == input);
+
+    // Random data of this size hit the same wrap by chance.
+    let mut s = 12_345u64;
+    let random: Vec<u8> = (0..70_000)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s as u8
+        })
+        .collect();
+    let decoded = decode_chunked(&encode_all(&random), 4096, 4096).unwrap();
+    assert!(decoded == random);
+}
+
 // ─── algorithm metadata ─────────────────────────────────────────────────
 
 #[test]
