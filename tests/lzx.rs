@@ -566,6 +566,49 @@ fn cab_word_aligned_uncompressed_header_skips_full_pad_word() {
     assert_eq!(decode_all_ways(&w.framed(16, data.len())), data);
 }
 
+/// Odd-sized uncompressed blocks carry one pad byte, and a following block
+/// must decode normally. The decoder used to reject the pad with
+/// `Unsupported`, so any stream with an odd uncompressed block before its
+/// last one failed.
+#[test]
+fn cab_odd_uncompressed_block_followed_by_more() {
+    let data: Vec<u8> = (0..1001u32).map(|i| (i * 7) as u8).collect();
+    let mut w = BitW::new();
+    w.put(1, 0);
+    put_uncompressed_block(&mut w, &data[..501]);
+    put_uncompressed_block(&mut w, &data[501..]);
+    assert_eq!(decode_all_ways(&w.framed(16, data.len())), data);
+}
+
+/// A frame boundary can fall on an odd byte inside an uncompressed block
+/// (here the block starts at frame offset 32767). The decoder used to put
+/// both bytes of that word in the old frame, making it 32769 bytes long
+/// and shifting E8 translation for everything after it.
+#[test]
+fn cab_frame_boundary_inside_uncompressed_word() {
+    const FILESIZE: u32 = 0x0010_0000;
+    let mut head: Vec<u8> = (0..32_767u32).map(|i| (i % 200) as u8).collect();
+    // Frame 1 ends at 32768: an E8 at 32758 is inside its last 10 bytes and
+    // must stay untranslated, which only holds if the frame ends there.
+    head[32_758..32_763].copy_from_slice(&[0xE8, 5, 0, 0, 0]);
+    let mut tail: Vec<u8> = (0..3_000u32).map(|i| (i % 200) as u8).collect();
+    for i in [0usize, 7, 20, 300, 2_980] {
+        tail[i] = 0xE8;
+    }
+    let mut w = BitW::new();
+    w.put(1, 1);
+    w.put(32, FILESIZE);
+    put_verbatim_literals(&mut w, 16, &head, true);
+    put_uncompressed_block(&mut w, &tail);
+    let mut want = head.clone();
+    want.extend_from_slice(&tail);
+    for (k, frame) in want.chunks_mut(32_768).enumerate() {
+        e8_reference(frame, (k * 32_768) as i64, FILESIZE as i64);
+    }
+    let total = want.len();
+    assert_eq!(decode_all_ways(&w.framed(16, total)), want);
+}
+
 // ─── factory ─────────────────────────────────────────────────────────────
 
 #[cfg(feature = "factory")]
