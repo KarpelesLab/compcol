@@ -443,9 +443,9 @@ fn decoder_compressed_chunk_literal_then_match() {
     //   bit 3: match (offset=3, length=13)
     // flag = 0b0000_1000 = 0x08
     //
-    // Match token: pos_before = 3, split table → offset_bits=12,
-    // length_bits=4. off_code = 3-1 = 2, len_code = 13-3 = 10.
-    // token = (2 << 4) | 10 = 0x2A = 42 → little-endian [0x2A, 0x00].
+    // Match token: pos_before = 3, split table → offset_bits=4,
+    // length_bits=12. off_code = 3-1 = 2, len_code = 13-3 = 10.
+    // token = (2 << 12) | 10 = 0x200A → little-endian [0x0A, 0x20].
     //
     // Compressed body: [flag, 'A', 'B', 'C', token_lo, token_hi]
     //                = [0x08, 0x41, 0x42, 0x43, 0x2A, 0x00]
@@ -454,7 +454,7 @@ fn decoder_compressed_chunk_literal_then_match() {
         0x05, 0xB0, // header (compressed, size 6)
         0x08, // flag byte: bit 3 set
         0x41, 0x42, 0x43, // literals 'A', 'B', 'C'
-        0x2A, 0x00, // match token: offset 3, length 13
+        0x0A, 0x20, // match token: offset 3, length 13
     ];
     let decoded = decode_chunked(&encoded, 16, 32);
     assert_eq!(&decoded, b"ABCABCABCABCABCA");
@@ -494,11 +494,11 @@ fn decoder_rejects_match_with_no_history() {
 fn decoder_rejects_match_past_history() {
     // 2 literals then a match with offset 5 (past available history).
     // flag = 0b100 = 0x04, tokens: 'A', 'B', match(offset=5, len=3)
-    // pos before match = 2, split = (12,4). off_code = 5-1 = 4,
-    // len_code = 0. token = (4 << 4) | 0 = 0x40 → LE [0x40, 0x00].
-    // body = [0x04, 'A', 'B', 0x40, 0x00], len=5
+    // pos before match = 2, split = (4,12). off_code = 5-1 = 4,
+    // len_code = 0. token = (4 << 12) | 0 = 0x4000 → LE [0x00, 0x40].
+    // body = [0x04, 'A', 'B', 0x00, 0x40], len=5
     // header = 0xB004 → LE [0x04, 0xB0].
-    let encoded = [0x04, 0xB0, 0x04, b'A', b'B', 0x40, 0x00];
+    let encoded = [0x04, 0xB0, 0x04, b'A', b'B', 0x00, 0x40];
     let mut dec = Decoder::new();
     let mut out = [0u8; 16];
     let res = dec.decode(&encoded, &mut out);
@@ -527,6 +527,41 @@ fn decoder_rejects_truncated_body() {
     let _ = dec.decode(&encoded, &mut out).unwrap();
     let err = dec.finish(&mut out).unwrap_err();
     assert_eq!(err, compcol::Error::UnexpectedEnd);
+}
+
+#[test]
+fn decoder_ms_xca_section_3_3_example() {
+    // The worked LZNT1 example from MS-XCA section 3.3: 142 bytes of text
+    // (with the terminating NUL) compressed into one 59-byte chunk. Its
+    // first match, 0x2000 at U = 3, is 4 bits of displacement and 12 bits
+    // of length; the decoder used to read the split the other way round
+    // and rejected the stream with InvalidDistance.
+    let encoded: [u8; 59] = [
+        0x38, 0xb0, 0x88, 0x46, 0x23, 0x20, 0x00, 0x20, 0x47, 0x20, 0x41, 0x00, 0x10, 0xa2, 0x47,
+        0x01, 0xa0, 0x45, 0x20, 0x44, 0x00, 0x08, 0x45, 0x01, 0x50, 0x79, 0x00, 0xc0, 0x45, 0x20,
+        0x05, 0x24, 0x13, 0x88, 0x05, 0xb4, 0x02, 0x4a, 0x44, 0xef, 0x03, 0x58, 0x02, 0x8c, 0x09,
+        0x16, 0x01, 0x48, 0x45, 0x00, 0xbe, 0x00, 0x9e, 0x00, 0x04, 0x01, 0x18, 0x90, 0x00,
+    ];
+    let mut expected = b"F# F# G A A G F# E D D E F# F# E E F# F# G A A G F# E D D E F# E D D \
+E E F# D E F# G F# D E F# G F# E D E A F# F# G A A G F# E D D E F# E D D"
+        .to_vec();
+    expected.push(0);
+    assert_eq!(expected.len(), 142);
+    assert_eq!(decode_chunked(&encoded, 59, 256), expected);
+    assert_eq!(decode_chunked(&encoded, 1, 1), expected);
+}
+
+#[test]
+fn encoder_uses_spec_split_at_chunk_start() {
+    // "abcabcabc...": 3 literals, then one match at U = 3 with offset 3.
+    // Per MS-XCA that token has 4 offset bits and 12 length bits, so the
+    // offset code (2) sits in the top nibble.
+    let input = b"abcabcabcabcabcabcabc";
+    let encoded = encode_chunked(input, input.len(), 256);
+    // header(2) + flag(1) + 3 literals → token at bytes 6..8.
+    let token = u16::from_le_bytes([encoded[6], encoded[7]]);
+    assert_eq!(token >> 12, 2, "token {token:#06x}");
+    assert_eq!((token & 0x0FFF) as usize + 3, input.len() - 3);
 }
 
 // ─── multi-chunk fixture ─────────────────────────────────────────────────
