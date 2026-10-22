@@ -78,6 +78,10 @@ const MIN_WINDOW_SIZE: usize = 0x20000; // 128 KiB
 const MAX_WINDOW_SIZE: usize = 0x4000_0000; // 1 GiB
 const DEFAULT_WINDOW_SIZE: usize = 0x10_0000; // 1 MiB
 
+/// Finished output buffered in `ready` before block decoding pauses to let
+/// the caller drain it.
+const READY_HIGH_WATER: usize = 1 << 20;
+
 /// Streaming RAR5 LZ77+Huffman decoder. See module docs for framing.
 pub struct Decoder {
     state: State,
@@ -305,19 +309,9 @@ impl RawDecoder for Decoder {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
-        let mut written = 0usize;
-        while written < output.len()
-            && let Some(b) = self.ready.pop_front()
-        {
-            output[written] = b;
-            written += 1;
-        }
-        if self.unpack_so_far == self.unpack_total
-            && self.ready.is_empty()
-            && self.out_queue.is_empty()
-        {
-            self.state = State::Done;
-        }
+        // Drain, resuming any block decoding that paused at
+        // READY_HIGH_WATER; this also marks the stream Done when complete.
+        let written = self.raw_decode(&[], output)?.written;
         match &self.state {
             State::Done => Ok(RawProgress {
                 consumed: 0,
@@ -333,7 +327,7 @@ impl RawDecoder for Decoder {
                 })
             }
             _ => {
-                if written == 0 {
+                if written == 0 && self.ready.is_empty() {
                     Err(self.poison(Error::UnexpectedEnd))
                 } else {
                     Ok(RawProgress {
@@ -482,6 +476,15 @@ impl Decoder {
             }
             if self.unpack_so_far + self.out_queue.len() as u64 >= self.unpack_total {
                 return Ok(progressed);
+            }
+            // Yield once enough finished output is waiting for the caller.
+            // A block can expand to gigabytes (one bit per multi-KiB match),
+            // so decoding it whole before returning would buffer all of it
+            // here — beyond the reach of an output cap like
+            // `LimitedDecoder`. The block's bit position is kept in
+            // `State::InBlock`, so the next call resumes where this stops.
+            if self.ready.len() >= READY_HIGH_WATER {
+                return Ok(true);
             }
             // Cap the in-flight out_queue to avoid unbounded growth. We
             // flush it through filters at every iteration so this only
