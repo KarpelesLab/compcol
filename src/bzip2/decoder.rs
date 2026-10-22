@@ -691,19 +691,21 @@ impl RawDecoder for Decoder {
         let p = self.raw_decode(&[], output)?;
         if p.done {
             Ok(p)
-        } else if output.is_empty() || p.written == output.len() {
+        } else if output.is_empty() || p.written > 0 {
             // A whole decoded block can be larger than the caller's
             // buffer: the input may be fully absorbed while decoded bytes
             // are still pending. `finish` must stay drainable — report
-            // "not done" so the caller drains and calls again.
+            // "not done" so the caller drains and calls again. Only a call
+            // with nothing left to hand over reports a truncated stream;
+            // failing earlier dropped the bytes written this call.
             Ok(RawProgress {
                 consumed: 0,
                 written: p.written,
                 done: false,
             })
         } else {
-            // We're not done, the output has room, and there is no input
-            // left to advance with — truncated stream.
+            // We're not done, nothing is left to hand over, and there is
+            // no input left to advance with — truncated stream.
             Err(self.poison(Error::UnexpectedEnd))
         }
     }

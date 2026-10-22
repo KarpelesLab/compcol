@@ -1509,3 +1509,135 @@ fn invalid_filter_chains_rejected() {
         Error::Corrupt
     );
 }
+
+/// The documented loop hands the whole stream to `decode` and then calls
+/// `finish` until `StreamEnd`, draining between calls. When the buffer
+/// is smaller than what is still pending, `finish` must say `OutputFull`
+/// and be callable again, not fail with `UnexpectedEnd`.
+#[test]
+fn finish_drains_pending_output_through_a_small_buffer() {
+    let plain = mixed_corpus();
+    let stream = encode_all(&plain);
+    let mut cat = stream.clone();
+    cat.extend_from_slice(&[0, 0, 0, 0]);
+    cat.extend_from_slice(&stream);
+    let mut want = plain.clone();
+    want.extend_from_slice(&plain);
+
+    // With and without a filter chain: the BCJ stage holds back a tail
+    // of its own.
+    let mut x86 = None;
+    if let Ok(mut child) = Command::new("xz")
+        .args(["-c", "--x86", "--lzma2"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        child.stdin.take().unwrap().write_all(&plain).unwrap();
+        x86 = Some(child.wait_with_output().unwrap().stdout);
+    }
+
+    let mut cases = vec![(stream, plain.clone()), (cat, want)];
+    if let Some(s) = x86 {
+        cases.push((s, plain.clone()));
+    }
+    // xz-utils packs up to 2 MiB of output into one LZMA2 chunk: a few
+    // input bytes of zeros leave megabytes pending once all input is in.
+    let zeros = vec![0u8; 3 << 20];
+    if let Ok(mut child) = Command::new("xz")
+        .arg("-c")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        let data = zeros.clone();
+        let writer = std::thread::spawn(move || stdin.write_all(&data));
+        let s = child.wait_with_output().unwrap().stdout;
+        writer.join().unwrap().unwrap();
+        cases.push((s, zeros));
+    }
+    for (stream, want) in &cases {
+        for out_chunk in [1usize, 7, 4096, 1 << 16] {
+            let mut dec = Decoder::new();
+            let mut buf = vec![0u8; out_chunk];
+            let mut got = Vec::new();
+            let mut pos = 0;
+            while pos < stream.len() {
+                let (p, _) = dec.decode(&stream[pos..], &mut buf).unwrap();
+                got.extend_from_slice(&buf[..p.written]);
+                pos += p.consumed;
+            }
+            loop {
+                let (p, status) = dec.finish(&mut buf).unwrap();
+                got.extend_from_slice(&buf[..p.written]);
+                match status {
+                    Status::StreamEnd => break,
+                    Status::OutputFull => assert!(p.written > 0, "finish stalled"),
+                    Status::InputEmpty => panic!("finish returned InputEmpty"),
+                }
+            }
+            assert!(got == *want, "out_chunk {out_chunk}");
+        }
+    }
+
+    // A truncated stream is still an error once the output has room.
+    let short = &cases[0].0[..cases[0].0.len() - 20];
+    let mut dec = Decoder::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let _ = dec.decode(short, &mut buf).unwrap();
+    assert_eq!(dec.finish(&mut buf).unwrap_err(), Error::UnexpectedEnd);
+}
+
+/// A truncated stream still ends in `UnexpectedEnd`, but only after
+/// `finish` has handed over everything already decoded, whatever the
+/// buffer size. It used to fail on the first call, dropping the decoded
+/// bytes it had just written: up to a buffer's worth whenever the input
+/// stopped right after an LZMA2 chunk whose output was still pending.
+#[test]
+fn finish_drains_decoded_bytes_before_reporting_truncation() {
+    fn decode_truncated(cut: &[u8], out_chunk: usize) -> (Vec<u8>, Error) {
+        let mut dec = Decoder::new();
+        let mut buf = vec![0u8; out_chunk];
+        let mut got = Vec::new();
+        let mut pos = 0;
+        while pos < cut.len() {
+            let (p, _) = dec.decode(&cut[pos..], &mut buf).unwrap();
+            got.extend_from_slice(&buf[..p.written]);
+            pos += p.consumed;
+        }
+        let err = loop {
+            match dec.finish(&mut buf) {
+                Ok((p, status)) => {
+                    assert_ne!(status, Status::StreamEnd);
+                    assert!(p.written > 0, "finish stalled");
+                    got.extend_from_slice(&buf[..p.written]);
+                }
+                Err(e) => break e,
+            }
+        };
+        (got, err)
+    }
+
+    let plain: Vec<u8> = (0..300_000u32)
+        .map(|i| (i % 251) as u8 ^ (i >> 9) as u8)
+        .collect();
+    let stream = encode_all(&plain);
+    // Every cut in the tail: after the last chunk, the end marker, the
+    // Block Check, inside the Index and the Stream Footer.
+    for cut_len in stream.len() - 64..stream.len() {
+        let cut = &stream[..cut_len];
+        let (want, _) = decode_truncated(cut, 1 << 20);
+        assert!(plain.starts_with(&want));
+        for out_chunk in [1usize, 7, 4096] {
+            let (got, err) = decode_truncated(cut, out_chunk);
+            assert_eq!(err, Error::UnexpectedEnd);
+            assert!(
+                got == want,
+                "cut {cut_len}, out_chunk {out_chunk}: {} of {} bytes",
+                got.len(),
+                want.len()
+            );
+        }
+    }
+}
