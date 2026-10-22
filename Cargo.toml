@@ -1,6 +1,6 @@
 [package]
 name          = "compcol"
-version       = "0.7.4"
+version       = "0.7.5"
 edition       = "2024"
 # Edition 2024 stabilised in Rust 1.85 and the code uses `let chains`
 # (Rust 1.88); 1.95 matches the MSRV of our other crates.
