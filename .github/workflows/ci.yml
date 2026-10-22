@@ -77,11 +77,13 @@ jobs:
 
       # `all` pulls in `std`, which hides codecs that only build with it
       # (brotli once called the std-only `f32::log2`). Build every
-      # algorithm again on `alloc` alone.
+      # algorithm again on `alloc` alone: the list is `all` minus the
+      # features that enable `std`, read from Cargo.toml so new codecs are
+      # covered automatically.
       - name: Build every algorithm on alloc without std
-        run: >-
-          cargo build --no-default-features --features
-          alloc,factory,rle,rle90,deflate,deflate64,zlib,gzip,lzma,xz,lzma2,zstd,brotli,lz4,lz5,snappy,lzw,lzss,bzip2,lzo,lzf,lzx,amiga_lzx,quantum,lzfse,adc,ppmd,xpress_huffman,lznt1,xpress,packbits,zip_implode,lzs,lzham,sit13,lzah,arsenic,rar1,rar2,rar3,rar5,zip_shrink,zip_reduce,lha,bcj,bcj2,delta,arc_crunch,arc_squeeze,arc_squash,hpack,qpack,huffman,rangecoder,mtf,bwt,checksum
+        run: |
+          features=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "compcol") | .features.all | map(select(. != "std" and . != "tokio")) | unique | join(",")')
+          cargo build --no-default-features --features "$features"
 
       - name: Build no_std embed deflate family (no alloc)
         run: cargo build --no-default-features --features embed,deflate,zlib,gzip
