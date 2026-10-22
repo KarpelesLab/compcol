@@ -338,11 +338,14 @@ impl RawDecoder for Decoder {
         // validated yet.
         let empty: [u8; 0] = [];
         let p = self.raw_decode(&empty, output)?;
-        if matches!(self.phase, DecPhase::Done) {
+        let done = matches!(self.phase, DecPhase::Done);
+        // Output the deflate decoder still held, for want of room, is handed
+        // out first; the caller comes back for the rest.
+        if done || p.written > 0 {
             Ok(RawProgress {
                 consumed: 0,
                 written: p.written,
-                done: true,
+                done,
             })
         } else {
             Err(self.poison(Error::UnexpectedEnd))
