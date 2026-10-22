@@ -27,6 +27,23 @@ use super::encoder_iac::{
 use super::encoder_lz77::{FinderParams, MAX_MATCH, MIN_MATCH, MatchFinder, match_len_at};
 use super::{Command, CopyKind, DistRing, dictionary};
 
+/// `log2(x)` for positive, finite `x`, without `std`: `f32::log2` lives in
+/// `std` (it calls into libm) and this crate is `no_std`, so using it broke
+/// every build of the `brotli` feature without `std`. The exponent comes
+/// from the float's bits and `log2` of the mantissa `m ∈ [1, 2)` from the
+/// `atanh` series `ln m = 2·(y + y³/3 + y⁵/5 + y⁷/7)`, `y = (m-1)/(m+1) ≤
+/// 1/3`, accurate to ~1e-5 bits — far below what the cost model resolves.
+fn log2f(x: f32) -> f32 {
+    debug_assert!(x > 0.0 && x.is_finite());
+    let bits = x.to_bits();
+    let exp = ((bits >> 23) & 0xFF) as i32 - 127;
+    let m = f32::from_bits((bits & 0x007F_FFFF) | 0x3F80_0000);
+    let y = (m - 1.0) / (m + 1.0);
+    let y2 = y * y;
+    let ln_m = 2.0 * y * (1.0 + y2 * (1.0 / 3.0 + y2 * (1.0 / 5.0 + y2 * (1.0 / 7.0))));
+    exp as f32 + ln_m * core::f32::consts::LOG2_E
+}
+
 /// Per-symbol bit-cost model derived from a histogram. `cost[s]` is the
 /// estimated code length (in bits) of symbol `s`.
 struct SymCost {
@@ -44,19 +61,19 @@ impl SymCost {
         let total: u64 = hist.iter().map(|&h| h as u64).sum();
         let len = hist.len();
         if total == 0 {
-            let flat = (len as f32).max(2.0).log2();
+            let flat = log2f((len as f32).max(2.0));
             return Self {
                 cost: vec![flat; len],
                 missing: flat,
             };
         }
-        let log2_total = (total as f32).log2();
+        let log2_total = log2f(total as f32);
         let mut cost = vec![0.0f32; len];
         for (i, &h) in hist.iter().enumerate() {
             cost[i] = if h == 0 {
                 log2_total + 2.0
             } else {
-                let c = log2_total - (h as f32).log2();
+                let c = log2_total - log2f(h as f32);
                 if c < 1.0 { 1.0 } else { c }
             };
         }
@@ -91,12 +108,12 @@ impl CostModel {
         Self {
             lit: SymCost::from_hist(&lit_hist),
             cmd: SymCost {
-                cost: vec![(11.0f32).log2(); 704],
-                missing: (11.0f32).log2(),
+                cost: vec![log2f(11.0); 704],
+                missing: log2f(11.0),
             },
             dist: SymCost {
-                cost: vec![(20.0f32).log2(); 64],
-                missing: (20.0f32).log2(),
+                cost: vec![log2f(20.0); 64],
+                missing: log2f(20.0),
             },
         }
     }
@@ -787,6 +804,32 @@ fn emit_path(
                     distance: node.dist,
                 },
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::log2f;
+
+    #[test]
+    fn log2f_matches_reference() {
+        // Reference values (no `std` here, so no `f64::log2` to compare to).
+        let cases: [(f32, f32); 10] = [
+            (1.0, 0.0),
+            (2.0, 1.0),
+            (3.0, 1.584_962_5),
+            (5.0, 2.321_928),
+            (11.0, 3.459_432),
+            (20.0, 4.321_928),
+            (255.0, 7.994_353_4),
+            (704.0, 9.459_432),
+            (65_536.0, 16.0),
+            (1_000_000.0, 19.931_568),
+        ];
+        for (x, want) in cases {
+            let got = log2f(x);
+            assert!((want - got).abs() < 1e-4, "log2({x}) = {got}, want {want}");
         }
     }
 }
