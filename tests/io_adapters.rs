@@ -211,3 +211,87 @@ fn decoder_reader_drains_pending_output_when_input_exhausted_deflate() {
     }
     assert_eq!(decoded, input);
 }
+
+// ─── inner reader errors must not replay buffered bytes ─────────────────
+
+/// Serves `data` in `chunk`-sized pieces and fails every other call with
+/// `kind` — the way a reader hit by signals (`Interrupted`) or a
+/// non-blocking socket (`WouldBlock`) behaves.
+struct FlakyReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    chunk: usize,
+    kind: std::io::ErrorKind,
+    fail_next: bool,
+}
+
+impl Read for FlakyReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.fail_next = !self.fail_next;
+        if self.fail_next {
+            return Err(std::io::Error::new(self.kind, "flaky"));
+        }
+        let n = self.chunk.min(buf.len()).min(self.data.len() - self.pos);
+        buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+fn read_retrying<R: Read>(r: &mut R, bufsz: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; bufsz];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => return out,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(e) => panic!("read failed: {e}"),
+        }
+    }
+}
+
+#[test]
+fn reader_adapters_survive_transient_inner_errors() {
+    let input = payload(150_000);
+    let compressed = compcol::vec::compress_to_vec::<Gzip>(&input).unwrap();
+    for kind in [
+        std::io::ErrorKind::Interrupted,
+        std::io::ErrorKind::WouldBlock,
+    ] {
+        for (chunk, bufsz) in [(usize::MAX, 64 * 1024), (13, 5)] {
+            let inner = FlakyReader {
+                data: &compressed,
+                pos: 0,
+                chunk,
+                kind,
+                fail_next: false,
+            };
+            let mut r = DecoderReader::new(inner, Gzip::decoder());
+            assert_eq!(
+                read_retrying(&mut r, bufsz),
+                input,
+                "DecoderReader {kind:?}"
+            );
+
+            let inner = FlakyReader {
+                data: &input,
+                pos: 0,
+                chunk,
+                kind,
+                fail_next: false,
+            };
+            let mut r = EncoderReader::new(inner, Gzip::encoder());
+            let out = read_retrying(&mut r, bufsz);
+            assert_eq!(
+                compcol::vec::decompress_to_vec::<Gzip>(&out).unwrap(),
+                input,
+                "EncoderReader {kind:?}"
+            );
+        }
+    }
+}

@@ -239,9 +239,13 @@ impl<R: Read, E: Encoder> Read for EncoderReader<R, E> {
             }
             // Try to refill from the inner reader.
             if !self.inner_eof {
+                // Read into a local first: if the inner reader fails
+                // (`Interrupted`, `WouldBlock`, …) the buffer cursors must
+                // stay untouched, or the retry would replay stale bytes.
+                let n = self.inner.read(&mut self.in_buf)?;
                 self.in_consumed = 0;
-                self.in_filled = self.inner.read(&mut self.in_buf)?;
-                if self.in_filled == 0 {
+                self.in_filled = n;
+                if n == 0 {
                     self.inner_eof = true;
                 }
                 continue;
@@ -439,10 +443,22 @@ impl<R: Read, D: Decoder> Read for DecoderReader<R, D> {
             // No output this round. If decode reported InputEmpty we can
             // try to refill; OutputFull is impossible here because `buf`
             // is non-empty and we just wrote zero bytes into it.
+            if self.in_consumed < self.in_filled {
+                // Buffered input is still pending: never overwrite it with a
+                // refill. Keep feeding it while the decoder makes progress.
+                if p.consumed > 0 {
+                    continue;
+                }
+                return Err(io::Error::other("decoder stalled with input pending"));
+            }
             if !self.inner_eof {
+                // Read into a local first: if the inner reader fails
+                // (`Interrupted`, `WouldBlock`, …) the buffer cursors must
+                // stay untouched, or the retry would replay stale bytes.
+                let n = self.inner.read(&mut self.in_buf)?;
                 self.in_consumed = 0;
-                self.in_filled = self.inner.read(&mut self.in_buf)?;
-                if self.in_filled == 0 {
+                self.in_filled = n;
+                if n == 0 {
                     self.inner_eof = true;
                 }
                 continue;
