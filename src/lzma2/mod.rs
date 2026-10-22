@@ -75,6 +75,16 @@
 //! also uses a 4 MiB window — round-trips the output exactly. If you transport
 //! this stream inside a 7z container, advertise a dictionary size of at least
 //! 4 MiB in the coder property.
+//!
+//! ### Flush
+//!
+//! [`Encoder::flush`](crate::Encoder::flush) encodes every byte given so far
+//! into complete chunks and emits them without the `0x00` end marker, so a
+//! decoder fed the bytes produced so far outputs all of it.
+//! [`Flush::Sync`] keeps the dictionary and model;
+//! [`Flush::Full`] makes the next chunk a dictionary
+//! reset (`0xE0` / `0x01`), so nothing after the flush references data
+//! before it.
 
 #![cfg_attr(docsrs, doc(cfg(feature = "lzma2")))]
 
@@ -84,7 +94,7 @@ use alloc::vec::Vec;
 
 use crate::error::Error;
 use crate::lzma2_internal::lzma2_decoder::{Lzma2Props, LzmaCore, lzma2_dict_size};
-use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
+use crate::traits::{Algorithm, Flush, RawDecoder, RawEncoder, RawProgress};
 
 /// Hard cap on the LZMA2 dictionary we will allocate, regardless of the
 /// dictionary-size code. Bounds memory against a crafted property byte;
@@ -514,6 +524,60 @@ impl RawEncoder for Encoder {
                 // Unreachable: normalized to `Finishing` above.
                 EncPhase::Body | EncPhase::DrainPending => {
                     self.phase = EncPhase::Finishing;
+                }
+            }
+        }
+    }
+
+    /// Emit every byte given so far as complete LZMA2 chunks (no `0x00` end
+    /// marker), so a decoder fed the bytes produced so far outputs all of it.
+    /// [`Flush::Full`] also makes the next chunk a dictionary reset, so
+    /// nothing after the flush references data before it.
+    fn raw_flush(&mut self, output: &mut [u8], mode: Flush) -> Result<RawProgress, Error> {
+        let mut written = 0usize;
+        loop {
+            match self.phase {
+                EncPhase::Body => {
+                    if self.pending_idx < self.pending.len() {
+                        self.phase = EncPhase::DrainPending;
+                        continue;
+                    }
+                    // Encode whatever the stream encoder still buffers. Once it
+                    // has been drained this is a no-op, which ends the loop.
+                    if let Some(stream) = self.stream.as_mut() {
+                        let chunks = stream.flush();
+                        if mode == Flush::Full {
+                            stream.reset_dict();
+                        }
+                        self.stage_chunks(chunks);
+                    }
+                    if self.pending_idx < self.pending.len() {
+                        self.phase = EncPhase::DrainPending;
+                    } else {
+                        return Ok(RawProgress {
+                            consumed: 0,
+                            written,
+                            done: true,
+                        });
+                    }
+                }
+                EncPhase::DrainPending => {
+                    if !self.drain_pending(output, &mut written) {
+                        return Ok(RawProgress {
+                            consumed: 0,
+                            written,
+                            done: false,
+                        });
+                    }
+                    self.phase = EncPhase::Body;
+                }
+                // `finish` has started: everything is already on its way out.
+                EncPhase::Finishing | EncPhase::DrainEnd | EncPhase::Done => {
+                    return Ok(RawProgress {
+                        consumed: 0,
+                        written,
+                        done: true,
+                    });
                 }
             }
         }
