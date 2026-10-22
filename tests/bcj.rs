@@ -356,3 +356,14 @@ fn x86_matches_xz() {
     check_xz_vector::<BcjX86>(0, 0x0008_3d3d_31d9_c5e4);
     check_xz_vector::<BcjX86>(0xFFFF_FFF0, 0xe741_7170_673b_fa34);
 }
+
+#[test]
+fn arm64_matches_xz() {
+    // ADRP whose 21-bit immediate is outside +/-512 MiB: xz leaves it alone.
+    let data = [0xF7u8, 0xF0, 0xC0, 0xF0];
+    let mut e = BcjArm64::encoder_with(Config { start_offset: 4096 });
+    assert_eq!(drive(&mut e, &data, 1, 1), data);
+
+    check_xz_vector::<BcjArm64>(0, 0xd3b2_5211_4914_fa97);
+    check_xz_vector::<BcjArm64>(4096, 0xf013_81aa_a90c_d814);
+}

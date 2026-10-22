@@ -268,24 +268,25 @@ impl BcjArch for Arm64 {
                 let out = (0x25 << 26) | addr;
                 wr_le32(&mut data[i..], out);
             } else if (instr & 0x9F00_0000) == 0x9000_0000 {
-                // ADRP: 21-bit immediate (immlo bits[30:29], immhi bits[23:5]).
-                let immlo = (instr >> 29) & 0x3;
-                let immhi = (instr >> 5) & 0x0007_FFFF;
-                let src = (immhi << 2) | immlo; // 21-bit page offset
-                // Sign-extend 21 bits then treat as page units.
-                let src21 = src & 0x001F_FFFF;
-                // Only rewrite "reasonable" ADRP per SDK (it checks the top
-                // bits to avoid corrupting unrelated encodings).
-                let pagepc = pc >> 12;
-                let addr = if encode {
-                    src21.wrapping_add(pagepc)
-                } else {
-                    src21.wrapping_sub(pagepc)
-                } & 0x001F_FFFF;
-                let new_immlo = addr & 0x3;
-                let new_immhi = (addr >> 2) & 0x0007_FFFF;
-                let out = (instr & 0x9F00_001F) | (new_immlo << 29) | (new_immhi << 5);
-                wr_le32(&mut data[i..], out);
+                // ADRP (xz `simple/arm64.c`): immlo bits[30:29], immhi
+                // bits[23:5]. Only immediates within +/-512 MiB (the top
+                // four bits of the 21-bit value all equal) are converted;
+                // the converted value keeps 18 bits and sign-extends bit 17
+                // into immhi's top three bits.
+                let src = ((instr >> 29) & 0x3) | ((instr >> 3) & 0x001F_FFFC);
+                if (src.wrapping_add(0x0002_0000) & 0x001C_0000) == 0 {
+                    let pagepc = pc >> 12;
+                    let dest = if encode {
+                        src.wrapping_add(pagepc)
+                    } else {
+                        src.wrapping_sub(pagepc)
+                    };
+                    let out = (instr & 0x9000_001F)
+                        | ((dest & 0x3) << 29)
+                        | ((dest & 0x0003_FFFC) << 3)
+                        | (0u32.wrapping_sub(dest & 0x0002_0000) & 0x00E0_0000);
+                    wr_le32(&mut data[i..], out);
+                }
             }
             i += 4;
         }
