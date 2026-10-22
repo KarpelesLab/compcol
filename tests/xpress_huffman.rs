@@ -105,6 +105,69 @@ fn round_trip(input: &[u8]) {
     assert_eq!(decoded, input, "round-trip mismatch len {}", input.len());
 }
 
+/// Pack `bits` (MSB-first) into MS-XCA 16-bit little-endian words, padded
+/// with zero words up to `words` total.
+fn pack_words(bits: &[bool], words: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for w in 0..words {
+        let mut v = 0u16;
+        for i in 0..16 {
+            if bits.get(w * 16 + i).copied().unwrap_or(false) {
+                v |= 1 << (15 - i);
+            }
+        }
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+/// MS-XCA §2.2.4 checks `OutputPosition >= BlockEnd` only before each
+/// symbol, so a match may run past the 65,536-byte block end and the next
+/// block's `BlockEnd` is counted from wherever that match stopped. The
+/// decoder used to cut such a match short at the block end, losing bytes.
+#[test]
+fn match_may_cross_block_end() {
+    // Block 1: nine literal 'a's (code 0), then 3855 matches of length 17,
+    // offset 1 (symbol 256 + 14, code 1) → 9 + 3855 * 17 = 65544 bytes; the
+    // last match starts 9 bytes before the block end and runs 8 past it.
+    let mut table1 = [0u8; 256];
+    table1[97 / 2] |= 1 << 4; // symbol 97 ('a'), odd → high nibble
+    table1[270 / 2] |= 1; // symbol 270, even → low nibble
+    let mut bits = vec![false; 9];
+    bits.extend(std::iter::repeat_n(true, 3855));
+    // Words the decoder consumes: the 2-word prefill plus one refill per
+    // 16 bits beyond the first 16.
+    let words1 = 2 + (bits.len() - 16).div_ceil(16);
+    // Block 2: a single 'b' (symbol 98, code 0; symbol 256 fills the tree).
+    let mut table2 = [0u8; 256];
+    table2[98 / 2] |= 1;
+    table2[256 / 2] |= 1;
+
+    let total = 65544 + 1;
+    let mut stream = (total as u32).to_le_bytes().to_vec();
+    stream.extend_from_slice(&table1);
+    stream.extend_from_slice(&pack_words(&bits, words1));
+    stream.extend_from_slice(&table2);
+    stream.extend_from_slice(&pack_words(&[false], 3));
+
+    let mut expected = vec![b'a'; 65544];
+    expected.push(b'b');
+    let decoded = decode_chunked(&stream, stream.len(), 1 << 20).unwrap();
+    assert!(
+        decoded == expected,
+        "decoded {} bytes, first diff {:?}",
+        decoded.len(),
+        decoded.iter().zip(&expected).position(|(a, b)| a != b)
+    );
+    let decoded = decode_chunked(&stream, 7, 1000).unwrap();
+    assert!(
+        decoded == expected,
+        "decoded {} bytes, first diff {:?}",
+        decoded.len(),
+        decoded.iter().zip(&expected).position(|(a, b)| a != b)
+    );
+}
+
 // ─── algorithm metadata ─────────────────────────────────────────────────
 
 #[test]

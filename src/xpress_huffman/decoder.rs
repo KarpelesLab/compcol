@@ -335,14 +335,14 @@ impl Decoder {
             // Byte-by-byte copy: match length may exceed match offset
             // (run-length expansion), so we cannot do bulk memcpy. Source
             // bytes are read from the retained history (which is appended
-            // to as we emit), allowing the copy to extend itself.
+            // to as we emit), allowing the copy to extend itself. MS-XCA
+            // §2.2.4 only tests `BlockEnd` before each symbol, so a match
+            // may run past the block end; the next block's end is then
+            // counted from where the match stopped.
             for _ in 0..match_length {
                 let src = self.out_history.len() - match_offset as usize;
                 let b = self.out_history[src];
                 self.emit_byte(b);
-                if self.output_emitted >= self.block_end_emitted {
-                    break;
-                }
                 if self.output_emitted == self.total_output {
                     break;
                 }
