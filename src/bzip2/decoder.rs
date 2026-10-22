@@ -43,6 +43,11 @@ enum Phase {
     DrainDecoded,
     /// End-of-stream magic seen; reading combined CRC.
     StreamCrc,
+    /// A stream's combined CRC checked out. Like `bzip2 -d`, another
+    /// `BZh<level>` stream may follow (`cat a.bz2 b.bz2`, pbzip2/lbzip2
+    /// output); the next bytes decide between that and `Done` (anything
+    /// else is trailing garbage, ignored as the reference tool does).
+    BetweenStreams,
     /// Stream successfully terminated; drain any remaining decoded
     /// bytes and return `done=true`.
     Done,
@@ -73,6 +78,10 @@ pub struct Decoder {
 
     phase: Phase,
     poisoned: bool,
+
+    /// Set by `finish`: no more input will arrive, so a partial
+    /// `BZh` prefix after a stream is trailing garbage.
+    finishing: bool,
 }
 
 impl Decoder {
@@ -87,6 +96,7 @@ impl Decoder {
             level: 0,
             phase: Phase::Header,
             poisoned: false,
+            finishing: false,
         }
     }
 
@@ -105,6 +115,7 @@ impl Decoder {
             Phase::BlockOrEnd => self.try_block_or_end(),
             Phase::DrainDecoded => Ok(false), // caller drains, then we advance from BlockOrEnd
             Phase::StreamCrc => self.try_stream_crc(),
+            Phase::BetweenStreams => self.try_between_streams(),
             Phase::Done => Ok(false),
         }
     }
@@ -192,7 +203,33 @@ impl Decoder {
         }
         self.bit_pos = p;
         self.in_committed_bytes = self.bit_pos / 8;
-        self.phase = Phase::Done;
+        self.phase = Phase::BetweenStreams;
+        Ok(true)
+    }
+
+    fn try_between_streams(&mut self) -> Result<bool, Error> {
+        let avail = &self.in_buf[self.in_committed_bytes..];
+        let n = avail.len().min(3);
+        if avail[..n] != b"BZh"[..n] {
+            // Trailing garbage: the stream is over.
+            self.phase = Phase::Done;
+            return Ok(true);
+        }
+        if avail.len() < 4 {
+            if self.finishing {
+                // No more input: nothing (or a lone partial magic) follows.
+                self.phase = Phase::Done;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        if (b'1'..=b'9').contains(&avail[3]) {
+            // Another stream: its combined CRC starts afresh.
+            self.combined_crc = 0;
+            self.phase = Phase::Header;
+        } else {
+            self.phase = Phase::Done;
+        }
         Ok(true)
     }
 
@@ -539,6 +576,7 @@ impl RawDecoder for Decoder {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
+        self.finishing = true;
         let empty: [u8; 0] = [];
         let p = self.raw_decode(&empty, output)?;
         if matches!(self.phase, Phase::Done) && self.decoded_idx == self.decoded.len() {
@@ -574,5 +612,6 @@ impl RawDecoder for Decoder {
         self.level = 0;
         self.phase = Phase::Header;
         self.poisoned = false;
+        self.finishing = false;
     }
 }
