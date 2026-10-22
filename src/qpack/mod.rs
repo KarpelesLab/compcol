@@ -547,7 +547,7 @@ impl QpackDecoder {
     /// [`DEFAULT_MAX_TABLE_CAPACITY`] bytes, with the
     /// [`DEFAULT_MAX_FIELD_SECTION_SIZE`] cap.
     #[deprecated(
-        since = "0.6.12",
+        since = "0.7.4",
         note = "choose a decoded-size cap explicitly: use `QpackDecoder::with_limits`"
     )]
     pub fn new() -> Self {
@@ -557,7 +557,7 @@ impl QpackDecoder {
     /// New decoder whose dynamic-table capacity ceiling is `max` bytes, with
     /// the [`DEFAULT_MAX_FIELD_SECTION_SIZE`] cap.
     #[deprecated(
-        since = "0.6.12",
+        since = "0.7.4",
         note = "choose a decoded-size cap explicitly: use `QpackDecoder::with_limits`"
     )]
     pub fn with_max_table_capacity(max: usize) -> Self {
