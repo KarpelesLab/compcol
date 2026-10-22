@@ -1704,15 +1704,18 @@ impl RawDecoder for Decoder {
                             // Stash; we re-use `block_header_size` after
                             // blocks have been processed.
                             self.block_header_size = index_size as usize;
-                            // Any bytes that arrived *past* the index in
-                            // `index_buf` actually belong to the Stream
-                            // Footer. Pre-seed `scratch` with them.
+                            // Any bytes slurped *past* the index belong to the
+                            // Stream Footer and whatever follows the stream.
+                            // They all arrived in this call (an earlier call
+                            // would have completed the index), so hand them
+                            // back unconsumed; the footer phase re-reads them
+                            // and anything after the footer stays the
+                            // caller's.
+                            let extra = self.index_buf.len() - need_total;
+                            consumed -= extra;
+                            self.index_buf.truncate(need_total);
                             self.scratch.clear();
                             self.scratch_want = 12;
-                            if self.index_buf.len() > need_total {
-                                self.scratch
-                                    .extend_from_slice(&self.index_buf[need_total..]);
-                            }
                             self.phase = DecPhase::StreamFooter;
                             break;
                         }

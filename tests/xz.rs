@@ -679,3 +679,32 @@ mod factory {
         assert_eq!(&decoded[..], input);
     }
 }
+
+/// Bytes after the Stream Footer (a following file, Stream Padding, a second
+/// concatenated stream) belong to the caller: `decode` must not report them
+/// as consumed, whatever the input chunking.
+#[test]
+fn trailing_bytes_after_footer_are_not_consumed() {
+    let input = b"hello hello hello trailing-data test".repeat(50);
+    let mut stream = encode_all(&input);
+    let stream_len = stream.len();
+    stream.extend_from_slice(b"NEXT-FILE-DATA");
+    for in_chunk in [1usize, 5, 13, stream.len()] {
+        let mut dec = Xz::decoder();
+        let mut out = vec![0u8; 1 << 16];
+        let mut decoded = Vec::new();
+        let mut pos = 0;
+        loop {
+            let end = (pos + in_chunk).min(stream.len());
+            let (p, status) = dec.decode(&stream[pos..end], &mut out).unwrap();
+            decoded.extend_from_slice(&out[..p.written]);
+            pos += p.consumed;
+            if status == Status::StreamEnd {
+                break;
+            }
+            assert!(p.consumed > 0 || p.written > 0, "stalled at {pos}");
+        }
+        assert_eq!(decoded, input);
+        assert_eq!(pos, stream_len, "in_chunk={in_chunk}");
+    }
+}
