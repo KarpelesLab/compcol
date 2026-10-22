@@ -60,7 +60,8 @@ impl Default for DecoderConfig {
 
 /// Skippable_Frame magic numbers occupy 0x184D2A50..=0x184D2A5F. We do not
 /// decode them; they're rejected as unsupported.
-const SKIPPABLE_MAGIC_HI3: [u8; 3] = [0x4D, 0x2A, 0x18];
+/// Bytes 1..4 of the little-endian magic are `2A 4D 18`.
+const SKIPPABLE_MAGIC_HI3: [u8; 3] = [0x2A, 0x4D, 0x18];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DecPhase {
