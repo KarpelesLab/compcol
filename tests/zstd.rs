@@ -987,3 +987,19 @@ fn encoder_writes_frame_content_size_for_single_block_inputs() {
         input
     );
 }
+
+/// Skippable_Frame magics (`0x184D2A50..=0x184D2A5F`, little-endian on the
+/// wire) are reported as `Unsupported`, not as a bad header.
+#[test]
+fn skippable_frame_magic_is_unsupported() {
+    for lo in 0x50u8..=0x5F {
+        let frame = [lo, 0x2A, 0x4D, 0x18, 0, 0, 0, 0];
+        let mut dec = Zstd::decoder();
+        let mut out = [0u8; 16];
+        assert_eq!(
+            dec.decode(&frame, &mut out).unwrap_err(),
+            Error::Unsupported,
+            "magic low byte {lo:#x}"
+        );
+    }
+}
