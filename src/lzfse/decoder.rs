@@ -97,6 +97,19 @@ impl Decoder {
         self.trim_history();
     }
 
+    /// Total bytes `input_buf` must hold for the current state to advance.
+    fn bytes_needed(&self) -> usize {
+        match self.state {
+            State::AwaitMagic => 4,
+            State::AwaitHeader(BlockKind::Uncompressed) => 4,
+            State::AwaitHeader(BlockKind::Lzvn) => 8,
+            State::AwaitHeader(BlockKind::V2) => lzfse_v2::V2_HEADER_FIXED_BYTES,
+            State::AwaitHeader(BlockKind::V1) => 0,
+            State::AwaitPayload { payload_len, .. } => payload_len,
+            State::Done => 0,
+        }
+    }
+
     fn trim_history(&mut self) {
         if self.history.len() > 2 * HISTORY_WINDOW {
             let excess = self.history.len() - HISTORY_WINDOW;
@@ -145,10 +158,14 @@ impl Decoder {
             }
 
             // 3. Pull from caller's `input` into `input_buf`. We pull lazily:
-            //    only as much as the current state needs.
-            if consumed < input.len() {
-                self.input_buf.extend_from_slice(&input[consumed..]);
-                consumed = input.len();
+            //    only as much as the current state needs, so bytes after the
+            //    end-of-stream marker are never reported as consumed.
+            let need = self.bytes_needed().saturating_sub(self.input_buf.len());
+            let take = need.min(input.len() - consumed);
+            if take > 0 {
+                self.input_buf
+                    .extend_from_slice(&input[consumed..consumed + take]);
+                consumed += take;
             }
 
             // 4. Advance the state machine.
