@@ -693,6 +693,65 @@ fn cab_long_max_code_near_end_of_stream() {
     }
 }
 
+/// A match that ends exactly on a 32 KiB frame boundary, followed by more
+/// symbols in the same block. The decoder used to read the next symbol
+/// before closing the frame, so it skipped the frame-end realignment (and
+/// the E8 pass), mis-decoding the rest of the stream. Found by comparing
+/// random valid streams against cabextract.
+#[test]
+fn cab_match_ending_on_frame_boundary() {
+    // First block, window 16: main alphabet 256 + 32 * 8. Symbols: 'a' (1
+    // bit), 'b' (2 bits) and match symbol 256 = slot 0 (R0 = 1), length 2
+    // (2 bits). Empty length tree. Pretree deltas from 0: "0" = keep 0,
+    // "1" + 4 bits = delta symbol k in 1..=16.
+    let main_len = 256 + 32 * 8;
+    let mut lens = vec![0u8; main_len];
+    lens[usize::from(b'a')] = 1;
+    lens[usize::from(b'b')] = 2;
+    lens[256] = 2;
+    // Canonical codes: 'a' = 0, 'b' = 10, match = 11.
+    let mut w = BitW::new();
+    w.put(1, 0);
+    let n_a = 32_766usize;
+    let n_b = 100usize;
+    w.put(3, 1);
+    w.put(24, (n_a + 2 + n_b) as u32);
+    let deltas = |w: &mut BitW, lens: &[u8]| {
+        for sym in 0..20 {
+            w.put(
+                4,
+                [1, 5][usize::from((1..=16).contains(&sym))] * u32::from(sym <= 16),
+            );
+        }
+        for &l in lens {
+            let sym = (17 - u32::from(l)) % 17;
+            if sym == 0 {
+                w.put(1, 0);
+            } else {
+                w.put(5, 0b10000 | (sym - 1));
+            }
+        }
+    };
+    deltas(&mut w, &lens[..256]);
+    deltas(&mut w, &lens[256..]);
+    deltas(&mut w, &[0u8; 249]);
+    for _ in 0..n_a {
+        w.put(1, 0);
+    }
+    w.put(2, 0b11); // match: 2 bytes at distance 1 → output reaches 32768
+    assert_ne!(w.n, 0, "frame end must be mid-word for the test to bite");
+    w.put(16 - w.n, 0); // frame-end realignment
+    for _ in 0..n_b {
+        w.put(2, 0b10);
+    }
+    if w.n != 0 {
+        w.put(16 - w.n, 0);
+    }
+    let mut want = vec![b'a'; n_a + 2];
+    want.extend_from_slice(&[b'b'; 100]);
+    assert_eq!(decode_all_ways(&w.framed(16, want.len())), want);
+}
+
 // ─── factory ─────────────────────────────────────────────────────────────
 
 #[cfg(feature = "factory")]
