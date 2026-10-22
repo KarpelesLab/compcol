@@ -576,6 +576,25 @@ mod factory {
 // either the stream ends or output fills again.
 
 #[test]
+fn encoder_many_blocks_in_one_call_matches_chunked() {
+    // One `encode` call holding many meta-blocks (and drained through a
+    // small buffer) walks the pending input by offset and compacts its
+    // output queue lazily — once quadratic memmoves. The bytes must match
+    // a stream fed and drained in small pieces.
+    let input: Vec<u8> = (0..(7 << 16) + 12_345u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8 & 0x3F)
+        .collect();
+    for quality in [1, 6] {
+        let mut enc = Encoder::with_config(EncoderConfig { quality });
+        let one_call = encode_chunked(&mut enc, &input, input.len(), 1000);
+        enc.reset();
+        let chunked = encode_chunked(&mut enc, &input, 4096, 1 << 20);
+        assert_eq!(one_call, chunked, "quality {quality}");
+        assert_eq!(decode_chunked(&one_call, 1 << 20, 1 << 20).unwrap(), input);
+    }
+}
+
+#[test]
 fn encoder_above_128kib() {
     // 131 072 bytes — one byte past the 128 KiB threshold called out in
     // the original report. Used to fail; must round-trip now.
