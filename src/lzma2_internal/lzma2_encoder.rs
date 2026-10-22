@@ -825,12 +825,12 @@ impl LzmaEncCore {
         rc_encode_bit(&mut self.rc, &mut self.is_match[idx], 0);
 
         let i = pos - base;
-        let prev_byte = if pos > 0 { win[i - 1] } else { 0 };
+        let prev_byte = if i > 0 { win[i - 1] } else { 0 };
         let match_byte = if self.state < LIT_STATES {
             None
         } else {
             let d = self.rep0 as usize + 1;
-            if d <= pos { Some(win[i - d]) } else { None }
+            if d <= i { Some(win[i - d]) } else { None }
         };
         self.encode_literal_full(win[i], prev_byte, match_byte);
 
@@ -1073,7 +1073,7 @@ impl HashChain {
         }
         let h = hash3(win[pi], win[pi + 1], win[pi + 2]) as usize & self.head_mask;
         let max_len = MAX_MATCH_LEN.min((win.len() - pi) as u32);
-        let max_dist = (dict_size as usize).min(pos);
+        let max_dist = (dict_size as usize).min(pi);
         let mut best_len: u32 = 0;
         let mut best_dist: u32 = 0;
         let mut cur = self.head[h];
@@ -1140,7 +1140,7 @@ impl HashChain {
         }
         let h = hash3(win[pi], win[pi + 1], win[pi + 2]) as usize & self.head_mask;
         let max_len = MAX_MATCH_LEN.min((win.len() - pi) as u32);
-        let max_dist = (dict_size as usize).min(pos);
+        let max_dist = (dict_size as usize).min(pi);
         let mut best_len: u32 = MATCH_LEN_MIN - 1;
         let mut cur = self.head[h];
         let mut steps = 0usize;
@@ -1194,12 +1194,17 @@ impl HashChain {
 
 /// Length of a repeat match at absolute `pos` against 0-based LZ distance
 /// `dist`, reading from the sliding window `win` (first byte = absolute `base`).
+///
+/// A distance reaching before `base` is unusable: during normal streaming the
+/// window keeps at least `dict_size` bytes of history (so this only rejects
+/// what the dictionary could not hold anyway), and after a dictionary reset
+/// `base` is the reset point, which no match may cross.
 fn rep_match_len(win: &[u8], base: usize, pos: usize, dist: u32) -> u32 {
     let d = dist as usize + 1;
-    if d > pos {
+    let pi = pos - base;
+    if d > pi {
         return 0;
     }
-    let pi = pos - base;
     let max_len = MAX_MATCH_LEN.min((win.len() - pi) as u32) as usize;
     match_len_at(win, pi - d, pi, max_len)
 }
@@ -1388,12 +1393,12 @@ fn literal_price_at(
     let pos_state = (out_pos as u32) & core.pos_mask;
     let im_idx = state * POS_STATES_MAX + pos_state as usize;
     let i = pos - base;
-    let prev_byte = if pos > 0 { win[i - 1] } else { 0 };
+    let prev_byte = if i > 0 { win[i - 1] } else { 0 };
     let match_byte = if state < LIT_STATES {
         None
     } else {
         let d = rep0 as usize + 1;
-        if d <= pos { Some(win[i - d]) } else { None }
+        if d <= i { Some(win[i - d]) } else { None }
     };
     snap.is_match[im_idx][0] + core.literal_price(prices, out_pos, win[i], prev_byte, match_byte)
 }
@@ -1452,9 +1457,10 @@ const WINDOW_SLOP: usize = MAX_MATCH_LEN as usize + 16;
 pub(crate) struct Lzma2Chunk {
     /// Number of uncompressed input bytes this chunk represents.
     pub uncomp_len: usize,
-    /// `true` when this is the first chunk of the stream and therefore must
-    /// reset the dictionary (`0xE0` compressed / `0x01` uncompressed); `false`
-    /// for every later chunk, which continues the dictionary.
+    /// `true` when this chunk must reset the dictionary (`0xE0` compressed /
+    /// `0x01` uncompressed): the first chunk of the stream, and the first
+    /// chunk after [`Lzma2StreamEncoder::reset_dict`]. `false` for every other
+    /// chunk, which continues the dictionary.
     pub reset_dict: bool,
     /// For a compressed chunk (`body.is_some()`): `true` when the LZMA state +
     /// probability model are reset for this chunk (control `0xE0` on the first
@@ -1523,7 +1529,8 @@ pub(crate) struct Lzma2StreamEncoder {
     pos: usize,
     /// Absolute count of bytes appended via `push` (encodable extent).
     appended: usize,
-    /// `true` until the first chunk is emitted.
+    /// `true` when the next chunk must reset the dictionary: before the first
+    /// chunk, and after [`reset_dict`](Self::reset_dict).
     first: bool,
     /// `true` when the next compressed chunk must reset the LZMA state +
     /// probability model rather than continue it. Set on the first chunk and
@@ -1574,6 +1581,16 @@ impl Lzma2StreamEncoder {
 
     /// Flush any remaining buffered bytes as a final chunk (or chunks).
     pub fn finish(&mut self) -> Vec<Lzma2Chunk> {
+        self.flush()
+    }
+
+    /// Encode every buffered byte now, as complete chunks, without ending the
+    /// stream: once the caller frames them, a decoder holding all chunks so far
+    /// can decode everything pushed. Encoding continues afterwards with the
+    /// same dictionary and model (later chunks are `0x80`/`0xC0`
+    /// continuations); the only cost is a shorter chunk with its own framing
+    /// and range-coder flush.
+    pub fn flush(&mut self) -> Vec<Lzma2Chunk> {
         let mut out = Vec::new();
         while self.pos < self.appended {
             let end = (self.pos + CHUNK_UNCOMP_MAX).min(self.appended);
@@ -1581,6 +1598,26 @@ impl Lzma2StreamEncoder {
             self.trim_window();
         }
         out
+    }
+
+    /// Start a fresh dictionary at the current position. Call right after
+    /// [`flush`](Self::flush), with nothing buffered.
+    ///
+    /// The next chunk resets the dictionary, state and properties (`0xE0`, or
+    /// `0x01` for an uncompressed chunk), so the decoder empties its window
+    /// and restarts its position at zero. The encoder mirrors that: the window
+    /// is emptied so its base is the reset point, which no match or rep
+    /// distance may cross (every distance is bounds-checked against `base`),
+    /// and `output_pos` restarts at zero to keep `pos_state` in step. Stale
+    /// hash-chain entries stay but always lie before `base`, so the chain walk
+    /// stops at them; this avoids clearing the `O(dict_size)` tables.
+    pub fn reset_dict(&mut self) {
+        debug_assert_eq!(self.pos, self.appended, "reset_dict with input pending");
+        self.win.clear();
+        self.win_base = self.pos;
+        self.first = true;
+        self.need_state_reset = true;
+        self.core.output_pos = 0;
     }
 
     /// Encode a chunk starting at `self.pos`, covering at most up to

@@ -9,7 +9,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use compcol::xz::{Decoder, Encoder, EncoderConfig, Xz};
-use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Status};
+use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Flush, Status};
 
 // ─── helpers ───────────────────────────────────────────────────────────────
 
@@ -706,5 +706,287 @@ fn trailing_bytes_after_footer_are_not_consumed() {
         }
         assert_eq!(decoded, input);
         assert_eq!(pos, stream_len, "in_chunk={in_chunk}");
+    }
+}
+
+// ─── flush ──────────────────────────────────────────────────────────────
+
+/// Feed all of `input` through `enc.encode`, draining via `out_chunk`-byte
+/// buffers, and append what it emits to `wire`.
+fn flush_test_encode(enc: &mut Encoder, input: &[u8], out_chunk: usize, wire: &mut Vec<u8>) {
+    let mut buf = vec![0u8; out_chunk];
+    let mut consumed = 0;
+    loop {
+        let (p, status) = enc.encode(&input[consumed..], &mut buf).unwrap();
+        wire.extend_from_slice(&buf[..p.written]);
+        consumed += p.consumed;
+        match status {
+            Status::InputEmpty if consumed == input.len() => break,
+            Status::InputEmpty | Status::OutputFull => {}
+            Status::StreamEnd => panic!("encode returned StreamEnd"),
+        }
+    }
+}
+
+/// Drive `enc.flush(mode)` until it reports `InputEmpty`, re-calling on
+/// `OutputFull` as the trait requires.
+fn flush_test_flush(enc: &mut Encoder, mode: Flush, out_chunk: usize, wire: &mut Vec<u8>) {
+    let mut buf = vec![0u8; out_chunk];
+    for _ in 0..10_000_000 {
+        let (p, status) = enc.flush(&mut buf, mode).unwrap();
+        wire.extend_from_slice(&buf[..p.written]);
+        match status {
+            Status::InputEmpty => return,
+            Status::OutputFull => {}
+            Status::StreamEnd => panic!("flush returned StreamEnd"),
+        }
+    }
+    panic!("flush never completed");
+}
+
+fn flush_test_finish(enc: &mut Encoder, out_chunk: usize, wire: &mut Vec<u8>) {
+    let mut buf = vec![0u8; out_chunk];
+    loop {
+        let (p, status) = enc.finish(&mut buf).unwrap();
+        wire.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            return;
+        }
+    }
+}
+
+/// Decode a stream cut short at a flush point: `decode` only, never
+/// `finish` (the stream is deliberately unterminated).
+fn decode_prefix(wire: &[u8]) -> Vec<u8> {
+    let mut dec = Decoder::new();
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut consumed = 0;
+    loop {
+        let (p, _) = dec.decode(&wire[consumed..], &mut buf).unwrap();
+        out.extend_from_slice(&buf[..p.written]);
+        consumed += p.consumed;
+        if p.consumed == 0 && p.written == 0 {
+            return out;
+        }
+    }
+}
+
+/// Encode `flush_segments()` with a `mode` flush after each, checking after
+/// every flush that the bytes emitted so far decode to everything given so
+/// far. Returns the finished stream and the concatenated input.
+fn flush_after_each_segment(mode: Flush, out_chunk: usize) -> (Vec<u8>, Vec<u8>) {
+    let mut enc = Encoder::new();
+    let mut wire = Vec::new();
+    let mut given = Vec::new();
+    for seg in flush_segments() {
+        flush_test_encode(&mut enc, &seg, out_chunk, &mut wire);
+        given.extend_from_slice(&seg);
+        flush_test_flush(&mut enc, mode, out_chunk, &mut wire);
+        let got = decode_prefix(&wire);
+        assert!(
+            got == given,
+            "{mode:?} flush after {} bytes: decoded {} bytes from the prefix",
+            given.len(),
+            got.len()
+        );
+        // A second flush with nothing new pending emits nothing.
+        let before = wire.len();
+        flush_test_flush(&mut enc, mode, out_chunk, &mut wire);
+        assert_eq!(wire.len(), before, "empty {mode:?} flush emitted bytes");
+    }
+    flush_test_finish(&mut enc, out_chunk, &mut wire);
+    assert_eq!(decode_chunked(&wire, 4096, 4096).unwrap(), given);
+    (wire, given)
+}
+
+#[test]
+fn sync_flush_makes_everything_given_decodable() {
+    flush_after_each_segment(Flush::Sync, 4096);
+}
+
+#[test]
+fn full_flush_makes_everything_given_decodable() {
+    flush_after_each_segment(Flush::Full, 4096);
+}
+
+#[test]
+fn flush_with_one_byte_output_buffer() {
+    flush_after_each_segment(Flush::Sync, 1);
+    flush_after_each_segment(Flush::Full, 1);
+}
+
+/// After a `Sync` flush, repeated data back-references the pre-flush bytes
+/// and costs almost nothing; after a `Full` flush it must be encoded from
+/// scratch.
+#[test]
+fn full_flush_drops_history_sync_keeps_it() {
+    let text = flush_text(20_000);
+    let tail_size = |mode: Flush| {
+        let mut enc = Encoder::new();
+        let mut wire = Vec::new();
+        flush_test_encode(&mut enc, &text, 4096, &mut wire);
+        flush_test_flush(&mut enc, mode, 4096, &mut wire);
+        let mark = wire.len();
+        flush_test_encode(&mut enc, &text, 4096, &mut wire);
+        flush_test_flush(&mut enc, Flush::Sync, 4096, &mut wire);
+        let tail = wire.len() - mark;
+        flush_test_finish(&mut enc, 4096, &mut wire);
+        let mut expect = text.clone();
+        expect.extend_from_slice(&text);
+        assert_eq!(decode_chunked(&wire, 4096, 4096).unwrap(), expect);
+        tail
+    };
+    let sync_tail = tail_size(Flush::Sync);
+    let full_tail = tail_size(Flush::Full);
+    assert!(sync_tail < 100, "sync tail {sync_tail} bytes");
+    assert!(
+        full_tail > 10 * sync_tail,
+        "full tail {full_tail} bytes vs sync tail {sync_tail}"
+    );
+}
+
+/// `-d -c` on a stream cut at each flush point writes out everything given
+/// before that flush (then complains about the truncated stream), and the
+/// finished stream decodes cleanly.
+fn check_flushes_with_system_tool(cmd: &str, mode: Flush) {
+    let mut enc = Encoder::new();
+    let mut wire = Vec::new();
+    let mut given = Vec::new();
+    for seg in flush_segments() {
+        flush_test_encode(&mut enc, &seg, 4096, &mut wire);
+        given.extend_from_slice(&seg);
+        flush_test_flush(&mut enc, mode, 4096, &mut wire);
+        let out = run_tool(cmd, &["-d", "-c"], &wire);
+        assert!(
+            out.stdout == given,
+            "{cmd} -dc on a stream cut at a {mode:?} flush after {} bytes wrote {} bytes",
+            given.len(),
+            out.stdout.len()
+        );
+    }
+    flush_test_finish(&mut enc, 4096, &mut wire);
+    let out = run_tool(cmd, &["-d", "-c"], &wire);
+    assert!(
+        out.status.success(),
+        "{cmd} -d rejected the {mode:?}-flushed stream"
+    );
+    assert!(
+        out.stdout == given,
+        "{cmd} -d decoded the {mode:?}-flushed stream wrong"
+    );
+}
+
+/// Run `cmd args` with `stdin_data` on stdin; returns its output whatever
+/// the exit status.
+fn run_tool(cmd: &str, args: &[&str], stdin_data: &[u8]) -> std::process::Output {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let data = stdin_data.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&data);
+    });
+    let out = child.wait_with_output().unwrap();
+    let _ = writer.join();
+    out
+}
+
+fn flush_words(n: usize, seed: u32) -> Vec<u8> {
+    const WORDS: [&[u8]; 8] = [
+        b"alpha ",
+        b"beta ",
+        b"gamma ",
+        b"delta ",
+        b"epsilon ",
+        b"zeta ",
+        b"eta ",
+        b"theta ",
+    ];
+    let mut x = seed;
+    let mut out = Vec::with_capacity(n + 8);
+    while out.len() < n {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        out.extend_from_slice(WORDS[((x >> 16) & 7) as usize]);
+    }
+    out.truncate(n);
+    out
+}
+
+fn flush_noise(n: usize, seed: u32) -> Vec<u8> {
+    let mut x = seed;
+    (0..n)
+        .map(|_| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (x >> 16) as u8
+        })
+        .collect()
+}
+
+/// Segments fed between flushes: tiny, compressible, incompressible, and
+/// one longer than the encoder's 1 MiB chunk lookahead so a flush lands
+/// after a full chunk has already gone out.
+fn flush_segments() -> Vec<Vec<u8>> {
+    vec![
+        b"x".to_vec(),
+        flush_words(100, 1),
+        flush_words(5_000, 2),
+        flush_noise(3_000, 3),
+        flush_words(1_200_000, 4),
+        b"tail".to_vec(),
+        flush_words(70_000, 5),
+    ]
+}
+
+/// Incompressible on its own, so a second copy is cheap only when it can
+/// back-reference the first.
+fn flush_text(n: usize) -> Vec<u8> {
+    flush_noise(n, 11)
+}
+
+#[test]
+fn flushes_interoperate_with_system_xz() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    check_flushes_with_system_tool("xz", Flush::Sync);
+    check_flushes_with_system_tool("xz", Flush::Full);
+}
+
+/// Both parsers (greedy at level 0, optimal above) must keep matches and
+/// repeat distances on the post-reset side of a `Full` flush, including
+/// right at the reset point where the window is empty.
+#[test]
+fn full_flush_at_greedy_and_optimal_levels() {
+    let text = flush_words(30_000, 9);
+    let noise = flush_noise(500, 1);
+    for level in [0, 1, 6, 9] {
+        let mut enc = Encoder::with_config(EncoderConfig { level });
+        let mut wire = Vec::new();
+        let mut given = Vec::new();
+        for seg in [&text[..], &text[..7], &text[..], &noise[..], &text[..]] {
+            flush_test_encode(&mut enc, seg, 4096, &mut wire);
+            given.extend_from_slice(seg);
+            flush_test_flush(&mut enc, Flush::Full, 4096, &mut wire);
+            assert!(decode_prefix(&wire) == given, "level {level}");
+        }
+        flush_test_finish(&mut enc, 4096, &mut wire);
+        assert_eq!(
+            decode_chunked(&wire, 4096, 4096).unwrap(),
+            given,
+            "level {level}"
+        );
+        if tool_available("xz") {
+            let out = run_tool("xz", &["-d", "-c"], &wire);
+            assert!(out.status.success() && out.stdout == given, "level {level}");
+        }
     }
 }
