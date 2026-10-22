@@ -73,8 +73,16 @@ impl BitReader {
             self.bits_left += 16;
             Ok(())
         } else if self.eof && !self.eof_padding_used {
-            // Inject 16 zero bits exactly once at EOF.
+            // libmspack appends two zero bytes once at EOF and keeps reading
+            // byte pairs. An odd final byte therefore pairs with the first
+            // zero (it must not be dropped); the second zero can never
+            // complete another pair, so either way the padding is spent.
             self.eof_padding_used = true;
+            if self.byte_pos < buf.len() {
+                let b0 = buf[self.byte_pos] as u32;
+                self.byte_pos += 1;
+                self.bit_buffer |= (b0 << 8) << (BITBUF_WIDTH - 16 - self.bits_left);
+            }
             self.bits_left += 16;
             Ok(())
         } else {
@@ -210,6 +218,38 @@ mod tests {
             0b101_0110_0011_1001_1010
         );
         assert_eq!(br.read_bits(4, &buf).unwrap(), 0b0101);
+    }
+
+    /// At EOF an odd final byte is read (paired with one zero pad byte), as
+    /// libmspack's `read_input` does; it used to be replaced by zeros.
+    #[test]
+    fn eof_keeps_odd_final_byte() {
+        let buf = [0x12, 0x34, 0xAB];
+        let mut br = BitReader::new();
+        assert_eq!(br.read_bits(16, &buf).unwrap(), 0x1234);
+        assert_eq!(
+            br.read_bits(8, &buf).unwrap_err(),
+            crate::error::Error::UnexpectedEnd
+        );
+        br.set_eof(true);
+        assert_eq!(br.read_bits(8, &buf).unwrap(), 0xAB);
+        assert_eq!(br.read_bits(8, &buf).unwrap(), 0x00);
+        assert_eq!(br.byte_pos(), 3);
+        assert_eq!(
+            br.read_bits(1, &buf).unwrap_err(),
+            crate::error::Error::UnexpectedEnd
+        );
+
+        // Even length: still exactly 16 zero bits of padding.
+        let buf = [0x12, 0x34];
+        let mut br = BitReader::new();
+        br.set_eof(true);
+        assert_eq!(br.read_bits(16, &buf).unwrap(), 0x1234);
+        assert_eq!(br.read_bits(16, &buf).unwrap(), 0);
+        assert_eq!(
+            br.read_bits(1, &buf).unwrap_err(),
+            crate::error::Error::UnexpectedEnd
+        );
     }
 
     #[test]
