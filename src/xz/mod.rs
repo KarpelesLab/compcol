@@ -15,6 +15,8 @@
 //!  Index (Index Indicator 00 | NumRecords varint | (UnpaddedSize varint,
 //!         UncompressedSize varint)+ | 0..3 zero pad | CRC32 of all the above)
 //!  Stream Footer (12 B)
+//!  Stream Padding (zero bytes, a multiple of 4), then optionally further
+//!  Streams, each followed by optional padding
 //! ```
 //!
 //! This implementation supports a single filter (LZMA2, filter ID 0x21).
@@ -54,6 +56,18 @@
 //! makes the next chunk a dictionary reset (control `0xE0`, or `0x01` if it
 //! is stored uncompressed), so nothing after the flush references data
 //! before it. Both stay within the single xz Block.
+//!
+//! ## Concatenated Streams
+//!
+//! Like `xz -d`, the decoder accepts several Streams back to back, each
+//! optionally followed by Stream Padding (zero bytes, a multiple of four in
+//! total, else [`Error::Corrupt`]), and decodes them as one output. Bytes
+//! after the last Stream that are neither padding nor another Stream Header
+//! end the data: `decode` reports the end and leaves the bytes that arrived
+//! in that call unconsumed, so the caller can see where the xz data stops.
+//! Because another Stream may still arrive, `decode` reports the end only
+//! once it sees such bytes; when the input ends right after a Stream (or its
+//! padding), `finish` settles it.
 //!
 //! ## Integrity checks
 //!
@@ -1240,6 +1254,11 @@ enum DecPhase {
     Index,
     /// Reading the Stream Footer (12 bytes).
     StreamFooter,
+    /// A Stream ended. Like `xz -d`, Stream Padding (zero bytes, a multiple
+    /// of four in all) and further concatenated Streams may follow; the
+    /// next non-zero bytes decide between another Stream Header and `Done`
+    /// (anything else is not xz data and is left to the caller).
+    StreamPadding,
     Done,
 }
 
@@ -1312,6 +1331,12 @@ pub struct Decoder {
     /// required on subsequent reset chunks.
     last_props: u8,
 
+    /// Stream Padding bytes seen since the last Stream Footer, modulo 4.
+    stream_padding: u8,
+    /// Set by `finish`: no more input will arrive, so whatever follows the
+    /// last Stream (nothing, or a lone partial magic) settles the end.
+    finishing: bool,
+
     poisoned: bool,
 }
 
@@ -1343,6 +1368,8 @@ impl Decoder {
             comp_decoded: Vec::new(),
             comp_decoded_pos: 0,
             last_props: 0,
+            stream_padding: 0,
+            finishing: false,
             poisoned: false,
         }
     }
@@ -2064,7 +2091,9 @@ impl RawDecoder for Decoder {
                         if s[10] != FOOTER_MAGIC[0] || s[11] != FOOTER_MAGIC[1] {
                             return Err(self.poison(Error::BadHeader));
                         }
-                        self.phase = DecPhase::Done;
+                        self.scratch.clear();
+                        self.stream_padding = 0;
+                        self.phase = DecPhase::StreamPadding;
                     } else {
                         return Ok(RawProgress {
                             consumed,
@@ -2073,13 +2102,81 @@ impl RawDecoder for Decoder {
                         });
                     }
                 }
+                DecPhase::StreamPadding => {
+                    // `scratch` holds the start of a following Stream Header's
+                    // magic when an earlier call ended inside it; padding can
+                    // only come before that.
+                    if self.scratch.is_empty() {
+                        while consumed < input.len() && input[consumed] == 0x00 {
+                            self.stream_padding = (self.stream_padding + 1) % 4;
+                            consumed += 1;
+                        }
+                    }
+                    if consumed >= input.len() {
+                        if !self.finishing {
+                            // Another Stream or more padding may still come;
+                            // `finish` settles it.
+                            return Ok(RawProgress {
+                                consumed,
+                                written,
+                                done: false,
+                            });
+                        }
+                        if self.stream_padding != 0 {
+                            return Err(self.poison(Error::Corrupt));
+                        }
+                        // Nothing (or a partial magic, which is not a
+                        // Stream) follows: the Streams are over.
+                        self.scratch.clear();
+                        self.phase = DecPhase::Done;
+                        continue;
+                    }
+                    // A non-zero byte ends the padding, which the spec
+                    // requires to be a multiple of four bytes.
+                    if self.stream_padding != 0 {
+                        return Err(self.poison(Error::Corrupt));
+                    }
+                    let mut i = consumed;
+                    while self.scratch.len() < STREAM_MAGIC.len() && i < input.len() {
+                        if input[i] != STREAM_MAGIC[self.scratch.len()] {
+                            break;
+                        }
+                        self.scratch.push(input[i]);
+                        i += 1;
+                    }
+                    if self.scratch.len() == STREAM_MAGIC.len() {
+                        // Another Stream: parse its header; the per-Stream
+                        // state (blocks for the Index cross-check, check ID)
+                        // starts afresh.
+                        consumed = i;
+                        self.blocks.clear();
+                        self.scratch_want = 12;
+                        self.phase = DecPhase::StreamHeader;
+                    } else if i == input.len() {
+                        // So far a magic prefix; wait for the rest.
+                        consumed = i;
+                        return Ok(RawProgress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    } else {
+                        // Not xz data: the Streams are over. Hand back the
+                        // bytes this call matched against the magic (an
+                        // earlier call's had already been buffered), so the
+                        // caller sees where the xz data stops.
+                        self.scratch.clear();
+                        self.phase = DecPhase::Done;
+                        continue;
+                    }
+                }
                 DecPhase::Done => {
-                    // Terminal (Done follows the Stream Footer; concatenated
-                    // streams are not supported). Report completion so the
-                    // bridge yields StreamEnd. Reporting `false` left a caller
-                    // that hands over trailing bytes after the footer getting
-                    // `OutputFull` with nothing consumed and nothing written,
-                    // spinning on unchanged state.
+                    // Terminal: the Streams are over and the bytes after them
+                    // (if any) are not ours. Report completion so the bridge
+                    // yields StreamEnd, leaving those bytes unconsumed.
+                    // Reporting `false` left a caller that hands over trailing
+                    // bytes getting `OutputFull` with nothing consumed and
+                    // nothing written, spinning on unchanged state.
                     return Ok(RawProgress {
                         consumed,
                         written,
@@ -2102,6 +2199,7 @@ impl RawDecoder for Decoder {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
+        self.finishing = true;
         let empty: [u8; 0] = [];
         let p = self.raw_decode(&empty, output)?;
         if matches!(self.phase, DecPhase::Done) {

@@ -680,9 +680,9 @@ mod factory {
     }
 }
 
-/// Bytes after the Stream Footer (a following file, Stream Padding, a second
-/// concatenated stream) belong to the caller: `decode` must not report them
-/// as consumed, whatever the input chunking.
+/// Bytes after the Stream Footer that are neither Stream Padding nor another
+/// Stream (e.g. a following file) belong to the caller: `decode` must not
+/// report them as consumed, whatever the input chunking.
 #[test]
 fn trailing_bytes_after_footer_are_not_consumed() {
     let input = b"hello hello hello trailing-data test".repeat(50);
@@ -1119,5 +1119,173 @@ fn system_xz_checks_decode() {
                 "{check} chunk {chunk}"
             );
         }
+    }
+}
+
+// ─── concatenated Streams and Stream Padding ────────────────────────────
+
+/// Decode `wire` fed in `in_chunk`-byte slices through a small output
+/// buffer, then `finish` unless `decode` already reported the end. Returns
+/// the output, how many input bytes the decoder consumed, and whether
+/// `decode` itself answered `StreamEnd`.
+fn decode_tracking(wire: &[u8], in_chunk: usize) -> Result<(Vec<u8>, usize, bool), Error> {
+    let mut dec = Decoder::new();
+    let mut out = Vec::new();
+    let mut buf = [0u8; 777];
+    let mut pos = 0;
+    while pos < wire.len() {
+        let end = (pos + in_chunk).min(wire.len());
+        let (p, status) = dec.decode(&wire[pos..end], &mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        pos += p.consumed;
+        match status {
+            Status::StreamEnd => return Ok((out, pos, true)),
+            Status::InputEmpty | Status::OutputFull => {}
+        }
+    }
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            return Ok((out, pos, false));
+        }
+        assert!(p.written > 0, "finish stalled");
+    }
+}
+
+#[test]
+fn concatenated_streams_and_padding_decode_as_one() {
+    let a = b"first stream ".repeat(40);
+    let b = mixed_corpus();
+    let c = b"".to_vec();
+    let (sa, sb, sc) = (encode_all(&a), encode_all(&b), encode_all(&c));
+    let pad = |n: usize| vec![0u8; n];
+    let want: Vec<u8> = [&a[..], &b[..], &c[..]].concat();
+    for wire in [
+        [&sa[..], &sb[..], &sc[..]].concat(),
+        [&sa[..], &pad(4), &sb[..], &pad(12), &sc[..]].concat(),
+        [&sa[..], &sb[..], &sc[..], &pad(8)].concat(),
+        [&sa[..], &pad(4), &sb[..], &pad(4), &sc[..], &pad(4)].concat(),
+    ] {
+        for in_chunk in [1, 3, 4096, wire.len()] {
+            // Input ending exactly at a Stream boundary (or after padding)
+            // leaves the question "another Stream?" open: `decode` keeps
+            // waiting and `finish` settles it.
+            let (out, consumed, ended_in_decode) = decode_tracking(&wire, in_chunk).unwrap();
+            assert_eq!(out, want, "in_chunk {in_chunk}");
+            assert_eq!(consumed, wire.len(), "in_chunk {in_chunk}");
+            assert!(!ended_in_decode, "in_chunk {in_chunk}");
+        }
+        if tool_available("xz") {
+            let out = run_tool("xz", &["-d", "-c"], &wire);
+            assert!(out.status.success(), "xz -d rejected the test wire");
+            assert_eq!(out.stdout, want);
+        }
+    }
+}
+
+#[test]
+fn stream_padding_not_multiple_of_four_rejected() {
+    let a = b"padding".repeat(9);
+    let s = encode_all(&a);
+    for wire in [
+        // Between Streams.
+        [&s[..], &[0u8; 3], &s[..]].concat(),
+        [&s[..], &[0u8; 5], &s[..]].concat(),
+        // After the last Stream.
+        [&s[..], &[0u8; 1]].concat(),
+        [&s[..], &[0u8; 6]].concat(),
+        // Before bytes that are not a Stream.
+        [&s[..], &[0u8; 2], b"junk"].concat(),
+    ] {
+        for in_chunk in [1, 5, wire.len()] {
+            assert_eq!(
+                decode_tracking(&wire, in_chunk).unwrap_err(),
+                Error::Corrupt,
+                "len {} in_chunk {in_chunk}",
+                wire.len()
+            );
+        }
+        if tool_available("xz") {
+            let out = run_tool("xz", &["-d", "-c"], &wire);
+            assert!(!out.status.success(), "xz -d accepted bad padding");
+        }
+    }
+}
+
+/// Bytes after the last Stream (and its padding) that are not another
+/// Stream end the data: `decode` answers `StreamEnd` and leaves them
+/// unconsumed.
+#[test]
+fn trailing_garbage_after_concatenated_streams() {
+    let a = b"alpha ".repeat(20);
+    let b = b"beta ".repeat(30);
+    let (sa, sb) = (encode_all(&a), encode_all(&b));
+    let want = [&a[..], &b[..]].concat();
+    for (xz_len, wire, partial_magic) in [
+        (
+            sa.len() + sb.len(),
+            [&sa[..], &sb[..], b"GARBAGE"].concat(),
+            false,
+        ),
+        (
+            sa.len() + 4 + sb.len() + 8,
+            [&sa[..], &[0; 4], &sb[..], &[0; 8], b"\x01\x00\x00\x00"].concat(),
+            false,
+        ),
+        // A partial Stream Header magic that then diverges is not a Stream.
+        (
+            sa.len() + sb.len(),
+            [&sa[..], &sb[..], &[0xFD, 0x37, 0x7A, 0x00, 0x00, 0x00]].concat(),
+            true,
+        ),
+    ] {
+        for in_chunk in [1, 2, 7, wire.len()] {
+            let (out, consumed, ended_in_decode) = decode_tracking(&wire, in_chunk).unwrap();
+            assert_eq!(out, want, "in_chunk {in_chunk}");
+            assert!(ended_in_decode, "in_chunk {in_chunk}");
+            // The bytes of a partial magic that arrived in earlier calls
+            // were already buffered; the ones in the call that found the
+            // end are handed back.
+            if partial_magic && in_chunk < wire.len() {
+                assert!(consumed >= xz_len && consumed < wire.len());
+            } else {
+                assert_eq!(consumed, xz_len, "in_chunk {in_chunk}");
+            }
+        }
+    }
+    // Input ending inside a magic prefix is not a Stream either: `finish`
+    // ends the data cleanly.
+    let wire = [&sa[..], &[0xFD, 0x37]].concat();
+    for in_chunk in [1, wire.len()] {
+        let (out, _, ended_in_decode) = decode_tracking(&wire, in_chunk).unwrap();
+        assert_eq!(out, a);
+        assert!(!ended_in_decode);
+    }
+}
+
+#[test]
+fn system_xz_concatenated_streams_decode() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    let parts = [
+        (b"one ".repeat(1000), "--check=crc64"),
+        (mixed_corpus(), "--check=sha256"),
+        (Vec::new(), "--check=none"),
+        (b"four".to_vec(), "--check=crc32"),
+    ];
+    let mut wire = Vec::new();
+    let mut want = Vec::new();
+    for (data, check) in &parts {
+        wire.extend(pipe_through("xz", &["-c", "-z", check], data).unwrap());
+        wire.extend_from_slice(&[0; 4]);
+        want.extend_from_slice(data);
+    }
+    for in_chunk in [13, 4096, wire.len()] {
+        let (out, consumed, _) = decode_tracking(&wire, in_chunk).unwrap();
+        assert_eq!(out, want, "in_chunk {in_chunk}");
+        assert_eq!(consumed, wire.len());
     }
 }
