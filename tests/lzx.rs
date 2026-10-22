@@ -503,6 +503,55 @@ fn cab_e8_translation_matches_libmspack() {
     assert_eq!(decode_all_ways(&w.framed(16, data.len())), want);
 }
 
+/// Verbatim block coding `data` as literals only: every byte value gets an
+/// 8-bit code (so a literal's code is the byte itself), no matches. The
+/// pretree codes "length 8" (delta symbol 9) and "length 0" (symbol 0) in
+/// one bit each. With `realign`, the bitstream is padded to a word boundary
+/// after each 32 KiB frame, as MS-CAB compressors do.
+fn put_verbatim_literals(w: &mut BitW, window_bits: u8, data: &[u8], realign: bool) {
+    let slots = [30u32, 32, 34, 36, 38, 42, 50][(window_bits - 15) as usize];
+    w.put(3, 1);
+    w.put(24, data.len() as u32);
+    let pretree = |w: &mut BitW| {
+        for sym in 0..20 {
+            w.put(4, u32::from(sym == 0 || sym == 9));
+        }
+    };
+    pretree(w);
+    for _ in 0..256 {
+        w.put(1, 1); // main lens 0..256: 0 -> 8
+    }
+    pretree(w);
+    for _ in 0..slots * 8 {
+        w.put(1, 0); // no match symbols
+    }
+    pretree(w);
+    for _ in 0..249 {
+        w.put(1, 0); // empty length tree
+    }
+    for (i, &b) in data.iter().enumerate() {
+        if realign && i > 0 && i % 32_768 == 0 && w.n != 0 {
+            w.put(16 - w.n, 0);
+        }
+        w.put(8, u32::from(b));
+    }
+}
+
+/// The bitstream is realigned to 16 bits at every 32 KiB frame boundary
+/// (cabextract decodes this stream; without the padding it does not). The
+/// decoder used to read straight through, mis-decoding everything after
+/// the first frame.
+#[test]
+fn cab_frame_boundary_realigns_bitstream() {
+    let data: Vec<u8> = (0..80_000u32).map(|i| (i % 251) as u8).collect();
+    let mut w = BitW::new();
+    w.put(1, 0);
+    put_verbatim_literals(&mut w, 16, &data, true);
+    // The frame-1 symbols end mid-word, so the padding is really there.
+    assert_ne!((1 + 27 + 3 * 80 + 256 + 256 + 249 + 8 * 32_768) % 16, 0);
+    assert_eq!(decode_all_ways(&w.framed(16, data.len())), data);
+}
+
 // ─── factory ─────────────────────────────────────────────────────────────
 
 #[cfg(feature = "factory")]

@@ -489,8 +489,12 @@ fn step(ctx: &mut RunCtx) -> Result<(), Error> {
         }
         // Enforce frame boundary — once frame_buf hits FRAME_SIZE we must
         // apply the E8 filter (if active) and yield to the caller for drain.
+        // The compressor pads the bitstream to a 16-bit boundary at the end
+        // of every frame, so realign before the next frame's bits (libmspack
+        // does the same; inside an uncompressed block this is a no-op).
         if ctx.frame_buf.len() >= FRAME_SIZE {
             apply_e8_to_frame(ctx);
+            ctx.bit_reader.align_to_word();
             ctx.frame_ready = true;
             return Ok(());
         }
