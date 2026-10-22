@@ -2419,6 +2419,7 @@ impl Decoder {
         let cl_decoder = HuffmanDecoder::from_lengths_sparse(&cl_cl_lengths)?;
         let mut cl_lengths = [0u8; 18];
         let mut space: i32 = 32;
+        let mut num_codes = 0u32;
         let mut idx = hskip as usize;
         while idx < 18 {
             let sym_pos = CODE_LENGTH_ORDER[idx];
@@ -2428,6 +2429,7 @@ impl Decoder {
             }
             cl_lengths[sym_pos] = v as u8;
             if v != 0 {
+                num_codes += 1;
                 space -= 32 >> v;
                 if space <= 0 {
                     break;
@@ -2435,7 +2437,10 @@ impl Decoder {
             }
             idx += 1;
         }
-        if space != 0 {
+        // RFC 7932 §3.5: the code lengths must fill the code space exactly,
+        // unless only one is non-zero — that symbol then has a zero-length
+        // code (the reference decoder's `num_codes == 1 || space == 0`).
+        if num_codes != 1 && space != 0 {
             return Err(Error::InvalidHuffmanTree);
         }
         // 2. Build the cl-symbol decoder.
