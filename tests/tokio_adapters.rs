@@ -238,3 +238,31 @@ fn decoder_reader_delivers_buffered_output_before_more_input() {
     }
     assert_eq!(got, input.len());
 }
+
+// ─── poll_flush makes everything written so far decodable ───────────────
+
+// The `embed` deflate encoder cannot byte-align mid-stream, so its flush
+// is a no-op.
+#[cfg(not(feature = "embed"))]
+#[test]
+fn encoder_writer_flush_emits_sync_point() {
+    use compcol::{Decoder, Status};
+    runtime().block_on(async {
+        let mut w = EncoderWriter::new(Vec::<u8>::new(), Gzip::encoder());
+        w.write_all(b"request one\n").await.unwrap();
+        w.flush().await.unwrap();
+
+        let mut dec = Gzip::decoder();
+        let mut buf = [0u8; 64];
+        let (p, status) = dec.decode(w.get_ref(), &mut buf).unwrap();
+        assert_eq!(&buf[..p.written], b"request one\n");
+        assert_eq!(status, Status::InputEmpty);
+
+        w.write_all(b"request two\n").await.unwrap();
+        let compressed = w.shutdown_into_inner().await.unwrap();
+        assert_eq!(
+            compcol::vec::decompress_to_vec::<Gzip>(&compressed).unwrap(),
+            b"request one\nrequest two\n"
+        );
+    });
+}

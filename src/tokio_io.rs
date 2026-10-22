@@ -36,7 +36,7 @@ use std::io;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::{Decoder, Encoder, Error, Status};
+use crate::{Decoder, Encoder, Error, Flush, Status};
 
 const SCRATCH: usize = 64 * 1024;
 
@@ -71,6 +71,9 @@ pub struct EncoderWriter<W: AsyncWrite + Unpin, E: Encoder + Unpin> {
     out_pos: usize,
     /// Position within the encoder's `finish` drain state during shutdown.
     finished: bool,
+    /// The encoder has been sync-flushed since the last input; a re-poll of
+    /// `poll_flush` only has to push the staged bytes out.
+    sync_flushed: bool,
 }
 
 impl<W: AsyncWrite + Unpin, E: Encoder + Unpin> EncoderWriter<W, E> {
@@ -83,6 +86,7 @@ impl<W: AsyncWrite + Unpin, E: Encoder + Unpin> EncoderWriter<W, E> {
             out: Vec::with_capacity(SCRATCH),
             out_pos: 0,
             finished: false,
+            sync_flushed: false,
         }
     }
 
@@ -144,6 +148,9 @@ impl<W: AsyncWrite + Unpin, E: Encoder + Unpin> AsyncWrite for EncoderWriter<W, 
         loop {
             let (p, _status) = me.enc.encode(buf, &mut me.scratch)?;
             me.out.extend_from_slice(&me.scratch[..p.written]);
+            if p.consumed > 0 {
+                me.sync_flushed = false;
+            }
             if p.consumed > 0 || p.written == 0 || buf.is_empty() {
                 return Poll::Ready(Ok(p.consumed));
             }
@@ -155,8 +162,30 @@ impl<W: AsyncWrite + Unpin, E: Encoder + Unpin> AsyncWrite for EncoderWriter<W, 
         }
     }
 
+    /// Sync-flushes the encoder ([`Flush::Sync`]) so everything written so
+    /// far is decodable by the peer, then flushes the inner writer. Formats
+    /// without an in-band sync marker flush nothing extra.
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let me = Pin::into_inner(self);
+        if !me.finished && !me.sync_flushed {
+            loop {
+                let (p, status) = match me.enc.flush(&mut me.scratch, Flush::Sync) {
+                    Ok(r) => r,
+                    // A build that cannot byte-align mid-stream (`embed`)
+                    // has nothing it can flush; that's not a write error.
+                    Err(Error::Unsupported) => break,
+                    Err(e) => return Poll::Ready(Err(e.into())),
+                };
+                me.out.extend_from_slice(&me.scratch[..p.written]);
+                if !matches!(status, Status::OutputFull) {
+                    break;
+                }
+                if p.written == 0 {
+                    return Poll::Ready(Err(io::Error::other("encoder stalled in flush")));
+                }
+            }
+            me.sync_flushed = true;
+        }
         ready_poll!(me.drain_out(cx))?;
         Pin::new(&mut me.inner).poll_flush(cx)
     }
