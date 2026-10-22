@@ -286,3 +286,23 @@ fn truncated_payload_is_unexpected_end() {
     // Either UnexpectedEnd (ran out of bits) — must not panic.
     assert!(matches!(err, Error::UnexpectedEnd | Error::Corrupt));
 }
+
+/// A declared length far beyond the payload must be rejected before any
+/// allocation: `2^63` used to panic with `capacity overflow`, and `2^32`
+/// with a single-symbol table materialised 4 GiB from an 8-byte stream.
+#[test]
+fn declared_length_beyond_payload_is_rejected() {
+    for declared in [1u64 << 63, 1u64 << 32, 9] {
+        let mut s = Vec::new();
+        write_varint(&mut s, declared);
+        // Single-symbol table: byte 0 has length 1, the other 255 are absent.
+        s.extend_from_slice(&[0x01, 0xF0, 236]);
+        s.push(0x00); // one payload byte = 8 symbols at most
+        assert_eq!(decode(&s).unwrap_err(), Error::UnexpectedEnd, "{declared}");
+    }
+    // The bound is exact: 8 symbols fit in the one payload byte.
+    let mut s = Vec::new();
+    write_varint(&mut s, 8);
+    s.extend_from_slice(&[0x01, 0xF0, 236, 0x00]);
+    assert_eq!(decode(&s).unwrap(), vec![0u8; 8]);
+}
