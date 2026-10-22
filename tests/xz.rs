@@ -1289,3 +1289,223 @@ fn system_xz_concatenated_streams_decode() {
         assert_eq!(consumed, wire.len());
     }
 }
+
+// ─── filter chains (Delta / BCJ before LZMA2) ───────────────────────────
+
+/// Bytes biased towards the opcodes every BCJ converter looks for (x86
+/// E8/E9 with 00/FF operands, ARM/Thumb/ARM64 BL, PowerPC `bl`, SPARC
+/// `call`, RISC-V JAL/AUIPC, IA-64 templates), so each filter really
+/// rewrites operands, mixed with plain noise.
+fn branchy_corpus(len: usize, seed: u32) -> Vec<u8> {
+    const HOT: [u8; 16] = [
+        0x00, 0xFF, 0xE8, 0xE9, 0xEB, 0x94, 0x48, 0x40, 0xF0, 0xF8, 0xEF, 0x17, 0x90, 0x10, 0x01,
+        0x97,
+    ];
+    let mut s = seed;
+    let mut v = Vec::with_capacity(len);
+    while v.len() < len {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let r = (s >> 8) as u8;
+        v.push(if s >> 31 == 0 {
+            HOT[(r & 15) as usize]
+        } else {
+            r
+        });
+    }
+    v
+}
+
+/// Something with real x86-64 branches in it: the test binary itself.
+fn own_code(max: usize) -> Vec<u8> {
+    let mut v = std::fs::read("/proc/self/exe").unwrap_or_default();
+    v.truncate(max);
+    v
+}
+
+/// Every xz filter-chain option set exercised below (a `--block-size`
+/// makes several Blocks, each restarting the filters).
+const FILTER_ARGS: &[&[&str]] = &[
+    &["--delta=dist=1", "--lzma2"],
+    &["--delta=dist=4", "--lzma2"],
+    &["--delta=dist=256", "--lzma2"],
+    &["--x86", "--lzma2"],
+    &["--x86=start=12345", "--lzma2"],
+    &["--powerpc", "--lzma2"],
+    &["--powerpc=start=8", "--lzma2"],
+    &["--ia64", "--lzma2"],
+    &["--ia64=start=4096", "--lzma2"],
+    &["--arm", "--lzma2"],
+    &["--arm=start=1024", "--lzma2"],
+    &["--armthumb", "--lzma2"],
+    &["--armthumb=start=6", "--lzma2"],
+    &["--sparc", "--lzma2"],
+    &["--sparc=start=16", "--lzma2"],
+    &["--arm64", "--lzma2"],
+    &["--arm64=start=4096", "--lzma2"],
+    &["--riscv", "--lzma2"],
+    &["--riscv=start=2", "--lzma2"],
+    // Longer chains: up to the format's four filters.
+    &["--x86", "--delta=dist=2", "--lzma2"],
+    &["--delta=dist=3", "--arm64", "--lzma2"],
+    &["--x86", "--delta=dist=4", "--arm", "--lzma2"],
+    &["--riscv", "--sparc", "--ia64", "--lzma2"],
+    &["--x86", "--lzma2", "--block-size=40000"],
+    &[
+        "--delta=dist=7",
+        "--powerpc",
+        "--lzma2",
+        "--block-size=33333",
+    ],
+];
+
+#[test]
+fn system_xz_filter_chains_decode() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    let mut input = branchy_corpus(150_000, 7);
+    input.extend(own_code(200_000));
+    // An odd length leaves every BCJ filter a short unconverted tail.
+    input.extend_from_slice(&branchy_corpus(13, 9));
+    for args in FILTER_ARGS {
+        let mut cmd_args = vec!["-c", "-z", "--check=crc64"];
+        cmd_args.extend_from_slice(args);
+        let encoded = match pipe_through("xz", &cmd_args, &input) {
+            Ok(v) => v,
+            Err(e) => {
+                // Older xz-utils lack ARM64 (5.4) / RISC-V (5.6).
+                println!("skipping {args:?}: {e}");
+                continue;
+            }
+        };
+        for in_chunk in [1 << 20, 4099, 1] {
+            if in_chunk == 1 && encoded.len() > 100_000 && args.len() > 2 {
+                continue; // keep the byte-at-a-time pass to the short chains
+            }
+            let (out, consumed, _) = decode_tracking(&encoded, in_chunk)
+                .unwrap_or_else(|e| panic!("{args:?} in_chunk {in_chunk}: {e:?}"));
+            assert!(out == input, "{args:?} in_chunk {in_chunk}: output differs");
+            assert_eq!(consumed, encoded.len());
+        }
+        // A one-byte output buffer drains the chain's buffer piecemeal.
+        let out = decode_chunked(&encoded, 65_536, 1).unwrap();
+        assert!(out == input, "{args:?} out_chunk 1: output differs");
+
+        // The start offset matters (and the filter really rewrote
+        // branches): decoding with it zeroed fails the Block Check.
+        if let Some(start) = args[0].split("start=").nth(1) {
+            let start: u32 = start.parse().unwrap();
+            let header_len = (encoded[12] as usize + 1) * 4;
+            let mut header = encoded[12..12 + header_len].to_vec();
+            let props = [&[4u8][..], &start.to_le_bytes()].concat();
+            let at = header
+                .windows(5)
+                .position(|w| w == props)
+                .expect("start offset in Block Header");
+            header[at + 1..at + 5].fill(0);
+            let patched = with_block_header(&encoded, &header);
+            assert_eq!(
+                decode_chunked(&patched, 65_536, 65_536).unwrap_err(),
+                Error::ChecksumMismatch,
+                "{args:?}"
+            );
+        }
+    }
+}
+
+/// `printf 'abcdabcdabcd' | xz --delta=dist=4 --lzma2 --check=crc32`: a
+/// filter chain fixture that does not need the CLI.
+const DELTA4_XZ: [u8; 76] = [
+    0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x01, 0x69, 0x22, 0xde, 0x36, 0x04, 0xc1, 0x12, 0x0c,
+    0x03, 0x01, 0x03, 0x21, 0x01, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0x9f, 0x62, 0x18,
+    0xe0, 0x00, 0x0b, 0x00, 0x0a, 0x5d, 0x00, 0x30, 0x98, 0x88, 0x98, 0x39, 0xa0, 0xa0, 0x60, 0x80,
+    0x00, 0x00, 0x00, 0x00, 0xb7, 0xe5, 0xb9, 0xd5, 0x00, 0x01, 0x2a, 0x0c, 0x28, 0x35, 0x5b, 0x46,
+    0x90, 0x42, 0x99, 0x0d, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x59, 0x5a,
+];
+
+#[test]
+fn delta_filter_chain_fixture() {
+    for in_chunk in [1, 5, DELTA4_XZ.len()] {
+        assert_eq!(
+            decode_chunked(&DELTA4_XZ, in_chunk, 3).unwrap(),
+            b"abcdabcdabcd"
+        );
+    }
+}
+
+/// Patch the Block Header (at offset 12) of `stream` with `header` (same
+/// length, CRC32 recomputed).
+fn with_block_header(stream: &[u8], header: &[u8]) -> Vec<u8> {
+    let mut s = stream.to_vec();
+    let n = header.len();
+    s[12..12 + n].copy_from_slice(header);
+    let crc = test_crc32(&s[12..12 + n - 4]);
+    s[12 + n - 4..12 + n].copy_from_slice(&crc.to_le_bytes());
+    s
+}
+
+#[test]
+fn invalid_filter_chains_rejected() {
+    // Block Header of DELTA4_XZ (20 bytes): size, flags (2 filters, both
+    // sizes), the sizes, delta (1-byte props), lzma2 (1-byte props),
+    // padding, CRC32. Replacements keep the length and drop the sizes.
+    assert_eq!(
+        &DELTA4_XZ[12..22],
+        &[0x04, 0xc1, 0x12, 0x0c, 0x03, 0x01, 0x03, 0x21, 0x01, 0x16]
+    );
+    let bad = |body: [u8; 16]| {
+        let mut h = body.to_vec();
+        h.extend_from_slice(&[0; 4]);
+        with_block_header(&DELTA4_XZ, &h)
+    };
+    for (label, stream) in [
+        // LZMA2 not last.
+        (
+            "lzma2 first",
+            bad([
+                4, 0x01, 0x21, 0x01, 0x16, 0x03, 0x01, 0x03, 0, 0, 0, 0, 0, 0, 0, 0,
+            ]),
+        ),
+        // Last filter is not LZMA2.
+        (
+            "delta last",
+            bad([4, 0x00, 0x03, 0x01, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        ),
+        // Unknown filter ID.
+        (
+            "unknown id",
+            bad([
+                4, 0x01, 0x0C, 0x00, 0x21, 0x01, 0x16, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ]),
+        ),
+        // Delta with 2-byte properties.
+        (
+            "delta props",
+            bad([
+                4, 0x01, 0x03, 0x02, 0x03, 0x00, 0x21, 0x01, 0x16, 0, 0, 0, 0, 0, 0, 0,
+            ]),
+        ),
+        // BCJ with a 2-byte start offset (must be 0 or 4 bytes).
+        (
+            "bcj props",
+            bad([
+                4, 0x01, 0x04, 0x02, 0x00, 0x00, 0x21, 0x01, 0x16, 0, 0, 0, 0, 0, 0, 0,
+            ]),
+        ),
+    ] {
+        assert_eq!(
+            decode_chunked(&stream, 4096, 4096).unwrap_err(),
+            Error::Unsupported,
+            "{label}"
+        );
+    }
+    // Properties running past the Block Header.
+    let stream = bad([
+        4, 0x01, 0x03, 0x7F, 0x03, 0x21, 0x01, 0x16, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]);
+    assert_eq!(
+        decode_chunked(&stream, 4096, 4096).unwrap_err(),
+        Error::Corrupt
+    );
+}

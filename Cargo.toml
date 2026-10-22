@@ -98,8 +98,10 @@ gzip    = ["deflate"]
 # probability tables and the LZ window.
 lzma    = ["alloc"]
 # xz container (RFC-style stream/block headers + check codes; the inner
-# LZMA2 chunk codec is inlined inside `src/xz/`).
-xz      = ["lzma"]
+# LZMA2 chunk codec is inlined inside `src/xz/`). Pulls `bcj` and `delta`:
+# the decoder undoes those filters when a Block's filter chain uses them
+# (`xz --x86`, `xz --delta`, ...), reusing their transforms.
+xz      = ["lzma", "bcj", "delta"]
 # Raw LZMA2 chunk stream (7-Zip coder id 21) — the dict-reset control bytes
 # + LZMA chunks, without the `.xz` container. Decode-only entry point that
 # reuses the same LZMA2 chunk codec the `xz` feature uses. The 7z coder
