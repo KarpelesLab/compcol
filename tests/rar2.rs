@@ -624,6 +624,18 @@ fn repeat_last_match_updates_old_offsets() {
     assert_eq!(&out[..p.written], WANT);
 }
 
+/// Regression: a hostile declared unpack size (64 TiB here) used to be
+/// reserved up front with `reserve_exact`, aborting the process with an
+/// allocation failure before a single input byte was read. It must now fail
+/// cleanly on the short input instead.
+#[test]
+fn huge_declared_unpack_size_does_not_preallocate() {
+    let mut dec = Decoder::with_unpack_size(1 << 46);
+    dec.decode(&[0u8; 8], &mut []).unwrap();
+    let mut out = [0u8; 16];
+    assert!(dec.finish(&mut out).is_err());
+}
+
 // ─── factory (only if the feature is enabled) ─────────────────────────────
 
 #[cfg(feature = "factory")]

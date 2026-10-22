@@ -67,6 +67,10 @@ use super::tables::{
     SYM_SHORT_FIRST, SYM_SHORT_LAST, WINDOW_MASK, WINDOW_SIZE,
 };
 
+/// Cap on the speculative output preallocation taken from the declared
+/// unpack size (same policy as the RAR3 decoder).
+const OUT_PREALLOC_CAP: usize = 64 << 20;
+
 /// Streaming RAR 2.x decoder. See module docs for the streaming model.
 pub struct Decoder {
     /// Configured unpacked output size in bytes. `None` means "unknown" — the
@@ -206,7 +210,11 @@ impl Decoder {
             return Err(self.poison(Error::Unsupported));
         }
         let target = self.unpack_size as usize;
-        self.output.reserve_exact(target);
+        // Preallocate from the declared size, but capped: the size comes
+        // from the container header, so an unchecked reservation lets a
+        // hostile header abort the process before any input is read. Real
+        // members past the cap still decode; `output` grows the rest.
+        self.output.reserve_exact(target.min(OUT_PREALLOC_CAP));
 
         let mut ctx = Box::new(RunCtx::new(target));
         let input = core::mem::take(&mut self.input_buf);
