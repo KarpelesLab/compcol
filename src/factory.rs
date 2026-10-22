@@ -205,7 +205,8 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
 ///
 /// * `deflate`/`zlib`/`gzip`: 1..=9, default 6
 /// * `lzma`/`xz`: 0..=9, default 6
-/// * `zstd`: 1..=22, default 3
+/// * `zstd`: 1..=22, default 3 (0 also selects the default; the negative
+///   "fast" levels need [`crate::zstd::EncoderConfig`] directly)
 /// * `brotli` quality: 0..=11, default 6
 ///
 /// For algorithms without a level (everything else) the parameter is
@@ -245,7 +246,9 @@ pub fn encoder_by_name_with_level(name: &str, level: u8) -> Option<Box<dyn Encod
         ))),
         #[cfg(feature = "zstd")]
         crate::zstd::Zstd::NAME => Some(Box::new(<crate::zstd::Zstd as Algorithm>::encoder_with(
-            crate::zstd::EncoderConfig { level },
+            crate::zstd::EncoderConfig {
+                level: i32::from(level),
+            },
         ))),
         #[cfg(feature = "brotli")]
         crate::brotli::Brotli::NAME => Some(Box::new(

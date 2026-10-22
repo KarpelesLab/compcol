@@ -50,6 +50,17 @@
 //!   RLE_Mode for sequence FSE tables, multi-frame output, content checksum,
 //!   or dictionaries.
 //!
+//! # Compression levels
+//!
+//! [`EncoderConfig::level`] is an `i32` taking libzstd's full range,
+//! [`MIN_LEVEL`]`..=`[`MAX_LEVEL`] (`-131072..=22`); out-of-range values are
+//! clamped. `0` selects [`DEFAULT_LEVEL`] (3). Negative levels are the "fast"
+//! levels (`zstd --fast=N` is level `-N`): level 1's match finder with an
+//! acceleration of `-level` that makes the parser stride over unmatched input,
+//! so each more negative level is faster with a lower ratio. Output at every
+//! level is an ordinary frame any decoder accepts; it is not byte-identical
+//! to libzstd's at the same level.
+//!
 //! # Window size and memory
 //!
 //! The decoder retains only `Window_Size` bytes of history (plus a small
@@ -94,7 +105,7 @@ mod sequences;
 mod xxhash;
 
 pub use decoder::{DEFAULT_MAX_WINDOW_SIZE, Decoder, DecoderConfig, RECOMMENDED_WINDOW_SIZE};
-pub use encoder::{Encoder, EncoderConfig};
+pub use encoder::{DEFAULT_LEVEL, Encoder, EncoderConfig, MAX_LEVEL, MIN_LEVEL};
 
 /// Internal helpers exposed for integration tests only. Not part of the
 /// public API; subject to change without notice.
