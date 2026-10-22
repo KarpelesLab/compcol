@@ -6,7 +6,7 @@
 #![cfg(feature = "bzip2")]
 
 use compcol::bzip2::{Bzip2, Decoder, Encoder, EncoderConfig};
-use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Status};
+use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Flush, Status};
 
 /// Drive an encoder to completion, feeding `input` in `in_chunk`-sized
 /// slices and draining via an `out_chunk`-sized buffer.
@@ -798,4 +798,146 @@ fn one_byte_input_on_large_block_is_not_quadratic() {
     assert_eq!(decode_chunked(&encoded, 1, 65536).unwrap(), input);
     // Generous bound for slow debug CI; the quadratic path took minutes.
     assert!(start.elapsed().as_secs() < 60, "{:?}", start.elapsed());
+}
+
+// ─── byte-identity with libbzip2 ───────────────────────────────────────
+
+fn encode_level(input: &[u8], level: u8) -> Vec<u8> {
+    let mut enc = Encoder::with_config(EncoderConfig { level });
+    encode_chunked(&mut enc, input, input.len().max(1), 4096)
+}
+
+/// 510 zero bytes RLE-1 to a block of period 5, whose two equal
+/// rotations make the origin a matter of sort order: libbzip2 reports 0,
+/// and so must we (we used to say 1). Reference: `bzip2 -9`.
+#[test]
+fn periodic_block_origin_matches_libbzip2() {
+    const REF: [u8; 41] = [
+        0x42, 0x5a, 0x68, 0x39, 0x31, 0x41, 0x59, 0x26, 0x53, 0x59, 0x8f, 0x19, 0xb0, 0x35, 0x00,
+        0x00, 0x00, 0x40, 0x00, 0xc0, 0x00, 0x00, 0x08, 0x20, 0x00, 0x30, 0x80, 0x2a, 0x69, 0x21,
+        0xc5, 0xdc, 0x91, 0x4e, 0x14, 0x24, 0x23, 0xc6, 0x6c, 0x0d, 0x40,
+    ];
+    assert_eq!(encode_level(&[0u8; 510], 9), REF);
+}
+
+/// Inputs that put a run on a block boundary (libbzip2 closes a block
+/// without the run in progress, which then starts the next block),
+/// periodic blocks either side of the 10 000-byte switch to the main
+/// sort and past its work budget, and plain text, at several levels.
+/// Compared with the system `bzip2` when there is one.
+#[cfg(feature = "std")]
+#[test]
+fn output_matches_system_bzip2() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    if Command::new("bzip2").arg("--help").output().is_err() {
+        eprintln!("bzip2 not available; skipping");
+        return;
+    }
+    let mut s = 0x2545_F491_4F6C_DD1Du64;
+    let mut rnd = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    // Runs of 1..=8 and some long ones: over 1 MB at level 1 this ends
+    // many blocks inside a run.
+    let mut runs = Vec::new();
+    while runs.len() < 1_200_000 {
+        let r = rnd();
+        let len = if r % 16 == 0 {
+            (r >> 8) % 300
+        } else {
+            (r >> 8) % 8 + 1
+        };
+        runs.extend(std::iter::repeat_n(
+            b'a' + (r >> 20) as u8 % 3,
+            len as usize,
+        ));
+    }
+    let cases: Vec<(Vec<u8>, u8)> = vec![
+        (runs.clone(), 1),
+        (runs, 2),
+        (b"ab".repeat(4_000), 9),
+        (b"abcde".repeat(30_000), 9),
+        (b"hello world, periodic ".repeat(60_000), 1),
+        (vec![7u8; 3_000_000], 1),
+        (gen_words(250_000), 1),
+    ];
+    for (input, level) in &cases {
+        let mut child = Command::new("bzip2")
+            .arg(format!("-{level}"))
+            .arg("-c")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn bzip2");
+        let mut stdin = child.stdin.take().unwrap();
+        let data = input.clone();
+        let writer = std::thread::spawn(move || stdin.write_all(&data));
+        let out = child.wait_with_output().expect("wait bzip2");
+        writer.join().unwrap().unwrap();
+        let ours = encode_level(input, *level);
+        assert!(
+            ours == out.stdout,
+            "differs from bzip2 -{level} on {} bytes: {} vs {}",
+            input.len(),
+            ours.len(),
+            out.stdout.len()
+        );
+    }
+}
+
+/// `flush` is libbzip2's `BZ_FLUSH`: it closes the block and hands out
+/// the bytes libbzip2 would — all but the bits of the last write, which
+/// a bzip2 stream has no way to pad. Reference: libbzip2 with BZ_RUN /
+/// BZ_FLUSH / BZ_FINISH at level 1, flushing at offsets 0, 6 and 6 of
+/// "hello hello hello world" (3, 31 and 31 bytes out after each flush).
+#[test]
+fn flush_matches_libbzip2() {
+    const REF: [u8; 78] = [
+        0x42, 0x5a, 0x68, 0x31, 0x31, 0x41, 0x59, 0x26, 0x53, 0x59, 0x76, 0x69, 0xe0, 0xd4, 0x00,
+        0x00, 0x01, 0x11, 0x00, 0x40, 0x00, 0x02, 0x44, 0xa0, 0x00, 0x30, 0xcd, 0x00, 0xc3, 0x46,
+        0x29, 0x97, 0x31, 0x41, 0x59, 0x26, 0x53, 0x59, 0xde, 0x9d, 0x45, 0x08, 0x00, 0x00, 0x02,
+        0x91, 0x80, 0x40, 0x00, 0x06, 0x44, 0x90, 0x80, 0x20, 0x00, 0x31, 0x0c, 0x08, 0x12, 0x81,
+        0xea, 0x08, 0xa6, 0x66, 0xe8, 0x87, 0x73, 0xe2, 0xee, 0x48, 0xa7, 0x0a, 0x12, 0x06, 0x49,
+        0xd0, 0x94, 0x00,
+    ];
+    let input = b"hello hello hello world";
+    for out_chunk in [1, 5, 4096] {
+        let mut enc = Encoder::with_config(EncoderConfig { level: 1 });
+        let mut buf = vec![0u8; out_chunk];
+        let mut out = Vec::new();
+        let mut after_flush = Vec::new();
+        let mut fed = 0;
+        for split in [0, 6, 6, input.len()] {
+            while fed < split {
+                let (p, _) = enc.encode(&input[fed..split], &mut buf).unwrap();
+                out.extend_from_slice(&buf[..p.written]);
+                fed += p.consumed;
+            }
+            if split == input.len() {
+                break;
+            }
+            loop {
+                let (p, status) = enc.flush(&mut buf, Flush::Sync).unwrap();
+                out.extend_from_slice(&buf[..p.written]);
+                if status == Status::InputEmpty {
+                    break;
+                }
+            }
+            after_flush.push(out.len());
+        }
+        loop {
+            let (p, status) = enc.finish(&mut buf).unwrap();
+            out.extend_from_slice(&buf[..p.written]);
+            if status == Status::StreamEnd {
+                break;
+            }
+        }
+        assert_eq!(after_flush, [3, 31, 31], "out_chunk {out_chunk}");
+        assert_eq!(out, REF, "out_chunk {out_chunk}");
+    }
 }

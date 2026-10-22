@@ -68,7 +68,7 @@ flag accept; *Ext* is what `factory::extension(name)` returns.
 | LZFSE (Apple) | `lzfse` | `lzfse` | `.lzfse` | `Unsupported` (decoder-only) | `bvx-` raw + `bvxn` (LZVN) + `bvx2` (LZ77 + FSE); `bvx1` returns `Unsupported` | round-trip (bvx2 vs own FSE encoder; no Apple toolchain bundled) |
 | ADC (Apple DMG) | `adc` | `adc` | `.adc` | LZSS-style greedy match-finder | full | hand-built fixtures |
 | PackBits (Apple / TIFF / PSD) | `packbits` | `packbits` | `.packbits` | full (libtiff-equivalent greedy) | full | PIL TIFF PackBits fixtures |
-| bzip2 | `bzip2` | `bzip2` | `.bz2` | full (RLE-1 + SA-IS BWT + MTF + RLE-2 + dynamic Huffman) | full | `bzip2(1)` both directions |
+| bzip2 | `bzip2` | `bzip2` | `.bz2` | full (byte-identical to libbzip2: RLE-1 + `BZ2_blockSort` BWT + MTF + RLE-2 + dynamic Huffman) | full | `bzip2(1)` both directions |
 | PPMd (Shkarin's PPMII variant H) | `ppmd` | `ppmd` | `.ppmd` | `Unsupported` (decoder-only; PPM model is intricate) | full (used in 7z / RAR3+ / ZIP method 98) | `python3 ppmd-cffi` |
 | Microsoft Xpress (plain LZ77) | `xpress` | `xpress` | `.xpress` | full | full (per [MS-XCA] §2.2) | hand-built fixtures |
 | Microsoft Xpress Huffman | `xpress_huffman` | `xpress-huffman` | `.xph` | full (LZ77 + canonical Huffman) | full (per [MS-XCA] §2.1; used in WIM / CompactOS NTFS) | hand-built fixtures |

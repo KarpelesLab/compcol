@@ -1,18 +1,24 @@
 //! bzip2 streaming encoder.
 //!
-//! The encoder buffers input up to the configured block size, then
-//! produces an encoded block on `raw_finish` (or whenever the buffer
-//! fills). The pipeline per block is:
+//! The encoder RLE-1-encodes input into a block as it arrives and
+//! produces an encoded block whenever the block fills, on `flush`, and
+//! on `finish`. The pipeline per block is:
 //!
 //! ```text
 //! raw bytes → RLE-1 → BWT → MTF → RLE-2 → multi-table Huffman → bitstream
 //! ```
 //!
+//! Block boundaries, and everything else that decides the output bytes,
+//! follow libbzip2 (`bzlib.c` / `compress.c`): fed the same input through
+//! `encode` and then `finish`, the stream is byte-identical to what
+//! `BZ2_bzCompress` produces with `BZ_RUN` then `BZ_FINISH` (the `bzip2`
+//! tool, `BZ2_bzWrite`) at work factor 30.
+//!
 //! The output is staged into a `Vec<u8>` that we drain into the
 //! caller's output buffer. We emit:
 //! - The 4-byte stream header `"BZh<level>"` exactly once, on the first
 //!   `raw_encode`/`raw_finish` call.
-//! - One block payload per filled or finished block.
+//! - One block payload per filled, flushed or finished block.
 //! - The stream footer (end-of-stream magic + combined CRC + byte-
 //!   align padding) once `raw_finish` runs.
 
@@ -21,20 +27,20 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::traits::{RawEncoder, RawProgress};
+use crate::traits::{Flush, RawEncoder, RawProgress};
 
 use super::bits::BitWriter;
 use super::bwt::bwt_forward;
 use super::crc::Crc32;
 use super::huffman::{MAX_CODE_LEN, build_canonical_codes, build_canonical_lengths};
 use super::mtf::mtf_forward_reduced;
-use super::rle::{Rle1Encoder, rle1_forward, rle2_forward};
+use super::rle::rle2_forward;
 
 /// Tunables for the bzip2 encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncoderConfig {
     /// Block size in 100 KB units, 1..=9. Default 6 (matches reference
-    /// bzip2). The post-RLE-1 buffer is capped at
+    /// bzip2). A block is closed once its post-RLE-1 size reaches
     /// `level * 100_000 - 19` bytes.
     pub level: u8,
 }
@@ -58,7 +64,7 @@ const MAX_SELECTORS: usize = 18002; // matches bzip2 reference
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    /// Accepting raw input into `pending`. Header may or may not be
+    /// Accepting raw input into `block`. Header may or may not be
     /// flushed yet (header bytes live in `out` if not).
     Accepting,
     /// All pending input has been consumed, encoded blocks (if any)
@@ -71,15 +77,18 @@ enum Phase {
 
 pub struct Encoder {
     config: EncoderConfig,
-    /// Per-block raw input buffer. Retained verbatim because the block
-    /// CRC is computed over the raw bytes; `encode_block` re-runs RLE-1
-    /// over it. Block boundaries, however, are governed by the *post*-
-    /// RLE-1 size tracked in `rle1` (matching reference bzip2's
-    /// `nblock`-based blocking), not by `pending.len()`.
-    pending: Vec<u8>,
-    /// Streaming RLE-1 size tracker mirroring `pending`. Used only to
-    /// decide when the current block has reached the post-RLE-1 cap.
-    rle1: Rle1Encoder,
+    /// The current block after RLE-1 (libbzip2's `block[0..nblock]`).
+    /// Runs enter it only once they end, so it never holds the run in
+    /// progress.
+    block: Vec<u8>,
+    /// CRC of the raw bytes behind `block` (libbzip2's `blockCRC`).
+    block_crc: Crc32,
+    /// The run in progress: `in_len` copies of `in_ch`, 0..=255 of them
+    /// (libbzip2's `state_in_ch` / `state_in_len`). It is not part of
+    /// any block yet: when a block fills, the run carries over and
+    /// starts the next one, exactly as in libbzip2.
+    in_ch: u8,
+    in_len: u32,
     /// Encoded bytes waiting to be returned to the caller.
     out: Vec<u8>,
     /// Index into `out` of the next byte to deliver.
@@ -105,8 +114,10 @@ impl Encoder {
         config.level = config.level.clamp(1, 9);
         Self {
             config,
-            pending: Vec::new(),
-            rle1: Rle1Encoder::new(),
+            block: Vec::new(),
+            block_crc: Crc32::new(),
+            in_ch: 0,
+            in_len: 0,
             out: Vec::new(),
             out_idx: 0,
             header_written: false,
@@ -116,12 +127,55 @@ impl Encoder {
         }
     }
 
-    /// Maximum number of post-RLE-1 bytes per block. We follow the
-    /// reference upper bound `level * 100_000 - 19`; the
-    /// `-19` cushions the worst-case expansion of pathological inputs
-    /// passing through the post-MTF / Huffman layers.
+    /// Post-RLE-1 size at which a block is closed (libbzip2's
+    /// `nblockMAX`). A run of 4+ enters the block as 5 bytes at once, so
+    /// a block can end up to 4 bytes past this; the `-19` keeps that,
+    /// and the run `finish` adds, within `level * 100_000`.
     fn block_input_cap(&self) -> usize {
         (self.config.level as usize) * 100_000 - 19
+    }
+
+    /// Move the finished run into the block (libbzip2's
+    /// `add_pair_to_block`): 1..=3 copies verbatim, 4..=255 as four
+    /// copies and a count of the rest.
+    fn add_pair_to_block(&mut self) {
+        let ch = self.in_ch;
+        let len = self.in_len as usize;
+        if len == 1 {
+            self.block_crc.update(&[ch]);
+            self.block.push(ch);
+            return;
+        }
+        self.block_crc.update(&[ch; 255][..len]);
+        if len < 4 {
+            self.block.extend_from_slice(&[ch; 3][..len]);
+        } else {
+            self.block
+                .extend_from_slice(&[ch, ch, ch, ch, (len - 4) as u8]);
+        }
+    }
+
+    /// Feed one raw byte (libbzip2's `ADD_CHAR_TO_BLOCK`).
+    #[inline]
+    fn add_char(&mut self, b: u8) {
+        if b == self.in_ch && self.in_len != 0 && self.in_len < 255 {
+            self.in_len += 1;
+        } else {
+            if self.in_len != 0 {
+                self.add_pair_to_block();
+            }
+            self.in_ch = b;
+            self.in_len = 1;
+        }
+    }
+
+    /// End the run in progress so the block can be closed (libbzip2's
+    /// `flush_RL`), as `flush` and `finish` do.
+    fn flush_run(&mut self) {
+        if self.in_len != 0 {
+            self.add_pair_to_block();
+            self.in_len = 0;
+        }
     }
 
     /// Lazy-init the stream header bit accumulator.
@@ -129,39 +183,37 @@ impl Encoder {
         if self.header_written {
             return;
         }
-        // "BZh" + ASCII level digit.
-        self.out.push(b'B');
-        self.out.push(b'Z');
-        self.out.push(b'h');
-        self.out.push(b'0' + self.config.level);
-        self.bw = Some(BitWriter::new());
+        // "BZh" + ASCII level digit, through the bit writer so a flush
+        // right after it holds the last byte back as libbzip2 does.
+        let mut bw = BitWriter::new();
+        for b in [b'B', b'Z', b'h', b'0' + self.config.level] {
+            bw.write_bits(8, b as u32);
+        }
+        self.bw = Some(bw);
         self.header_written = true;
     }
 
-    /// Encode the bytes currently buffered in `pending` into a single
-    /// bzip2 block, appending its bit-stream to `self.bw`. Resets
-    /// `pending` to empty afterwards.
+    /// Encode `self.block` (already RLE-1'd) as one bzip2 block,
+    /// appending its bit-stream to `self.bw`, and start an empty block.
     fn encode_block(&mut self) {
-        let block: Vec<u8> = core::mem::take(&mut self.pending);
-        // Reset the RLE-1 size tracker for the next block.
-        self.rle1 = Rle1Encoder::new();
+        let rle1: Vec<u8> = core::mem::take(&mut self.block);
         // Sanity: a "no input" block is not produced — we only call
-        // encode_block when pending is non-empty.
-        debug_assert!(!block.is_empty());
+        // encode_block when the block is non-empty.
+        debug_assert!(!rle1.is_empty());
 
-        // Step 1: per-block CRC of the **raw** bytes (CRC-32/MPEG-2).
-        let mut crc = Crc32::new();
-        crc.update(&block);
-        let block_crc = crc.value();
+        // Step 1: per-block CRC of the **raw** bytes (CRC-32/MPEG-2),
+        // accumulated as runs entered the block.
+        let block_crc = self.block_crc.value();
+        self.block_crc = Crc32::new();
 
         // Update the running combined CRC: rotate-left then XOR.
         self.combined_crc = self.combined_crc.rotate_left(1) ^ block_crc;
 
-        // Step 2: RLE-1.
-        let rle1 = rle1_forward(&block);
-
-        // Step 3: BWT.
+        // Steps 2 and 3: RLE-1 already happened on the way in; BWT.
         let (l_column, origin) = bwt_forward(&rle1);
+        // Keep the allocation for the next block.
+        self.block = rle1;
+        self.block.clear();
 
         // Step 4: reduced alphabet of the bytes that appear in L. The
         // 16-byte stripe map encoding (in the header) needs this.
@@ -350,30 +402,11 @@ impl Encoder {
         }
     }
 
-    /// Flush the in-progress bit writer's whole-byte content into
-    /// `self.out` (the writer keeps any partial byte still buffered).
+    /// Move the encoded bytes libbzip2 would have output by now from
+    /// the bit writer into `self.out`; see [`BitWriter::take_settled`].
     fn flush_full_bytes(&mut self) {
         if let Some(ref mut bw) = self.bw {
-            // The BitWriter's API exposes `into_bytes` (consuming) and
-            // `align_to_byte` — neither is "give me the complete bytes
-            // and keep the partial byte". We work around this by
-            // taking the writer out, splitting the assembled bytes,
-            // and reinstalling a fresh writer with the partial bits
-            // restored.
-            //
-            // Practical detail: between blocks bzip2 streams may be at
-            // an unaligned boundary, so we MUST preserve the partial
-            // byte across calls. We achieve this by always emitting
-            // bits eagerly into `bw` (BitWriter pushes a whole byte to
-            // its internal Vec as soon as 8 bits accumulate) and
-            // periodically extracting those whole bytes into `out`.
-            let taken = core::mem::replace(bw, BitWriter::new());
-            // Split the internal vector from the trailing partial byte
-            // by going through the writer's internals — which we
-            // expose via a dedicated helper.
-            let (bytes, cur, nbits) = bw_internals(taken);
-            self.out.extend_from_slice(&bytes);
-            *bw = bw_rehydrate(cur, nbits);
+            bw.take_settled(&mut self.out);
         }
     }
 
@@ -383,25 +416,9 @@ impl Encoder {
         bw.write_bits_48(STREAM_END_MAGIC);
         bw.write_bits(32, self.combined_crc);
         bw.align_to_byte();
-        let taken = core::mem::replace(bw, BitWriter::new());
-        let (bytes, _, _) = bw_internals(taken);
-        self.out.extend_from_slice(&bytes);
+        bw.take_all(&mut self.out);
         self.bw = None;
     }
-}
-
-// ─── BitWriter internals access helpers ──────────────────────────────────
-//
-// These let us peek into the writer to extract its complete-byte buffer
-// without losing the partial-byte state. We keep them tightly scoped to
-// this module so the BitWriter remains a regular type elsewhere.
-
-fn bw_internals(bw: BitWriter) -> (Vec<u8>, u8, u8) {
-    bw.internals_for_encoder()
-}
-
-fn bw_rehydrate(cur: u8, nbits: u8) -> BitWriter {
-    BitWriter::rehydrate(cur, nbits)
 }
 
 // ─── Huffman table count chooser ────────────────────────────────────────
@@ -519,6 +536,16 @@ fn optimize_tables(
     for _iter in 0..HUFF_N_ITERS {
         // Per-table accumulated frequencies for this pass.
         let mut table_freq: Vec<Vec<u32>> = vec![vec![0u32; alpha_size]; num_tables];
+        // The tables' code lengths transposed, six per symbol, so one
+        // pass over a group scores it under every table at once (what
+        // libbzip2 does with its packed `len_pack`). Unused table slots
+        // stay 0 and are never chosen.
+        let mut lens_by_sym = vec![[0u16; 6]; alpha_size];
+        for (t, lens) in tables.iter().enumerate() {
+            for (row, &l) in lens_by_sym.iter_mut().zip(lens) {
+                row[t] = l as u16;
+            }
+        }
 
         // For each group: score it under every table, pick the cheapest,
         // record the selector, and fold the group's symbols into the
@@ -529,16 +556,21 @@ fn optimize_tables(
             let end = (g + HUFF_GROUP_SIZE).min(symbols.len());
             let group = &symbols[g..end];
 
-            // Cost of coding this group under each table.
-            let mut best_table = 0usize;
-            let mut best_cost = u64::MAX;
-            for (t, lens) in tables.iter().enumerate() {
-                let mut cost = 0u64;
-                for &s in group {
-                    cost += lens[s as usize] as u64;
+            // Cost of coding this group under each table (at most
+            // 50 * 20 bits, so u16 cannot overflow).
+            let mut cost = [0u16; 6];
+            for &s in group {
+                let row = &lens_by_sym[s as usize];
+                for t in 0..6 {
+                    cost[t] += row[t];
                 }
-                if cost < best_cost {
-                    best_cost = cost;
+            }
+            // The first cheapest table wins ties, as in libbzip2.
+            let mut best_table = 0usize;
+            let mut best_cost = u16::MAX;
+            for (t, &c) in cost[..num_tables].iter().enumerate() {
+                if c < best_cost {
+                    best_cost = c;
                     best_table = t;
                 }
             }
@@ -596,20 +628,16 @@ impl RawEncoder for Encoder {
             });
         }
 
-        // Now accept input, filling each block up to the per-block
-        // *post-RLE-1* cap (reference bzip2 sizes blocks by `nblock`,
-        // the RLE-1 output length). We feed bytes through both the raw
-        // buffer (kept for the CRC and the in-block RLE-1 re-run) and
-        // the streaming size tracker, cutting a block the moment the
-        // tracked RLE-1 length reaches the cap. When a block fills we
-        // encode it, drain to output, and continue.
+        // Now accept input. As in libbzip2, the block is measured
+        // after RLE-1 and without the run in progress, and it is closed
+        // as soon as it reaches the cap; the run in progress then
+        // starts the next block. When a block fills we encode it, drain
+        // to output, and continue.
         while consumed < input.len() {
-            let b = input[consumed];
-            self.pending.push(b);
-            self.rle1.push(b);
+            self.add_char(input[consumed]);
             consumed += 1;
 
-            if self.rle1.encoded_len() >= cap {
+            if self.block.len() >= cap {
                 self.encode_block();
                 self.flush_full_bytes();
                 self.drain_out(output, &mut written);
@@ -647,7 +675,8 @@ impl RawEncoder for Encoder {
 
         // Encode any pending bytes into a final block.
         if matches!(self.phase, Phase::Accepting) {
-            if !self.pending.is_empty() {
+            self.flush_run();
+            if !self.block.is_empty() {
                 self.encode_block();
                 self.flush_full_bytes();
             }
@@ -678,9 +707,34 @@ impl RawEncoder for Encoder {
         })
     }
 
+    fn raw_flush(&mut self, output: &mut [u8], _mode: Flush) -> Result<RawProgress, Error> {
+        let mut written = 0usize;
+        if matches!(self.phase, Phase::Accepting) {
+            self.ensure_header();
+            // libbzip2's BZ_FLUSH: end the run, close the block (blocks
+            // are independent, so Sync and Full are the same thing) and
+            // hand out every whole byte. A bzip2 stream has no padding
+            // or sync marker, so the block's last 0..=7 bits stay in the
+            // bit writer until the next block or the footer follows
+            // them, exactly as with libbzip2.
+            self.flush_run();
+            if !self.block.is_empty() {
+                self.encode_block();
+            }
+            self.flush_full_bytes();
+        }
+        self.drain_out(output, &mut written);
+        Ok(RawProgress {
+            consumed: 0,
+            written,
+            done: self.out.is_empty(),
+        })
+    }
+
     fn raw_reset(&mut self) {
-        self.pending.clear();
-        self.rle1 = Rle1Encoder::new();
+        self.block.clear();
+        self.block_crc = Crc32::new();
+        self.in_len = 0;
         self.out.clear();
         self.out_idx = 0;
         self.header_written = false;

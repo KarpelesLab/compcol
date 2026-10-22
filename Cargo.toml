@@ -130,8 +130,8 @@ lzw     = ["alloc"]
 # delimit.
 lzss    = ["alloc"]
 # bzip2 (block-sorted: RLE-1 → BWT → MTF → RLE-2 → Huffman). Encoder
-# and decoder both implemented; the encoder uses a naive O(n² log n)
-# suffix-array build (rather than SA-IS) for the BWT.
+# and decoder both implemented; the encoder's output is byte-identical
+# to libbzip2's (its block sort is a port of `BZ2_blockSort`).
 bzip2   = ["alloc"]
 # LZO (Lempel–Ziv–Oberhumer), LZO1X-1 variant.
 lzo     = ["alloc"]
