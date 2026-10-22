@@ -11,7 +11,7 @@
 //! - reject truncated input without panicking;
 //! - confirm garbage doesn't panic;
 //! - confirm `reset()` puts the decoder back to AwaitMagic;
-//! - confirm `bvx2` blocks return [`Error::Unsupported`] (documented gap).
+//! - decode real multi-block `bvx2` streams from an independent encoder.
 //!
 //! Canonical v0.3 port: every codec call returns `(Progress, Status)` and
 //! loops dispatch on `Status` rather than inferring from byte counts.
@@ -478,4 +478,75 @@ mod factory {
     fn extension_is_lzfse() {
         assert_eq!(factory::extension("lzfse"), Some("lzfse"));
     }
+}
+
+// ─── bvx2 streams from an independent encoder ───────────────────────────
+
+/// Input of `fixtures/lzfse/sample_400000.lzfse`: a small-alphabet text with
+/// back-references up to 200 KB away, so the stream holds several `bvx2`
+/// blocks whose matches reach into earlier blocks.
+fn lzfse_sample(n: usize) -> Vec<u8> {
+    let mut s = 0x9E37_79B9_7F4A_7C15u64;
+    let mut v: Vec<u8> = Vec::with_capacity(n);
+    while v.len() < n {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        if v.len() > 1000 && s.is_multiple_of(4) {
+            let d = 1 + ((s >> 8) as usize) % v.len().min(200_000);
+            let l = 4 + ((s >> 40) as usize) % 200;
+            let st = v.len() - d;
+            for i in 0..l {
+                let b = v[st + i % d];
+                v.push(b);
+            }
+        } else {
+            v.push(b"abcdefgh ijk\n"[((s >> 20) as usize) % 13]);
+        }
+    }
+    v.truncate(n);
+    v
+}
+
+/// Decode with `in_chunk`-byte input slices and an `out_chunk`-byte buffer.
+fn decode_chunked(input: &[u8], in_chunk: usize, out_chunk: usize) -> Vec<u8> {
+    let mut dec = Lzfse::decoder();
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; out_chunk];
+    let mut pos = 0;
+    loop {
+        let end = (pos + in_chunk).min(input.len());
+        let (p, status) = dec.decode(&input[pos..end], &mut buf).unwrap();
+        pos += p.consumed;
+        out.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            return out;
+        }
+        assert!(p.consumed > 0 || p.written > 0, "decoder stalled at {pos}");
+    }
+}
+
+/// Real `bvx2` streams (produced by the `lzfse_rust` crate, which is
+/// validated against Apple's reference library) used to be rejected as
+/// `Corrupt`: the decoder spread FSE table slots zstd-style, read the
+/// payload bits LSB-first, swapped the state/extra-bit split of L/M/D
+/// fields, emitted the literal stream's padding as output, and refused
+/// match distances reaching into earlier blocks.
+#[test]
+fn bvx2_reference_multi_block_stream() {
+    let fixture = include_bytes!("fixtures/lzfse/sample_400000.lzfse");
+    let expected = lzfse_sample(400_000);
+    assert_eq!(decode_chunked(fixture, usize::MAX / 2, 1 << 20), expected);
+    assert_eq!(decode_chunked(fixture, 1, 1), expected);
+    assert_eq!(decode_chunked(fixture, 4093, 777), expected);
+}
+
+#[test]
+fn bvx2_reference_zeros() {
+    let fixture = include_bytes!("fixtures/lzfse/zeros_300000.lzfse");
+    assert_eq!(
+        decode_chunked(fixture, 1 << 20, 1 << 20),
+        vec![0u8; 300_000]
+    );
+    assert_eq!(decode_chunked(fixture, 1, 4096), vec![0u8; 300_000]);
 }

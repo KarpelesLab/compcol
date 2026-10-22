@@ -6,11 +6,10 @@
 //!   packed 8-byte sequence of small-bit-width fields (20, 20, 10, …).
 //!   Pure LSB-first over a small contiguous byte slice.
 //! - **`FseBits`** — used by the literal-stream and LMD-stream FSE decoders.
-//!   Reads the bitstream **from the end of the payload toward the start**:
-//!   the FSE encoder works LIFO so the decoder undoes the encoder by
-//!   pulling bits in reverse. State is `(accum: u64, n_bits: i32, end: i32)`
-//!   where `end` is the byte index of the next unread byte (working down).
-//!   This mirrors Apple's reference `fse_in_stream` precisely.
+//!   Reads the bitstream **from the end of the payload toward the start**,
+//!   most-significant bit first: the FSE encoder works LIFO so the decoder
+//!   undoes the encoder by pulling bits in reverse. This mirrors Apple's
+//!   reference `fse_in_stream`.
 //!
 //! ## Status
 //!
@@ -78,96 +77,62 @@ impl<'a> HeaderBits<'a> {
 
 /// FSE bit-stream reader. Reads from the END of `payload` toward the start.
 ///
-/// Apple's reference layout (`fse_in_stream`):
-/// - The encoder, after appending the last FSE state-pull bits to its output
-///   buffer, flushes any remaining bits as a "stub" at the very end. The
-///   decoder restores that stub from the LMD payload's final byte and then
-///   pulls fresh bytes off the end of the payload as needed.
-/// - `n_bits` may be negative immediately after init (we owe up to 7 bits to
-///   the buffer); after the first `pull` it is in `0..=63`.
+/// Apple's reference layout (`fse_in_stream` in `lzfse_internal.h`): the
+/// payload is a little-endian bit string whose **most significant** bits are
+/// read first. Bit `b` of the stream is bit `b % 8` of byte `b / 8`; the
+/// reader starts at the top of the payload and every `pull(n)` returns the
+/// `n` bits immediately below the current position as an integer (the
+/// first-pulled bit is the value's MSB), then moves down.
 ///
-/// `payload` is the FSE encoded bitstream (concatenation of literal stream
-/// then LMD stream, in the v2 block's outer layout). The caller passes the
-/// slice that ends exactly at the end of the stream being decoded — for the
-/// literal stream that's the last byte of the literal payload, for the LMD
-/// stream that's the last byte of the LMD payload.
+/// The block header stores a 3-bit field `f` per stream; Apple's decoder
+/// initialises with `nbits = f - 7`, i.e. the top `7 - f` bits of the
+/// payload's last byte are unused and the stream starts below them.
+///
+/// The caller passes the slice that ends exactly at the end of the stream
+/// being decoded — the literal payload or the LMD payload.
 pub(crate) struct FseBits<'a> {
-    /// Buffer the bitstream lives in. The decoder consumes bytes from the
-    /// end (index `end - 1`, then `end - 2`, …).
+    /// Buffer the bitstream lives in.
     pub(crate) payload: &'a [u8],
-    /// Number of bits currently buffered in `accum` (high bits unused if
-    /// `n_bits < 64`).
-    pub(crate) n_bits: i32,
-    /// Bits, right-justified. The high `n_bits` bits are valid; the bottom
-    /// `64 - n_bits` are pending.
-    pub(crate) accum: u64,
-    /// Index of the next-byte-to-pull. Bytes are pulled from `end - 1`
-    /// down to `0`. Once `end == 0` no more bytes are available.
-    pub(crate) end: usize,
+    /// Number of unread bits: the next `pull(n)` returns bits
+    /// `[pos - n, pos)`.
+    pub(crate) pos: usize,
 }
 
 impl<'a> FseBits<'a> {
-    /// Initialise the reader with the encoder's last-byte "stub":
-    /// after the encoder finished pushing FSE bits its accumulator had
-    /// `n_bits` (0..=7) bits left. The encoder writes those `n_bits` bits
-    /// at the top of the final byte. The decoder starts by reading exactly
-    /// that final byte and treating its top `n_bits` bits as the initial
-    /// buffer state.
-    ///
-    /// `stub_bits` must be `0..=7`.
-    pub(crate) fn new_with_stub(payload: &'a [u8], stub_bits: u32) -> Result<Self, Error> {
-        debug_assert!(stub_bits <= 7);
-        if payload.is_empty() {
-            // Stream is the entirety of zero bytes — only acceptable when
-            // the FSE decoder will not actually need to pull anything.
-            return Ok(Self {
-                payload,
-                n_bits: -(stub_bits as i32),
-                accum: 0,
-                end: 0,
-            });
-        }
-        let mut s = Self {
-            payload,
-            n_bits: 0,
-            accum: 0,
-            end: payload.len(),
-        };
-        // Read the final byte, take the top stub_bits bits.
-        s.end -= 1;
-        let last = payload[s.end] as u64;
-        // Apple uses 7 - stub_bits as the right-shift but the encoder writes
-        // the stub in the lower bits of that byte (LSB-first packing for the
-        // last bits). The reference is subtle; we mirror it: accumulate the
-        // stub bits into accum's bottom.
-        s.accum = last & ((1u64 << stub_bits) - 1);
-        s.n_bits = stub_bits as i32;
-        Ok(s)
-    }
-
-    /// Top up the bit buffer by pulling fresh bytes from the end of the
-    /// payload. After this call, `n_bits >= 56` (or we ran out of input).
-    pub(crate) fn refill(&mut self) {
-        while self.n_bits <= 56 && self.end > 0 {
-            self.end -= 1;
-            let b = self.payload[self.end] as u64;
-            // Bytes pulled from the end of the stream go to the high end of
-            // accum (the next bits the decoder will read).
-            self.accum |= b << self.n_bits;
-            self.n_bits += 8;
-        }
-    }
-
-    /// Pull `n` bits (`n <= 56` after the first refill) from the bottom of
-    /// the buffer. Caller is responsible for refilling before each pull.
-    pub(crate) fn pull(&mut self, n: u32) -> Result<u64, Error> {
-        if (self.n_bits as u32) < n {
+    /// Initialise the reader from the header's 3-bit `bits_field`
+    /// (`literal_bits` / `lmd_bits`, `0..=7`): the top `7 - bits_field`
+    /// bits of the final payload byte are skipped.
+    pub(crate) fn new_with_stub(payload: &'a [u8], bits_field: u32) -> Result<Self, Error> {
+        if bits_field > 7 {
             return Err(Error::Corrupt);
         }
-        let mask = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
-        let v = self.accum & mask;
-        self.accum >>= n;
-        self.n_bits -= n as i32;
-        Ok(v)
+        let unused = (7 - bits_field) as usize;
+        // An empty payload can only back a stream that never pulls a bit.
+        let pos = (payload.len() * 8).saturating_sub(unused);
+        Ok(Self { payload, pos })
+    }
+
+    /// Counterpart of Apple's `fse_in_flush`. This reader addresses the
+    /// payload directly, so there is nothing to top up.
+    #[inline]
+    pub(crate) fn refill(&mut self) {}
+
+    /// Pull `n` bits (`n <= 32`) from the top of the remaining stream.
+    pub(crate) fn pull(&mut self, n: u32) -> Result<u64, Error> {
+        debug_assert!(n <= 32);
+        let n = n as usize;
+        if n == 0 {
+            return Ok(0);
+        }
+        if self.pos < n {
+            return Err(Error::Corrupt);
+        }
+        let lo = self.pos - n;
+        let mut word = 0u64;
+        for (i, &b) in self.payload[lo / 8..=(self.pos - 1) / 8].iter().enumerate() {
+            word |= (b as u64) << (8 * i);
+        }
+        self.pos = lo;
+        Ok((word >> (lo % 8)) & ((1u64 << n) - 1))
     }
 }

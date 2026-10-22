@@ -1,12 +1,6 @@
 //! Finite State Entropy (FSE) primitives for LZFSE v2.
 //!
-//! ## Build status
-//!
-//! Currently **unused** — this module exists so that a future round can
-//! implement `bvx2` (LZFSE v2 compressed) block decoding without having
-//! to re-derive the FSE table construction and pull primitives from
-//! scratch. See [`super::lzfse_v2`] for why v2 is gated off in this
-//! build.
+//! Used by the `bvx2` block decoder in [`super::lzfse_v2`].
 //!
 //! ## What's here
 //!
@@ -22,15 +16,16 @@
 //!
 //! ## Table construction (general, k/k-1 split)
 //!
-//! Table construction matches Apple's `fse_init_decoder_table`: the `f`
-//! slots spread for a symbol are **not** all assigned the same bit-width.
-//! With `n_states = 2^L` (always a power of two) and per-symbol frequency
-//! `f` (arbitrary, `1..=n_states`, summing to `n_states`):
+//! Table construction matches Apple's `fse_init_decoder_table`: symbols
+//! occupy **consecutive** table slots in symbol order (no zstd-style
+//! spreading), and a symbol's `f` slots are **not** all assigned the same
+//! bit-width. With `n_states = 2^L` (always a power of two) and per-symbol
+//! frequency `f` (arbitrary, `1..=n_states`, summing to `n_states`):
 //!
 //! ```text
 //! k  = L - floor(log2(f))          // == clz(f) - clz(n_states)
 //! j0 = ((2 * n_states) >> k) - f
-//! for i in 0..f (i = the i-th slot for this symbol, in spread order):
+//! for i in 0..f (i = the i-th consecutive slot for this symbol):
 //!     if i < j0:  entry.k = k;     entry.delta = ((f + i) << k) - n_states
 //!     else:       entry.k = k - 1; entry.delta = (i - j0) << (k - 1)
 //! ```
@@ -70,11 +65,6 @@ pub(crate) struct LmdVEntry {
     pub(crate) v_base: i32,
 }
 
-/// Spread-table helper: Apple uses a fixed step and walks free slots.
-fn spread_step(n_states: usize) -> usize {
-    (n_states >> 1) + (n_states >> 3) + 3
-}
-
 /// Build an FSE decode table for the literal stream.
 pub(crate) fn build_literal_decoder(freq: &[u16], n_states: usize) -> Result<Vec<FseEntry>, Error> {
     if !n_states.is_power_of_two() || n_states == 0 {
@@ -88,10 +78,7 @@ pub(crate) fn build_literal_decoder(freq: &[u16], n_states: usize) -> Result<Vec
         return Err(Error::Corrupt);
     }
     let mut table = vec![FseEntry::default(); n_states];
-    let mut occupied = vec![false; n_states];
     let mut t = 0usize;
-    let step = spread_step(n_states);
-    let mask = n_states - 1;
     let n_states_log2 = n_states.trailing_zeros() as i32;
     for (s, &f) in freq.iter().enumerate() {
         let f = f as usize;
@@ -108,9 +95,6 @@ pub(crate) fn build_literal_decoder(freq: &[u16], n_states: usize) -> Result<Vec
         let k = k as u32;
         let j0 = (((2 * n_states) >> k) as i32) - f as i32;
         for i in 0..f {
-            while occupied[t] {
-                t = (t + step) & mask;
-            }
             let (ek, delta) = if (i as i32) < j0 {
                 (k, ((f as i32 + i as i32) << k) - n_states as i32)
             } else {
@@ -121,8 +105,7 @@ pub(crate) fn build_literal_decoder(freq: &[u16], n_states: usize) -> Result<Vec
                 symbol: s as u8,
                 delta: delta as i16,
             };
-            occupied[t] = true;
-            t = (t + step) & mask;
+            t += 1;
         }
     }
     Ok(table)
@@ -149,10 +132,7 @@ pub(crate) fn build_lmd_decoder(
         return Err(Error::Corrupt);
     }
     let mut table = vec![LmdVEntry::default(); n_states];
-    let mut occupied = vec![false; n_states];
     let mut t = 0usize;
-    let step = spread_step(n_states);
-    let mask = n_states - 1;
     let n_states_log2 = n_states.trailing_zeros() as i32;
     for (s, &f) in freq.iter().enumerate() {
         let f = f as usize;
@@ -169,9 +149,6 @@ pub(crate) fn build_lmd_decoder(
         let k = k as u32;
         let j0 = (((2 * n_states) >> k) as i32) - f as i32;
         for i in 0..f {
-            while occupied[t] {
-                t = (t + step) & mask;
-            }
             let (ek, delta) = if (i as i32) < j0 {
                 (k, ((f as i32 + i as i32) << k) - n_states as i32)
             } else {
@@ -183,8 +160,7 @@ pub(crate) fn build_lmd_decoder(
                 delta: delta as i16,
                 v_base: base_per_symbol[s],
             };
-            occupied[t] = true;
-            t = (t + step) & mask;
+            t += 1;
         }
     }
     Ok(table)
@@ -217,14 +193,11 @@ pub(crate) fn fse_decode_lmd(
     bits.refill();
     let total = e.total_bits as u32;
     let vb = e.value_bits as u32;
+    // Apple's `fse_value_decode`: the state bits are pulled first (the high
+    // part of the combined field), the value's extra bits follow (low part).
     let raw = bits.pull(total)?;
-    let kbits = total - vb;
-    let state_pull = if kbits == 0 {
-        0
-    } else {
-        raw & ((1u64 << kbits) - 1)
-    };
-    let value_extra = if kbits == 64 { 0 } else { raw >> kbits };
+    let state_pull = raw >> vb;
+    let value_extra = raw & ((1u64 << vb) - 1);
     let value = e.v_base + value_extra as i32;
     let next = state_pull as i32 + e.delta as i32;
     if next < 0 || next as usize >= table.len() {

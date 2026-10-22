@@ -34,7 +34,15 @@ pub struct Decoder {
     eos: bool,
     /// Set on any decode error so callers don't accidentally resume.
     poisoned: bool,
+    /// Tail of the decoded stream (at least [`HISTORY_WINDOW`] bytes once
+    /// that much has been produced). `bvx2` match distances may reach back
+    /// into earlier blocks, so each v2 block is decoded on top of this.
+    history: Vec<u8>,
 }
+
+/// Largest match distance a `bvx2` block can encode (D symbol 63: base
+/// 229_372 plus 15 extra bits), rounded up.
+const HISTORY_WINDOW: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -77,6 +85,22 @@ impl Decoder {
             state: State::AwaitMagic,
             eos: false,
             poisoned: false,
+            history: Vec::new(),
+        }
+    }
+
+    /// Record freshly decoded bytes as match history, keeping the buffer
+    /// bounded. The front is only discarded once it holds two windows' worth,
+    /// so the memmove is amortised O(1) per byte even for tiny blocks.
+    fn remember(&mut self, bytes: &[u8]) {
+        self.history.extend_from_slice(bytes);
+        self.trim_history();
+    }
+
+    fn trim_history(&mut self) {
+        if self.history.len() > 2 * HISTORY_WINDOW {
+            let excess = self.history.len() - HISTORY_WINDOW;
+            self.history.drain(..excess);
         }
     }
 
@@ -292,6 +316,9 @@ impl Decoder {
                             // Copy payload_len bytes into output_buf for drain.
                             self.output_buf
                                 .extend_from_slice(&self.input_buf[..payload_len]);
+                            self.history
+                                .extend_from_slice(&self.input_buf[..payload_len]);
+                            self.trim_history();
                             self.input_buf.drain(..payload_len);
                             self.state = State::AwaitMagic;
                         }
@@ -318,6 +345,7 @@ impl Decoder {
                                 self.poisoned = true;
                                 return Err(e);
                             }
+                            self.remember(&block_out);
                             self.output_buf.append(&mut block_out);
                             self.input_buf.drain(..payload_len);
                             self.state = State::AwaitMagic;
@@ -330,7 +358,10 @@ impl Decoder {
                             // more than LZVN, but is still bounded; the decoder
                             // enforces the exact `n_raw_bytes` internally).
                             let cap_hint = payload_len.saturating_mul(32).saturating_add(1 << 16);
-                            let mut block_out = Vec::new();
+                            // Decode on top of the stream history so matches
+                            // can reach into earlier blocks.
+                            let mut block_out = core::mem::take(&mut self.history);
+                            let history_len = block_out.len();
                             match lzfse_v2::decode_block(
                                 &self.input_buf[..payload_len],
                                 &mut block_out,
@@ -344,7 +375,9 @@ impl Decoder {
                                     return Err(e);
                                 }
                             }
-                            self.output_buf.append(&mut block_out);
+                            self.output_buf.extend_from_slice(&block_out[history_len..]);
+                            self.history = block_out;
+                            self.trim_history();
                             self.input_buf.drain(..payload_len);
                             self.state = State::AwaitMagic;
                         }
@@ -420,5 +453,6 @@ impl RawDecoder for Decoder {
         self.state = State::AwaitMagic;
         self.eos = false;
         self.poisoned = false;
+        self.history.clear();
     }
 }
