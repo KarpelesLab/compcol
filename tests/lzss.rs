@@ -105,6 +105,67 @@ fn round_trip(input: &[u8]) {
     assert_eq!(decoded, input, "round-trip mismatch len {}", input.len());
 }
 
+/// Once every input byte is consumed, a match (or literal) paused on a
+/// full output buffer must still be handed out by `finish`, which is
+/// documented as drainable with a small buffer. It used to return
+/// `UnexpectedEnd` and drop the tail.
+#[test]
+fn finish_drains_paused_match_with_small_buffer() {
+    let input = b"abcdefgh".repeat(64);
+    let encoded = encode_all(&input);
+    for out_len in [1usize, 2, 3, 7] {
+        let mut dec = Decoder::new();
+        let mut buf = vec![0u8; out_len];
+        let mut out = Vec::new();
+        let mut consumed = 0;
+        let mut ended = false;
+        while consumed < encoded.len() {
+            let (p, s) = dec.decode(&encoded[consumed..], &mut buf).unwrap();
+            out.extend_from_slice(&buf[..p.written]);
+            consumed += p.consumed;
+            if s == Status::StreamEnd {
+                ended = true;
+                break;
+            }
+        }
+        while !ended {
+            let (p, s) = dec.finish(&mut buf).unwrap();
+            out.extend_from_slice(&buf[..p.written]);
+            ended = s == Status::StreamEnd;
+            assert!(ended || p.written > 0, "finish stalled");
+        }
+        assert_eq!(out, input, "out_len {out_len}");
+    }
+}
+
+/// A stream cut inside its token data still reports `UnexpectedEnd` from
+/// `finish`, including after a paused match has been drained.
+#[test]
+fn finish_still_rejects_truncated_stream() {
+    let input = b"abcdefgh".repeat(64);
+    let mut encoded = encode_all(&input);
+    encoded.truncate(encoded.len() - 1);
+    let mut dec = Decoder::new();
+    let mut buf = [0u8; 1];
+    let mut consumed = 0;
+    while consumed < encoded.len() {
+        let (p, _) = dec.decode(&encoded[consumed..], &mut buf).unwrap();
+        consumed += p.consumed;
+    }
+    let mut result = Ok(());
+    for _ in 0..10_000 {
+        match dec.finish(&mut buf) {
+            Ok((_, Status::StreamEnd)) => panic!("truncated stream reported StreamEnd"),
+            Ok(_) => {}
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        }
+    }
+    assert_eq!(result, Err(Error::UnexpectedEnd));
+}
+
 // ─── algorithm metadata ─────────────────────────────────────────────────
 
 #[test]
