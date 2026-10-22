@@ -12,7 +12,7 @@
 #![cfg(feature = "lzma")]
 
 use compcol::lzma::{Decoder, Encoder, EncoderConfig, Lzma};
-use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Status};
+use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Flush, Status};
 
 fn hex(s: &str) -> Vec<u8> {
     let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
@@ -914,4 +914,199 @@ fn decoder_handles_liblzma_long_distance_slot() {
     let decoded = decode_one_shot(LIBLZMA_LONGDIST).expect("decode liblzma high-slot fixture");
     assert_eq!(decoded.len(), expected.len(), "length mismatch");
     assert_eq!(decoded, expected);
+}
+
+// ─── flush ──────────────────────────────────────────────────────────────
+//
+// `.lzma` has no in-band sync point: the range coder always holds its last
+// few undetermined bytes until the EOS marker ends the stream. `flush`
+// therefore guarantees only that everything given has been encoded and every
+// settled byte emitted, so a decoder lags by no more than what those last
+// few range-coder bytes cover. On incompressible input that is a handful of
+// bytes; before `flush` did anything, the encoder sat on up to 64 KiB.
+
+fn flush_noise(n: usize, seed: u32) -> Vec<u8> {
+    let mut x = seed;
+    (0..n)
+        .map(|_| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (x >> 16) as u8
+        })
+        .collect()
+}
+
+fn flush_test_encode(enc: &mut Encoder, input: &[u8], out_chunk: usize, wire: &mut Vec<u8>) {
+    let mut buf = vec![0u8; out_chunk];
+    let mut consumed = 0;
+    loop {
+        let (p, status) = enc.encode(&input[consumed..], &mut buf).unwrap();
+        wire.extend_from_slice(&buf[..p.written]);
+        consumed += p.consumed;
+        match status {
+            Status::InputEmpty if consumed == input.len() => break,
+            Status::InputEmpty | Status::OutputFull => {}
+            Status::StreamEnd => panic!("encode returned StreamEnd"),
+        }
+    }
+}
+
+fn flush_test_flush(enc: &mut Encoder, mode: Flush, out_chunk: usize, wire: &mut Vec<u8>) {
+    let mut buf = vec![0u8; out_chunk];
+    for _ in 0..10_000_000 {
+        let (p, status) = enc.flush(&mut buf, mode).unwrap();
+        wire.extend_from_slice(&buf[..p.written]);
+        match status {
+            Status::InputEmpty => return,
+            Status::OutputFull => {}
+            Status::StreamEnd => panic!("flush returned StreamEnd"),
+        }
+    }
+    panic!("flush never completed");
+}
+
+fn flush_test_finish(enc: &mut Encoder, out_chunk: usize, wire: &mut Vec<u8>) {
+    let mut buf = vec![0u8; out_chunk];
+    loop {
+        let (p, status) = enc.finish(&mut buf).unwrap();
+        wire.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            return;
+        }
+    }
+}
+
+/// Decode a stream cut short at a flush point: `decode` only, never
+/// `finish` (the stream is deliberately unterminated).
+fn decode_prefix(wire: &[u8]) -> Vec<u8> {
+    let mut dec = Decoder::new();
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut consumed = 0;
+    loop {
+        let (p, _) = dec.decode(&wire[consumed..], &mut buf).unwrap();
+        out.extend_from_slice(&buf[..p.written]);
+        consumed += p.consumed;
+        if p.consumed == 0 && p.written == 0 {
+            return out;
+        }
+    }
+}
+
+fn xz_available() -> bool {
+    std::process::Command::new("xz")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Run `xz --format=lzma -d -c` over `data`; returns its output whatever the
+/// exit status.
+fn xz_lzma_decode(data: &[u8]) -> std::process::Output {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("xz")
+        .args(["--format=lzma", "-d", "-c"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let data = data.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&data);
+    });
+    let out = child.wait_with_output().unwrap();
+    let _ = writer.join();
+    out
+}
+
+/// After each flush, both our decoder and `xz` decode all but the last few
+/// bytes given; the finished stream round-trips and `xz` accepts it.
+fn check_flush_lag(level: u8, mode: Flush, out_chunk: usize) {
+    const MAX_LAG: usize = 32;
+    let xz = xz_available();
+    let mut enc = Encoder::with_config(EncoderConfig { level });
+    let mut wire = Vec::new();
+    let mut given = Vec::new();
+    for (i, n) in [1usize, 100, 5_000, 70_000, 3, 20_000]
+        .into_iter()
+        .enumerate()
+    {
+        let seg = flush_noise(n, i as u32);
+        flush_test_encode(&mut enc, &seg, out_chunk, &mut wire);
+        given.extend_from_slice(&seg);
+        flush_test_flush(&mut enc, mode, out_chunk, &mut wire);
+        let got = decode_prefix(&wire);
+        assert!(
+            given.starts_with(&got),
+            "level {level}: decoded wrong bytes"
+        );
+        let lag = given.len() - got.len();
+        assert!(
+            lag <= MAX_LAG,
+            "level {level} {mode:?}: decoder lags {lag} bytes after a flush at {}",
+            given.len()
+        );
+        if xz {
+            let out = xz_lzma_decode(&wire);
+            assert!(
+                given.starts_with(&out.stdout),
+                "level {level}: xz decoded wrong"
+            );
+            let lag = given.len() - out.stdout.len();
+            assert!(
+                lag <= MAX_LAG,
+                "level {level} {mode:?}: xz lags {lag} bytes after a flush at {}",
+                given.len()
+            );
+        }
+        // A second flush with nothing new given emits nothing.
+        let before = wire.len();
+        flush_test_flush(&mut enc, mode, out_chunk, &mut wire);
+        assert_eq!(wire.len(), before, "empty {mode:?} flush emitted bytes");
+    }
+    flush_test_finish(&mut enc, out_chunk, &mut wire);
+    assert_eq!(decode_chunked(&wire, 4096, 4096).unwrap(), given);
+    if xz {
+        let out = xz_lzma_decode(&wire);
+        assert!(out.status.success() && out.stdout == given, "level {level}");
+    }
+}
+
+#[test]
+fn flush_emits_everything_but_the_range_coder_tail() {
+    for level in [0, 6, 9] {
+        check_flush_lag(level, Flush::Sync, 4096);
+    }
+    check_flush_lag(6, Flush::Full, 4096);
+}
+
+#[test]
+fn flush_with_one_byte_output_buffer() {
+    check_flush_lag(6, Flush::Sync, 1);
+}
+
+/// Repetitive data still round-trips through flushes, including a flush
+/// before any input.
+#[test]
+fn flushed_compressible_stream_round_trips() {
+    let text = lorem_corpus(50_000);
+    let mut enc = Encoder::new();
+    let mut wire = Vec::new();
+    flush_test_flush(&mut enc, Flush::Sync, 4096, &mut wire);
+    assert!(wire.is_empty(), "flush before any input emitted bytes");
+    let mut given = Vec::new();
+    for part in text.chunks(7_777) {
+        flush_test_encode(&mut enc, part, 4096, &mut wire);
+        given.extend_from_slice(part);
+        flush_test_flush(&mut enc, Flush::Sync, 4096, &mut wire);
+        assert!(given.starts_with(&decode_prefix(&wire)));
+    }
+    flush_test_finish(&mut enc, 4096, &mut wire);
+    assert_eq!(decode_chunked(&wire, 4096, 4096).unwrap(), given);
+    if xz_available() {
+        let out = xz_lzma_decode(&wire);
+        assert!(out.status.success() && out.stdout == given);
+    }
 }
