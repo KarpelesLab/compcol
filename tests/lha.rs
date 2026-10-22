@@ -426,3 +426,309 @@ fn static_decoder_streams_output_instead_of_materialising_it() {
     assert_eq!(err, Error::OutputLimitExceeded);
     assert_eq!(total, 1 << 20);
 }
+
+// ─── lh2 conformance ─────────────────────────────────────────────────────
+
+/// `M(len, dist)` or a literal, for hand-written token lists.
+#[derive(Clone, Copy)]
+enum Tok {
+    L(u8),
+    M(usize, usize),
+}
+
+/// Apply tokens to a space-filled 8 KiB history (the lh2 initial window).
+fn replay(tokens: &[Tok]) -> Vec<u8> {
+    let mut out = vec![b' '; 8192];
+    for &t in tokens {
+        match t {
+            Tok::L(b) => out.push(b),
+            Tok::M(len, dist) => {
+                for _ in 0..len {
+                    out.push(out[out.len() - dist]);
+                }
+            }
+        }
+    }
+    out.split_off(8192)
+}
+
+fn hex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+#[test]
+fn lh2_decodes_spec_vectors() {
+    // Streams checked against the LHa for UNIX decoder, with the token lists
+    // that produced them (escapes, matches into the initial spaces, several
+    // position-tree insertions at once, a length of 287).
+    let lits = |s: &[u8]| s.iter().map(|&b| Tok::L(b)).collect::<Vec<_>>();
+    let mut v2 = lits(b"hello ");
+    v2.extend([Tok::M(11, 6), Tok::L(10)]);
+    let mut v3 = vec![Tok::M(4, 1)];
+    v3.extend(lits(b"abc"));
+    let v4 = vec![Tok::M(256, 1), Tok::M(44, 1), Tok::L(120)];
+    let mut v5 = lits(b"abcdefgh");
+    v5.extend([
+        Tok::M(57, 8),
+        Tok::M(3, 65),
+        Tok::M(3, 2),
+        Tok::M(40, 100),
+        Tok::M(287, 128),
+    ]);
+    let cases = [
+        ("05", lits(b"A")),
+        ("2c2930df33f2660bce", v2),
+        ("c50094989c", v3),
+        ("e1e003843200f0", v4),
+        ("25262728292a2b2c25191f1006c01d908c7abfff80", v5),
+    ];
+    for (stream, tokens) in &cases {
+        let want = replay(tokens);
+        let stream = hex(stream);
+        for &(ic, oc) in &[(1 << 20, 1 << 20), (1, 1), (3, 7)] {
+            let dec = Lh2::decoder_with(DecoderConfig::with_len(want.len()));
+            assert_eq!(decode_chunked(dec, &stream, ic, oc), want);
+        }
+    }
+    assert_eq!(replay(&cases[1].1), b"hello hello hello\n");
+    assert_eq!(replay(&cases[2].1), b"    abc");
+}
+
+#[test]
+fn lh2_truncated_and_garbage_input_fail_cleanly() {
+    let data = lh2_stress_input();
+    let payload = encode_chunked(Lh2::encoder(), &data, 1 << 16, 1 << 16);
+    for cut in [0, 1, 7, payload.len() / 2, payload.len() - 1] {
+        let mut dec = Lh2::decoder_with(DecoderConfig::with_len(data.len()));
+        let mut buf = vec![0u8; 4096];
+        dec.decode(&payload[..cut], &mut buf).unwrap();
+        match dec.finish(&mut buf) {
+            // An empty stream is the zero-length payload.
+            Ok((p, _)) => assert!(cut == 0 && p.written == 0),
+            Err(e) => assert_eq!(e, Error::UnexpectedEnd, "cut at {cut}"),
+        }
+    }
+    for seed in 0..64 {
+        let stream = noise(300, seed);
+        let mut dec = Lh2::decoder_with(DecoderConfig::with_len(1 << 20));
+        let mut buf = vec![0u8; 8192];
+        let _ = dec.decode(&stream, &mut buf);
+        let mut produced = 0usize;
+        while let Ok((p, status)) = dec.finish(&mut buf) {
+            produced += p.written;
+            assert!(produced <= 1 << 20);
+            if matches!(status, Status::StreamEnd) || p.written == 0 {
+                break;
+            }
+        }
+    }
+}
+
+/// Input that drives lh2 through every part of the format: a long run
+/// (escaped lengths up to 256), a block repeated at nearly the full 8 KiB
+/// distance, and enough word salad for more than 32768 matches and C-tree
+/// symbols, so both trees are rebuilt.
+fn lh2_stress_input() -> Vec<u8> {
+    let mut data = vec![b'q'; 700];
+    for (i, run) in [32, 33, 47, 64, 100, 128, 200, 255, 256, 257]
+        .iter()
+        .enumerate()
+    {
+        data.extend(std::iter::repeat_n(b'A' + i as u8, run + 1));
+    }
+    let block = noise(8000, 7);
+    data.extend_from_slice(&block);
+    data.extend_from_slice(&noise(150, 8));
+    data.extend_from_slice(&block[..1000]);
+    let words = [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+        "juliett", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo",
+        "sierra", "tango", "uniform", "victor", "whiskey", "xray", "yankee", "zulu", "one", "two",
+        "three", "four", "five", "six",
+    ];
+    let mut rng = 99u32;
+    while data.len() < 600_000 {
+        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+        let r = (rng >> 16) as usize;
+        data.extend_from_slice(words[r % words.len()].as_bytes());
+        data.push(b" ,.\n"[(r >> 5) % 4]);
+    }
+    data
+}
+
+#[test]
+fn roundtrip_lh2_stress() {
+    let data = lh2_stress_input();
+    for &(ic, oc) in &[(1 << 20, 1 << 20), (4093, 517)] {
+        let encoded = encode_chunked(Lh2::encoder(), &data, ic, oc);
+        let dec = Lh2::decoder_with(DecoderConfig::with_len(data.len()));
+        assert!(decode_chunked(dec, &encoded, ic, oc) == data);
+    }
+}
+
+#[test]
+fn lh2_fixture_decodes() {
+    // Written by this crate's encoder from `lh2_fixture_text()` and checked
+    // with LHa for UNIX (`lha t` OK, `lha p` identical). The encoder is not
+    // required to reproduce it byte for byte.
+    let archive = include_bytes!("fixtures/lha/lh2.lzh");
+    let member = parse_lzh0(archive);
+    assert_eq!(member.method, *b"-lh2-");
+    let dec = Lh2::decoder_with(DecoderConfig::with_len(member.original));
+    let out = decode_chunked(dec, member.packed, 5, 11);
+    assert_eq!(crc16(&out), member.crc);
+    assert!(out == lh2_fixture_text());
+}
+
+fn lh2_fixture_text() -> Vec<u8> {
+    let mut text = Vec::new();
+    for i in 0..60u32 {
+        text.extend_from_slice(format!("line {i}: the quick brown fox jumps. ").as_bytes());
+        if i % 20 == 0 {
+            text.extend(std::iter::repeat_n(b'=', 300));
+        }
+        text.push(b'\n');
+    }
+    text
+}
+
+// ─── level-0 .lzh container (test-side only) ─────────────────────────────
+
+/// CRC-16 as LHA stores it (reflected 0xA001, initial 0).
+fn crc16(data: &[u8]) -> u16 {
+    let mut crc = 0u16;
+    for &b in data {
+        crc ^= b as u16;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xA001
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
+}
+
+/// A one-member level-0 archive holding `packed` as method `method`.
+fn build_lzh0(method: &[u8; 5], name: &[u8], original: &[u8], packed: &[u8]) -> Vec<u8> {
+    let mut body = method.to_vec();
+    body.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+    body.extend_from_slice(&(original.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0x5021_0000u32.to_le_bytes()); // 2020-01-01 00:00
+    body.extend_from_slice(&[0x20, 0, name.len() as u8]);
+    body.extend_from_slice(name);
+    body.extend_from_slice(&crc16(original).to_le_bytes());
+    let sum = body.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+    let mut out = vec![body.len() as u8, sum];
+    out.extend_from_slice(&body);
+    out.extend_from_slice(packed);
+    out.push(0); // end of archive
+    out
+}
+
+struct Lzh0Member<'a> {
+    method: [u8; 5],
+    original: usize,
+    crc: u16,
+    packed: &'a [u8],
+}
+
+fn parse_lzh0(a: &[u8]) -> Lzh0Member<'_> {
+    let size = a[0] as usize;
+    let body = &a[2..2 + size];
+    let u32le = |o: usize| u32::from_le_bytes(body[o..o + 4].try_into().unwrap()) as usize;
+    let name_len = body[19] as usize;
+    Lzh0Member {
+        method: body[..5].try_into().unwrap(),
+        original: u32le(9),
+        crc: u16::from_le_bytes([body[20 + name_len], body[21 + name_len]]),
+        packed: &a[2 + size..2 + size + u32le(5)],
+    }
+}
+
+// ─── LHa for UNIX oracle ─────────────────────────────────────────────────
+
+/// The LHa for UNIX binary: `$COMPCOL_LHA`, else `lha` on PATH if it is LHa
+/// for UNIX (other `lha`s, e.g. Lhasa, cannot decode `-lh2-`).
+fn lha_oracle() -> Option<std::ffi::OsString> {
+    if let Some(path) = std::env::var_os("COMPCOL_LHA") {
+        return Some(path);
+    }
+    let out = std::process::Command::new("lha")
+        .arg("--version")
+        .output()
+        .ok()?;
+    let text = [out.stdout, out.stderr].concat();
+    String::from_utf8_lossy(&text)
+        .contains("LHa for UNIX")
+        .then(|| "lha".into())
+}
+
+/// Wrap `packed` in a level-0 archive and check that the oracle tests it OK
+/// and prints back exactly `original`.
+fn oracle_check(lha: &std::ffi::OsStr, method: &[u8; 5], original: &[u8], packed: &[u8]) {
+    use std::process::Command;
+    let dir = std::env::temp_dir().join(format!(
+        "compcol-lha-{}-{}",
+        std::process::id(),
+        String::from_utf8_lossy(method).trim_matches('-')
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("t.lzh");
+    std::fs::write(&path, build_lzh0(method, b"data.bin", original, packed)).unwrap();
+
+    let what = format!(
+        "{} ({} bytes)",
+        String::from_utf8_lossy(method),
+        original.len()
+    );
+    let test = Command::new(lha).arg("tq").arg(&path).output().unwrap();
+    assert!(
+        test.status.success(),
+        "lha t failed for {what}: {}",
+        String::from_utf8_lossy(&test.stderr)
+    );
+    let print = Command::new(lha).arg("pq").arg(&path).output().unwrap();
+    assert!(print.status.success(), "lha p failed for {what}");
+    assert!(print.stdout == original, "lha p output differs for {what}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn oracle_decodes_our_streams() {
+    let Some(lha) = lha_oracle() else {
+        eprintln!("LHa for UNIX not found (set COMPCOL_LHA); skipping oracle conformance");
+        return;
+    };
+    let mut inputs = sample_inputs();
+    inputs.push(lh2_stress_input());
+    inputs.push(lh2_fixture_text());
+    fn check<A: Algorithm>(lha: &std::ffi::OsStr, method: &[u8; 5], inputs: &[Vec<u8>]) {
+        for data in inputs {
+            let packed = compcol::vec::compress_to_vec::<A>(data).unwrap();
+            oracle_check(lha, method, data, &packed);
+        }
+    }
+    check::<Lh2>(&lha, b"-lh2-", &inputs);
+    check::<Lh1>(&lha, b"-lh1-", &inputs);
+    check::<Lh4>(&lha, b"-lh4-", &inputs);
+    check::<Lh5>(&lha, b"-lh5-", &inputs);
+    check::<Lh6>(&lha, b"-lh6-", &inputs);
+    check::<Lh7>(&lha, b"-lh7-", &inputs);
+}
+
+/// Regenerate `tests/fixtures/lha/lh2.lzh` (then verify it with the oracle):
+/// `cargo test --features lha --test lha -- --ignored write_lh2_fixture`.
+#[test]
+#[ignore]
+fn write_lh2_fixture() {
+    let text = lh2_fixture_text();
+    let packed = compcol::vec::compress_to_vec::<Lh2>(&text).unwrap();
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/lha/lh2.lzh");
+    std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap()).unwrap();
+    std::fs::write(path, build_lzh0(b"-lh2-", b"lh2.txt", &text, &packed)).unwrap();
+}

@@ -78,7 +78,7 @@ flag accept; *Ext* is what `factory::extension(name)` returns.
 | PKZIP Shrink (ZIP method 1) | `zip_shrink` | `zip-shrink` | `.shrunk` | `Unsupported` (decode-only) | full (dynamic LZW + partial clear; 4-byte length header) | reference-encoder fixtures, validated with Info-ZIP `unzip` |
 | PKZIP Reduce (ZIP methods 2–5) | `zip_reduce` | `zip-reduce` | `.reduce` | `Unsupported` (decode-only) | full (all four factors; 5-byte factor + length header) | hwzip reference fixtures |
 | PKZIP Implode (ZIP method 6) | `zip_implode` | `zip-implode` | `.implode` | `Unsupported` (decode-only) | full (4/8 KiB window × 2/3 Shannon–Fano trees; 5-byte flag + length header) | in-test fixture builder + golden fixture |
-| LHA / LZH (`-lh1-`/`-lh2-`/`-lh4-`/`-lh5-`/`-lh6-`/`-lh7-`) | `lha` | `lh1` … `lh7` | `.lzh` | full (lh1/lh2 adaptive Huffman; lh4/5/6/7 static Huffman) | full (clean-room from Okumura LZHUF / ar002) | own round-trip (no reference fixture) |
+| LHA / LZH (`-lh1-`/`-lh2-`/`-lh4-`/`-lh5-`/`-lh6-`/`-lh7-`) | `lha` | `lh1` … `lh7` | `.lzh` | full (lh1/lh2 adaptive Huffman; lh4/5/6/7 static Huffman) | full (clean-room from Okumura LZHUF / ar002; lh2 from a written format spec) | LHa for UNIX decodes our lh1/lh2/lh4–lh7 output (when installed); lh2 spec vectors + fixture |
 | BCJ branch filters (x86, ARM, ARMT, ARM64, PPC, SPARC, IA-64, RISC-V) | `bcj` | `bcj-<arch>` | `bcj-<arch>` | full (reversible filter) | full | round-trip identity (public-domain LZMA SDK transform) |
 | BCJ2 (7z 4-stream x86 filter) | `bcj2` | — | — | `bcj2::encode` (fn API) | `bcj2::decode` (fn API) | round-trip identity (LZMA SDK algorithm) |
 | Delta filter (distance 1..=256) | `delta` | `delta` | `delta` | full (reversible filter) | full | round-trip identity |
@@ -126,11 +126,17 @@ for LZ5, LZX and Amiga LZX; the wire format is always conformant.
 The exceptions, where no reference toolchain or fixtures were available,
 are noted in the table above:
 
-- **LHA (`lha`)** and **ARC Crunch/Squeeze (`arc_crunch`/`arc_squeeze`)**
-  are clean-room implementations from public format descriptions,
-  validated by their own encoder↔decoder round-trip rather than against
-  reference-tool output. They are expected to be wire-compatible but this
-  has not been cross-checked against the original tools.
+- **ARC Crunch/Squeeze (`arc_crunch`/`arc_squeeze`)** are clean-room
+  implementations from public format descriptions, validated by their own
+  encoder↔decoder round-trip rather than against reference-tool output.
+  They are expected to be wire-compatible but this has not been
+  cross-checked against the original tools.
+- **LHA (`lha`)** is clean-room too (`lh2` from a written functional
+  specification, with no LHa code used). There are no archive fixtures
+  from the original tools; instead the tests check that LHa for UNIX
+  accepts and extracts this crate's `lh1`/`lh2`/`lh4`–`lh7` output when
+  it is installed (`COMPCOL_LHA` or `lha` on `PATH`), and `lh2` is pinned
+  to the specification's LHa-verified test vectors.
 - **BCJ (`bcj`)** and **Delta (`delta`)** are reversible *filters* (from
   the public-domain LZMA SDK lineage); correctness is the
   forward∘inverse identity, verified exhaustively.
