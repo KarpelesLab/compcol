@@ -681,7 +681,10 @@ fn write_block(bw: &mut BitWriter, tokens: &[Token], params: Params) {
     }
 
     // ── position table ──────────────────────────────────────────────
-    let p_single = single_symbol(&p_lens);
+    // A block without matches has no position symbols at all. Send that
+    // as the count-0 single-symbol form too (what LHa itself writes): an
+    // explicit all-zero length list is rejected by 7-Zip ("Data Error").
+    let p_single = single_symbol(&p_lens).or_else(|| p_lens.iter().all(|&l| l == 0).then_some(0));
     if let Some(sym) = p_single {
         bw.put_bits(params.pbit, 0);
         bw.put_bits(params.pbit, sym as u32);
@@ -839,6 +842,21 @@ mod tests {
             let enc = encode_payload(&data, params);
             assert!(first_block_p_count(&enc, params) <= params.np, "{name}");
             assert_eq!(decode_payload(&enc, None, params).unwrap(), data);
+        }
+    }
+
+    /// A block without matches must send its (unused) position table in the
+    /// count-0 single-symbol form; an explicit all-zero length list is
+    /// rejected by 7-Zip ("Data Error").
+    #[test]
+    fn match_free_block_uses_single_symbol_position_table() {
+        for name in ["lh4", "lh5", "lh6", "lh7"] {
+            let params = Params::for_method(name);
+            for data in [&b"x"[..], b"ab", b"aaa", b"abcdefgh"] {
+                let enc = encode_payload(data, params);
+                assert_eq!(first_block_p_count(&enc, params), 0, "{name} {data:?}");
+                assert_eq!(decode_payload(&enc, None, params).unwrap(), data);
+            }
         }
     }
 }
