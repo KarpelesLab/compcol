@@ -595,6 +595,23 @@ fn encoder_many_blocks_in_one_call_matches_chunked() {
 }
 
 #[test]
+fn decoder_many_blocks_in_one_call() {
+    // A whole multi-meta-block stream handed over in one `decode` call is
+    // decoded in place (no per-meta-block copy of the remaining input) and
+    // its consumed prefix dropped lazily; the result must not depend on
+    // how the input and output are sliced.
+    let input: Vec<u8> = (0..(9 << 16) + 777u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8 & 0x3F)
+        .collect();
+    let mut enc = Encoder::new();
+    let encoded = encode_chunked(&mut enc, &input, 1 << 20, 1 << 20);
+    for (in_chunk, out_chunk) in [(encoded.len(), 1000), (encoded.len(), 1 << 20), (4096, 333)] {
+        let decoded = decode_chunked(&encoded, in_chunk, out_chunk).unwrap();
+        assert!(decoded == input, "in {in_chunk} out {out_chunk}");
+    }
+}
+
+#[test]
 fn encoder_above_128kib() {
     // 131 072 bytes — one byte past the 128 KiB threshold called out in
     // the original report. Used to fail; must round-trip now.

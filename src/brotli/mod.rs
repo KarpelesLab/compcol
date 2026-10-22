@@ -1919,12 +1919,13 @@ impl Decoder {
         e
     }
 
-    /// Trim `raw` to byte-align with `bit_pos`. Cheaper than re-allocating
-    /// every meta-block; we just drain whole bytes that we've already
-    /// committed.
+    /// Drop the whole bytes of `raw` before `bit_pos`. Only done once they
+    /// make up at least half of `raw`: when one `decode` call hands over
+    /// a long stream, shifting the rest down after every meta-block is
+    /// quadratic.
     fn compact_raw(&mut self) {
         let drop_bytes = self.bit_pos >> 3;
-        if drop_bytes > 0 {
+        if drop_bytes > 0 && drop_bytes * 2 >= self.raw.len() {
             self.raw.drain(..drop_bytes);
             self.bit_pos -= drop_bytes * 8;
         }
@@ -2037,9 +2038,24 @@ impl Decoder {
     }
 
     fn try_process_meta_block(&mut self) -> Result<(), Error> {
+        // Move the raw byte buffer out for the duration of this meta-block
+        // decode. The decoder mutates `self` (output, ring buffer, p1/p2)
+        // while reading bits, and tying the BitSource's lifetime to
+        // `self.raw` would conflict with those mutations. (It used to be
+        // cloned, copying every not-yet-decoded byte — the rest of the
+        // stream when one call hands it all over — for every meta-block.)
+        let raw = core::mem::take(&mut self.raw);
+        let r = self.try_process_meta_block_in(&raw);
+        self.raw = raw;
+        if r.is_ok() {
+            self.compact_raw();
+        }
+        r
+    }
+
+    fn try_process_meta_block_in(&mut self, raw: &[u8]) -> Result<(), Error> {
         if core::option_env!("BROTLI_DEBUG").is_some() {
-            let s: alloc::string::String = self
-                .raw
+            let s: alloc::string::String = raw
                 .iter()
                 .take(12)
                 .map(|b| alloc::format!("{:02x} ", b))
@@ -2047,17 +2063,11 @@ impl Decoder {
             self.dbg_msgs.push(alloc::format!(
                 "try_pmb: bit_pos={}, raw.len()={}, first 12 bytes: {}",
                 self.bit_pos,
-                self.raw.len(),
+                raw.len(),
                 s
             ));
         }
-        // Clone the raw byte buffer for the duration of this meta-block
-        // decode. The decoder mutates `self` (output, ring buffer,
-        // p1/p2) while reading bits, and tying the BitSource's lifetime
-        // to `self.raw` would conflict with those mutations. The clone
-        // is cheap relative to the work done with it.
-        let raw = self.raw.clone();
-        let mut src = BitSource::at(&raw, self.bit_pos);
+        let mut src = BitSource::at(raw, self.bit_pos);
         let initial_pos = self.bit_pos;
         let is_last = src.read_bit()? != 0;
         let mut is_last_empty = false;
@@ -2109,13 +2119,12 @@ impl Decoder {
             // them; otherwise UnexpectedEnd.
             let byte_pos = src.position() / 8;
             let need = byte_pos + mskiplen as usize;
-            if self.raw.len() < need {
+            if raw.len() < need {
                 return Err(Error::UnexpectedEnd);
             }
             // Skip metadata bytes (they aren't emitted).
             src.set_position(need * 8);
             self.bit_pos = src.position();
-            self.compact_raw();
             return Ok(());
         }
 
@@ -2149,17 +2158,16 @@ impl Decoder {
             src.align_to_byte();
             let byte_pos = src.position() / 8;
             let need = byte_pos + mlen as usize;
-            if self.raw.len() < need {
+            if raw.len() < need {
                 return Err(Error::UnexpectedEnd);
             }
-            let slice = self.raw[byte_pos..need].to_vec();
+            let slice = raw[byte_pos..need].to_vec();
             // Push to output and update p1/p2/total.
             for b in &slice {
                 self.emit_literal(*b);
             }
             src.set_position(need * 8);
             self.bit_pos = src.position();
-            self.compact_raw();
             return Ok(());
         }
 
@@ -2200,7 +2208,6 @@ impl Decoder {
             return Err(e);
         }
         self.bit_pos = src.position();
-        self.compact_raw();
         if is_last {
             self.state = DecState::Done;
         }
