@@ -1,32 +1,42 @@
 //! LHA -lh2- : LZSS + dynamic (adaptive) Huffman over an 8 KiB window.
 //!
-//! `-lh2-` is the transitional LHA method: it keeps the adaptive-Huffman
-//! literal/length coding of [`lh1`](super::lzhuf) but enlarges the window to
-//! 8 KiB (13-bit positions, matches up to 256 bytes) **and** codes the match
-//! *position* with a second adaptive Huffman tree rather than lh1's fixed
-//! position buckets. Both sides update both trees identically after every
-//! symbol, so no tables are carried in the stream.
+//! `-lh2-` is the LHarc 1.x-era dynamic-Huffman method that LHA kept for
+//! compatibility. Its stream is continuous (no blocks, no tables): both
+//! sides start from the same trees and update them identically after every
+//! symbol.
 //!
 //! Coding, per symbol:
-//! - A literal/length symbol from the **char tree** (alphabet `NC` = 510:
-//!   256 byte literals + 254 length codes for match lengths 3..=256). Symbol
-//!   `< 256` is a literal; `256 + (len - MIN_MATCH)` is a match of that length.
-//! - For a match, a **position-class** symbol `p` from the **position tree**
-//!   (alphabet `NP` = 14), where `p` is the number of significant bits of the
-//!   ring distance-1. For `p >= 2`, the low `p - 1` bits follow raw.
+//! - A **char tree** over 286 symbols codes literals and match lengths.
+//!   Symbols `0..256` are literal bytes; `256..285` are matches of length
+//!   3..=31 (`symbol - 253`). Symbol 285 is an escape followed by 8 raw bits
+//!   `d`, for a length of `32 + d` (the encoder emits at most 256).
+//! - For a match, the **position tree** codes the top bits `pos >> 6` of the
+//!   ring offset (`pos` = distance - 1, `0..8192`), followed by its low 6
+//!   bits raw. The position tree starts with the single symbol 0 (coded in
+//!   zero bits) and *grows*: before a position is coded, symbol `k` is added
+//!   for every `64 * k` the output count (bytes produced before this match)
+//!   has strictly passed, up to symbol 127.
 //!
-//! Like `lh1`, the raw `-lh2-` stream is continuous and size-terminated (no
-//! in-band end marker), so the decoder needs the uncompressed length out of
-//! band via [`DecoderConfig::with_len`](super::DecoderConfig::with_len).
+//! Both trees use the leader/block adaptive-Huffman update LHA uses for
+//! `-lh1-`/`-lh2-` (nodes kept in non-increasing weight order from the root
+//! at the lowest index, the incremented node first swapped with the leader of
+//! its equal-weight block, the char tree halved and rebuilt when its root
+//! reaches 0x8000, the position tree when 0x8000 positions have been coded).
+//! The tree shapes, the order nodes are laid out in, and therefore every code
+//! bit, depend on those exact rules, so they are reproduced precisely; the
+//! ring starts filled with spaces. Code bits are MSB-first, root branch
+//! first, with bit 0 selecting the even-indexed (lighter) child of a pair.
 //!
-//! Clean-room from the public LHA dynamic-Huffman *description* (the adaptive
-//! sibling-property tree is Okumura's documented, public-domain `reconst` /
-//! `update` procedure; the 8 KiB window, 256-byte match limit, and dynamic
-//! position-class tree are reproduced from the format description, not copied
-//! from any licensed source). Validated by this crate's own encoder/decoder
-//! round-trip — there is no public `-lh2-` reference fixture (no mainstream
-//! tool emits the method), so bit-exact interop with archives in the wild is
-//! best-effort.
+//! Like `lh1`, the raw `-lh2-` stream has no in-band end marker, so the
+//! decoder needs the uncompressed length out of band via
+//! [`DecoderConfig::with_len`](super::DecoderConfig::with_len).
+//!
+//! Conformance: the format was checked against the behaviour of the LHa for
+//! UNIX extractor (its `-lh2-` decoder); this crate's tests have `lha` verify
+//! (`lha t`, CRC) and extract archives built from this encoder's output. No
+//! current tool *creates* `-lh2-` data, so there is no third-party-encoded
+//! fixture; the decoder shares every tree operation with the encoder that
+//! `lha` validates.
 
 extern crate alloc;
 use alloc::vec;
@@ -41,199 +51,402 @@ const DICBIT: usize = 13;
 const N: usize = 1 << DICBIT; // 8192 ring buffer
 const MIN_MATCH: usize = 3;
 const MAXMATCH: usize = 256;
-/// Char-tree alphabet: 256 literals + (MAXMATCH - MIN_MATCH + 1) length codes.
-const NC: usize = 256 + (MAXMATCH - MIN_MATCH + 1); // 510
-/// Position-tree alphabet: bit-length classes 0..=DICBIT.
-const NP: usize = DICBIT + 1; // 14
 
-const MAX_FREQ: u32 = 0x8000; // adaptive-tree rebuild threshold
+/// Char-tree alphabet size.
+const N_MAX: usize = 286;
+/// Escape symbol: followed by 8 raw bits extending the length.
+const ESCAPE: usize = N_MAX - 1; // 285
+/// `length = symbol - LEN_ADJUST` for symbols `>= 256`.
+const LEN_ADJUST: usize = 256 - MIN_MATCH; // 253
+/// Low position bits sent raw after the position-tree symbol.
+const POS_LOW_BITS: u32 = 6;
+/// Position-tree alphabet (`N >> POS_LOW_BITS`).
+const NP: usize = N >> POS_LOW_BITS; // 128
 
-// ─── generalized adaptive Huffman tree ───────────────────────────────────
+const MAX_FREQ: u32 = 0x8000; // rebuild threshold for both trees
 
-/// Adaptive Huffman tree (Okumura's sibling-property layout, parameterized by
-/// alphabet size). `son[v]` is the left child of internal node `v`, the right
-/// child is `son[v] + 1`; a node is a leaf when `son[v] >= t`, with symbol
-/// `son[v] - t`. `prnt[v]` is the parent; `prnt[symbol + t]` locates a leaf.
+// Node layout. The char tree occupies `0..2 * N_MAX - 1` (root at 0) inside
+// a slot range sized for lh1's larger 314-symbol alphabet, and the position
+// tree grows upward from `ROOT_P`. The slack matters: the update rule peeks
+// at the block of the node *after* the last one, which must be an unused
+// slot (block 0, never allocated) rather than a live node.
+const SLOTS_C: usize = 2 * 314;
+const SLOTS_P: usize = 2 * NP;
+const SLOTS: usize = SLOTS_C + SLOTS_P;
+const ROOT_C: usize = 0;
+const ROOT_P: usize = SLOTS_C;
+/// `leaf[]` index of position symbol 0 (char symbols use `0..N_MAX`).
+const LEAF_P: usize = 314;
+
+// ─── adaptive Huffman trees (char + position) ────────────────────────────
+
+/// Both adaptive trees of an lh2 stream.
 ///
-/// This is the same machinery as [`super::lzhuf::Tree`] but with a runtime
-/// alphabet size so both the 510-symbol char tree and the 14-symbol position
-/// tree share one implementation.
-struct AdaptiveTree {
-    t: usize,    // 2 * n_char - 1 internal+leaf nodes
-    root: usize, // t - 1
-    n_char: usize,
+/// Nodes are kept in non-increasing `freq` order by index from each root.
+/// An internal node `v` has children `child[v]` (reached by bit 0) and
+/// `child[v] - 1` (bit 1); a leaf stores `!symbol` (negative) instead.
+/// Runs of equal-`freq` nodes form *blocks*: `block[v]` is the block id of
+/// node `v`, `edge[b]` the leader (lowest index) of block `b`, and `stock`
+/// is the pool of free block ids (`stock[avail..]`).
+struct Trees {
+    child: Vec<i32>,
+    parent: Vec<usize>,
+    block: Vec<usize>,
+    edge: Vec<usize>,
+    stock: Vec<usize>,
+    /// Node index of each leaf symbol.
+    leaf: Vec<usize>,
     freq: Vec<u32>,
-    son: Vec<usize>,
-    prnt: Vec<usize>,
+    avail: usize,
+    /// Positions coded since the last position-tree rebuild.
+    total_p: u32,
+    /// Highest node index in use by the position tree.
+    most_p: usize,
+    /// Output count past which the next position symbol is added.
+    next_count: u64,
 }
 
-impl AdaptiveTree {
-    fn new(n_char: usize) -> Self {
-        let t = n_char * 2 - 1;
-        let root = t - 1;
-        let mut freq = vec![0u32; t + 1];
-        let mut son = vec![0usize; t];
-        let mut prnt = vec![0usize; t + n_char];
+impl Trees {
+    fn new() -> Self {
+        let mut t = Self {
+            child: vec![0; SLOTS],
+            parent: vec![0; SLOTS],
+            block: vec![0; SLOTS],
+            edge: vec![0; SLOTS],
+            // Ids >= SLOTS_C start as 0, as in the reference; with at most
+            // ~830 live nodes the pool never actually reaches them.
+            stock: (0..SLOTS + 2)
+                .map(|i| if i < SLOTS_C { i } else { 0 })
+                .collect(),
+            leaf: vec![0; SLOTS / 2],
+            freq: vec![0; SLOTS],
+            avail: 2,
+            total_p: 0,
+            most_p: ROOT_P,
+            next_count: 64,
+        };
+        t.start_c();
+        t.start_p();
+        t
+    }
 
-        for i in 0..n_char {
-            freq[i] = 1;
-            son[i] = i + t;
-            prnt[i + t] = i;
+    fn new_block(&mut self) -> usize {
+        let b = self.stock[self.avail];
+        self.avail += 1;
+        b
+    }
+
+    fn free_block(&mut self, b: usize) {
+        self.avail -= 1;
+        self.stock[self.avail] = b;
+    }
+
+    /// Initial char tree: all leaves weight 1, at the highest indices.
+    fn start_c(&mut self) {
+        let mut j = N_MAX * 2 - 2;
+        for i in 0..N_MAX {
+            self.freq[j] = 1;
+            self.child[j] = !(i as i32);
+            self.leaf[i] = j;
+            self.block[j] = 1;
+            j -= 1;
         }
-        let mut i = 0usize;
-        let mut j = n_char;
-        while j <= root {
-            freq[j] = freq[i] + freq[i + 1];
-            son[j] = i;
-            prnt[i] = j;
-            prnt[i + 1] = j;
-            i += 2;
-            j += 1;
-        }
-        freq[t] = 0xFFFF;
-        prnt[root] = 0;
-        Self {
-            t,
-            root,
-            n_char,
-            freq,
-            son,
-            prnt,
+        self.edge[1] = N_MAX - 1;
+        // Internal nodes, pairing from the bottom up.
+        let mut i = N_MAX * 2 - 2;
+        let mut j = N_MAX as isize - 2;
+        while j >= 0 {
+            let ju = j as usize;
+            let f = self.freq[i] + self.freq[i - 1];
+            self.freq[ju] = f;
+            self.child[ju] = i as i32;
+            self.parent[i] = ju;
+            self.parent[i - 1] = ju;
+            if f == self.freq[ju + 1] {
+                let b = self.block[ju + 1];
+                self.block[ju] = b;
+                self.edge[b] = ju;
+            } else {
+                let b = self.new_block();
+                self.block[ju] = b;
+                self.edge[b] = ju;
+            }
+            i -= 2;
+            j -= 1;
         }
     }
 
-    fn reconstruct(&mut self) {
-        let t = self.t;
-        let n_char = self.n_char;
-        // Collect leaves to the front, halving frequencies.
-        let mut j = 0usize;
-        for i in 0..t {
-            if self.son[i] >= t {
+    /// Initial position tree: the root is the single leaf for symbol 0.
+    fn start_p(&mut self) {
+        self.freq[ROOT_P] = 1;
+        self.child[ROOT_P] = !(LEAF_P as i32);
+        self.leaf[LEAF_P] = ROOT_P;
+        let b = self.new_block();
+        self.block[ROOT_P] = b;
+        self.edge[b] = ROOT_P;
+    }
+
+    /// Halve the leaf weights of the tree in `start..end` and rebuild it.
+    fn reconst(&mut self, start: usize, end: usize) {
+        // Compact the leaves (halved, rounding up) to the front and release
+        // every block.
+        let mut j = start;
+        let mut b = 0usize;
+        for i in start..end {
+            let k = self.child[i];
+            if k < 0 {
                 self.freq[j] = self.freq[i].div_ceil(2);
-                self.son[j] = self.son[i];
+                self.child[j] = k;
                 j += 1;
             }
-        }
-        // Rebuild internal nodes, inserting each pair-sum at its sorted spot.
-        let mut i = 0usize;
-        for j in n_char..t {
-            let f = self.freq[i] + self.freq[i + 1];
-            let mut k = j;
-            while k > 0 && self.freq[k - 1] > f {
-                k -= 1;
+            b = self.block[i];
+            if self.edge[b] == i {
+                self.free_block(b);
             }
-            let mut m = j;
-            while m > k {
-                self.freq[m] = self.freq[m - 1];
-                self.son[m] = self.son[m - 1];
-                m -= 1;
-            }
-            self.freq[k] = f;
-            self.son[k] = i;
-            i += 2;
         }
-        for i in 0..t {
-            let s = self.son[i];
-            self.prnt[s] = i;
-            if s < t {
-                self.prnt[s + 1] = i;
+        // Rebuild from the bottom: leaves move down to their final slots and
+        // each pair sum is inserted where it keeps the order non-increasing.
+        let start_i = start as isize;
+        let mut j = j as isize - 1;
+        let mut i = end as isize - 1;
+        let mut l = end as isize - 2;
+        while i >= start_i {
+            while i >= l {
+                self.freq[i as usize] = self.freq[j as usize];
+                self.child[i as usize] = self.child[j as usize];
+                i -= 1;
+                j -= 1;
+            }
+            let f = self.freq[l as usize] + self.freq[l as usize + 1];
+            let mut k = start;
+            while f < self.freq[k] {
+                k += 1;
+            }
+            while j >= k as isize {
+                self.freq[i as usize] = self.freq[j as usize];
+                self.child[i as usize] = self.child[j as usize];
+                i -= 1;
+                j -= 1;
+            }
+            self.freq[i as usize] = f;
+            self.child[i as usize] = (l + 1) as i32;
+            i -= 1;
+            l -= 2;
+        }
+        // Relink parents/leaves and regroup equal weights into blocks.
+        let mut f = 0u32;
+        for i in start..end {
+            let c = self.child[i];
+            if c < 0 {
+                self.leaf[!c as usize] = i;
+            } else {
+                let c = c as usize;
+                self.parent[c] = i;
+                self.parent[c - 1] = i;
+            }
+            let g = self.freq[i];
+            if g == f {
+                self.block[i] = b;
+            } else {
+                b = self.new_block();
+                self.block[i] = b;
+                self.edge[b] = i;
+                f = g;
             }
         }
     }
 
-    fn update(&mut self, c: usize) {
-        if self.freq[self.root] >= MAX_FREQ {
-            self.reconstruct();
+    /// Increment the weight of node `p` (first swapping it with its block
+    /// leader), keeping the blocks consistent. Returns the parent of the
+    /// node that was incremented.
+    fn swap_inc(&mut self, mut p: usize) -> usize {
+        let b = self.block[p];
+        let q = self.edge[b];
+        let join_or_split;
+        if q != p {
+            // Swap the subtrees at p and its leader q (equal weights).
+            let r = self.child[p];
+            let s = self.child[q];
+            self.child[p] = s;
+            self.child[q] = r;
+            self.relink(r, q);
+            self.relink(s, p);
+            p = q;
+            join_or_split = true;
+        } else {
+            join_or_split = b == self.block[p + 1];
         }
-        let mut node = self.prnt[c + self.t];
-        loop {
-            self.freq[node] += 1;
-            let f = self.freq[node];
-            if node < self.root && f > self.freq[node + 1] {
-                let mut l = node + 1;
-                while l < self.root && f > self.freq[l + 1] {
-                    l += 1;
-                }
-                self.freq[node] = self.freq[l];
-                self.freq[l] = f;
-
-                let sn = self.son[node];
-                let sl = self.son[l];
-                self.prnt[sl] = node;
-                if sl < self.t {
-                    self.prnt[sl + 1] = node;
-                }
-                self.prnt[sn] = l;
-                if sn < self.t {
-                    self.prnt[sn + 1] = l;
-                }
-                self.son[node] = sl;
-                self.son[l] = sn;
-
-                node = l;
+        if join_or_split {
+            // p leaves the front of its block.
+            self.edge[b] += 1;
+            self.freq[p] += 1;
+            if self.freq[p] == self.freq[p - 1] {
+                self.block[p] = self.block[p - 1];
+            } else {
+                let nb = self.new_block();
+                self.block[p] = nb;
+                self.edge[nb] = p;
             }
-            node = self.prnt[node];
-            if node == 0 {
+        } else {
+            // p was alone in its block.
+            self.freq[p] += 1;
+            if self.freq[p] == self.freq[p - 1] {
+                self.free_block(b);
+                self.block[p] = self.block[p - 1];
+            }
+        }
+        self.parent[p]
+    }
+
+    /// Point the subtree/leaf `c` back at its new holder node `at`.
+    fn relink(&mut self, c: i32, at: usize) {
+        if c >= 0 {
+            let c = c as usize;
+            self.parent[c] = at;
+            self.parent[c - 1] = at;
+        } else {
+            self.leaf[!c as usize] = at;
+        }
+    }
+
+    fn update_c(&mut self, sym: usize) {
+        if self.freq[ROOT_C] == MAX_FREQ {
+            self.reconst(ROOT_C, N_MAX * 2 - 1);
+        }
+        self.freq[ROOT_C] += 1;
+        let mut q = self.leaf[sym];
+        loop {
+            q = self.swap_inc(q);
+            if q == ROOT_C {
                 break;
             }
         }
     }
 
-    /// Decode one symbol, descending from the root by branch bits, then
-    /// update the tree.
-    fn decode(&mut self, br: &mut BitReader<'_>) -> Result<usize, Error> {
-        let mut c = self.son[self.root];
-        let mut guard = 0usize;
-        while c < self.t {
-            let bit = br.get_bits(1) as usize;
-            let idx = c + bit;
-            if idx >= self.t {
-                return Err(Error::Corrupt);
+    fn update_p(&mut self, sym: usize) {
+        if self.total_p == MAX_FREQ {
+            self.reconst(ROOT_P, self.most_p + 1);
+            self.total_p = self.freq[ROOT_P];
+            self.freq[ROOT_P] = 0xFFFF;
+        }
+        let mut q = self.leaf[sym + LEAF_P];
+        while q != ROOT_P {
+            q = self.swap_inc(q);
+        }
+        self.total_p += 1;
+    }
+
+    /// Add position symbol `sym`: the current lowest leaf `most_p` becomes
+    /// an internal node whose children are that leaf (moved down one slot)
+    /// and the new weight-0 leaf, which is then counted once.
+    fn make_new_node(&mut self, sym: usize) {
+        let mp = self.most_p;
+        let r = mp + 1;
+        let q = r + 1;
+        self.child[r] = self.child[mp];
+        self.leaf[!self.child[r] as usize] = r;
+        self.child[q] = !((sym + LEAF_P) as i32);
+        self.child[mp] = q as i32;
+        self.freq[r] = self.freq[mp];
+        self.freq[q] = 0;
+        self.block[r] = self.block[mp];
+        if mp == ROOT_P {
+            self.freq[ROOT_P] = 0xFFFF;
+            let b = self.block[ROOT_P];
+            self.edge[b] += 1;
+        }
+        self.parent[r] = mp;
+        self.parent[q] = mp;
+        let b = self.new_block();
+        self.block[q] = b;
+        self.edge[b] = q;
+        self.leaf[sym + LEAF_P] = q;
+        self.most_p = q;
+        self.update_p(sym);
+    }
+
+    /// Grow the position tree for an output count of `count` bytes.
+    fn grow_p(&mut self, count: u64) {
+        while count > self.next_count {
+            self.make_new_node((self.next_count / 64) as usize);
+            self.next_count += 64;
+            if self.next_count >= N as u64 {
+                self.next_count = u64::MAX;
             }
-            c = self.son[idx];
-            guard += 1;
-            if guard > self.t {
+        }
+    }
+
+    /// Walk from `root` to a leaf by input bits; returns the leaf's `leaf[]`
+    /// index.
+    fn walk(&self, root: usize, br: &mut BitReader<'_>) -> Result<usize, Error> {
+        let mut c = self.child[root];
+        let mut depth = 0usize;
+        while c > 0 {
+            let bit = br.get_bits(1) as usize;
+            c = self.child[c as usize - bit];
+            depth += 1;
+            if depth > SLOTS {
                 return Err(Error::Corrupt);
             }
         }
-        let sym = c - self.t;
-        if sym >= self.n_char {
+        Ok(!c as usize)
+    }
+
+    /// Emit the root-first code of the leaf at node `node` in the tree
+    /// rooted at `root`. Bit = node index parity (odd = second child).
+    fn put_code(&self, bw: &mut BitWriter, root: usize, mut node: usize) {
+        let mut bits: Vec<u8> = Vec::with_capacity(32);
+        while node != root {
+            bits.push((node & 1) as u8);
+            node = self.parent[node];
+        }
+        for &b in bits.iter().rev() {
+            bw.put_bits(1, b as u32);
+        }
+    }
+
+    fn decode_c(&mut self, br: &mut BitReader<'_>) -> Result<usize, Error> {
+        let sym = self.walk(ROOT_C, br)?;
+        if sym >= N_MAX {
             return Err(Error::Corrupt);
         }
-        self.update(sym);
+        self.update_c(sym);
+        if sym == ESCAPE {
+            return Ok(sym + br.get_bits(8) as usize);
+        }
         Ok(sym)
     }
 
-    /// Encode one symbol (root-first branch bits), then update the tree.
-    fn encode(&mut self, bw: &mut BitWriter, c: usize) {
-        let mut path: Vec<u8> = Vec::with_capacity(32);
-        let mut k = self.prnt[c + self.t];
-        loop {
-            let p = self.prnt[k];
-            path.push((k - self.son[p]) as u8);
-            if p == self.root {
-                break;
-            }
-            k = p;
-            if path.len() >= self.t {
-                break;
-            }
+    fn encode_c(&mut self, bw: &mut BitWriter, code: usize) {
+        let sym = code.min(ESCAPE);
+        self.put_code(bw, ROOT_C, self.leaf[sym]);
+        if sym == ESCAPE {
+            bw.put_bits(8, (code - ESCAPE) as u32);
         }
-        for &bit in path.iter().rev() {
-            bw.put_bits(1, bit as u32);
-        }
-        self.update(c);
+        self.update_c(sym);
     }
-}
 
-// ─── position bit-length class ───────────────────────────────────────────
+    /// Decode a ring offset (`distance - 1`) for a match starting after
+    /// `count` output bytes.
+    fn decode_p(&mut self, br: &mut BitReader<'_>, count: u64) -> Result<usize, Error> {
+        self.grow_p(count);
+        let sym = self
+            .walk(ROOT_P, br)?
+            .checked_sub(LEAF_P)
+            .filter(|&s| s < NP)
+            .ok_or(Error::Corrupt)?;
+        self.update_p(sym);
+        Ok((sym << POS_LOW_BITS) | br.get_bits(POS_LOW_BITS) as usize)
+    }
 
-/// Number of significant bits of `pos` (0 for `pos == 0`). This is the
-/// position-tree symbol; `pos` itself is recovered from the class plus
-/// `class - 1` low bits.
-fn pos_class(pos: usize) -> usize {
-    // pos < N = 2^13, so the class is at most DICBIT.
-    (usize::BITS - pos.leading_zeros()) as usize
+    /// Encode ring offset `pos` (`< count`, so its symbol already exists).
+    fn encode_p(&mut self, bw: &mut BitWriter, count: u64, pos: usize) {
+        self.grow_p(count);
+        let sym = pos >> POS_LOW_BITS;
+        self.put_code(bw, ROOT_P, self.leaf[sym + LEAF_P]);
+        self.update_p(sym);
+        bw.put_bits(POS_LOW_BITS, (pos & ((1 << POS_LOW_BITS) - 1)) as u32);
+    }
 }
 
 // ─── decoder ─────────────────────────────────────────────────────────────
@@ -246,14 +459,13 @@ pub fn decode_payload(payload: &[u8], expected: usize) -> Result<Vec<u8>, Error>
         return Ok(out);
     }
 
-    let mut ctree = AdaptiveTree::new(NC);
-    let mut ptree = AdaptiveTree::new(NP);
+    let mut trees = Trees::new();
     let mut ring = vec![b' '; N];
     let mut r = 0usize;
     let mut br = BitReader::new(payload);
 
     while out.len() < expected {
-        let c = ctree.decode(&mut br)?;
+        let c = trees.decode_c(&mut br)?;
         if br.overran() {
             return Err(Error::UnexpectedEnd);
         }
@@ -262,16 +474,11 @@ pub fn decode_payload(payload: &[u8], expected: usize) -> Result<Vec<u8>, Error>
             ring[r] = c as u8;
             r = (r + 1) & (N - 1);
         } else {
-            let len = (c - 256) + MIN_MATCH;
-            if len > MAXMATCH {
-                return Err(Error::Corrupt);
-            }
-            let pos = decode_position(&mut ptree, &mut br)?;
+            // Escaped lengths reach 287; the reference decoder accepts them.
+            let len = c - LEN_ADJUST;
+            let pos = trees.decode_p(&mut br, out.len() as u64)?;
             if br.overran() {
                 return Err(Error::UnexpectedEnd);
-            }
-            if pos >= N {
-                return Err(Error::Corrupt);
             }
             let src0 = (r + N - pos - 1) & (N - 1);
             for k in 0..len {
@@ -288,20 +495,6 @@ pub fn decode_payload(payload: &[u8], expected: usize) -> Result<Vec<u8>, Error>
     Ok(out)
 }
 
-/// Decode a position: a bit-length class from the adaptive position tree,
-/// then `class - 1` low bits (none for class 0 or 1).
-fn decode_position(ptree: &mut AdaptiveTree, br: &mut BitReader<'_>) -> Result<usize, Error> {
-    let class = ptree.decode(br)?;
-    if class == 0 {
-        return Ok(0);
-    }
-    if class == 1 {
-        return Ok(1);
-    }
-    let low = br.get_bits((class - 1) as u32) as usize;
-    Ok((1usize << (class - 1)) | low)
-}
-
 // ─── encoder ─────────────────────────────────────────────────────────────
 
 /// Encode `data` into an lh2 payload (no length header).
@@ -311,27 +504,22 @@ pub fn encode_payload(data: &[u8]) -> Vec<u8> {
         return bw.finish();
     }
 
-    let mut ctree = AdaptiveTree::new(NC);
-    let mut ptree = AdaptiveTree::new(NP);
-
+    let mut trees = Trees::new();
+    let mut count = 0u64;
     for t in lz_parse(data) {
         match t {
-            Tok::Lit(b) => ctree.encode(&mut bw, b as usize),
+            Tok::Lit(b) => {
+                trees.encode_c(&mut bw, b as usize);
+                count += 1;
+            }
             Tok::Match { len, pos } => {
-                ctree.encode(&mut bw, 256 + (len - MIN_MATCH));
-                encode_position(&mut ptree, &mut bw, pos);
+                trees.encode_c(&mut bw, len + LEN_ADJUST);
+                trees.encode_p(&mut bw, count, pos);
+                count += len as u64;
             }
         }
     }
     bw.finish()
-}
-
-fn encode_position(ptree: &mut AdaptiveTree, bw: &mut BitWriter, pos: usize) {
-    let class = pos_class(pos);
-    ptree.encode(bw, class);
-    if class >= 2 {
-        bw.put_bits((class - 1) as u32, (pos & ((1 << (class - 1)) - 1)) as u32);
-    }
 }
 
 enum Tok {
@@ -435,14 +623,35 @@ mod tests {
         round_trip(&v);
         // long run to exercise 256-byte matches over the 8 KiB window
         round_trip(&b"xyz".repeat(4000));
+        // > 0x8000 symbols and positions: both trees get rebuilt
+        let mut w = Vec::new();
+        for i in 0..60_000u32 {
+            w.extend_from_slice(&((i * 7919) % 1013).to_le_bytes()[..2]);
+        }
+        round_trip(&w);
     }
 
     #[test]
-    fn pos_class_is_significant_bits() {
-        assert_eq!(pos_class(0), 0);
-        assert_eq!(pos_class(1), 1);
-        assert_eq!(pos_class(2), 2);
-        assert_eq!(pos_class(3), 2);
-        assert_eq!(pos_class(8191), 13);
+    fn first_position_costs_no_tree_bits() {
+        // Until more than 64 bytes have been produced the position tree is a
+        // single leaf, so a position is just its 6 raw low bits.
+        let mut trees = Trees::new();
+        let mut bw = BitWriter::new();
+        trees.encode_p(&mut bw, 10, 5);
+        assert_eq!(bw.finish(), [5 << 2]);
+    }
+
+    #[test]
+    fn garbage_never_panics() {
+        let mut seed = 0x1234_5678u32;
+        for n in [1usize, 7, 64, 1000, 20_000, 200_000] {
+            let junk: Vec<u8> = (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    (seed >> 16) as u8
+                })
+                .collect();
+            let _ = decode_payload(&junk, n * 8);
+        }
     }
 }

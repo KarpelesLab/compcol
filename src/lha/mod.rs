@@ -8,8 +8,9 @@
 //!
 //! - `lh1`: 4 KiB dictionary, **adaptive** Huffman (the classic LZHUF
 //!   scheme of Yoshizaki & Okumura), fixed position code.
-//! - `lh2`: 8 KiB dictionary, **adaptive** Huffman for both literals/lengths
-//!   *and* positions (see [`dynamic_huff`]).
+//! - `lh2`: 8 KiB dictionary, **adaptive** Huffman for literals/lengths and
+//!   for the position's upper bits, with a position tree that grows with the
+//!   output (see [`dynamic_huff`]).
 //! - `lh4`: 4 KiB dictionary, static Huffman.
 //! - `lh5`: 8 KiB dictionary, static Huffman — the dominant method.
 //! - `lh6`: 32 KiB dictionary, static Huffman.
@@ -19,7 +20,8 @@
 //! (Okumura's public-domain ar002 layout — see [`static_huff`]) and differ
 //! only in dictionary size and the number of position-code bits. `lh1`
 //! uses the adaptive-Huffman tree-update scheme (see [`lzhuf`]); `lh2`
-//! extends it to an 8 KiB window with an adaptive position tree (see
+//! (LHarc 1.x) uses LHA's leader/block adaptive trees for both its
+//! 286-symbol char alphabet and a growing position alphabet (see
 //! [`dynamic_huff`]).
 //!
 //! ## Framing — none
@@ -42,13 +44,18 @@
 //! Clean-room from public LZH / LZHUF format *descriptions* (Okumura's
 //! LZHUF / ar002 algorithms are documented and were placed in the public
 //! domain). No code or code-length tables were copied from LGPL
-//! (The Unarchiver / XADMaster), GPL, or unRAR sources.
+//! (The Unarchiver / XADMaster), GPL, or unRAR sources. The `-lh2-`
+//! adaptive-tree rules were matched to the behaviour of the LHa for UNIX
+//! extractor (the only tool that still reads the method), since its exact
+//! node layout determines every code bit.
 //!
 //! ## What is validated
 //!
 //! Every method here round-trips arbitrary data through this crate's own
-//! encoder and decoder (the encoders for `lh1` and `lh4`/`lh5`/`lh6`/`lh7`
-//! are implemented, not stubbed). See `tests/lha.rs`.
+//! encoder and decoder, and `tests/lha.rs` wraps each method's encoder
+//! output in a `.lzh` archive that the `lha` CLI (LHa for UNIX) must test
+//! CRC-clean and extract identically (skipped when `lha` is not installed).
+//! `-lh2-` additionally has an `lha`-verified fixture.
 
 #![cfg_attr(docsrs, doc(cfg(feature = "lha")))]
 

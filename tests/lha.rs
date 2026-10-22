@@ -426,3 +426,196 @@ fn static_decoder_streams_output_instead_of_materialising_it() {
     assert_eq!(err, Error::OutputLimitExceeded);
     assert_eq!(total, 1 << 20);
 }
+
+// ─── conformance with the reference `lha` (LHa for UNIX) ─────────────────
+
+/// CRC-16/ARC, the checksum an LHA header stores for the file data.
+fn crc16_arc(data: &[u8]) -> u16 {
+    let mut crc = 0u16;
+    for &b in data {
+        crc ^= b as u16;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xA001
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
+}
+
+/// Wrap a raw method `payload` of `data` in a minimal one-member level-0
+/// `.lzh` archive (method, sizes, a fixed timestamp, name `f`, data CRC).
+fn lzh_level0(method: &[u8; 5], payload: &[u8], data: &[u8]) -> Vec<u8> {
+    let name = b"f";
+    let mut h = Vec::new();
+    h.extend_from_slice(method);
+    h.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    h.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    h.extend_from_slice(&0x5D56_4D47u32.to_le_bytes()); // DOS time/date
+    h.push(0x20); // attribute
+    h.push(0); // header level
+    h.push(name.len() as u8);
+    h.extend_from_slice(name);
+    h.extend_from_slice(&crc16_arc(data).to_le_bytes());
+    let sum = h.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+    let mut out = vec![h.len() as u8, sum];
+    out.extend_from_slice(&h);
+    out.extend_from_slice(payload);
+    out.push(0); // end of archive
+    out
+}
+
+/// Have the `lha` CLI test and extract `archive`. `None` when `lha` is not
+/// installed; otherwise whether `lha t` passed (CRC OK) and what `lha p`
+/// printed.
+fn lha_cli_check(archive: &[u8], label: &str) -> Option<(bool, Vec<u8>)> {
+    use std::process::Command;
+    if Command::new("lha").arg("--version").output().is_err() {
+        return None;
+    }
+    let path = std::env::temp_dir().join(format!("compcol-lha-{}-{label}.lzh", std::process::id()));
+    std::fs::write(&path, archive).unwrap();
+    let tested = Command::new("lha").arg("tq").arg(&path).output().unwrap();
+    let printed = Command::new("lha").arg("pq").arg(&path).output().unwrap();
+    let _ = std::fs::remove_file(&path);
+    Some((tested.status.success(), printed.stdout))
+}
+
+/// Inputs that reach every corner of the lh2 code: escape-coded lengths up
+/// to 256, the whole 8 KiB window, and enough symbols to force rebuilds of
+/// both adaptive trees.
+fn lh2_conformance_inputs() -> Vec<Vec<u8>> {
+    let mut inputs = sample_inputs();
+    let mut far = noise(9000, 7);
+    far.extend_from_within(..3000);
+    inputs.push(far);
+    inputs.push(b"xyz".repeat(30_000));
+    let mut text = Vec::new();
+    for i in 0..40_000u32 {
+        text.extend_from_slice(format!("{} ", (i * 7919) % 1013).as_bytes());
+    }
+    inputs.push(text);
+    // Short matches over a 4-letter alphabet: > 0x8000 positions.
+    inputs.push(
+        noise(400_000, 3)
+            .iter()
+            .map(|b| b"acgt"[*b as usize & 3])
+            .collect(),
+    );
+    inputs
+}
+
+fn lha_cli_accepts<A: Algorithm>(method: &[u8; 5]) {
+    for (i, data) in sample_inputs().iter().enumerate() {
+        let payload = encode_chunked(A::encoder(), data, 1 << 20, 1 << 20);
+        let archive = lzh_level0(method, &payload, data);
+        let Some((ok, printed)) = lha_cli_check(&archive, &format!("{}-{i}", A::NAME)) else {
+            eprintln!("lha CLI not installed; skipping");
+            return;
+        };
+        assert!(ok, "lha t rejected our {} archive (input #{i})", A::NAME);
+        assert!(
+            printed == *data,
+            "{}: lha p output differs (input #{i})",
+            A::NAME
+        );
+    }
+}
+
+#[test]
+fn other_methods_are_accepted_by_lha_cli() {
+    lha_cli_accepts::<Lh1>(b"-lh1-");
+    lha_cli_accepts::<Lh4>(b"-lh4-");
+    lha_cli_accepts::<Lh5>(b"-lh5-");
+    lha_cli_accepts::<Lh6>(b"-lh6-");
+    lha_cli_accepts::<Lh7>(b"-lh7-");
+}
+
+/// Plaintext of `fixtures/lha/lh2.lzh`: grows the position tree past its
+/// first symbols and needs escape-coded (> 31 byte) and 256-byte matches.
+fn lh2_fixture_text() -> Vec<u8> {
+    let mut v = Vec::new();
+    for i in 0..40 {
+        v.extend_from_slice(
+            format!("{i:02}: an lh2 fixture line, padded to a width.\n").as_bytes(),
+        );
+    }
+    v.extend_from_slice(&[b'='; 300]);
+    v.push(b'\n');
+    v
+}
+
+/// A level-0 `.lzh` holding `lh2_fixture_text()` as `-lh2-`. No current tool
+/// creates `-lh2-`, so it was made by this crate's encoder after the
+/// conformance fix (`lzh_level0(b"-lh2-", <Lh2 output>, &text)`) and verified with LHa for UNIX 1.14i (`lha t`: CRC OK;
+/// `lha p` reproduces the text). It pins the bitstream when `lha` is absent.
+static LH2_FIXTURE: &[u8] = include_bytes!("fixtures/lha/lh2.lzh");
+
+#[test]
+fn lh2_decodes_lha_verified_fixture() {
+    let a = LH2_FIXTURE;
+    let hdr = 2 + a[0] as usize;
+    assert_eq!(&a[2..7], b"-lh2-");
+    let packed = u32::from_le_bytes(a[7..11].try_into().unwrap()) as usize;
+    let orig = u32::from_le_bytes(a[11..15].try_into().unwrap()) as usize;
+    let crc = u16::from_le_bytes(a[hdr - 2..hdr].try_into().unwrap());
+    let payload = &a[hdr..hdr + packed];
+
+    let want = lh2_fixture_text();
+    assert_eq!(orig, want.len());
+    assert_eq!(crc, crc16_arc(&want));
+    for &(ic, oc) in &[(1 << 20, 1 << 20), (1, 1), (7, 3)] {
+        let dec = Lh2::decoder_with(DecoderConfig::with_len(orig));
+        assert!(
+            decode_chunked(dec, payload, ic, oc) == want,
+            "in={ic} out={oc}"
+        );
+    }
+    // The encoder still produces the same bytes.
+    let enc = encode_chunked(Lh2::encoder(), &want, 1 << 20, 1 << 20);
+    assert!(
+        enc == payload,
+        "lh2 encoder output drifted from the fixture"
+    );
+}
+
+#[test]
+fn lh2_decoder_reset_reuses_cleanly() {
+    let want = lh2_fixture_text();
+    let payload = encode_chunked(Lh2::encoder(), &want, 1 << 20, 1 << 20);
+    let mut dec = Lh2::decoder_with(DecoderConfig::with_len(want.len()));
+    for _ in 0..2 {
+        let mut out = vec![0u8; want.len() + 16];
+        let (p, _) = dec.decode(&payload, &mut out).unwrap();
+        assert_eq!(p.consumed, payload.len());
+        let mut got = out[..p.written].to_vec();
+        loop {
+            let (p, status) = dec.finish(&mut out).unwrap();
+            got.extend_from_slice(&out[..p.written]);
+            if matches!(status, Status::StreamEnd) {
+                break;
+            }
+        }
+        assert!(got == want);
+        dec.reset();
+    }
+}
+
+#[test]
+fn lh2_output_is_accepted_by_lha_cli() {
+    // Our lh2 encoder and decoder used to agree only with each other (an
+    // invented position code and 510-symbol alphabet): `lha` reported a CRC
+    // error for every non-empty archive we produced.
+    for (i, data) in lh2_conformance_inputs().iter().enumerate() {
+        let payload = encode_chunked(Lh2::encoder(), data, 1 << 20, 1 << 20);
+        let archive = lzh_level0(b"-lh2-", &payload, data);
+        let Some((ok, printed)) = lha_cli_check(&archive, &format!("lh2-{i}")) else {
+            eprintln!("lha CLI not installed; skipping");
+            return;
+        };
+        assert!(ok, "lha t rejected our lh2 archive (input #{i})");
+        assert!(printed == *data, "lha p output differs (input #{i})");
+    }
+}
