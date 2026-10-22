@@ -660,9 +660,20 @@ impl Decoder {
                     }
                 }
                 Some(_) => {
-                    // Filter starts at or before `pos`. Check if its full
-                    // range is covered by what's in out_queue.
+                    // Filter starts at or before `pos`.
                     let f = self.pending_filters[0];
+                    if f.start < pos {
+                        // The filter starts inside bytes already emitted
+                        // (it overlaps an earlier filter's region). unrar
+                        // skips such a filter — its start lies behind the
+                        // written border — so drop it too. Leaving it at
+                        // the head of the queue stalled all further output
+                        // while out_queue grew without bound.
+                        self.pending_filters.remove(0);
+                        continue;
+                    }
+                    // Check if its full range is covered by what's in
+                    // out_queue.
                     let end = f.start + f.length as u64;
                     let buf_end = pos + self.out_queue.len() as u64;
                     if end > buf_end {
@@ -672,13 +683,6 @@ impl Decoder {
                     // We have the whole filter range. Extract it into a
                     // contiguous Vec, apply the filter, then push back to
                     // ready.
-                    if f.start < pos {
-                        // The filter wants to reach into bytes we've
-                        // already emitted. Unsupported in our streaming
-                        // model — refuse.
-                        // (This shouldn't happen with normal RAR5 streams.)
-                        return Ok(());
-                    }
                     let leading = (f.start - pos) as usize;
                     for _ in 0..leading {
                         if let Some(b) = self.out_queue.pop_front() {

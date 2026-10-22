@@ -748,3 +748,50 @@ fn capped_decode_does_not_buffer_whole_block() {
         assert!(grown < 256, "peak RSS grew by {grown} MiB");
     }
 }
+
+/// Write a filter descriptor (after main symbol 256) for a 1-channel Delta
+/// filter over `[cur + start, cur + start + len)`.
+fn put_delta_filter(bw: &mut BitWriter, start: u32, len: u32) {
+    for v in [start, len] {
+        bw.put(3, 2);
+        for i in 0..4 {
+            bw.put((v >> (8 * i)) & 0xFF, 8);
+        }
+    }
+    bw.put(0, 3); // type 0: Delta
+    bw.put(0, 5); // 1 channel
+}
+
+/// Regression: a filter whose start lies inside an earlier filter's region
+/// (already emitted once that filter ran) sat at the head of the pending
+/// queue forever — every later byte stayed buffered, decode wrote nothing
+/// more, and `finish` failed. unrar skips such a filter; so must we.
+#[test]
+fn overlapping_filter_does_not_stall_output() {
+    let mut bw = BitWriter::default();
+    // Main code: 'A' → `0`, 256 → `10`, 305 → `11`; distance slot 0.
+    write_tables(&mut bw, &[(b'A' as usize, 1), (256, 2), (305, 2), (306, 1)]);
+    bw.put(0b10, 2);
+    put_delta_filter(&mut bw, 0, 100);
+    bw.put(0b10, 2);
+    put_delta_filter(&mut bw, 10, 4);
+    bw.put(0, 1);
+    for _ in 0..50 {
+        bw.put(0b11, 2);
+        bw.put(0x1FF, 9);
+        bw.put(0, 1);
+    }
+    let lb = bw.finish();
+    let comp = last_block(&bw.out, lb);
+
+    let mut want = vec![b'A'; 1 + 50 * 4097];
+    let mut prev = 0u8;
+    for b in &mut want[..100] {
+        prev = prev.wrapping_sub(*b);
+        *b = prev;
+    }
+    for out_chunk in [1, 4096] {
+        let mut dec = Decoder::new();
+        assert_eq!(drive_to_end(&mut dec, &comp, out_chunk).unwrap(), want);
+    }
+}
