@@ -349,6 +349,160 @@ fn decoder_reset_round_trip() {
     }
 }
 
+// ─── CAB conformance: hand-built bitstreams checked against libmspack ──
+//
+// Each stream below was wrapped in a CAB folder and decoded with
+// `cabextract` (libmspack) while writing these tests; the expected outputs
+// are what it produced.
+
+/// LZX bit writer: 16-bit little-endian words, bits MSB-first.
+struct BitW {
+    out: Vec<u8>,
+    acc: u32,
+    n: u32,
+}
+
+impl BitW {
+    fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            acc: 0,
+            n: 0,
+        }
+    }
+
+    fn put(&mut self, bits: u32, v: u32) {
+        for i in (0..bits).rev() {
+            self.acc = (self.acc << 1) | ((v >> i) & 1);
+            self.n += 1;
+            if self.n == 16 {
+                self.out.push(self.acc as u8);
+                self.out.push((self.acc >> 8) as u8);
+                self.acc = 0;
+                self.n = 0;
+            }
+        }
+    }
+
+    fn raw(&mut self, b: &[u8]) {
+        assert_eq!(self.n, 0, "raw bytes must start on a word boundary");
+        self.out.extend_from_slice(b);
+    }
+
+    /// The standalone framing: window_bits + LE total length + bitstream.
+    fn framed(&self, window_bits: u8, total: usize) -> Vec<u8> {
+        let mut s = vec![window_bits];
+        s.extend_from_slice(&(total as u32).to_le_bytes());
+        s.extend_from_slice(&self.out);
+        s
+    }
+}
+
+/// Uncompressed block, padded the way MS-CAB / libmspack expect: 1..=16
+/// bits to the next word boundary, R0..R2, the data, a pad byte if odd.
+fn put_uncompressed_block(w: &mut BitW, data: &[u8]) {
+    w.put(3, 3);
+    w.put(24, data.len() as u32);
+    let pad = if w.n == 0 { 16 } else { 16 - w.n };
+    w.put(pad, 0);
+    for _ in 0..3 {
+        w.raw(&1u32.to_le_bytes());
+    }
+    w.raw(data);
+    if data.len() % 2 == 1 {
+        w.raw(&[0]);
+    }
+}
+
+fn decode_all_ways(stream: &[u8]) -> Vec<u8> {
+    let whole = decode_chunked(stream, stream.len(), 1 << 20);
+    for (i, o) in [(1, 1), (3, 7), (4096, 1000)] {
+        assert_eq!(decode_chunked(stream, i, o), whole, "chunking {i}/{o}");
+    }
+    whole
+}
+
+/// libmspack's E8 decode over one frame: `curpos` is the absolute output
+/// position of the 0xE8 byte.
+fn e8_reference(frame: &mut [u8], frame_start: i64, filesize: i64) {
+    if frame.len() <= 10 {
+        return;
+    }
+    let mut i = 0;
+    while i < frame.len() - 10 {
+        if frame[i] != 0xE8 {
+            i += 1;
+            continue;
+        }
+        let curpos = frame_start + i as i64;
+        let abs = i32::from_le_bytes(frame[i + 1..i + 5].try_into().unwrap()) as i64;
+        if -curpos <= abs && abs < filesize {
+            let rel = if abs >= 0 {
+                abs - curpos
+            } else {
+                abs + filesize
+            };
+            frame[i + 1..i + 5].copy_from_slice(&(rel as i32).to_le_bytes());
+        }
+        i += 5;
+    }
+}
+
+/// The E8 call-translation filter measures `curpos` at the 0xE8 byte, and
+/// it runs over whole 32 KiB frames. It used to be off by one, and with
+/// small input chunks it drained partial frames before translating them.
+#[test]
+fn cab_e8_translation_matches_libmspack() {
+    const FILESIZE: u32 = 0x0010_0000;
+    let mut data = vec![0x90u8; 1000];
+    let sites: [(usize, i32); 6] = [
+        (0, 5),
+        (17, -3),
+        (100, 1000),
+        (300, 50_000),
+        (500, -200),
+        (989, 7),
+    ];
+    for (i, v) in sites {
+        data[i] = 0xE8;
+        data[i + 1..i + 5].copy_from_slice(&v.to_le_bytes());
+    }
+    let mut w = BitW::new();
+    w.put(1, 1);
+    w.put(32, FILESIZE);
+    put_uncompressed_block(&mut w, &data);
+    let out = decode_all_ways(&w.framed(16, data.len()));
+    // Values cabextract produced for this stream.
+    let want = [5, 1_048_573, 900, 49_700, 1_048_376, -982];
+    for ((i, _), want) in sites.iter().zip(want) {
+        assert_eq!(
+            i32::from_le_bytes(out[i + 1..i + 5].try_into().unwrap()),
+            want,
+            "@{i}"
+        );
+    }
+
+    // Several frames, E8 sites everywhere (including frame tails, which are
+    // left alone), fed in small chunks.
+    let mut data: Vec<u8> = (0..80_000u32).map(|i| (i * 31 % 251) as u8).collect();
+    let mut i = 3;
+    while i + 5 < data.len() {
+        data[i] = 0xE8;
+        i += 97 + (i % 13);
+    }
+    let mut w = BitW::new();
+    w.put(1, 1);
+    w.put(32, FILESIZE);
+    for block in data.chunks(30_000) {
+        put_uncompressed_block(&mut w, block);
+    }
+    let mut want = data.clone();
+    for (k, frame) in want.chunks_mut(32_768).enumerate() {
+        e8_reference(frame, (k * 32_768) as i64, FILESIZE as i64);
+    }
+    assert_eq!(decode_all_ways(&w.framed(16, data.len())), want);
+}
+
 // ─── factory ─────────────────────────────────────────────────────────────
 
 #[cfg(feature = "factory")]
