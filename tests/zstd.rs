@@ -9,7 +9,7 @@
 
 #![cfg(feature = "zstd")]
 
-use compcol::zstd::{Decoder, Encoder, EncoderConfig, Zstd};
+use compcol::zstd::{DEFAULT_LEVEL, Decoder, Encoder, EncoderConfig, MIN_LEVEL, Zstd};
 use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Flush, Status};
 
 // ─── helpers ─────────────────────────────────────────────────────────────
@@ -210,7 +210,7 @@ fn round_trip_mixed_corpus_default_level() {
 
 // ─── level-specific tests ───────────────────────────────────────────────
 
-fn encode_at_level(input: &[u8], level: u8) -> Vec<u8> {
+fn encode_at_level(input: &[u8], level: i32) -> Vec<u8> {
     let mut enc = Encoder::with_config(EncoderConfig { level });
     encode_chunked(&mut enc, input, 4096, 4096)
 }
@@ -297,15 +297,114 @@ fn level_1_does_less_work_than_level_9() {
 
 #[test]
 fn out_of_range_level_is_clamped() {
-    // Level 0 and level 250 should both produce valid streams (clamped to
-    // 1 and 22 respectively) — we don't expose a fallible constructor.
+    // Levels beyond either end should produce valid streams (clamped to
+    // MIN_LEVEL and 22 respectively) — we don't expose a fallible constructor.
     let input = b"the rain in spain falls mainly on the plain";
-    let mut enc_lo = Encoder::with_config(EncoderConfig { level: 0 });
-    let enc_lo_out = encode_chunked(&mut enc_lo, input, 4096, 4096);
-    assert_eq!(decode_chunked(&enc_lo_out, 4096, 4096).unwrap(), input);
-    let mut enc_hi = Encoder::with_config(EncoderConfig { level: 250 });
-    let enc_hi_out = encode_chunked(&mut enc_hi, input, 4096, 4096);
-    assert_eq!(decode_chunked(&enc_hi_out, 4096, 4096).unwrap(), input);
+    for level in [i32::MIN, MIN_LEVEL - 1, 250, i32::MAX] {
+        let mut enc = Encoder::with_config(EncoderConfig { level });
+        let out = encode_chunked(&mut enc, input, 4096, 4096);
+        assert_eq!(decode_chunked(&out, 4096, 4096).unwrap(), input);
+    }
+    let corpus = mixed_corpus();
+    assert_eq!(
+        encode_at_level(&corpus, i32::MIN),
+        encode_at_level(&corpus, MIN_LEVEL)
+    );
+    assert_eq!(encode_at_level(&corpus, 250), encode_at_level(&corpus, 22));
+}
+
+#[test]
+fn level_0_means_default() {
+    // As in libzstd, 0 selects the default level rather than clamping to 1.
+    let input = mixed_corpus();
+    assert_eq!(EncoderConfig::default().level, DEFAULT_LEVEL);
+    assert_eq!(
+        encode_at_level(&input, 0),
+        encode_at_level(&input, DEFAULT_LEVEL)
+    );
+}
+
+// ─── negative ("fast") levels ───────────────────────────────────────────
+
+/// Fast levels exercised by the tests below, from libzstd's `--fast=1` down
+/// to `ZSTD_minCLevel()`.
+const FAST_LEVELS: [i32; 6] = [-1, -3, -7, -50, -1000, MIN_LEVEL];
+
+#[test]
+fn negative_levels_round_trip() {
+    let inputs = [
+        Vec::new(),
+        b"hello world".to_vec(),
+        b"abcabcabcabcabc".repeat(100),
+        mixed_corpus(),
+        gen_words(200_000),
+        lcg_bytes(3, 150_000),
+    ];
+    for level in FAST_LEVELS {
+        for input in &inputs {
+            let encoded = encode_at_level(input, level);
+            assert_eq!(
+                &decode_chunked(&encoded, 4096, 4096).unwrap(),
+                input,
+                "level {level}, {} bytes",
+                input.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn negative_levels_trade_ratio_monotonically() {
+    // Each more negative level strides further past misses, so it can only
+    // find fewer matches: output grows (non-strictly) as the level drops,
+    // and a strongly negative level must be measurably worse than level 1.
+    let input = gen_words(100_000);
+    let mut text = Vec::new();
+    for i in 0..3_000 {
+        text.extend_from_slice(format!("line {i}: the quick brown fox {}\n", i % 97).as_bytes());
+    }
+    for input in [input, mixed_corpus(), text] {
+        let l1 = encode_at_level(&input, 1).len();
+        let mut prev = l1;
+        for level in FAST_LEVELS {
+            let n = encode_at_level(&input, level).len();
+            assert!(
+                n >= prev,
+                "level {level} ({n} bytes) beat a higher level ({prev} bytes)"
+            );
+            prev = n;
+        }
+        let fast = encode_at_level(&input, -50).len();
+        assert!(
+            fast > l1,
+            "level -50 ({fast} bytes) no larger than level 1 ({l1} bytes)"
+        );
+    }
+}
+
+#[test]
+fn negative_levels_interoperate_with_system_zstd() {
+    let available = std::process::Command::new("zstd")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !available {
+        println!("skipping: zstd not installed");
+        return;
+    }
+    let mut input = gen_words(150_000);
+    input.extend_from_slice(&lcg_bytes(5, 20_000));
+    input.extend_from_slice(&mixed_corpus());
+    for level in FAST_LEVELS {
+        let encoded = encode_at_level(&input, level);
+        let out = run_tool("zstd", &["-d", "-c"], &encoded);
+        assert!(
+            out.status.success(),
+            "zstd -d rejected level {level}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout == input, "zstd -d decoded level {level} wrong");
+    }
 }
 
 // ─── reset / reuse ──────────────────────────────────────────────────────

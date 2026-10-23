@@ -56,7 +56,7 @@ flag accept; *Ext* is what `factory::extension(name)` returns.
 | LZW (`compress(1)` `.Z`) | `lzw` | `lzw` | `.lzw` | full | full | `compress(1)` / `uncompress(1)` |
 | LZSS (Okumura `lzss.c` layout) | `lzss` | `lzss` | `.lzss` | hash-chain match finder | full (4-byte length header + raw payload) | fixtures from a port of Okumura's `lzss.c` (`docs/lzss-ref.py`) |
 | LZMA (legacy `.lzma`) | `lzma` | `lzma` | `.lzma` | full | full | `python3 -m lzma` (FORMAT_ALONE) |
-| xz | `xz` | `xz` | `.xz` | compressed-LZMA2 chunks + uncompressed fallback | full envelope + all reset variants | `xz(1)` both directions |
+| xz | `xz` | `xz` | `.xz` | compressed-LZMA2 chunks + uncompressed fallback | full: all LZMA2 reset variants, CRC32/CRC64/SHA-256 checks, Delta/BCJ filter chains, concatenated Streams + Stream Padding | `xz(1)` both directions |
 | Raw LZMA2 (7z coder 21) | `lzma2` | `lzma2` | `.lzma2` | full (raw LZMA2 chunk stream; reuses the xz LZMA2 engine) | full (raw LZMA2 chunk stream; reuses the xz LZMA2 engine) | round-trip + cross-decode via the shared xz LZMA2 codec |
 | Zstandard (RFC 8478) | `zstd` | `zstd` | `.zst` | LZ77 + Huffman literals + FSE_Compressed_Mode sequences + repeat offsets + RLE blocks; optimal parse at high levels | full Compressed_Block + XXH64 content checksum | `zstd(1)` both directions |
 | Brotli (RFC 7932) | `brotli` | `brotli` | `.br` | LZ77 + length-limited Huffman + 704-symbol IC alphabet + static-dictionary refs; context modeling + optimal parse at q9+ | full (with 122 KiB static dictionary) | `brotli(1)` both directions |
@@ -68,7 +68,7 @@ flag accept; *Ext* is what `factory::extension(name)` returns.
 | LZFSE (Apple) | `lzfse` | `lzfse` | `.lzfse` | `Unsupported` (decoder-only) | `bvx-` raw + `bvxn` (LZVN) + `bvx2` (LZ77 + FSE); `bvx1` returns `Unsupported` | round-trip (bvx2 vs own FSE encoder; no Apple toolchain bundled) |
 | ADC (Apple DMG) | `adc` | `adc` | `.adc` | LZSS-style greedy match-finder | full | hand-built fixtures |
 | PackBits (Apple / TIFF / PSD) | `packbits` | `packbits` | `.packbits` | full (libtiff-equivalent greedy) | full | PIL TIFF PackBits fixtures |
-| bzip2 | `bzip2` | `bzip2` | `.bz2` | full (RLE-1 + SA-IS BWT + MTF + RLE-2 + dynamic Huffman) | full | `bzip2(1)` both directions |
+| bzip2 | `bzip2` | `bzip2` | `.bz2` | full (byte-identical to libbzip2: RLE-1 + `BZ2_blockSort` BWT + MTF + RLE-2 + dynamic Huffman) | full | `bzip2(1)` both directions |
 | PPMd (Shkarin's PPMII variant H) | `ppmd` | `ppmd` | `.ppmd` | `Unsupported` (decoder-only; PPM model is intricate) | full (used in 7z / RAR3+ / ZIP method 98) | `python3 ppmd-cffi` |
 | Microsoft Xpress (plain LZ77) | `xpress` | `xpress` | `.xpress` | full | full (per [MS-XCA] §2.2) | hand-built fixtures |
 | Microsoft Xpress Huffman | `xpress_huffman` | `xpress-huffman` | `.xph` | full (LZ77 + canonical Huffman) | full (per [MS-XCA] §2.1; used in WIM / CompactOS NTFS) | hand-built fixtures |
@@ -139,7 +139,9 @@ are noted in the table above:
   to the specification's LHa-verified test vectors.
 - **BCJ (`bcj`)** and **Delta (`delta`)** are reversible *filters* (from
   the public-domain LZMA SDK lineage); correctness is the
-  forward∘inverse identity, verified exhaustively.
+  forward∘inverse identity, verified exhaustively. Their decoders are
+  also checked against `xz(1)` output through the xz container's filter
+  chains (`xz --x86`, `--delta`, ...).
 - **LZ5 (`lz5`)** ships a store-only encoder and a decoder for the most
   common reference-CLI block shape; **LZHAM (`lzham`)** parses only the
   `LZH0` container header. Both return `Unsupported` for what they don't
@@ -530,7 +532,8 @@ checksum = []                  # publish compcol::checksum::{Crc32, Adler32}
 ```
 
 Dependencies between algorithm features are resolved for you: `zlib` and
-`gzip` pull `deflate`, `xz` and `lzma2` pull `lzma`, `rar3` pulls `ppmd`,
+`gzip` pull `deflate`, `xz` and `lzma2` pull `lzma` (`xz` also pulls `bcj`
+and `delta` for its filter chains), `rar3` pulls `ppmd`,
 `qpack` pulls `hpack`, and every codec except `rle`, `checksum` and the
 deflate family pulls `alloc`. The deflate family needs `alloc` in its
 standard build (enable `alloc` or `std` alongside, as the defaults do; a

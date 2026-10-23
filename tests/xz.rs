@@ -680,9 +680,9 @@ mod factory {
     }
 }
 
-/// Bytes after the Stream Footer (a following file, Stream Padding, a second
-/// concatenated stream) belong to the caller: `decode` must not report them
-/// as consumed, whatever the input chunking.
+/// Bytes after the Stream Footer that are neither Stream Padding nor another
+/// Stream (e.g. a following file) belong to the caller: `decode` must not
+/// report them as consumed, whatever the input chunking.
 #[test]
 fn trailing_bytes_after_footer_are_not_consumed() {
     let input = b"hello hello hello trailing-data test".repeat(50);
@@ -987,6 +987,775 @@ fn full_flush_at_greedy_and_optimal_levels() {
         if tool_available("xz") {
             let out = run_tool("xz", &["-d", "-c"], &wire);
             assert!(out.status.success() && out.stdout == given, "level {level}");
+        }
+    }
+}
+
+// ─── Block Check kinds ──────────────────────────────────────────────────
+
+/// `printf 'hello xz check\n' | xz --check=crc64` (xz-utils 5.8).
+const HELLO_CRC64_XZ: [u8; 80] = [
+    0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x04, 0xe6, 0xd6, 0xb4, 0x46, 0x04, 0xc0, 0x13, 0x0f,
+    0x21, 0x01, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6e, 0xf9, 0xff, 0xe9,
+    0x01, 0x00, 0x0e, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x78, 0x7a, 0x20, 0x63, 0x68, 0x65, 0x63,
+    0x6b, 0x0a, 0x00, 0x00, 0x41, 0xd7, 0x58, 0x5c, 0x59, 0x9c, 0xfc, 0x20, 0x00, 0x01, 0x2f, 0x0f,
+    0xd7, 0x90, 0x25, 0xa2, 0x1f, 0xb6, 0xf3, 0x7d, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x59, 0x5a,
+];
+
+/// `printf 'hello xz check\n' | xz --check=sha256` (xz-utils 5.8).
+const HELLO_SHA256_XZ: [u8; 104] = [
+    0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x0a, 0xe1, 0xfb, 0x0c, 0xa1, 0x04, 0xc0, 0x13, 0x0f,
+    0x21, 0x01, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6e, 0xf9, 0xff, 0xe9,
+    0x01, 0x00, 0x0e, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x78, 0x7a, 0x20, 0x63, 0x68, 0x65, 0x63,
+    0x6b, 0x0a, 0x00, 0x00, 0xa8, 0xcd, 0x89, 0x31, 0x65, 0xd1, 0xe1, 0x9e, 0x28, 0x68, 0x2f, 0x7d,
+    0xb4, 0x9a, 0x1a, 0xfd, 0x77, 0x64, 0xb7, 0xed, 0xac, 0x93, 0x22, 0x09, 0xa4, 0xe5, 0xed, 0x05,
+    0x45, 0x1c, 0xf2, 0x8d, 0x00, 0x01, 0x47, 0x0f, 0x78, 0x71, 0x01, 0x0f, 0x18, 0x9b, 0x4b, 0x9a,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x59, 0x5a,
+];
+
+/// Offset of the 8-byte CRC64 / 32-byte SHA-256 Check in the fixtures above.
+const HELLO_CHECK_OFFSET: usize = 52;
+
+#[test]
+fn crc64_and_sha256_checks_verified() {
+    for (label, fixture, check_len) in [
+        ("crc64", &HELLO_CRC64_XZ[..], 8),
+        ("sha256", &HELLO_SHA256_XZ[..], 32),
+    ] {
+        for chunk in [1, 7, fixture.len()] {
+            let out = decode_chunked(fixture, chunk, 3).unwrap();
+            assert_eq!(out, b"hello xz check\n", "{label} chunk {chunk}");
+        }
+        // Flip one bit in each byte of the Check field in turn.
+        for i in 0..check_len {
+            let mut bad = fixture.to_vec();
+            bad[HELLO_CHECK_OFFSET + i] ^= 0x10;
+            assert_eq!(
+                decode_chunked(&bad, 4096, 4096).unwrap_err(),
+                Error::ChecksumMismatch,
+                "{label} check byte {i}"
+            );
+        }
+        // Corrupt the payload of the stored LZMA2 chunk: the container is
+        // still well-formed, only the Check catches it.
+        let mut bad = fixture.to_vec();
+        bad[40] ^= 0x01;
+        assert_eq!(
+            decode_chunked(&bad, 4096, 4096).unwrap_err(),
+            Error::ChecksumMismatch,
+            "{label} payload"
+        );
+    }
+}
+
+/// Bitwise CRC-32, for patching the fixtures' header/footer CRCs.
+fn test_crc32(data: &[u8]) -> u32 {
+    let mut c = !0u32;
+    for &b in data {
+        c ^= b as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 {
+                (c >> 1) ^ 0xEDB8_8320
+            } else {
+                c >> 1
+            };
+        }
+    }
+    !c
+}
+
+/// Rewrite the check ID in a Stream's header and footer flags, fixing both
+/// CRCs. The Check field size must stay the same.
+fn set_check_id(stream: &mut [u8], id: u8) {
+    stream[7] = id;
+    let crc = test_crc32(&stream[6..8]);
+    stream[8..12].copy_from_slice(&crc.to_le_bytes());
+    let n = stream.len();
+    stream[n - 3] = id;
+    let crc = test_crc32(&stream[n - 8..n - 2]);
+    stream[n - 12..n - 8].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// Reserved check IDs still define the Check field size; like liblzma by
+/// default (and `xz -d`, which only warns), decode and skip the field.
+#[test]
+fn reserved_check_id_is_skipped_unverified() {
+    let input = b"reserved check id ".repeat(30);
+    let mut stream = encode_all(&input);
+    // Our encoder writes CRC32 (4 bytes); 0x02 and 0x03 share that size.
+    for id in [0x02, 0x03] {
+        set_check_id(&mut stream, id);
+        assert_eq!(decode_chunked(&stream, 4096, 4096).unwrap(), input);
+        if tool_available("xz") {
+            let out = run_tool("xz", &["-d", "-c", "-q", "-q"], &stream);
+            assert_eq!(out.stdout, input, "xz -d check id {id:#x}");
+        }
+    }
+    // A non-zero reserved bit in the Stream Flags is still unsupported.
+    set_check_id(&mut stream, 0x11);
+    assert_eq!(
+        decode_chunked(&stream, 4096, 4096).unwrap_err(),
+        Error::Unsupported
+    );
+}
+
+#[test]
+fn system_xz_checks_decode() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    let input = mixed_corpus();
+    for check in ["none", "crc32", "crc64", "sha256"] {
+        let arg = format!("--check={check}");
+        // A small block size makes several Blocks, so the Check is verified
+        // (and restarted) per Block.
+        let encoded =
+            pipe_through("xz", &["-c", "-z", &arg, "--block-size=50000"], &input).unwrap();
+        for chunk in [997, encoded.len()] {
+            assert_eq!(
+                decode_chunked(&encoded, chunk, 4096).unwrap(),
+                input,
+                "{check} chunk {chunk}"
+            );
+        }
+    }
+}
+
+// ─── concatenated Streams and Stream Padding ────────────────────────────
+
+/// Decode `wire` fed in `in_chunk`-byte slices through a small output
+/// buffer, then `finish` unless `decode` already reported the end. Returns
+/// the output, how many input bytes the decoder consumed, and whether
+/// `decode` itself answered `StreamEnd`.
+fn decode_tracking(wire: &[u8], in_chunk: usize) -> Result<(Vec<u8>, usize, bool), Error> {
+    let mut dec = Decoder::new();
+    let mut out = Vec::new();
+    let mut buf = [0u8; 777];
+    let mut pos = 0;
+    while pos < wire.len() {
+        let end = (pos + in_chunk).min(wire.len());
+        let (p, status) = dec.decode(&wire[pos..end], &mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        pos += p.consumed;
+        match status {
+            Status::StreamEnd => return Ok((out, pos, true)),
+            Status::InputEmpty | Status::OutputFull => {}
+        }
+    }
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            return Ok((out, pos, false));
+        }
+        assert!(p.written > 0, "finish stalled");
+    }
+}
+
+#[test]
+fn concatenated_streams_and_padding_decode_as_one() {
+    let a = b"first stream ".repeat(40);
+    let b = mixed_corpus();
+    let c = b"".to_vec();
+    let (sa, sb, sc) = (encode_all(&a), encode_all(&b), encode_all(&c));
+    let pad = |n: usize| vec![0u8; n];
+    let want: Vec<u8> = [&a[..], &b[..], &c[..]].concat();
+    for wire in [
+        [&sa[..], &sb[..], &sc[..]].concat(),
+        [&sa[..], &pad(4), &sb[..], &pad(12), &sc[..]].concat(),
+        [&sa[..], &sb[..], &sc[..], &pad(8)].concat(),
+        [&sa[..], &pad(4), &sb[..], &pad(4), &sc[..], &pad(4)].concat(),
+    ] {
+        for in_chunk in [1, 3, 4096, wire.len()] {
+            // Input ending exactly at a Stream boundary (or after padding)
+            // leaves the question "another Stream?" open: `decode` keeps
+            // waiting and `finish` settles it.
+            let (out, consumed, ended_in_decode) = decode_tracking(&wire, in_chunk).unwrap();
+            assert_eq!(out, want, "in_chunk {in_chunk}");
+            assert_eq!(consumed, wire.len(), "in_chunk {in_chunk}");
+            assert!(!ended_in_decode, "in_chunk {in_chunk}");
+        }
+        if tool_available("xz") {
+            let out = run_tool("xz", &["-d", "-c"], &wire);
+            assert!(out.status.success(), "xz -d rejected the test wire");
+            assert_eq!(out.stdout, want);
+        }
+    }
+}
+
+#[test]
+fn stream_padding_not_multiple_of_four_rejected() {
+    let a = b"padding".repeat(9);
+    let s = encode_all(&a);
+    for wire in [
+        // Between Streams.
+        [&s[..], &[0u8; 3], &s[..]].concat(),
+        [&s[..], &[0u8; 5], &s[..]].concat(),
+        // After the last Stream.
+        [&s[..], &[0u8; 1]].concat(),
+        [&s[..], &[0u8; 6]].concat(),
+        // Before bytes that are not a Stream.
+        [&s[..], &[0u8; 2], b"junk"].concat(),
+    ] {
+        for in_chunk in [1, 5, wire.len()] {
+            assert_eq!(
+                decode_tracking(&wire, in_chunk).unwrap_err(),
+                Error::Corrupt,
+                "len {} in_chunk {in_chunk}",
+                wire.len()
+            );
+        }
+        if tool_available("xz") {
+            let out = run_tool("xz", &["-d", "-c"], &wire);
+            assert!(!out.status.success(), "xz -d accepted bad padding");
+        }
+    }
+}
+
+/// Bytes after the last Stream (and its padding) that are not another
+/// Stream end the data: `decode` answers `StreamEnd` and leaves them
+/// unconsumed.
+#[test]
+fn trailing_garbage_after_concatenated_streams() {
+    let a = b"alpha ".repeat(20);
+    let b = b"beta ".repeat(30);
+    let (sa, sb) = (encode_all(&a), encode_all(&b));
+    let want = [&a[..], &b[..]].concat();
+    for (xz_len, wire, partial_magic) in [
+        (
+            sa.len() + sb.len(),
+            [&sa[..], &sb[..], b"GARBAGE"].concat(),
+            false,
+        ),
+        (
+            sa.len() + 4 + sb.len() + 8,
+            [&sa[..], &[0; 4], &sb[..], &[0; 8], b"\x01\x00\x00\x00"].concat(),
+            false,
+        ),
+        // A partial Stream Header magic that then diverges is not a Stream.
+        (
+            sa.len() + sb.len(),
+            [&sa[..], &sb[..], &[0xFD, 0x37, 0x7A, 0x00, 0x00, 0x00]].concat(),
+            true,
+        ),
+    ] {
+        for in_chunk in [1, 2, 7, wire.len()] {
+            let (out, consumed, ended_in_decode) = decode_tracking(&wire, in_chunk).unwrap();
+            assert_eq!(out, want, "in_chunk {in_chunk}");
+            assert!(ended_in_decode, "in_chunk {in_chunk}");
+            // The bytes of a partial magic that arrived in earlier calls
+            // were already buffered; the ones in the call that found the
+            // end are handed back.
+            if partial_magic && in_chunk < wire.len() {
+                assert!(consumed >= xz_len && consumed < wire.len());
+            } else {
+                assert_eq!(consumed, xz_len, "in_chunk {in_chunk}");
+            }
+        }
+    }
+    // Input ending inside a magic prefix is not a Stream either: `finish`
+    // ends the data cleanly.
+    let wire = [&sa[..], &[0xFD, 0x37]].concat();
+    for in_chunk in [1, wire.len()] {
+        let (out, _, ended_in_decode) = decode_tracking(&wire, in_chunk).unwrap();
+        assert_eq!(out, a);
+        assert!(!ended_in_decode);
+    }
+}
+
+#[test]
+fn system_xz_concatenated_streams_decode() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    let parts = [
+        (b"one ".repeat(1000), "--check=crc64"),
+        (mixed_corpus(), "--check=sha256"),
+        (Vec::new(), "--check=none"),
+        (b"four".to_vec(), "--check=crc32"),
+    ];
+    let mut wire = Vec::new();
+    let mut want = Vec::new();
+    for (data, check) in &parts {
+        wire.extend(pipe_through("xz", &["-c", "-z", check], data).unwrap());
+        wire.extend_from_slice(&[0; 4]);
+        want.extend_from_slice(data);
+    }
+    for in_chunk in [13, 4096, wire.len()] {
+        let (out, consumed, _) = decode_tracking(&wire, in_chunk).unwrap();
+        assert_eq!(out, want, "in_chunk {in_chunk}");
+        assert_eq!(consumed, wire.len());
+    }
+}
+
+// ─── filter chains (Delta / BCJ before LZMA2) ───────────────────────────
+
+/// Bytes biased towards the opcodes every BCJ converter looks for (x86
+/// E8/E9 with 00/FF operands, ARM/Thumb/ARM64 BL, PowerPC `bl`, SPARC
+/// `call`, RISC-V JAL/AUIPC, IA-64 templates), so each filter really
+/// rewrites operands, mixed with plain noise.
+fn branchy_corpus(len: usize, seed: u32) -> Vec<u8> {
+    const HOT: [u8; 16] = [
+        0x00, 0xFF, 0xE8, 0xE9, 0xEB, 0x94, 0x48, 0x40, 0xF0, 0xF8, 0xEF, 0x17, 0x90, 0x10, 0x01,
+        0x97,
+    ];
+    let mut s = seed;
+    let mut v = Vec::with_capacity(len);
+    while v.len() < len {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let r = (s >> 8) as u8;
+        v.push(if s >> 31 == 0 {
+            HOT[(r & 15) as usize]
+        } else {
+            r
+        });
+    }
+    v
+}
+
+/// Something with real x86-64 branches in it: the test binary itself.
+fn own_code(max: usize) -> Vec<u8> {
+    let mut v = std::fs::read("/proc/self/exe").unwrap_or_default();
+    v.truncate(max);
+    v
+}
+
+/// Every xz filter-chain option set exercised below (a `--block-size`
+/// makes several Blocks, each restarting the filters).
+const FILTER_ARGS: &[&[&str]] = &[
+    &["--delta=dist=1", "--lzma2"],
+    &["--delta=dist=4", "--lzma2"],
+    &["--delta=dist=256", "--lzma2"],
+    &["--x86", "--lzma2"],
+    &["--x86=start=12345", "--lzma2"],
+    &["--powerpc", "--lzma2"],
+    &["--powerpc=start=8", "--lzma2"],
+    &["--ia64", "--lzma2"],
+    &["--ia64=start=4096", "--lzma2"],
+    &["--arm", "--lzma2"],
+    &["--arm=start=1024", "--lzma2"],
+    &["--armthumb", "--lzma2"],
+    &["--armthumb=start=6", "--lzma2"],
+    &["--sparc", "--lzma2"],
+    &["--sparc=start=16", "--lzma2"],
+    &["--arm64", "--lzma2"],
+    &["--arm64=start=4096", "--lzma2"],
+    &["--riscv", "--lzma2"],
+    &["--riscv=start=2", "--lzma2"],
+    // Longer chains: up to the format's four filters.
+    &["--x86", "--delta=dist=2", "--lzma2"],
+    &["--delta=dist=3", "--arm64", "--lzma2"],
+    &["--x86", "--delta=dist=4", "--arm", "--lzma2"],
+    &["--riscv", "--sparc", "--ia64", "--lzma2"],
+    &["--x86", "--lzma2", "--block-size=40000"],
+    &[
+        "--delta=dist=7",
+        "--powerpc",
+        "--lzma2",
+        "--block-size=33333",
+    ],
+];
+
+#[test]
+fn system_xz_filter_chains_decode() {
+    if !tool_available("xz") {
+        println!("skipping: xz not installed");
+        return;
+    }
+    let mut input = branchy_corpus(150_000, 7);
+    input.extend(own_code(200_000));
+    // An odd length leaves every BCJ filter a short unconverted tail.
+    input.extend_from_slice(&branchy_corpus(13, 9));
+    for args in FILTER_ARGS {
+        let mut cmd_args = vec!["-c", "-z", "--check=crc64"];
+        cmd_args.extend_from_slice(args);
+        let encoded = match pipe_through("xz", &cmd_args, &input) {
+            Ok(v) => v,
+            Err(e) => {
+                // Older xz-utils lack ARM64 (5.4) / RISC-V (5.6).
+                println!("skipping {args:?}: {e}");
+                continue;
+            }
+        };
+        for in_chunk in [1 << 20, 4099, 1] {
+            if in_chunk == 1 && encoded.len() > 100_000 && args.len() > 2 {
+                continue; // keep the byte-at-a-time pass to the short chains
+            }
+            let (out, consumed, _) = decode_tracking(&encoded, in_chunk)
+                .unwrap_or_else(|e| panic!("{args:?} in_chunk {in_chunk}: {e:?}"));
+            assert!(out == input, "{args:?} in_chunk {in_chunk}: output differs");
+            assert_eq!(consumed, encoded.len());
+        }
+        // A one-byte output buffer drains the chain's buffer piecemeal.
+        let out = decode_chunked(&encoded, 65_536, 1).unwrap();
+        assert!(out == input, "{args:?} out_chunk 1: output differs");
+
+        // The start offset matters (and the filter really rewrote
+        // branches): decoding with it zeroed fails the Block Check.
+        if let Some(start) = args[0].split("start=").nth(1) {
+            let start: u32 = start.parse().unwrap();
+            let header_len = (encoded[12] as usize + 1) * 4;
+            let mut header = encoded[12..12 + header_len].to_vec();
+            let props = [&[4u8][..], &start.to_le_bytes()].concat();
+            let at = header
+                .windows(5)
+                .position(|w| w == props)
+                .expect("start offset in Block Header");
+            header[at + 1..at + 5].fill(0);
+            let patched = with_block_header(&encoded, &header);
+            assert_eq!(
+                decode_chunked(&patched, 65_536, 65_536).unwrap_err(),
+                Error::ChecksumMismatch,
+                "{args:?}"
+            );
+        }
+    }
+}
+
+/// `printf 'abcdabcdabcd' | xz --delta=dist=4 --lzma2 --check=crc32`: a
+/// filter chain fixture that does not need the CLI.
+const DELTA4_XZ: [u8; 76] = [
+    0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x01, 0x69, 0x22, 0xde, 0x36, 0x04, 0xc1, 0x12, 0x0c,
+    0x03, 0x01, 0x03, 0x21, 0x01, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0x9f, 0x62, 0x18,
+    0xe0, 0x00, 0x0b, 0x00, 0x0a, 0x5d, 0x00, 0x30, 0x98, 0x88, 0x98, 0x39, 0xa0, 0xa0, 0x60, 0x80,
+    0x00, 0x00, 0x00, 0x00, 0xb7, 0xe5, 0xb9, 0xd5, 0x00, 0x01, 0x2a, 0x0c, 0x28, 0x35, 0x5b, 0x46,
+    0x90, 0x42, 0x99, 0x0d, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x59, 0x5a,
+];
+
+#[test]
+fn delta_filter_chain_fixture() {
+    for in_chunk in [1, 5, DELTA4_XZ.len()] {
+        assert_eq!(
+            decode_chunked(&DELTA4_XZ, in_chunk, 3).unwrap(),
+            b"abcdabcdabcd"
+        );
+    }
+}
+
+/// Patch the Block Header (at offset 12) of `stream` with `header` (same
+/// length, CRC32 recomputed).
+fn with_block_header(stream: &[u8], header: &[u8]) -> Vec<u8> {
+    let mut s = stream.to_vec();
+    let n = header.len();
+    s[12..12 + n].copy_from_slice(header);
+    let crc = test_crc32(&s[12..12 + n - 4]);
+    s[12 + n - 4..12 + n].copy_from_slice(&crc.to_le_bytes());
+    s
+}
+
+#[test]
+fn invalid_filter_chains_rejected() {
+    // Block Header of DELTA4_XZ (20 bytes): size, flags (2 filters, both
+    // sizes), the sizes, delta (1-byte props), lzma2 (1-byte props),
+    // padding, CRC32. Replacements keep the length and drop the sizes.
+    assert_eq!(
+        &DELTA4_XZ[12..22],
+        &[0x04, 0xc1, 0x12, 0x0c, 0x03, 0x01, 0x03, 0x21, 0x01, 0x16]
+    );
+    let bad = |body: [u8; 16]| {
+        let mut h = body.to_vec();
+        h.extend_from_slice(&[0; 4]);
+        with_block_header(&DELTA4_XZ, &h)
+    };
+    for (label, stream) in [
+        // LZMA2 not last.
+        (
+            "lzma2 first",
+            bad([
+                4, 0x01, 0x21, 0x01, 0x16, 0x03, 0x01, 0x03, 0, 0, 0, 0, 0, 0, 0, 0,
+            ]),
+        ),
+        // Last filter is not LZMA2.
+        (
+            "delta last",
+            bad([4, 0x00, 0x03, 0x01, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        ),
+        // Unknown filter ID.
+        (
+            "unknown id",
+            bad([
+                4, 0x01, 0x0C, 0x00, 0x21, 0x01, 0x16, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ]),
+        ),
+        // Delta with 2-byte properties.
+        (
+            "delta props",
+            bad([
+                4, 0x01, 0x03, 0x02, 0x03, 0x00, 0x21, 0x01, 0x16, 0, 0, 0, 0, 0, 0, 0,
+            ]),
+        ),
+        // BCJ with a 2-byte start offset (must be 0 or 4 bytes).
+        (
+            "bcj props",
+            bad([
+                4, 0x01, 0x04, 0x02, 0x00, 0x00, 0x21, 0x01, 0x16, 0, 0, 0, 0, 0, 0, 0,
+            ]),
+        ),
+    ] {
+        assert_eq!(
+            decode_chunked(&stream, 4096, 4096).unwrap_err(),
+            Error::Unsupported,
+            "{label}"
+        );
+    }
+    // Properties running past the Block Header.
+    let stream = bad([
+        4, 0x01, 0x03, 0x7F, 0x03, 0x21, 0x01, 0x16, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]);
+    assert_eq!(
+        decode_chunked(&stream, 4096, 4096).unwrap_err(),
+        Error::Corrupt
+    );
+}
+
+/// The documented loop hands the whole stream to `decode` and then calls
+/// `finish` until `StreamEnd`, draining between calls. When the buffer
+/// is smaller than what is still pending, `finish` must say `OutputFull`
+/// and be callable again, not fail with `UnexpectedEnd`.
+#[test]
+fn finish_drains_pending_output_through_a_small_buffer() {
+    let plain = mixed_corpus();
+    let stream = encode_all(&plain);
+    let mut cat = stream.clone();
+    cat.extend_from_slice(&[0, 0, 0, 0]);
+    cat.extend_from_slice(&stream);
+    let mut want = plain.clone();
+    want.extend_from_slice(&plain);
+
+    // With and without a filter chain: the BCJ stage holds back a tail
+    // of its own.
+    let mut x86 = None;
+    if let Ok(mut child) = Command::new("xz")
+        .args(["-c", "--x86", "--lzma2"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        child.stdin.take().unwrap().write_all(&plain).unwrap();
+        x86 = Some(child.wait_with_output().unwrap().stdout);
+    }
+
+    let mut cases = vec![(stream, plain.clone()), (cat, want)];
+    if let Some(s) = x86 {
+        cases.push((s, plain.clone()));
+    }
+    // xz-utils packs up to 2 MiB of output into one LZMA2 chunk: a few
+    // input bytes of zeros leave megabytes pending once all input is in.
+    let zeros = vec![0u8; 3 << 20];
+    if let Ok(mut child) = Command::new("xz")
+        .arg("-c")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        let data = zeros.clone();
+        let writer = std::thread::spawn(move || stdin.write_all(&data));
+        let s = child.wait_with_output().unwrap().stdout;
+        writer.join().unwrap().unwrap();
+        cases.push((s, zeros));
+    }
+    for (stream, want) in &cases {
+        for out_chunk in [1usize, 7, 4096, 1 << 16] {
+            let mut dec = Decoder::new();
+            let mut buf = vec![0u8; out_chunk];
+            let mut got = Vec::new();
+            let mut pos = 0;
+            while pos < stream.len() {
+                let (p, _) = dec.decode(&stream[pos..], &mut buf).unwrap();
+                got.extend_from_slice(&buf[..p.written]);
+                pos += p.consumed;
+            }
+            loop {
+                let (p, status) = dec.finish(&mut buf).unwrap();
+                got.extend_from_slice(&buf[..p.written]);
+                match status {
+                    Status::StreamEnd => break,
+                    Status::OutputFull => assert!(p.written > 0, "finish stalled"),
+                    Status::InputEmpty => panic!("finish returned InputEmpty"),
+                }
+            }
+            assert!(got == *want, "out_chunk {out_chunk}");
+        }
+    }
+
+    // A truncated stream is still an error once the output has room.
+    let short = &cases[0].0[..cases[0].0.len() - 20];
+    let mut dec = Decoder::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let _ = dec.decode(short, &mut buf).unwrap();
+    assert_eq!(dec.finish(&mut buf).unwrap_err(), Error::UnexpectedEnd);
+}
+
+/// Offset and compressed size of the first LZMA2 chunk in a one-filter
+/// stream: after the 12-byte Stream Header and the Block Header, a
+/// compressed chunk's header is control, 2 bytes of size, then 2 bytes of
+/// compressed size - 1 (and a props byte).
+fn first_compressed_chunk(stream: &[u8]) -> (usize, usize) {
+    let hdr = (stream[12] as usize + 1) * 4;
+    let at = 12 + hdr;
+    assert!(stream[at] >= 0x80, "first chunk is not compressed");
+    let comp = ((stream[at + 3] as usize) << 8 | stream[at + 4] as usize) + 1;
+    let header = if stream[at] >= 0xC0 { 6 } else { 5 };
+    (at + header, comp)
+}
+
+/// Decoding starts while a compressed chunk is still arriving, as in
+/// liblzma: half of the first chunk's bytes already give output. It used
+/// to wait for the whole chunk (up to 64 KiB of input, 2 MiB of output).
+#[test]
+fn compressed_chunk_decodes_as_it_arrives() {
+    let plain = mixed_corpus();
+    let stream = encode_all(&plain);
+    let (start, comp) = first_compressed_chunk(&stream);
+    let half = &stream[..start + comp / 2];
+    for in_chunk in [1usize, 100, half.len()] {
+        let mut dec = Decoder::new();
+        let mut buf = vec![0u8; 1 << 17];
+        let mut got = Vec::new();
+        for piece in half.chunks(in_chunk) {
+            let (p, _) = dec.decode(piece, &mut buf).unwrap();
+            assert_eq!(p.consumed, piece.len());
+            got.extend_from_slice(&buf[..p.written]);
+        }
+        assert!(
+            !got.is_empty(),
+            "in_chunk {in_chunk}: no output from half a chunk"
+        );
+        assert!(plain.starts_with(&got));
+    }
+    // And the rest of the stream, fed in odd pieces, completes it.
+    assert_eq!(decode_chunked(&stream, 333, 1000).unwrap(), plain);
+}
+
+/// A stream cut inside a compressed chunk yields every byte the cut-off
+/// chunk's complete packets hold, then `UnexpectedEnd` — like `xz -d`,
+/// and checked against it when the tool is installed. It used to lose
+/// the whole chunk.
+#[test]
+fn truncated_chunk_yields_what_it_holds() {
+    fn decode_cut(cut: &[u8], out_chunk: usize) -> Vec<u8> {
+        let mut dec = Decoder::new();
+        let mut buf = vec![0u8; out_chunk];
+        let mut got = Vec::new();
+        let mut pos = 0;
+        while pos < cut.len() {
+            let (p, _) = dec.decode(&cut[pos..], &mut buf).unwrap();
+            got.extend_from_slice(&buf[..p.written]);
+            pos += p.consumed;
+        }
+        loop {
+            match dec.finish(&mut buf) {
+                Ok((p, status)) => {
+                    assert_ne!(status, Status::StreamEnd);
+                    got.extend_from_slice(&buf[..p.written]);
+                }
+                Err(e) => {
+                    assert_eq!(e, Error::UnexpectedEnd);
+                    return got;
+                }
+            }
+        }
+    }
+
+    let plain = mixed_corpus();
+    let stream = encode_all(&plain);
+    let (start, comp) = first_compressed_chunk(&stream);
+    for cut_len in [
+        start + 30,
+        start + comp / 2,
+        start + comp - 1,
+        stream.len() / 2,
+    ] {
+        let cut = &stream[..cut_len];
+        let got = decode_cut(cut, 1 << 20);
+        assert!(plain.starts_with(&got), "cut {cut_len}");
+        // More than the whole chunks before the cut (our encoder's chunks
+        // hold 64 KiB each).
+        assert!(
+            !got.len().is_multiple_of(65536),
+            "cut {cut_len}: {} bytes",
+            got.len()
+        );
+        for out_chunk in [1usize, 4096] {
+            assert!(
+                decode_cut(cut, out_chunk) == got,
+                "cut {cut_len}/{out_chunk}"
+            );
+        }
+        if let Ok(mut child) = Command::new("xz")
+            .args(["-dc"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            let data = cut.to_vec();
+            let writer = std::thread::spawn(move || stdin.write_all(&data));
+            let out = child.wait_with_output().unwrap();
+            let _ = writer.join().unwrap();
+            assert!(
+                out.stdout == got,
+                "cut {cut_len}: xz -d {} vs {}",
+                out.stdout.len(),
+                got.len()
+            );
+        }
+    }
+}
+
+/// A truncated stream still ends in `UnexpectedEnd`, but only after
+/// `finish` has handed over everything already decoded, whatever the
+/// buffer size. It used to fail on the first call, dropping the decoded
+/// bytes it had just written: up to a buffer's worth whenever the input
+/// stopped right after an LZMA2 chunk whose output was still pending.
+#[test]
+fn finish_drains_decoded_bytes_before_reporting_truncation() {
+    fn decode_truncated(cut: &[u8], out_chunk: usize) -> (Vec<u8>, Error) {
+        let mut dec = Decoder::new();
+        let mut buf = vec![0u8; out_chunk];
+        let mut got = Vec::new();
+        let mut pos = 0;
+        while pos < cut.len() {
+            let (p, _) = dec.decode(&cut[pos..], &mut buf).unwrap();
+            got.extend_from_slice(&buf[..p.written]);
+            pos += p.consumed;
+        }
+        let err = loop {
+            match dec.finish(&mut buf) {
+                Ok((p, status)) => {
+                    assert_ne!(status, Status::StreamEnd);
+                    assert!(p.written > 0, "finish stalled");
+                    got.extend_from_slice(&buf[..p.written]);
+                }
+                Err(e) => break e,
+            }
+        };
+        (got, err)
+    }
+
+    let plain: Vec<u8> = (0..300_000u32)
+        .map(|i| (i % 251) as u8 ^ (i >> 9) as u8)
+        .collect();
+    let stream = encode_all(&plain);
+    // Every cut in the tail: after the last chunk, the end marker, the
+    // Block Check, inside the Index and the Stream Footer.
+    for cut_len in stream.len() - 64..stream.len() {
+        let cut = &stream[..cut_len];
+        let (want, _) = decode_truncated(cut, 1 << 20);
+        assert!(plain.starts_with(&want));
+        for out_chunk in [1usize, 7, 4096] {
+            let (got, err) = decode_truncated(cut, out_chunk);
+            assert_eq!(err, Error::UnexpectedEnd);
+            assert!(
+                got == want,
+                "cut {cut_len}, out_chunk {out_chunk}: {} of {} bytes",
+                got.len(),
+                want.len()
+            );
         }
     }
 }

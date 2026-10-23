@@ -18,8 +18,8 @@
 //! - [`huffman`](self#canonical-huffman) — canonical Huffman code
 //!   construction (encoder) and prefix-code decode tables (decoder),
 //!   limited to 20 bits.
-//! - [`bwt`](self#burrowswheeler) — forward (naive O(n² log n) suffix
-//!   sort) and inverse (classic O(n) permutation walk) BWT.
+//! - [`bwt`](self#burrowswheeler) — forward (a port of libbzip2's
+//!   `BZ2_blockSort`) and inverse (classic O(n) permutation walk) BWT.
 //! - [`mtf`](self#move-to-front) — MTF over a reduced byte alphabet.
 //! - [`rle`](self#rle) — RLE-1 (raw-byte pre-pass, runs of 4+
 //!   compressed into 4 copies + count) and RLE-2 (post-MTF zero-run
@@ -28,12 +28,13 @@
 //!
 //! ## Round-trip status
 //!
-//! Both directions work on arbitrary input. The encoder is correctness
-//! first, not byte-for-byte compatible with reference `bzip2 -c`: it
-//! picks slightly different (still valid) selectors and table
-//! frequencies. Streams produced here decompress cleanly with system
-//! `bunzip2`, and our decoder accepts arbitrary system-`bzip2`-produced
-//! streams.
+//! Both directions work on arbitrary input. The encoder's output is
+//! byte-for-byte what libbzip2 produces for the same input and block
+//! size (`bzip2 -c -<level>`, or `BZ2_bzCompress` with `BZ_RUN` then
+//! `BZ_FINISH` at the default work factor): same block boundaries, same
+//! sort (and so the same origin for periodic blocks), same tables and
+//! selectors. [`Encoder::flush`](crate::Encoder::flush) behaves like
+//! `BZ_FLUSH`. Our decoder accepts arbitrary libbzip2-produced streams.
 //!
 //! ## Concatenated streams
 //!
@@ -44,6 +45,19 @@
 //! the reference tool does. Because another stream may still arrive,
 //! `decode` reports the end only once it sees such bytes; `finish`
 //! settles it otherwise.
+//!
+//! [`DecoderConfig::with_multi_stream(false)`](DecoderConfig::with_multi_stream)
+//! decodes a single stream instead, like `BZ2_bzDecompress`: `decode`
+//! reports `StreamEnd` right after the trailer and leaves the bytes after
+//! it unconsumed.
+//!
+//! ## Where the stream ends
+//!
+//! `decode` hands back the bytes of its `input` that it has not parsed
+//! when it returns because the stream ended or the output is full, so
+//! the bytes after a stream are never reported consumed by the call that
+//! reaches the end. While waiting for more input it keeps everything it
+//! was given.
 
 #![cfg_attr(docsrs, doc(cfg(feature = "bzip2")))]
 
@@ -64,7 +78,7 @@ mod rle;
 #[allow(unused_imports)]
 use _Error as _;
 
-pub use decoder::Decoder;
+pub use decoder::{Decoder, DecoderConfig};
 pub use encoder::{Encoder, EncoderConfig};
 
 /// Zero-sized marker type implementing [`Algorithm`] for bzip2.
@@ -76,12 +90,12 @@ impl Algorithm for Bzip2 {
     type Encoder = Encoder;
     type Decoder = Decoder;
     type EncoderConfig = EncoderConfig;
-    type DecoderConfig = ();
+    type DecoderConfig = DecoderConfig;
 
     fn encoder_with(c: Self::EncoderConfig) -> Encoder {
         Encoder::with_config(c)
     }
-    fn decoder_with(_: ()) -> Decoder {
-        Decoder::new()
+    fn decoder_with(c: DecoderConfig) -> Decoder {
+        Decoder::with_config(c)
     }
 }

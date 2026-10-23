@@ -2,36 +2,33 @@
 //!
 //! ## Forward
 //!
-//! We build the suffix array of `input` (sorted indices of all
-//! rotations of the string treated as cyclic), then the BWT column L is
-//! the byte immediately preceding each suffix in cyclic order:
+//! We sort all cyclic rotations of the block, then the BWT column L is
+//! the byte immediately preceding each rotation's start:
 //!
 //! ```text
-//! L[i] = input[(sa[i] - 1) mod n]
+//! L[i] = input[(ptr[i] - 1) mod n]
 //! ```
 //!
 //! The "origin" or "pointer" returned alongside is `pos` such that
-//! `sa[pos] == 0` — i.e. the row in the sorted matrix that corresponds
+//! `ptr[pos] == 0` — i.e. the row in the sorted matrix that corresponds
 //! to the original (unrotated) string. The decoder needs this to know
 //! where the original string sits in the reconstructed matrix.
 //!
-//! Cyclic-rotation sort is reduced to ordinary suffix sort over the
-//! **doubled** input `T + T` followed by a sentinel that is strictly
-//! smaller than any byte. Suffix `i` of `T+T+$` for `0 <= i < n` begins
-//! with the i-th cyclic rotation of `T` (the first `n` characters
-//! match exactly); for non-periodic `T` this means the suffix-sort
-//! order over those `n` positions equals the cyclic-rotation order.
-//! For periodic `T` two rotations may be equal, in which case any
-//! consistent tie-break produces a valid BWT (the L bytes are the same
-//! anyway). The sentinel ensures the SA-IS recursion has a strictly
-//! smallest character, and any entries `SA[i] >= n` are filtered out
-//! (they represent suffixes of the duplicated half).
+//! The sort is a faithful port of reference bzip2's `BZ2_blockSort`
+//! (`blocksort.c`, bzip2 1.0.8, © 1996-2019 Julian Seward, BSD-style
+//! licence): blocks under 10 000 bytes go to the exponential radix sort
+//! (`fallbackSort`); larger ones to the two-byte radix + three-way
+//! quicksort + bucket-synthesis `mainSort`, abandoned for `fallbackSort`
+//! once it exceeds a work budget of `nblock * 9` (work factor 30, the
+//! default of both the `bzip2` tool and `BZ2_bzBuffToBuffCompress`).
 //!
-//! The suffix array itself is built with **SA-IS** (Suffix Array by
-//! Induced Sorting; Nong, Zhang & Chan, IEEE TC 2009), a linear-time
-//! O(n) algorithm. The classification, induced-sort, and recursion on
-//! LMS substrings give us a single-digit-millisecond build on the
-//! 900 KB bzip2 block, replacing the previous Θ(n²·log n) naive sort.
+//! Porting the algorithm rather than using any other suffix sort is
+//! what makes the output byte-identical to libbzip2's. For a block
+//! whose rotations are all distinct every correct sort gives the same
+//! result, but a periodic block (`"ab"` repeated, a block of RLE-1'd
+//! zeros, ...) has groups of equal rotations, and *which* of them is
+//! reported as the origin depends on the exact sequence of partitions
+//! and insertion sorts. Any choice decodes, but only this one matches.
 //!
 //! ## Inverse
 //!
@@ -49,356 +46,764 @@ use alloc::vec::Vec;
 /// Returns `(L, origin)` where `L` is the BWT output (same length as
 /// `input`) and `origin` is the row index of the original (unrotated)
 /// string in the sorted rotation matrix.
-///
-/// Panics: never (no asserts under release builds; debug ones only).
 pub(crate) fn bwt_forward(input: &[u8]) -> (Vec<u8>, u32) {
     let n = input.len();
     if n == 0 {
         return (Vec::new(), 0);
     }
-
-    // Build suffix array of the **doubled** input `T + T + sentinel`.
-    // Bytes are encoded as values 1..=256 and the sentinel as 0 so the
-    // SA-IS routine can use an unsigned alphabet of size 257.
-    //
-    // n is bounded by ~9·100_000 for bzip2 (well within i32, even
-    // doubled).
-    let mut text: Vec<i32> = Vec::with_capacity(2 * n + 1);
-    for &b in input {
-        text.push(b as i32 + 1);
-    }
-    for &b in input {
-        text.push(b as i32 + 1);
-    }
-    text.push(0); // sentinel
-
-    let sa = sa_is(&text, 257);
-
-    debug_assert_eq!(sa.len(), 2 * n + 1);
-    debug_assert_eq!(sa[0] as usize, 2 * n); // sentinel-only suffix sorts first.
-
-    // Filter `sa` to entries `< n` (cyclic rotations of original `T`);
-    // the others are suffixes of the duplicated second half and are
-    // dominated by the corresponding rotation in the first half.
+    let ptr = block_sort(input);
     let mut l = Vec::with_capacity(n);
-    let mut origin: u32 = 0;
-    let mut out_i: u32 = 0;
-    for &s32 in sa.iter() {
-        let s = s32 as usize;
-        if s >= n {
-            continue;
+    let mut origin = 0u32;
+    for (i, &p) in ptr.iter().enumerate() {
+        let p = p as usize;
+        if p == 0 {
+            origin = i as u32;
+            l.push(input[n - 1]);
+        } else {
+            l.push(input[p - 1]);
         }
-        let prev = if s == 0 { n - 1 } else { s - 1 };
-        l.push(input[prev]);
-        if s == 0 {
-            origin = out_i;
-        }
-        out_i += 1;
     }
-    debug_assert_eq!(l.len(), n);
     (l, origin)
 }
 
-// ─── SA-IS suffix array construction ──────────────────────────────────
+// ─── BZ2_blockSort ───────────────────────────────────────────────────────
+//
+// Variable names, loop shapes and the order of every comparison and swap
+// follow the C source, since the order of equal rotations — and therefore
+// the origin of a periodic block — is a by-product of exactly those steps.
+// Indices are `i32` as in the C so the wrap-around arithmetic reads the
+// same.
 
-/// Build the suffix array of `text` over an integer alphabet whose
-/// largest symbol is `< alphabet_size`. The text MUST end with a unique
-/// sentinel symbol that is strictly smaller than every other symbol
-/// (we use 0; real bytes are shifted into 1..=256). The sentinel
-/// guarantees the last suffix is S-type and unique.
-///
-/// Returns an array of length `text.len()`, where `sa[i]` is the start
-/// index of the i-th smallest suffix.
-///
-/// Linear time, linear extra space. Pure safe Rust.
-fn sa_is(text: &[i32], alphabet_size: usize) -> Vec<i32> {
-    let n = text.len();
-    let mut sa = vec![-1i32; n];
-    sa_is_inner(text, &mut sa, alphabet_size);
-    sa
-}
+/// `BZ_N_RADIX + BZ_N_QSORT + BZ_N_SHELL + 2`: how far past the block end
+/// `mainGtU` may read (the block and quadrant arrays repeat their start
+/// there).
+const N_OVERSHOOT: usize = 2 + 12 + 18 + 2;
+const N_RADIX: i32 = 2;
+const N_QSORT: i32 = 12;
+/// libbzip2's default work factor (`bzip2 -9`, `BZ2_bzBuffToBuffCompress`
+/// with `workFactor = 0`).
+const WORK_FACTOR: i32 = 30;
 
-/// SA-IS core. Writes the suffix array into `sa` (length must equal
-/// `text.len()`; entries get overwritten).
-fn sa_is_inner(text: &[i32], sa: &mut [i32], alphabet_size: usize) {
-    let n = text.len();
-    debug_assert_eq!(sa.len(), n);
-
-    if n == 0 {
-        return;
-    }
-    if n == 1 {
-        sa[0] = 0;
-        return;
-    }
-    if n == 2 {
-        // Two suffixes; just compare.
-        if text[0] < text[1] {
-            sa[0] = 0;
-            sa[1] = 1;
-        } else {
-            sa[0] = 1;
-            sa[1] = 0;
-        }
-        return;
-    }
-
-    // 1. Classify each suffix as S-type or L-type. By convention the
-    //    last suffix (just the sentinel) is S-type. A suffix i is
-    //    S-type iff text[i] < text[i+1], or text[i] == text[i+1] and
-    //    suffix i+1 is S-type. Otherwise L-type.
-    //
-    //    `t[i] == true` ⇒ S-type.
-    //
-    //    While we classify, collect the LMS positions (left-to-right)
-    //    once so we don't have to rescan the type array later.
-    let mut t = vec![false; n];
-    t[n - 1] = true;
-    // An LMS position is an S-type whose left neighbour is L-type. We
-    // know `t[i+1]` as we walk right-to-left, so we can detect the LMS
-    // at `i+1` the moment we set `t[i]` (it is LMS iff t[i+1] && !t[i]).
-    let mut lms_positions: Vec<i32> = Vec::new();
-    for i in (0..n - 1).rev() {
-        let si = if text[i] < text[i + 1] {
-            true
-        } else if text[i] == text[i + 1] {
-            t[i + 1]
-        } else {
-            false
-        };
-        t[i] = si;
-        // i+1 is LMS iff it is S-type (t[i+1]) and i is L-type (!si).
-        if t[i + 1] && !si {
-            lms_positions.push((i + 1) as i32);
-        }
-    }
-    // We pushed LMS positions in descending order; reverse for ascending.
-    lms_positions.reverse();
-    let n1 = lms_positions.len();
-
-    // 2. Compute bucket sizes (count of each symbol in `text`).
-    //    `counts` holds the per-symbol counts; `bucket` is a reusable
-    //    scratch into which we materialise either bucket starts or ends.
-    let mut counts = vec![0i32; alphabet_size];
-    for &c in text {
-        counts[c as usize] += 1;
-    }
-    let mut bucket = vec![0i32; alphabet_size];
-
-    // 3. Step A: place LMS suffixes at the END of their buckets in `sa`.
-    sa.fill(-1);
-    fill_bucket_ends(&counts, &mut bucket);
-    for &p in &lms_positions {
-        let c = text[p as usize] as usize;
-        bucket[c] -= 1;
-        sa[bucket[c] as usize] = p;
-    }
-
-    // 4. Induced sort of L-suffixes (left-to-right pass).
-    induce_sort_l(text, sa, &t, &counts, &mut bucket);
-
-    // 5. Induced sort of S-suffixes (right-to-left pass).
-    induce_sort_s(text, sa, &t, &counts, &mut bucket);
-
-    // 6. Compact LMS suffixes to the front of SA (preserving the order
-    //    we just induced) and name them by their LMS-substring identity.
-    let mut j1 = 0usize;
-    for i in 0..n {
-        if sa[i] >= 0 && is_lms(&t, sa[i] as usize) {
-            sa[j1] = sa[i];
-            j1 += 1;
-        }
-    }
-    debug_assert_eq!(j1, n1);
-    // Clear the rest as a workspace for naming.
-    for slot in sa.iter_mut().take(n).skip(n1) {
-        *slot = -1;
-    }
-
-    // Name LMS substrings.
-    let mut name: i32 = 0;
-    let mut prev: i32 = -1;
-    for i in 0..n1 {
-        let pos = sa[i] as usize;
-        let mut diff = false;
-        if prev == -1 {
-            diff = true;
-        } else {
-            let p = prev as usize;
-            // Compare LMS substrings starting at `pos` and `p`.
-            let mut d = 0usize;
-            loop {
-                if pos + d >= n || p + d >= n {
-                    diff = true;
-                    break;
-                }
-                if text[pos + d] != text[p + d] || t[pos + d] != t[p + d] {
-                    diff = true;
-                    break;
-                }
-                if d > 0 && (is_lms(&t, pos + d) || is_lms(&t, p + d)) {
-                    // Reached the next LMS; substrings agreed.
-                    if is_lms(&t, pos + d) != is_lms(&t, p + d) {
-                        diff = true;
-                    }
-                    break;
-                }
-                d += 1;
-            }
-        }
-        if diff {
-            name += 1;
-            prev = pos as i32;
-        }
-        // Store name at position pos/2 in the back half.
-        sa[n1 + pos / 2] = name - 1;
-    }
-    // Compact names into the back half (which had -1 in unused slots).
-    let mut j = n - 1;
-    for i in (n1..n).rev() {
-        if sa[i] >= 0 {
-            sa[j] = sa[i];
-            j -= 1;
-        }
-    }
-    // Now sa[n - n1..n] holds the reduced text of length n1.
-
-    // 7. Solve the reduced problem.
-    let new_alpha = (name as usize) + 1;
-    let (sa1_area, t1_area) = sa.split_at_mut(n - n1);
-    // sa1_area is sa[..n - n1]; t1_area is sa[n - n1..] = reduced text.
-    if (name as usize) == n1 {
-        // All names distinct ⇒ SA is directly computable from names.
-        for (i, &name_of_pos) in t1_area.iter().enumerate() {
-            sa1_area[name_of_pos as usize] = i as i32;
-        }
+/// Sort the rotations of `block`, returning the start of each in
+/// ascending order (libbzip2's `ptr`).
+fn block_sort(block: &[u8]) -> Vec<u32> {
+    let nblock = block.len();
+    let mut ptr = vec![0u32; nblock];
+    if nblock < 10000 {
+        fallback_sort(&mut ptr, block);
     } else {
-        // Recurse on the reduced text in place, with no copy. The
-        // reduced text occupies the trailing n1 cells (t1_area[..n1])
-        // and the sub-suffix-array is written into the leading n1 cells
-        // (sa1_area[..n1]). These come from the two disjoint halves of
-        // `split_at_mut`, so we can hold an immutable borrow of the text
-        // and a mutable borrow of the output simultaneously. They are
-        // guaranteed non-overlapping because n1 <= n/2 (no two adjacent
-        // positions are both LMS), hence n1 <= n - n1.
-        let reduced_text: &[i32] = &t1_area[..n1];
-        let sa1 = &mut sa1_area[..n1];
-        sa_is_inner(reduced_text, sa1, new_alpha);
-    }
-
-    // 8. Recover positions of LMS suffixes in the original text using
-    //    the `lms_positions` list (in left-to-right order) we collected
-    //    during classification. sa1[i] is the rank/index in that list.
-    //    Translate the sorted LMS order (currently in sa[..n1]) into
-    //    original positions, in place.
-    for slot in sa.iter_mut().take(n1) {
-        let idx = *slot as usize; // recursive SA gave us the LMS index in left-to-right order.
-        *slot = lms_positions[idx];
-    }
-    // Clear the rest.
-    for slot in sa.iter_mut().take(n).skip(n1) {
-        *slot = -1;
-    }
-
-    // 9. Place sorted LMS suffixes at the ENDS of their buckets in SA,
-    //    in the order produced by the recursive call.
-    //
-    //    The sorted LMS positions sit in sa[..n1]. We scatter them to
-    //    bucket ends going right-to-left. Because scattering reads from
-    //    the front of `sa` while writing toward bucket ends (which are
-    //    at indices >= the read cursor for every symbol except possibly
-    //    the sentinel — and the sentinel bucket holds exactly the single
-    //    n-1 suffix that is never LMS), a destructive in-place scatter
-    //    could clobber a not-yet-read entry. To stay safe and simple we
-    //    snapshot the n1 sorted positions, clear `sa`, then scatter.
-    let mut lms_sorted: Vec<i32> = Vec::with_capacity(n1);
-    lms_sorted.extend_from_slice(&sa[..n1]);
-    for slot in sa.iter_mut().take(n) {
-        *slot = -1;
-    }
-    fill_bucket_ends(&counts, &mut bucket);
-    for &pos in lms_sorted.iter().rev() {
-        let c = text[pos as usize] as usize;
-        bucket[c] -= 1;
-        sa[bucket[c] as usize] = pos;
-    }
-
-    // 10. Final induced sorts: L then S.
-    induce_sort_l(text, sa, &t, &counts, &mut bucket);
-    induce_sort_s(text, sa, &t, &counts, &mut bucket);
-}
-
-/// `true` iff suffix `i` is S-type AND suffix `i-1` is L-type (left-
-/// most S in a run). Suffix 0 is never an LMS in our convention.
-#[inline(always)]
-fn is_lms(t: &[bool], i: usize) -> bool {
-    i > 0 && t[i] && !t[i - 1]
-}
-
-/// Materialise the *start* index of each bucket (exclusive prefix sum
-/// of `counts`) into the reusable scratch `out`.
-#[inline]
-fn fill_bucket_starts(counts: &[i32], out: &mut [i32]) {
-    let mut acc = 0i32;
-    for (o, &c) in out.iter_mut().zip(counts.iter()) {
-        *o = acc;
-        acc += c;
-    }
-}
-
-/// Materialise the *end* (one-past-last) index of each bucket
-/// (inclusive prefix sum of `counts`) into the reusable scratch `out`.
-#[inline]
-fn fill_bucket_ends(counts: &[i32], out: &mut [i32]) {
-    let mut acc = 0i32;
-    for (o, &c) in out.iter_mut().zip(counts.iter()) {
-        acc += c;
-        *o = acc;
-    }
-}
-
-/// Induced sort of L-type suffixes. Scans `sa` left-to-right; for each
-/// non-negative entry `sa[i] = j`, if `j > 0` and suffix `j-1` is
-/// L-type, place `j-1` at the next free slot at the START of bucket
-/// `text[j-1]`. `bucket` is reusable scratch of length `alphabet_size`.
-fn induce_sort_l(text: &[i32], sa: &mut [i32], t: &[bool], counts: &[i32], bucket: &mut [i32]) {
-    let n = text.len();
-    fill_bucket_starts(counts, bucket);
-    for i in 0..n {
-        let v = sa[i];
-        if v <= 0 {
-            continue; // -1 or 0 — we handle 0 by not predecessing.
-        }
-        let j = (v as usize) - 1;
-        if !t[j] {
-            // L-type.
-            let c = text[j] as usize;
-            let slot = bucket[c];
-            sa[slot as usize] = j as i32;
-            bucket[c] = slot + 1;
+        let mut blk = Vec::with_capacity(nblock + N_OVERSHOOT);
+        blk.extend_from_slice(block);
+        blk.resize(nblock + N_OVERSHOOT, 0);
+        let mut quadrant = vec![0u16; nblock + N_OVERSHOOT];
+        let mut budget = nblock as i32 * ((WORK_FACTOR - 1) / 3);
+        main_sort(
+            &mut ptr,
+            &mut blk,
+            &mut quadrant,
+            nblock as i32,
+            &mut budget,
+        );
+        if budget < 0 {
+            fallback_sort(&mut ptr, block);
         }
     }
+    ptr
 }
 
-/// Induced sort of S-type suffixes. Scans `sa` right-to-left; for each
-/// non-negative entry `sa[i] = j`, if `j > 0` and suffix `j-1` is
-/// S-type, place `j-1` at the next free slot at the END of bucket
-/// `text[j-1]`. `bucket` is reusable scratch of length `alphabet_size`.
-fn induce_sort_s(text: &[i32], sa: &mut [i32], t: &[bool], counts: &[i32], bucket: &mut [i32]) {
-    let n = text.len();
-    fill_bucket_ends(counts, bucket);
-    for i in (0..n).rev() {
-        let v = sa[i];
-        if v <= 0 {
+// ─── fallbackSort: O(N log(N)^2), for repetitive blocks ─────────────────
+
+fn fallback_simple_sort(fmap: &mut [u32], eclass: &[u32], lo: i32, hi: i32) {
+    if lo == hi {
+        return;
+    }
+    if hi - lo > 3 {
+        let mut i = hi - 4;
+        while i >= lo {
+            let tmp = fmap[i as usize];
+            let ec_tmp = eclass[tmp as usize];
+            let mut j = i + 4;
+            while j <= hi && ec_tmp > eclass[fmap[j as usize] as usize] {
+                fmap[(j - 4) as usize] = fmap[j as usize];
+                j += 4;
+            }
+            fmap[(j - 4) as usize] = tmp;
+            i -= 1;
+        }
+    }
+    let mut i = hi - 1;
+    while i >= lo {
+        let tmp = fmap[i as usize];
+        let ec_tmp = eclass[tmp as usize];
+        let mut j = i + 1;
+        while j <= hi && ec_tmp > eclass[fmap[j as usize] as usize] {
+            fmap[(j - 1) as usize] = fmap[j as usize];
+            j += 1;
+        }
+        fmap[(j - 1) as usize] = tmp;
+        i -= 1;
+    }
+}
+
+const FALLBACK_QSORT_SMALL_THRESH: i32 = 10;
+const FALLBACK_QSORT_STACK_SIZE: usize = 100;
+
+fn fvswap(fmap: &mut [u32], mut p1: i32, mut p2: i32, mut n: i32) {
+    while n > 0 {
+        fmap.swap(p1 as usize, p2 as usize);
+        p1 += 1;
+        p2 += 1;
+        n -= 1;
+    }
+}
+
+fn fallback_qsort3(fmap: &mut [u32], eclass: &[u32], lo_st: i32, hi_st: i32) {
+    let mut stack_lo = [0i32; FALLBACK_QSORT_STACK_SIZE];
+    let mut stack_hi = [0i32; FALLBACK_QSORT_STACK_SIZE];
+    let mut r: u32 = 0;
+    let mut sp = 0usize;
+    stack_lo[sp] = lo_st;
+    stack_hi[sp] = hi_st;
+    sp += 1;
+
+    while sp > 0 {
+        sp -= 1;
+        let lo = stack_lo[sp];
+        let hi = stack_hi[sp];
+        if hi - lo < FALLBACK_QSORT_SMALL_THRESH {
+            fallback_simple_sort(fmap, eclass, lo, hi);
             continue;
         }
-        let j = (v as usize) - 1;
-        if t[j] {
-            // S-type.
-            let c = text[j] as usize;
-            let slot = bucket[c] - 1;
-            bucket[c] = slot;
-            sa[slot as usize] = j as i32;
+
+        // Random partitioning (Sedgewick's constants, as in the C).
+        r = (r * 7621 + 1) % 32768;
+        let med = match r % 3 {
+            0 => eclass[fmap[lo as usize] as usize],
+            1 => eclass[fmap[((lo + hi) >> 1) as usize] as usize],
+            _ => eclass[fmap[hi as usize] as usize],
+        };
+
+        let (mut un_lo, mut lt_lo) = (lo, lo);
+        let (mut un_hi, mut gt_hi) = (hi, hi);
+        loop {
+            while un_lo <= un_hi {
+                let e = eclass[fmap[un_lo as usize] as usize];
+                if e == med {
+                    fmap.swap(un_lo as usize, lt_lo as usize);
+                    lt_lo += 1;
+                    un_lo += 1;
+                    continue;
+                }
+                if e > med {
+                    break;
+                }
+                un_lo += 1;
+            }
+            while un_lo <= un_hi {
+                let e = eclass[fmap[un_hi as usize] as usize];
+                if e == med {
+                    fmap.swap(un_hi as usize, gt_hi as usize);
+                    gt_hi -= 1;
+                    un_hi -= 1;
+                    continue;
+                }
+                if e < med {
+                    break;
+                }
+                un_hi -= 1;
+            }
+            if un_lo > un_hi {
+                break;
+            }
+            fmap.swap(un_lo as usize, un_hi as usize);
+            un_lo += 1;
+            un_hi -= 1;
+        }
+
+        if gt_hi < lt_lo {
+            continue;
+        }
+
+        let n = (lt_lo - lo).min(un_lo - lt_lo);
+        fvswap(fmap, lo, un_lo - n, n);
+        let m = (hi - gt_hi).min(gt_hi - un_hi);
+        fvswap(fmap, un_lo, hi - m + 1, m);
+
+        let n = lo + un_lo - lt_lo - 1;
+        let m = hi - (gt_hi - un_hi) + 1;
+
+        if n - lo > hi - m {
+            stack_lo[sp] = lo;
+            stack_hi[sp] = n;
+            sp += 1;
+            stack_lo[sp] = m;
+            stack_hi[sp] = hi;
+            sp += 1;
+        } else {
+            stack_lo[sp] = m;
+            stack_hi[sp] = hi;
+            sp += 1;
+            stack_lo[sp] = lo;
+            stack_hi[sp] = n;
+            sp += 1;
+        }
+    }
+}
+
+#[inline(always)]
+fn set_bh(bhtab: &mut [u32], z: i32) {
+    bhtab[(z >> 5) as usize] |= 1 << (z & 31);
+}
+#[inline(always)]
+fn clear_bh(bhtab: &mut [u32], z: i32) {
+    bhtab[(z >> 5) as usize] &= !(1 << (z & 31));
+}
+#[inline(always)]
+fn isset_bh(bhtab: &[u32], z: i32) -> bool {
+    bhtab[(z >> 5) as usize] & (1 << (z & 31)) != 0
+}
+#[inline(always)]
+fn word_bh(bhtab: &[u32], z: i32) -> u32 {
+    bhtab[(z >> 5) as usize]
+}
+#[inline(always)]
+fn unaligned_bh(z: i32) -> bool {
+    z & 0x1f != 0
+}
+
+/// libbzip2's `fallbackSort`. The C version keeps the equivalence
+/// classes in the block's own storage and rebuilds the block afterwards;
+/// here they get their own array.
+fn fallback_sort(fmap: &mut [u32], block: &[u8]) {
+    let nblock = block.len() as i32;
+    let mut ftab = [0i32; 257];
+    let mut eclass = vec![0u32; block.len()];
+    // Sentinel bits reach bit nblock + 63.
+    let mut bhtab = vec![0u32; block.len() / 32 + 4];
+
+    // Initial 1-char radix sort to generate the initial fmap and BH bits.
+    for &b in block {
+        ftab[b as usize] += 1;
+    }
+    for i in 1..257 {
+        ftab[i] += ftab[i - 1];
+    }
+    for (i, &b) in block.iter().enumerate() {
+        let k = ftab[b as usize] - 1;
+        ftab[b as usize] = k;
+        fmap[k as usize] = i as u32;
+    }
+    for &f in &ftab[..256] {
+        set_bh(&mut bhtab, f);
+    }
+
+    // Sentinel bits for block-end detection.
+    for i in 0..32 {
+        set_bh(&mut bhtab, nblock + 2 * i);
+        clear_bh(&mut bhtab, nblock + 2 * i + 1);
+    }
+
+    // The log(N) loop: Manber-Myers-style bucket refinement.
+    let mut h: i32 = 1;
+    loop {
+        let mut j = 0;
+        for i in 0..nblock {
+            if isset_bh(&bhtab, i) {
+                j = i;
+            }
+            let mut k = fmap[i as usize] as i32 - h;
+            if k < 0 {
+                k += nblock;
+            }
+            eclass[k as usize] = j as u32;
+        }
+
+        let mut n_not_done = 0;
+        let mut r: i32 = -1;
+        loop {
+            // Find the next non-singleton bucket.
+            let mut k = r + 1;
+            while isset_bh(&bhtab, k) && unaligned_bh(k) {
+                k += 1;
+            }
+            if isset_bh(&bhtab, k) {
+                while word_bh(&bhtab, k) == 0xffff_ffff {
+                    k += 32;
+                }
+                while isset_bh(&bhtab, k) {
+                    k += 1;
+                }
+            }
+            let l = k - 1;
+            if l >= nblock {
+                break;
+            }
+            while !isset_bh(&bhtab, k) && unaligned_bh(k) {
+                k += 1;
+            }
+            if !isset_bh(&bhtab, k) {
+                while word_bh(&bhtab, k) == 0 {
+                    k += 32;
+                }
+                while !isset_bh(&bhtab, k) {
+                    k += 1;
+                }
+            }
+            r = k - 1;
+            if r >= nblock {
+                break;
+            }
+
+            // [l, r] bracket the current bucket.
+            if r > l {
+                n_not_done += r - l + 1;
+                fallback_qsort3(fmap, &eclass, l, r);
+
+                // Scan the bucket and generate header bits.
+                let mut cc: i64 = -1;
+                for i in l..=r {
+                    let cc1 = eclass[fmap[i as usize] as usize] as i64;
+                    if cc != cc1 {
+                        set_bh(&mut bhtab, i);
+                        cc = cc1;
+                    }
+                }
+            }
+        }
+
+        h *= 2;
+        if h > nblock || n_not_done == 0 {
+            break;
+        }
+    }
+}
+
+// ─── mainSort: two-byte radix + three-way quicksort, for normal blocks ──
+
+/// Is the rotation at `i1` greater than the one at `i2`? Compares
+/// block bytes (and, past the first 12, the quadrant cache) and charges
+/// the budget one unit per 8 positions, giving up — "equal" — after a
+/// full cycle.
+#[inline]
+fn main_gtu(
+    mut i1: u32,
+    mut i2: u32,
+    block: &[u8],
+    quadrant: &[u16],
+    nblock: u32,
+    budget: &mut i32,
+) -> bool {
+    // Fixed-length windows: one bounds check per stretch rather than
+    // one per byte (the overshoot area guarantees they fit).
+    let b1: &[u8; 12] = block[i1 as usize..][..12].try_into().unwrap();
+    let b2: &[u8; 12] = block[i2 as usize..][..12].try_into().unwrap();
+    for (&c1, &c2) in b1.iter().zip(b2) {
+        if c1 != c2 {
+            return c1 > c2;
+        }
+    }
+    i1 += 12;
+    i2 += 12;
+
+    let mut k = nblock as i32 + 8;
+    loop {
+        let b1: &[u8; 8] = block[i1 as usize..][..8].try_into().unwrap();
+        let b2: &[u8; 8] = block[i2 as usize..][..8].try_into().unwrap();
+        let q1: &[u16; 8] = quadrant[i1 as usize..][..8].try_into().unwrap();
+        let q2: &[u16; 8] = quadrant[i2 as usize..][..8].try_into().unwrap();
+        for t in 0..8 {
+            if b1[t] != b2[t] {
+                return b1[t] > b2[t];
+            }
+            if q1[t] != q2[t] {
+                return q1[t] > q2[t];
+            }
+        }
+        i1 += 8;
+        i2 += 8;
+        if i1 >= nblock {
+            i1 -= nblock;
+        }
+        if i2 >= nblock {
+            i2 -= nblock;
+        }
+        k -= 8;
+        *budget -= 1;
+        if k < 0 {
+            return false;
+        }
+    }
+}
+
+/// Knuth's increments, as in the C.
+const INCS: [i32; 14] = [
+    1, 4, 13, 40, 121, 364, 1093, 3280, 9841, 29524, 88573, 265720, 797161, 2391484,
+];
+
+#[allow(clippy::too_many_arguments)]
+fn main_simple_sort(
+    ptr: &mut [u32],
+    block: &[u8],
+    quadrant: &[u16],
+    nblock: i32,
+    lo: i32,
+    hi: i32,
+    d: i32,
+    budget: &mut i32,
+) {
+    let big_n = hi - lo + 1;
+    if big_n < 2 {
+        return;
+    }
+    let mut hp = 0usize;
+    while INCS[hp] < big_n {
+        hp += 1;
+    }
+
+    // `for (hp--; hp >= 0; hp--)`
+    while hp > 0 {
+        hp -= 1;
+        let h = INCS[hp];
+        let mut i = lo + h;
+        loop {
+            // The C unrolls this body three times and checks the budget
+            // after each group of three; keep that cadence, since an
+            // abandoned sort leaves `ptr` in whatever state it reached.
+            let mut ran_out = false;
+            for _ in 0..3 {
+                if i > hi {
+                    ran_out = true;
+                    break;
+                }
+                let v = ptr[i as usize];
+                let mut j = i;
+                while main_gtu(
+                    ptr[(j - h) as usize] + d as u32,
+                    v + d as u32,
+                    block,
+                    quadrant,
+                    nblock as u32,
+                    budget,
+                ) {
+                    ptr[j as usize] = ptr[(j - h) as usize];
+                    j -= h;
+                    if j < lo + h {
+                        break;
+                    }
+                }
+                ptr[j as usize] = v;
+                i += 1;
+            }
+            if ran_out {
+                break;
+            }
+            if *budget < 0 {
+                return;
+            }
+        }
+    }
+}
+
+#[inline]
+fn mmed3(mut a: u8, mut b: u8, c: u8) -> u8 {
+    if a > b {
+        core::mem::swap(&mut a, &mut b);
+    }
+    if b > c {
+        b = c;
+        if a > b {
+            b = a;
+        }
+    }
+    b
+}
+
+fn mvswap(ptr: &mut [u32], mut p1: i32, mut p2: i32, mut n: i32) {
+    while n > 0 {
+        ptr.swap(p1 as usize, p2 as usize);
+        p1 += 1;
+        p2 += 1;
+        n -= 1;
+    }
+}
+
+const MAIN_QSORT_SMALL_THRESH: i32 = 20;
+const MAIN_QSORT_DEPTH_THRESH: i32 = N_RADIX + N_QSORT;
+const MAIN_QSORT_STACK_SIZE: usize = 100;
+
+#[allow(clippy::too_many_arguments)]
+fn main_qsort3(
+    ptr: &mut [u32],
+    block: &[u8],
+    quadrant: &[u16],
+    nblock: i32,
+    lo_st: i32,
+    hi_st: i32,
+    d_st: i32,
+    budget: &mut i32,
+) {
+    let mut stack_lo = [0i32; MAIN_QSORT_STACK_SIZE];
+    let mut stack_hi = [0i32; MAIN_QSORT_STACK_SIZE];
+    let mut stack_d = [0i32; MAIN_QSORT_STACK_SIZE];
+    let mut sp = 0usize;
+    stack_lo[sp] = lo_st;
+    stack_hi[sp] = hi_st;
+    stack_d[sp] = d_st;
+    sp += 1;
+
+    while sp > 0 {
+        sp -= 1;
+        let lo = stack_lo[sp];
+        let hi = stack_hi[sp];
+        let d = stack_d[sp];
+        if hi - lo < MAIN_QSORT_SMALL_THRESH || d > MAIN_QSORT_DEPTH_THRESH {
+            main_simple_sort(ptr, block, quadrant, nblock, lo, hi, d, budget);
+            if *budget < 0 {
+                return;
+            }
+            continue;
+        }
+
+        let at = |p: u32| block[(p as i32 + d) as usize];
+        let med = mmed3(
+            at(ptr[lo as usize]),
+            at(ptr[hi as usize]),
+            at(ptr[((lo + hi) >> 1) as usize]),
+        ) as i32;
+
+        let (mut un_lo, mut lt_lo) = (lo, lo);
+        let (mut un_hi, mut gt_hi) = (hi, hi);
+        loop {
+            while un_lo <= un_hi {
+                let n = at(ptr[un_lo as usize]) as i32 - med;
+                if n == 0 {
+                    ptr.swap(un_lo as usize, lt_lo as usize);
+                    lt_lo += 1;
+                    un_lo += 1;
+                    continue;
+                }
+                if n > 0 {
+                    break;
+                }
+                un_lo += 1;
+            }
+            while un_lo <= un_hi {
+                let n = at(ptr[un_hi as usize]) as i32 - med;
+                if n == 0 {
+                    ptr.swap(un_hi as usize, gt_hi as usize);
+                    gt_hi -= 1;
+                    un_hi -= 1;
+                    continue;
+                }
+                if n < 0 {
+                    break;
+                }
+                un_hi -= 1;
+            }
+            if un_lo > un_hi {
+                break;
+            }
+            ptr.swap(un_lo as usize, un_hi as usize);
+            un_lo += 1;
+            un_hi -= 1;
+        }
+
+        if gt_hi < lt_lo {
+            stack_lo[sp] = lo;
+            stack_hi[sp] = hi;
+            stack_d[sp] = d + 1;
+            sp += 1;
+            continue;
+        }
+
+        let n = (lt_lo - lo).min(un_lo - lt_lo);
+        mvswap(ptr, lo, un_lo - n, n);
+        let m = (hi - gt_hi).min(gt_hi - un_hi);
+        mvswap(ptr, un_lo, hi - m + 1, m);
+
+        let n = lo + un_lo - lt_lo - 1;
+        let m = hi - (gt_hi - un_hi) + 1;
+
+        let mut next = [(lo, n, d), (m, hi, d), (n + 1, m - 1, d + 1)];
+        let size = |t: (i32, i32, i32)| t.1 - t.0;
+        if size(next[0]) < size(next[1]) {
+            next.swap(0, 1);
+        }
+        if size(next[1]) < size(next[2]) {
+            next.swap(1, 2);
+        }
+        if size(next[0]) < size(next[1]) {
+            next.swap(0, 1);
+        }
+        for (l, h, dd) in next {
+            stack_lo[sp] = l;
+            stack_hi[sp] = h;
+            stack_d[sp] = dd;
+            sp += 1;
+        }
+    }
+}
+
+const SETMASK: u32 = 1 << 21;
+const CLEARMASK: u32 = !SETMASK;
+
+/// libbzip2's `mainSort`. `block` and `quadrant` are `nblock +
+/// N_OVERSHOOT` long. On return with `*budget < 0` the sort was
+/// abandoned and `ptr` is garbage.
+fn main_sort(
+    ptr: &mut [u32],
+    block: &mut [u8],
+    quadrant: &mut [u16],
+    nblock: i32,
+    budget: &mut i32,
+) {
+    let n = nblock as usize;
+    let mut ftab = vec![0u32; 65537];
+
+    // Set up the 2-byte frequency table.
+    let mut j: u32 = (block[0] as u32) << 8;
+    for i in (0..n).rev() {
+        quadrant[i] = 0;
+        j = (j >> 8) | ((block[i] as u32) << 8);
+        ftab[j as usize] += 1;
+    }
+    for i in 0..N_OVERSHOOT {
+        block[n + i] = block[i];
+        quadrant[n + i] = 0;
+    }
+
+    // Complete the initial radix sort.
+    for i in 1..=65536 {
+        ftab[i] += ftab[i - 1];
+    }
+    let mut s: u16 = (block[0] as u16) << 8;
+    for i in (0..n).rev() {
+        s = (s >> 8) | ((block[i] as u16) << 8);
+        let j = ftab[s as usize] - 1;
+        ftab[s as usize] = j;
+        ptr[j as usize] = i as u32;
+    }
+
+    // ftab now holds the first slot of every small bucket. Order the big
+    // buckets from smallest to largest (a Shell sort, as in the C).
+    let bigfreq = |ftab: &[u32], b: i32| ftab[((b + 1) << 8) as usize] - ftab[(b << 8) as usize];
+    let mut big_done = [false; 256];
+    let mut running_order = [0i32; 256];
+    for (i, r) in running_order.iter_mut().enumerate() {
+        *r = i as i32;
+    }
+    {
+        let mut h: i32 = 1;
+        loop {
+            h = 3 * h + 1;
+            if h > 256 {
+                break;
+            }
+        }
+        loop {
+            h /= 3;
+            for i in h..=255 {
+                let vv = running_order[i as usize];
+                let mut j = i;
+                while bigfreq(&ftab, running_order[(j - h) as usize]) > bigfreq(&ftab, vv) {
+                    running_order[j as usize] = running_order[(j - h) as usize];
+                    j -= h;
+                    if j < h {
+                        break;
+                    }
+                }
+                running_order[j as usize] = vv;
+            }
+            if h == 1 {
+                break;
+            }
+        }
+    }
+
+    let mut copy_start = [0i32; 256];
+    let mut copy_end = [0i32; 256];
+
+    for (i, &ss) in running_order.iter().enumerate() {
+        let ss = ss as usize;
+
+        // Step 1: complete the big bucket [ss] by quicksorting any small
+        // bucket [ss, j] not already synthesised by an earlier step 2.
+        for j in 0..=255usize {
+            if j != ss {
+                let sb = (ss << 8) + j;
+                if ftab[sb] & SETMASK == 0 {
+                    let lo = (ftab[sb] & CLEARMASK) as i32;
+                    let hi = (ftab[sb + 1] & CLEARMASK) as i32 - 1;
+                    if hi > lo {
+                        main_qsort3(ptr, block, quadrant, nblock, lo, hi, N_RADIX, budget);
+                        if *budget < 0 {
+                            return;
+                        }
+                    }
+                }
+                ftab[sb] |= SETMASK;
+            }
+        }
+
+        // Step 2: scan big bucket [ss] to synthesise the sorted order of
+        // the small buckets [t, ss] for all t, including [ss, ss].
+        for j in 0..=255usize {
+            copy_start[j] = (ftab[(j << 8) + ss] & CLEARMASK) as i32;
+            copy_end[j] = (ftab[(j << 8) + ss + 1] & CLEARMASK) as i32 - 1;
+        }
+        let mut j = (ftab[ss << 8] & CLEARMASK) as i32;
+        while j < copy_start[ss] {
+            let mut k = ptr[j as usize] as i32 - 1;
+            if k < 0 {
+                k += nblock;
+            }
+            let c1 = block[k as usize] as usize;
+            if !big_done[c1] {
+                ptr[copy_start[c1] as usize] = k as u32;
+                copy_start[c1] += 1;
+            }
+            j += 1;
+        }
+        let mut j = (ftab[(ss + 1) << 8] & CLEARMASK) as i32 - 1;
+        while j > copy_end[ss] {
+            let mut k = ptr[j as usize] as i32 - 1;
+            if k < 0 {
+                k += nblock;
+            }
+            let c1 = block[k as usize] as usize;
+            if !big_done[c1] {
+                ptr[copy_end[c1] as usize] = k as u32;
+                copy_end[c1] -= 1;
+            }
+            j -= 1;
+        }
+        debug_assert!(
+            copy_start[ss] - 1 == copy_end[ss]
+                || (copy_start[ss] == 0 && copy_end[ss] == nblock - 1)
+        );
+        for j in 0..=255usize {
+            ftab[(j << 8) + ss] |= SETMASK;
+        }
+
+        // Step 3: record the bucket as done and cache its order in the
+        // quadrant array (overshoot area included) so later comparisons
+        // finish sooner. Pointless after the last bucket.
+        big_done[ss] = true;
+        if i < 255 {
+            let bb_start = (ftab[ss << 8] & CLEARMASK) as i32;
+            let bb_size = (ftab[(ss + 1) << 8] & CLEARMASK) as i32 - bb_start;
+            let mut shifts = 0;
+            while (bb_size >> shifts) > 65534 {
+                shifts += 1;
+            }
+            for j in (0..bb_size).rev() {
+                let a2update = ptr[(bb_start + j) as usize] as usize;
+                let q_val = (j >> shifts) as u16;
+                quadrant[a2update] = q_val;
+                if a2update < N_OVERSHOOT {
+                    quadrant[a2update + n] = q_val;
+                }
+            }
         }
     }
 }
@@ -608,7 +1013,7 @@ sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
 
     #[test]
     fn matches_naive_on_small_inputs() {
-        // Cross-check SA-IS output against a naive cyclic sort for
+        // Cross-check the block sort against a naive cyclic sort for
         // several small inputs.
         fn naive(input: &[u8]) -> (Vec<u8>, u32) {
             let n = input.len();

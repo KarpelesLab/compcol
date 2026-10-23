@@ -78,8 +78,16 @@ const BLOCK_SIZE: usize = 128 * 1024;
 /// Tunables for the Zstandard encoder.
 ///
 /// `level` controls the speed/ratio trade-off, following Zstandard's own
-/// 1..=22 range with a default of `3`:
+/// [`MIN_LEVEL`]`..=`[`MAX_LEVEL`] range (`-131072..=22`) with a default of
+/// [`DEFAULT_LEVEL`] (`3`):
 ///
+/// - Negative levels are libzstd's "fast" levels (`zstd --fast=N` is level
+///   `-N`). They use level 1's match-finder settings plus an *acceleration*
+///   of `-level`: after a miss the parser skips ahead by a stride that grows
+///   with the acceleration and with the length of the current literal run,
+///   so the more negative the level, the faster the encoder gets through
+///   poorly-compressible input and the lower the ratio.
+/// - `0` means "default" (level 3), as in libzstd.
 /// - Levels 1..=3 use a small chain budget and short "nice match" cutoff for
 ///   maximum throughput (zstd's `fast`/`dfast` strategies, approximated).
 /// - Levels 4..=9 grow the chain budget and nice cutoff to find better
@@ -91,17 +99,30 @@ const BLOCK_SIZE: usize = 128 * 1024;
 ///   the reference encoder's at those levels — but the size relation
 ///   `level=9 ≤ level=1` continues to hold.
 ///
-/// Values outside `1..=22` are clamped at encoder construction time rather
+/// Values outside the range are clamped at encoder construction time rather
 /// than rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncoderConfig {
-    /// Compression level in `1..=22`. Defaults to `3`.
-    pub level: u8,
+    /// Compression level in [`MIN_LEVEL`]`..=`[`MAX_LEVEL`]
+    /// (`-131072..=22`); `0` selects [`DEFAULT_LEVEL`]. Defaults to `3`.
+    /// Signed, like libzstd's `int compressionLevel`, so the negative "fast"
+    /// levels are expressible.
+    pub level: i32,
 }
+
+/// Lowest accepted level, libzstd's `ZSTD_minCLevel()` (`-(1 << 17)`).
+pub const MIN_LEVEL: i32 = -(1 << 17);
+/// Highest accepted level, libzstd's `ZSTD_maxCLevel()`.
+pub const MAX_LEVEL: i32 = 22;
+/// Level used when [`EncoderConfig::level`] is `0`, libzstd's
+/// `ZSTD_CLEVEL_DEFAULT`.
+pub const DEFAULT_LEVEL: i32 = 3;
 
 impl Default for EncoderConfig {
     fn default() -> Self {
-        Self { level: 3 }
+        Self {
+            level: DEFAULT_LEVEL,
+        }
     }
 }
 
@@ -111,9 +132,15 @@ impl Default for EncoderConfig {
 /// walk deeper chains and accept longer matches before bailing out.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LevelParams {
-    /// Clamped compression level (1..=22). Retained so the parser can gate
-    /// behaviour (e.g. the statistics-driven repricing passes) on it.
+    /// Clamped compression level (1..=22; negative levels map to 1).
+    /// Retained so the parser can gate behaviour (e.g. the
+    /// statistics-driven repricing passes) on it.
     pub level: u8,
+    /// Acceleration of the negative "fast" levels (`-level`); 0 for levels
+    /// ≥ 1. Mirrors libzstd's use of `targetLength` as the `fast` strategy's
+    /// step size: on a miss the greedy parser advances by [`miss_step`]
+    /// instead of one byte, and only the probed positions are indexed.
+    pub accel: usize,
     /// Maximum number of hash-chain links the match finder walks per probe.
     pub max_chain: usize,
     /// Length at which the match finder stops looking for a longer candidate.
@@ -148,14 +175,25 @@ fn optimal_chain_cap(level: u8) -> usize {
 }
 
 impl LevelParams {
-    /// Clamp `level` to `1..=22` and expand to match-finder tuning. The
-    /// table broadly tracks zstd's reference presets but doesn't try to
-    /// reproduce them exactly — the strategy here is hash-chain greedy
-    /// parsing at low levels and hash-chain lazy parsing at level ≥ 4.
-    /// Repeat-offset checks fire at every level (they're cheap enough that
-    /// even level 1 can afford them).
-    pub(crate) fn from_level(level: u8) -> Self {
-        let level = level.clamp(1, 22);
+    /// Clamp `level` to [`MIN_LEVEL`]`..=`[`MAX_LEVEL`] and expand to
+    /// match-finder tuning. The table broadly tracks zstd's reference presets
+    /// but doesn't try to reproduce them exactly — the strategy here is
+    /// hash-chain greedy parsing at low levels and hash-chain lazy parsing at
+    /// level ≥ 4. Repeat-offset checks fire at every level (they're cheap
+    /// enough that even level 1 can afford them). `0` is the default level; a
+    /// negative level is level 1 with an acceleration of `-level`, as in
+    /// libzstd.
+    pub(crate) fn from_level(level: i32) -> Self {
+        let level = match level {
+            0 => DEFAULT_LEVEL,
+            l => l.clamp(MIN_LEVEL, MAX_LEVEL),
+        };
+        let accel = if level < 0 {
+            level.unsigned_abs() as usize
+        } else {
+            0
+        };
+        let level = level.max(1) as u8;
         // Lazy parsing kicks in at level 4 — matches zstd's reference table
         // where `lazy` strategies start at level 4.
         let lazy_search = level >= 4;
@@ -187,11 +225,31 @@ impl LevelParams {
         };
         Self {
             level,
+            accel,
             max_chain,
             nice_match,
             lazy_search,
             optimal,
         }
+    }
+}
+
+/// Literal-run length (log2) per which the miss stride of the negative levels
+/// grows by one more acceleration step — libzstd's `kSearchStrength`.
+const SEARCH_STRENGTH: u32 = 8;
+
+/// Bytes to advance after a failed probe, given acceleration `accel` and a
+/// current literal run of `run` bytes. Levels ≥ 1 (`accel` 0) always step one
+/// byte. A negative level steps `1 + accel` bytes, plus `accel` more per 256
+/// bytes of unmatched run, so long incompressible stretches are crossed in
+/// ever larger strides (libzstd's `fast` strategy grows its step the same
+/// way, by `(ip - anchor) >> kSearchStrength`).
+#[inline]
+fn miss_step(accel: usize, run: usize) -> usize {
+    if accel == 0 {
+        1
+    } else {
+        1 + accel.saturating_mul(1 + (run >> SEARCH_STRENGTH))
     }
 }
 
@@ -253,8 +311,9 @@ impl Encoder {
     }
 
     /// Build an encoder with explicit configuration. `config.level` is
-    /// clamped to `1..=22` internally — out-of-range values are snapped to
-    /// the nearest valid level rather than rejected.
+    /// clamped to [`MIN_LEVEL`]`..=`[`MAX_LEVEL`] internally — out-of-range
+    /// values are snapped to the nearest valid level rather than rejected —
+    /// and `0` selects [`DEFAULT_LEVEL`].
     pub fn with_config(config: EncoderConfig) -> Self {
         Self {
             state: State::Accepting,
@@ -371,6 +430,7 @@ impl Encoder {
         }
 
         let lazy = self.params.lazy_search;
+        let accel = self.params.accel;
         let max_chain = self.params.max_chain;
         let nice_match = self.params.nice_match;
 
@@ -428,7 +488,11 @@ impl Encoder {
                 );
 
                 if m_len == 0 {
-                    pos += 1;
+                    pos += miss_step(accel, pos - lit_start);
+                    if accel > 0 {
+                        // Fast levels index only the positions they probe.
+                        next_insert = next_insert.max(pos);
+                    }
                     continue;
                 }
 
@@ -465,6 +529,11 @@ impl Encoder {
                     offset_value,
                 });
                 let match_end = best_pos + best_len;
+                if accel > 0 {
+                    // Fast levels index only the match's last two positions
+                    // (libzstd's `fast` strategy does the same), not its body.
+                    next_insert = next_insert.max(match_end.saturating_sub(2));
+                }
                 while next_insert < match_end {
                     self.matcher.insert(buffer, next_insert);
                     next_insert += 1;

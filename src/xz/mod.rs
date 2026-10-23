@@ -11,13 +11,24 @@
 //!    (chunk: 01 hi lo <up-to-65536 bytes>)+
 //!    00 end marker
 //!  Block Padding (0..3 zero bytes, total Block size to 4 B alignment)
-//!  Check (4 B CRC32 of uncompressed Block data)
+//!  Check (of the uncompressed Block data: none, CRC32, CRC64 or SHA-256)
 //!  Index (Index Indicator 00 | NumRecords varint | (UnpaddedSize varint,
 //!         UncompressedSize varint)+ | 0..3 zero pad | CRC32 of all the above)
 //!  Stream Footer (12 B)
+//!  Stream Padding (zero bytes, a multiple of 4), then optionally further
+//!  Streams, each followed by optional padding
 //! ```
 //!
-//! This implementation supports a single filter (LZMA2, filter ID 0x21).
+//! The encoder writes a single filter (LZMA2, filter ID 0x21). The decoder
+//! also accepts the filter chains the spec defines: up to three non-last
+//! filters before LZMA2 — Delta (`0x03`) and the BCJ branch converters x86
+//! (`0x04`), PowerPC (`0x05`), IA-64 (`0x06`), ARM (`0x07`), ARM-Thumb
+//! (`0x08`), SPARC (`0x09`), ARM64 (`0x0A`) and RISC-V (`0x0B`), with
+//! their start-offset properties — undone in the private `filters`
+//! submodule with this crate's `delta` and `bcj` transforms (the `xz`
+//! feature pulls both in). Other filter IDs fail with
+//! [`Error::Unsupported`].
+//!
 //! Decoding handles every LZMA2 chunk type: `0x00` (end marker), `0x01`
 //! (uncompressed + dictionary reset), `0x02` (uncompressed, no reset),
 //! and `0x80..=0xFF` (LZMA-compressed, with the spec's full matrix of
@@ -55,10 +66,31 @@
 //! is stored uncompressed), so nothing after the flush references data
 //! before it. Both stay within the single xz Block.
 //!
+//! ## Concatenated Streams
+//!
+//! Like `xz -d`, the decoder accepts several Streams back to back, each
+//! optionally followed by Stream Padding (zero bytes, a multiple of four in
+//! total, else [`Error::Corrupt`]), and decodes them as one output. Bytes
+//! after the last Stream that are neither padding nor another Stream Header
+//! end the data: `decode` reports the end and leaves the bytes that arrived
+//! in that call unconsumed, so the caller can see where the xz data stops.
+//! Because another Stream may still arrive, `decode` reports the end only
+//! once it sees such bytes; when the input ends right after a Stream (or its
+//! padding), `finish` settles it.
+//!
+//! ## Integrity checks
+//!
+//! The encoder writes a CRC32 Block Check. The decoder verifies every check
+//! type the format defines — CRC32 (`0x01`), CRC64 (`0x04`, the `xz` CLI
+//! default) and SHA-256 (`0x0A`) — and fails with
+//! [`Error::ChecksumMismatch`] on a mismatch. A reserved check ID still
+//! fixes the Check field's size, so, like liblzma by default, such a Stream
+//! decodes with its Check skipped unverified.
+//!
 //! No dependency on the sibling `lzma` module: the small amount of LZMA2
-//! framing we need (control byte, big-endian 16-bit size) and the CRC-32 we
-//! use for the Block Check, Stream Header CRC, and Index CRC are all defined
-//! inline below.
+//! framing we need (control byte, big-endian 16-bit size), the CRC-32 used
+//! for the Stream Header, Block Header and Index CRCs, and the CRC-64 and
+//! SHA-256 Block Checks are all defined inline below.
 
 // The state machines in this file are written as a series of `match` arms
 // each containing an `if`/`else` that either makes progress or returns; the
@@ -76,10 +108,13 @@ use crate::traits::{Algorithm, Flush, RawDecoder, RawEncoder, RawProgress};
 // (`crate::lzma2_internal`) so it can also back the public raw LZMA2
 // decoder exposed under the `lzma2` feature without pulling in this xz
 // container. See `lib.rs`.
-use crate::lzma2_internal::lzma2_decoder::{Lzma2Props, LzmaCore, lzma2_dict_size};
+use crate::lzma2_internal::lzma2_decoder::{IN_REQUIRED, Lzma2Props, LzmaCore, lzma2_dict_size};
 use crate::lzma2_internal::lzma2_encoder::{
     EncoderParams, LZMA2_PROPS_BYTE, Lzma2Chunk, Lzma2StreamEncoder,
 };
+
+mod filters;
+use filters::FilterChain;
 
 // ─── constants ─────────────────────────────────────────────────────────────
 
@@ -171,6 +206,235 @@ fn crc32(data: &[u8]) -> u32 {
     let mut c = Crc32::new();
     c.update(data);
     c.finalize()
+}
+
+// ─── inline CRC-64 ─────────────────────────────────────────────────────────
+//
+// CRC-64/XZ (ECMA-182 polynomial, reflected 0xC96C5795D7870F42), initial
+// and final XOR all ones: the Block Check of a Stream whose check ID is 0x04
+// (`xz --check=crc64`, the CLI default).
+
+#[derive(Clone, Copy)]
+struct Crc64 {
+    state: u64,
+}
+
+impl Crc64 {
+    const fn new() -> Self {
+        Self { state: !0 }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        let mut s = self.state;
+        for &b in data {
+            let idx = ((s ^ b as u64) & 0xFF) as usize;
+            s = (s >> 8) ^ CRC64_TABLE[idx];
+        }
+        self.state = s;
+    }
+
+    const fn finalize(self) -> u64 {
+        !self.state
+    }
+}
+
+const CRC64_TABLE: [u64; 256] = {
+    let mut table = [0u64; 256];
+    let mut i = 0u64;
+    while i < 256 {
+        let mut c = i;
+        let mut k = 0;
+        while k < 8 {
+            c = if c & 1 != 0 {
+                0xC96C_5795_D787_0F42 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+            k += 1;
+        }
+        table[i as usize] = c;
+        i += 1;
+    }
+    table
+};
+
+// ─── inline SHA-256 ────────────────────────────────────────────────────────
+//
+// FIPS 180-4 SHA-256: the Block Check of a Stream whose check ID is 0x0A
+// (`xz --check=sha256`). Only the decoder needs it, to verify; a plain
+// one-block-at-a-time compression function is plenty.
+
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+#[derive(Clone)]
+struct Sha256 {
+    h: [u32; 8],
+    /// Partial 64-byte message block awaiting compression.
+    buf: [u8; 64],
+    buf_len: usize,
+    /// Message length so far, in bytes.
+    total: u64,
+}
+
+impl Sha256 {
+    const fn new() -> Self {
+        Self {
+            h: [
+                0x6a09_e667,
+                0xbb67_ae85,
+                0x3c6e_f372,
+                0xa54f_f53a,
+                0x510e_527f,
+                0x9b05_688c,
+                0x1f83_d9ab,
+                0x5be0_cd19,
+            ],
+            buf: [0; 64],
+            buf_len: 0,
+            total: 0,
+        }
+    }
+
+    fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
+        let mut w = [0u32; 64];
+        for (i, word) in block.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*word);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(SHA256_K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (x, v) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *x = x.wrapping_add(v);
+        }
+    }
+
+    fn update(&mut self, mut data: &[u8]) {
+        self.total = self.total.wrapping_add(data.len() as u64);
+        if self.buf_len > 0 {
+            let take = (64 - self.buf_len).min(data.len());
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
+            self.buf_len += take;
+            data = &data[take..];
+            if self.buf_len < 64 {
+                return;
+            }
+            Self::compress(&mut self.h, &self.buf);
+            self.buf_len = 0;
+        }
+        let (blocks, rest) = data.as_chunks::<64>();
+        for block in blocks {
+            Self::compress(&mut self.h, block);
+        }
+        self.buf[..rest.len()].copy_from_slice(rest);
+        self.buf_len = rest.len();
+    }
+
+    fn finalize(mut self) -> [u8; 32] {
+        let bit_len = self.total.wrapping_mul(8);
+        // 0x80 terminator, zero fill, then the 64-bit big-endian bit length
+        // ending a block (spilling into a second block if it does not fit).
+        let mut pad = [0u8; 72];
+        pad[0] = 0x80;
+        let zeros = (55usize.wrapping_sub(self.buf_len)) % 64;
+        pad[1 + zeros..9 + zeros].copy_from_slice(&bit_len.to_be_bytes());
+        self.update(&pad[..9 + zeros]);
+        debug_assert_eq!(self.buf_len, 0);
+        let mut out = [0u8; 32];
+        for (o, v) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.h) {
+            o.copy_from_slice(&v.to_be_bytes());
+        }
+        out
+    }
+}
+
+/// Running Block Check, selected by the Stream Flags' check ID.
+#[derive(Clone)]
+enum BlockCheck {
+    /// Check ID 0x00 (no check), or a reserved ID this build does not
+    /// implement: the Check field is skipped unverified, as liblzma does.
+    Unverified,
+    Crc32(Crc32),
+    Crc64(Crc64),
+    Sha256(Box<Sha256>),
+}
+
+impl BlockCheck {
+    fn new(check_id: u8) -> Self {
+        match check_id {
+            0x01 => Self::Crc32(Crc32::new()),
+            0x04 => Self::Crc64(Crc64::new()),
+            0x0A => Self::Sha256(Box::new(Sha256::new())),
+            _ => Self::Unverified,
+        }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            Self::Unverified => {}
+            Self::Crc32(c) => c.update(data),
+            Self::Crc64(c) => c.update(data),
+            Self::Sha256(s) => s.update(data),
+        }
+    }
+
+    /// Compare against the stored Check field (whose length the caller
+    /// sized from the check ID).
+    fn matches(&self, stored: &[u8]) -> bool {
+        match self {
+            Self::Unverified => true,
+            Self::Crc32(c) => stored == c.finalize().to_le_bytes(),
+            Self::Crc64(c) => stored == c.finalize().to_le_bytes(),
+            Self::Sha256(s) => stored == s.as_ref().clone().finalize(),
+        }
+    }
+}
+
+/// Size of the Check field for a check ID (xz-file-format.txt §3.4: IDs
+/// come in groups of three sharing a size, reserved ones included).
+const fn check_size_for(check_id: u8) -> usize {
+    match check_id {
+        0x00 => 0,
+        0x01..=0x03 => 4,
+        0x04..=0x06 => 8,
+        0x07..=0x09 => 16,
+        0x0A..=0x0C => 32,
+        _ => 64,
+    }
 }
 
 // ─── varint (multibyte integer) ────────────────────────────────────────────
@@ -989,9 +1253,10 @@ enum DecPhase {
     /// Buffering the remaining bytes of a compressed-LZMA2 chunk header
     /// (4 or 5 more bytes after the control byte).
     Lzma2CompHeader,
-    /// Buffering the compressed payload for the current chunk.
+    /// Buffering the compressed payload for the current chunk and
+    /// decoding as much of it as is safe (see `LzmaCore::decode_partial`).
     Lzma2CompBuffer,
-    /// Streaming the decoded chunk bytes out to the caller.
+    /// Streaming the chunk bytes decoded so far out to the caller.
     Lzma2CompDrain,
     /// After the LZMA2 end marker: skip 0..=3 padding zeros and read the
     /// 4-byte Check.
@@ -1002,6 +1267,11 @@ enum DecPhase {
     Index,
     /// Reading the Stream Footer (12 bytes).
     StreamFooter,
+    /// A Stream ended. Like `xz -d`, Stream Padding (zero bytes, a multiple
+    /// of four in all) and further concatenated Streams may follow; the
+    /// next non-zero bytes decide between another Stream Header and `Done`
+    /// (anything else is not xz data and is left to the caller).
+    StreamPadding,
     Done,
 }
 
@@ -1026,8 +1296,9 @@ pub struct Decoder {
     block_compressed_seen: u64,
     block_uncompressed_seen: u64,
 
-    /// Block check (CRC32 of all uncompressed bytes in the block).
-    check: Crc32,
+    /// Running Block Check over the uncompressed bytes of the block, of
+    /// the kind the Stream Header's check ID selects.
+    check: BlockCheck,
 
     /// Collected blocks for index cross-check: (unpadded_size, uncompressed).
     blocks: Vec<(u64, u64)>,
@@ -1064,14 +1335,33 @@ pub struct Decoder {
     comp_size: u32,
     /// Buffer for the compressed payload of the current chunk.
     comp_buf: Vec<u8>,
-    /// Decoded output of the current compressed chunk, drained byte-by-byte.
+    /// Decoded output of the current compressed chunk (sized to the whole
+    /// chunk), filled as the compressed bytes arrive.
     comp_decoded: Vec<u8>,
+    /// How much of `comp_decoded` is decoded so far.
+    comp_produced: usize,
     /// Read cursor within `comp_decoded` during streaming drain.
     comp_decoded_pos: usize,
+    /// The range coder has been initialised from the chunk's first 5 bytes.
+    comp_range_ready: bool,
+    /// `finish` found the chunk cut short and decoded what it could; the
+    /// core is mid-packet now, so nothing more may be decoded.
+    comp_truncated: bool,
     /// Properties byte from the most recent reset chunk; only valid when
     /// `lzma_core` is `Some`. Used to detect whether `replace_props` is
     /// required on subsequent reset chunks.
     last_props: u8,
+
+    /// The current Block's Delta/BCJ filters, undone on the LZMA2 output
+    /// before it reaches the caller; `None` for a plain LZMA2 Block. When
+    /// set, all of the Block's output goes through its buffer.
+    filters: Option<FilterChain>,
+
+    /// Stream Padding bytes seen since the last Stream Footer, modulo 4.
+    stream_padding: u8,
+    /// Set by `finish`: no more input will arrive, so whatever follows the
+    /// last Stream (nothing, or a lone partial magic) settles the end.
+    finishing: bool,
 
     poisoned: bool,
 }
@@ -1088,7 +1378,7 @@ impl Decoder {
             block_header_size_seen: 0,
             block_compressed_seen: 0,
             block_uncompressed_seen: 0,
-            check: Crc32::new(),
+            check: BlockCheck::Unverified,
             blocks: Vec::new(),
             index_buf: Vec::new(),
             index_records_remaining: 0,
@@ -1102,8 +1392,14 @@ impl Decoder {
             comp_size: 0,
             comp_buf: Vec::new(),
             comp_decoded: Vec::new(),
+            comp_produced: 0,
             comp_decoded_pos: 0,
+            comp_range_ready: false,
+            comp_truncated: false,
             last_props: 0,
+            filters: None,
+            stream_padding: 0,
+            finishing: false,
             poisoned: false,
         }
     }
@@ -1128,6 +1424,22 @@ impl Decoder {
         if let Some(core) = self.lzma_core.as_mut() {
             core.append_literals(src);
         }
+    }
+
+    /// Hand the filter chain's final bytes to `output`, updating the Block
+    /// Check and size. Returns `false` while some are left (output full).
+    fn drain_filtered(&mut self, output: &mut [u8], written: &mut usize) -> bool {
+        let Some(chain) = self.filters.as_mut() else {
+            return true;
+        };
+        let ready = chain.ready();
+        let take = ready.len().min(output.len() - *written);
+        output[*written..*written + take].copy_from_slice(&ready[..take]);
+        self.check.update(&ready[..take]);
+        chain.consume(take);
+        self.block_uncompressed_seen += take as u64;
+        *written += take;
+        chain.ready().is_empty()
     }
 
     fn poison(&mut self, e: Error) -> Error {
@@ -1160,16 +1472,11 @@ impl Decoder {
         if check_id & 0xF0 != 0 {
             return Err(self.poison(Error::Unsupported));
         }
-        // Accept the spec's standard check types. We verify CRC32 (0x01)
-        // bit-for-bit; for CRC64 (0x04) and SHA-256 (0x0A) we simply
-        // consume the trailing bytes without validating them, since the
-        // CRC64 polynomial and SHA-256 hash function aren't built into
-        // this crate. Reserved values are rejected.
-        match check_id & 0x0F {
-            0x00 | 0x01 | 0x04 | 0x0A => {}
-            _ => return Err(self.poison(Error::Unsupported)),
-        }
-        self.check_id = check_id & 0x0F;
+        // CRC32 (0x01), CRC64 (0x04) and SHA-256 (0x0A) are verified. The
+        // reserved IDs still define the Check field's size (spec §2.1.1.2),
+        // so, like liblzma by default, accept them and skip the field
+        // unverified.
+        self.check_id = check_id;
 
         let stored_crc = u32::from_le_bytes([
             self.scratch[8],
@@ -1184,13 +1491,7 @@ impl Decoder {
     }
 
     fn check_size(&self) -> usize {
-        match self.check_id {
-            0x00 => 0,
-            0x01 => 4,
-            0x04 => 8,
-            0x0A => 32,
-            _ => 0, // unreachable: parse_stream_header rejects others
-        }
+        check_size_for(self.check_id)
     }
 
     fn parse_block_header(&mut self) -> Result<(), Error> {
@@ -1231,25 +1532,48 @@ impl Decoder {
             varint_decode(&self.scratch[..body_end], &mut cur)?
                 .ok_or_else(|| self.poison(Error::Corrupt))?;
         }
-        if num_filters != 1 {
-            // We only support a single LZMA2 filter.
+        // Filter Flags: `(id varint, props size varint, props)` per filter,
+        // in encode order. Only LZMA2 may (and must) be last; the others
+        // are the Delta/BCJ filters `filters` undoes after it.
+        let mut chain: [(u64, &[u8]); 3] = [(0, &[]); 3];
+        let mut chain_len = 0;
+        let mut lzma2_props: &[u8] = &[];
+        for i in 0..num_filters {
+            let Some(id) = varint_decode(&self.scratch[..body_end], &mut cur)? else {
+                return Err(self.poison(Error::Corrupt));
+            };
+            let Some(size) = varint_decode(&self.scratch[..body_end], &mut cur)? else {
+                return Err(self.poison(Error::Corrupt));
+            };
+            if size > (body_end - cur) as u64 {
+                return Err(self.poison(Error::Corrupt));
+            }
+            let props = &self.scratch[cur..cur + size as usize];
+            cur += size as usize;
+            if i + 1 < num_filters {
+                if id == FILTER_ID_LZMA2 as u64 {
+                    return Err(self.poison(Error::Unsupported));
+                }
+                chain[chain_len] = (id, props);
+                chain_len += 1;
+            } else if id == FILTER_ID_LZMA2 as u64 {
+                lzma2_props = props;
+            } else {
+                return Err(self.poison(Error::Unsupported));
+            }
+        }
+        let filters = if chain_len > 0 {
+            Some(FilterChain::new(&chain[..chain_len]))
+        } else {
+            None
+        };
+        let [dict_flag] = *lzma2_props else {
             return Err(self.poison(Error::Unsupported));
-        }
-        let filter_id = varint_decode(&self.scratch[..body_end], &mut cur)?
-            .ok_or_else(|| self.poison(Error::Corrupt))?;
-        if filter_id != FILTER_ID_LZMA2 as u64 {
-            return Err(self.poison(Error::Unsupported));
-        }
-        let props_size = varint_decode(&self.scratch[..body_end], &mut cur)?
-            .ok_or_else(|| self.poison(Error::Corrupt))?;
-        if props_size != 1 {
-            return Err(self.poison(Error::Unsupported));
-        }
-        if cur >= body_end {
-            return Err(self.poison(Error::Corrupt));
-        }
-        let dict_flag = self.scratch[cur];
-        cur += 1;
+        };
+        self.filters = match filters.transpose() {
+            Ok(f) => f,
+            Err(e) => return Err(self.poison(e)),
+        };
         if dict_flag & 0xC0 != 0 {
             return Err(self.poison(Error::Unsupported));
         }
@@ -1289,6 +1613,17 @@ impl RawDecoder for Decoder {
             let init_c = consumed;
             let init_w = written;
             let init_phase = self.phase;
+
+            // Filtered Block output goes out before anything else, so every
+            // phase below runs with the chain's final bytes all handed over
+            // (in particular the Block Check covers all of them).
+            if !self.drain_filtered(output, &mut written) {
+                return Ok(RawProgress {
+                    consumed,
+                    written,
+                    done: false,
+                });
+            }
 
             match self.phase {
                 DecPhase::StreamHeader => {
@@ -1333,7 +1668,7 @@ impl RawDecoder for Decoder {
                             self.block_header_size_seen = self.block_header_size as u64;
                             self.block_compressed_seen = 0;
                             self.block_uncompressed_seen = 0;
-                            self.check = Crc32::new();
+                            self.check = BlockCheck::new(self.check_id);
                             self.lzma_core = None;
                             self.expecting_block_first_chunk = true;
                             self.phase = DecPhase::BlockHeader;
@@ -1385,6 +1720,13 @@ impl RawDecoder for Decoder {
                             + self.check_size() as u64;
                         let pad = (4 - (unpadded_no_pad % 4) as usize) % 4;
                         self.scratch_want = pad;
+                        // The Block's data is complete: finalise the filters'
+                        // tails (drained before the Check is read).
+                        if let Some(chain) = self.filters.as_mut()
+                            && let Err(e) = chain.finish()
+                        {
+                            return Err(self.poison(e));
+                        }
                         // Free the (potentially MiB-sized) compressed-chunk
                         // working buffers now that the block has ended.
                         self.lzma_core = None;
@@ -1538,6 +1880,12 @@ impl RawDecoder for Decoder {
                     self.expecting_block_first_chunk = false;
                     self.scratch.clear();
                     self.comp_buf.clear();
+                    self.comp_decoded.clear();
+                    self.comp_decoded
+                        .resize(self.comp_uncomp_size as usize, 0u8);
+                    self.comp_produced = 0;
+                    self.comp_decoded_pos = 0;
+                    self.comp_range_ready = false;
                     self.scratch_want = 0;
                     self.phase = DecPhase::Lzma2CompBuffer;
                 }
@@ -1550,38 +1898,68 @@ impl RawDecoder for Decoder {
                             .extend_from_slice(&input[consumed..consumed + take]);
                         consumed += take;
                     }
-                    if self.comp_buf.len() < self.comp_size as usize {
+                    let complete = self.comp_buf.len() == self.comp_size as usize;
+                    // Decode as the bytes arrive, like liblzma, rather than
+                    // waiting for the whole chunk: only packets that cannot
+                    // run out of input partway, until the chunk is complete.
+                    // At `finish` with the chunk cut short, decode what the
+                    // bytes hold, so a truncated stream still yields every
+                    // byte before the cut (as `xz -d` does).
+                    let cut_short = !complete && self.finishing && consumed == input.len();
+                    let margin = if complete || cut_short {
+                        0
+                    } else {
+                        IN_REQUIRED
+                    };
+                    let before = self.comp_produced;
+                    if !self.comp_truncated {
+                        let Some(core) = self.lzma_core.as_mut() else {
+                            return Err(self.poison(Error::Corrupt));
+                        };
+                        if !self.comp_range_ready && (complete || self.comp_buf.len() >= 5) {
+                            if let Err(e) = core.init_range(&self.comp_buf) {
+                                return Err(self.poison(e));
+                            }
+                            self.comp_range_ready = true;
+                        }
+                        if self.comp_range_ready {
+                            match core.decode_partial(
+                                &self.comp_buf,
+                                &mut self.comp_decoded,
+                                &mut self.comp_produced,
+                                margin,
+                            ) {
+                                Ok(()) => {}
+                                Err(Error::UnexpectedEnd) if cut_short => {}
+                                Err(e) => return Err(self.poison(e)),
+                            }
+                        }
+                        if cut_short {
+                            self.comp_truncated = true;
+                        }
+                    }
+                    if complete && self.comp_produced == self.comp_decoded.len() {
+                        self.block_compressed_seen += self.comp_size as u64;
+                    } else if self.comp_produced == before {
+                        // Nothing new to hand out: wait for more input.
                         return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
                         });
                     }
-                    self.block_compressed_seen += self.comp_size as u64;
-                    // Decode the entire chunk into comp_decoded.
-                    self.comp_decoded.clear();
-                    self.comp_decoded
-                        .resize(self.comp_uncomp_size as usize, 0u8);
-                    if self.lzma_core.is_none() {
-                        return Err(self.poison(Error::Corrupt));
-                    }
-                    let init_res = self.lzma_core.as_mut().unwrap().init_range(&self.comp_buf);
-                    if let Err(e) = init_res {
-                        return Err(self.poison(e));
-                    }
-                    let dec_res = self
-                        .lzma_core
-                        .as_mut()
-                        .unwrap()
-                        .decode_chunk(&self.comp_buf, &mut self.comp_decoded);
-                    if let Err(e) = dec_res {
-                        return Err(self.poison(e));
-                    }
-                    self.comp_decoded_pos = 0;
                     self.phase = DecPhase::Lzma2CompDrain;
                 }
                 DecPhase::Lzma2CompDrain => {
-                    let total = self.comp_decoded.len();
+                    let total = self.comp_produced;
+                    if let Some(chain) = self.filters.as_mut() {
+                        // Through the filters; the top of the loop drains.
+                        if let Err(e) = chain.push(&self.comp_decoded[self.comp_decoded_pos..total])
+                        {
+                            return Err(self.poison(e));
+                        }
+                        self.comp_decoded_pos = total;
+                    }
                     while self.comp_decoded_pos < total && written < output.len() {
                         let take = (total - self.comp_decoded_pos).min(output.len() - written);
                         let src =
@@ -1592,20 +1970,42 @@ impl RawDecoder for Decoder {
                         self.comp_decoded_pos += take;
                         written += take;
                     }
-                    if self.comp_decoded_pos >= total {
-                        // Chunk drained; back to control byte parsing.
-                        self.scratch.clear();
-                        self.scratch_want = 1;
-                        self.phase = DecPhase::Lzma2Control;
-                    } else {
+                    if self.comp_decoded_pos < total {
                         return Ok(RawProgress {
                             consumed,
                             written,
                             done: false,
                         });
                     }
+                    if total == self.comp_decoded.len()
+                        && self.comp_buf.len() == self.comp_size as usize
+                    {
+                        // Chunk done; back to control byte parsing.
+                        self.scratch.clear();
+                        self.scratch_want = 1;
+                        self.phase = DecPhase::Lzma2Control;
+                    } else {
+                        // Decoded so far is out; more of the chunk to come.
+                        self.phase = DecPhase::Lzma2CompBuffer;
+                    }
                 }
                 DecPhase::Lzma2Data => {
+                    if self.filters.is_some() && self.chunk_remaining > 0 && consumed < input.len()
+                    {
+                        // Through the filters; the top of the loop drains.
+                        // A chunk is at most 64 KiB, so this stays bounded.
+                        let take = self.chunk_remaining.min(input.len() - consumed);
+                        let src = &input[consumed..consumed + take];
+                        self.feed_uncompressed_dict(src);
+                        if let Some(chain) = self.filters.as_mut()
+                            && let Err(e) = chain.push(src)
+                        {
+                            return Err(self.poison(e));
+                        }
+                        self.block_compressed_seen += take as u64;
+                        self.chunk_remaining -= take;
+                        consumed += take;
+                    }
                     while self.chunk_remaining > 0
                         && consumed < input.len()
                         && written < output.len()
@@ -1673,26 +2073,20 @@ impl RawDecoder for Decoder {
                             + self.check_size() as u64;
                         self.blocks
                             .push((unpadded_size, self.block_uncompressed_seen));
+                        self.filters = None;
                         self.scratch.clear();
                         self.scratch_want = 1;
                         self.phase = DecPhase::BlockOrIndex;
                     } else if self.fill_scratch(input, &mut consumed) {
-                        if self.check_id == 0x01 {
-                            let got = u32::from_le_bytes([
-                                self.scratch[0],
-                                self.scratch[1],
-                                self.scratch[2],
-                                self.scratch[3],
-                            ]);
-                            if got != self.check.finalize() {
-                                return Err(self.poison(Error::ChecksumMismatch));
-                            }
+                        if !self.check.matches(&self.scratch) {
+                            return Err(self.poison(Error::ChecksumMismatch));
                         }
                         let unpadded_size = self.block_header_size_seen
                             + self.block_compressed_seen
                             + self.check_size() as u64;
                         self.blocks
                             .push((unpadded_size, self.block_uncompressed_seen));
+                        self.filters = None;
                         self.scratch.clear();
                         self.scratch_want = 1;
                         self.phase = DecPhase::BlockOrIndex;
@@ -1838,13 +2232,15 @@ impl RawDecoder for Decoder {
                         if back != want_back {
                             return Err(self.poison(Error::TrailerMismatch));
                         }
-                        if s[8] != STREAM_FLAGS[0] || (s[9] & 0x0F) != self.check_id {
+                        if s[8] != STREAM_FLAGS[0] || s[9] != self.check_id {
                             return Err(self.poison(Error::Corrupt));
                         }
                         if s[10] != FOOTER_MAGIC[0] || s[11] != FOOTER_MAGIC[1] {
                             return Err(self.poison(Error::BadHeader));
                         }
-                        self.phase = DecPhase::Done;
+                        self.scratch.clear();
+                        self.stream_padding = 0;
+                        self.phase = DecPhase::StreamPadding;
                     } else {
                         return Ok(RawProgress {
                             consumed,
@@ -1853,13 +2249,81 @@ impl RawDecoder for Decoder {
                         });
                     }
                 }
+                DecPhase::StreamPadding => {
+                    // `scratch` holds the start of a following Stream Header's
+                    // magic when an earlier call ended inside it; padding can
+                    // only come before that.
+                    if self.scratch.is_empty() {
+                        while consumed < input.len() && input[consumed] == 0x00 {
+                            self.stream_padding = (self.stream_padding + 1) % 4;
+                            consumed += 1;
+                        }
+                    }
+                    if consumed >= input.len() {
+                        if !self.finishing {
+                            // Another Stream or more padding may still come;
+                            // `finish` settles it.
+                            return Ok(RawProgress {
+                                consumed,
+                                written,
+                                done: false,
+                            });
+                        }
+                        if self.stream_padding != 0 {
+                            return Err(self.poison(Error::Corrupt));
+                        }
+                        // Nothing (or a partial magic, which is not a
+                        // Stream) follows: the Streams are over.
+                        self.scratch.clear();
+                        self.phase = DecPhase::Done;
+                        continue;
+                    }
+                    // A non-zero byte ends the padding, which the spec
+                    // requires to be a multiple of four bytes.
+                    if self.stream_padding != 0 {
+                        return Err(self.poison(Error::Corrupt));
+                    }
+                    let mut i = consumed;
+                    while self.scratch.len() < STREAM_MAGIC.len() && i < input.len() {
+                        if input[i] != STREAM_MAGIC[self.scratch.len()] {
+                            break;
+                        }
+                        self.scratch.push(input[i]);
+                        i += 1;
+                    }
+                    if self.scratch.len() == STREAM_MAGIC.len() {
+                        // Another Stream: parse its header; the per-Stream
+                        // state (blocks for the Index cross-check, check ID)
+                        // starts afresh.
+                        consumed = i;
+                        self.blocks.clear();
+                        self.scratch_want = 12;
+                        self.phase = DecPhase::StreamHeader;
+                    } else if i == input.len() {
+                        // So far a magic prefix; wait for the rest.
+                        consumed = i;
+                        return Ok(RawProgress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    } else {
+                        // Not xz data: the Streams are over. Hand back the
+                        // bytes this call matched against the magic (an
+                        // earlier call's had already been buffered), so the
+                        // caller sees where the xz data stops.
+                        self.scratch.clear();
+                        self.phase = DecPhase::Done;
+                        continue;
+                    }
+                }
                 DecPhase::Done => {
-                    // Terminal (Done follows the Stream Footer; concatenated
-                    // streams are not supported). Report completion so the
-                    // bridge yields StreamEnd. Reporting `false` left a caller
-                    // that hands over trailing bytes after the footer getting
-                    // `OutputFull` with nothing consumed and nothing written,
-                    // spinning on unchanged state.
+                    // Terminal: the Streams are over and the bytes after them
+                    // (if any) are not ours. Report completion so the bridge
+                    // yields StreamEnd, leaving those bytes unconsumed.
+                    // Reporting `false` left a caller that hands over trailing
+                    // bytes getting `OutputFull` with nothing consumed and
+                    // nothing written, spinning on unchanged state.
                     return Ok(RawProgress {
                         consumed,
                         written,
@@ -1882,6 +2346,7 @@ impl RawDecoder for Decoder {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
+        self.finishing = true;
         let empty: [u8; 0] = [];
         let p = self.raw_decode(&empty, output)?;
         if matches!(self.phase, DecPhase::Done) {
@@ -1890,7 +2355,21 @@ impl RawDecoder for Decoder {
                 written: p.written,
                 done: true,
             })
+        } else if output.is_empty() || p.written > 0 {
+            // Decoded bytes may still be waiting (a whole LZMA2 chunk can
+            // be up to 2 MiB): `finish` must stay drainable, so report "not
+            // done" and let the caller drain and call again. Failing here
+            // threw away bytes already written to `output` this call; the
+            // truncation is reported by the first call with nothing left
+            // to hand over.
+            Ok(RawProgress {
+                consumed: 0,
+                written: p.written,
+                done: false,
+            })
         } else {
+            // Not done, nothing left to hand over, and no input to advance
+            // with: the stream is truncated.
             Err(self.poison(Error::UnexpectedEnd))
         }
     }

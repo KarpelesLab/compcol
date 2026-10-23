@@ -35,20 +35,29 @@ pub(crate) fn mtf_forward_reduced(input: &[u8], alphabet: &[u8]) -> Vec<u8> {
 
     let mut out = Vec::with_capacity(input.len());
     for &b in input {
-        // Linear scan to find b in list[..n]. For bzip2 block sizes
-        // (up to 900 KB) the cache-friendliness of the linear scan
+        if list[0] == b {
+            out.push(0);
+            continue;
+        }
+        // Linear scan to find b in list[..n], shifting each entry we
+        // pass one place right as we go (libbzip2's generateMTFValues),
+        // so finding b and moving it to the front is a single pass. For
+        // bzip2 block sizes the cache-friendliness of the linear scan
         // beats any fancy structure; the alphabet is at most 256 long.
+        let mut carry = list[0];
         let mut pos = 0;
-        while pos < n && list[pos] != b {
+        loop {
             pos += 1;
+            debug_assert!(pos < n, "byte {} not in MTF alphabet", b);
+            let cur = list[pos];
+            list[pos] = carry;
+            if cur == b {
+                break;
+            }
+            carry = cur;
         }
-        debug_assert!(pos < n, "byte {} not in MTF alphabet", b);
+        list[0] = b;
         out.push(pos as u8);
-        // Move b to the front: shift list[0..pos] right by 1, set list[0] = b.
-        if pos > 0 {
-            list.copy_within(0..pos, 1);
-            list[0] = b;
-        }
     }
     out
 }

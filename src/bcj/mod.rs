@@ -91,7 +91,7 @@ pub trait BcjArch {
 pub struct NoState;
 
 // Largest instruction/bundle any architecture buffers (IA-64 bundle = 16).
-const MAX_INSN: usize = 16;
+pub(crate) const MAX_INSN: usize = 16;
 
 /// Configuration shared by every BCJ encoder/decoder: the absolute address
 /// assigned to the first byte of the stream. xz uses a per-filter

@@ -1,6 +1,6 @@
 [package]
 name          = "compcol"
-version       = "0.7.3"
+version       = "0.7.5"
 edition       = "2024"
 # Edition 2024 stabilised in Rust 1.85 and the code uses `let chains`
 # (Rust 1.88); 1.95 matches the MSRV of our other crates.
@@ -98,8 +98,10 @@ gzip    = ["deflate"]
 # probability tables and the LZ window.
 lzma    = ["alloc"]
 # xz container (RFC-style stream/block headers + check codes; the inner
-# LZMA2 chunk codec is inlined inside `src/xz/`).
-xz      = ["lzma"]
+# LZMA2 chunk codec is inlined inside `src/xz/`). Pulls `bcj` and `delta`:
+# the decoder undoes those filters when a Block's filter chain uses them
+# (`xz --x86`, `xz --delta`, ...), reusing their transforms.
+xz      = ["lzma", "bcj", "delta"]
 # Raw LZMA2 chunk stream (7-Zip coder id 21) — the dict-reset control bytes
 # + LZMA chunks, without the `.xz` container. Decode-only entry point that
 # reuses the same LZMA2 chunk codec the `xz` feature uses. The 7z coder
@@ -130,8 +132,8 @@ lzw     = ["alloc"]
 # delimit.
 lzss    = ["alloc"]
 # bzip2 (block-sorted: RLE-1 → BWT → MTF → RLE-2 → Huffman). Encoder
-# and decoder both implemented; the encoder uses a naive O(n² log n)
-# suffix-array build (rather than SA-IS) for the BWT.
+# and decoder both implemented; the encoder's output is byte-identical
+# to libbzip2's (its block sort is a port of `BZ2_blockSort`).
 bzip2   = ["alloc"]
 # LZO (Lempel–Ziv–Oberhumer), LZO1X-1 variant.
 lzo     = ["alloc"]
