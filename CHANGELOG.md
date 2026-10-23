@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.6](https://github.com/KarpelesLab/compcol/compare/v0.7.5...v0.7.6) - 2026-10-23
+
+### Fixed
+
+- *(lha)* implement the real -lh2- format ([#152](https://github.com/KarpelesLab/compcol/pull/152))
+
 ## [0.7.5](https://github.com/KarpelesLab/compcol/compare/v0.7.4...v0.7.5) - 2026-10-22
 
 ### Fixed
