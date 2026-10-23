@@ -9,7 +9,10 @@
 //! - `lh1`: 4 KiB dictionary, **adaptive** Huffman (the classic LZHUF
 //!   scheme of Yoshizaki & Okumura), fixed position code.
 //! - `lh2`: 8 KiB dictionary, **adaptive** Huffman for both literals/lengths
-//!   *and* positions (see [`dynamic_huff`]).
+//!   *and* positions: a 286-symbol char tree (literals, lengths 3..=31 and an
+//!   escape followed by 8 raw length bits) and a position tree over the high
+//!   bits of the position that grows as output accumulates, with the low 6
+//!   bits raw (see [`dynamic_huff`]).
 //! - `lh4`: 4 KiB dictionary, static Huffman.
 //! - `lh5`: 8 KiB dictionary, static Huffman — the dominant method.
 //! - `lh6`: 32 KiB dictionary, static Huffman.
@@ -19,8 +22,9 @@
 //! (Okumura's public-domain ar002 layout — see [`static_huff`]) and differ
 //! only in dictionary size and the number of position-code bits. `lh1`
 //! uses the adaptive-Huffman tree-update scheme (see [`lzhuf`]); `lh2`
-//! extends it to an 8 KiB window with an adaptive position tree (see
-//! [`dynamic_huff`]).
+//! applies the same scheme to a smaller, escaped char alphabet over an
+//! 8 KiB window, and codes positions with a second, growing adaptive tree
+//! (see [`dynamic_huff`]).
 //!
 //! ## Framing — none
 //!
@@ -44,11 +48,20 @@
 //! domain). No code or code-length tables were copied from LGPL
 //! (The Unarchiver / XADMaster), GPL, or unRAR sources.
 //!
+//! `lh2` was implemented clean-room from a written functional specification
+//! of the format, prepared separately by someone else from the behaviour of
+//! LHa for UNIX, and validated black-box against the LHa for UNIX decoder.
+//! No LHa code was used.
+//!
 //! ## What is validated
 //!
 //! Every method here round-trips arbitrary data through this crate's own
-//! encoder and decoder (the encoders for `lh1` and `lh4`/`lh5`/`lh6`/`lh7`
-//! are implemented, not stubbed). See `tests/lha.rs`.
+//! encoder and decoder. The `lh2` decoder reproduces the specification's
+//! test vectors, and its encoder reproduces their streams bit for bit from
+//! the same token sequences. When LHa for UNIX is available (`COMPCOL_LHA`,
+//! or `lha` on `PATH`), `tests/lha.rs` also wraps this crate's `lh1`, `lh2`
+//! and `lh4`..`lh7` output in `.lzh` archives and checks that LHa tests them
+//! OK and extracts the original bytes.
 
 #![cfg_attr(docsrs, doc(cfg(feature = "lha")))]
 

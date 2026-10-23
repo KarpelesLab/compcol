@@ -228,14 +228,14 @@ zip_shrink = ["alloc"]
 # PKZip Reduce (methods 2..5). Decoder-only: the encoder permanently
 # returns `Error::Unsupported`.
 zip_reduce = ["alloc"]
-# LHA / LZH compression methods (-lh1-/-lh4-/-lh5-/-lh6-/-lh7-): LZSS
+# LHA / LZH compression methods (-lh1-/-lh2-/-lh4-..-lh7-): LZSS
 # sliding-dictionary back-references with Huffman-coded literal/length
 # and position codes. lh4/lh5/lh6/lh7 share the static-Huffman block
 # structure (Okumura's public-domain ar002 layout) and differ only in
 # dictionary size and number of position bits; lh1 uses the classic
-# adaptive-Huffman LZHUF scheme. These are the raw method payloads (no
-# LHA container header). Decoder for all five plus a static-Huffman
-# lh5/lh6/lh7 encoder (clean-room, round-trip validated).
+# adaptive-Huffman LZHUF scheme and lh2 adds an adaptive position tree.
+# These are the raw method payloads (no LHA container header). Encoder and
+# decoder for all six (clean-room).
 lha     = ["alloc"]
 # BCJ branch-converter filters (x86/ARM/ARMT/ARM64/PPC/SPARC/IA-64/RISC-V),
 # from the public-domain LZMA SDK lineage. Reversible filters, not

@@ -1,6 +1,6 @@
 #![no_main]
 use compcol::Decoder as _;
-use compcol::lha::{DecoderConfig, Lh1, Lh5};
+use compcol::lha::{DecoderConfig, Lh1, Lh2, Lh5};
 use libfuzzer_sys::fuzz_target;
 
 // Smoke property: the decoder must not panic on arbitrary input.
@@ -10,11 +10,12 @@ use libfuzzer_sys::fuzz_target;
 //
 // LHA methods come in two flavors here. The static-Huffman methods
 // (lh4..lh7, e.g. `Lh5`) self-delimit and can be fuzzed in finish-mode
-// with the default (no-length) decoder. The dynamic `lh1` method has no
-// in-band end marker, so it returns `Unsupported` without an out-of-band
-// length — to actually exercise its decode loop we must supply one via
-// `DecoderConfig::with_len`. We read a 4-byte LE length prefix, cap it to
-// 256 KiB, fuzz `Lh5` both ways and `Lh1` with the length.
+// with the default (no-length) decoder. The dynamic `lh1`/`lh2` methods
+// have no in-band end marker, so they return `Unsupported` without an
+// out-of-band length — to actually exercise their decode loops we must
+// supply one via `DecoderConfig::with_len`. We read a 4-byte LE length
+// prefix, cap it to 256 KiB, fuzz `Lh5` both ways and `Lh1`/`Lh2` with the
+// length.
 fn drive<A: compcol::Algorithm<DecoderConfig = DecoderConfig>>(cfg: DecoderConfig, payload: &[u8]) {
     let mut dec = A::decoder_with(cfg);
     let mut out = vec![0u8; 64 * 1024];
@@ -66,6 +67,7 @@ fuzz_target!(|data: &[u8]| {
     drive::<Lh5>(DecoderConfig::default(), payload);
     // Static-Huffman lh5 with an out-of-band length.
     drive::<Lh5>(DecoderConfig::with_len(n), payload);
-    // Dynamic lh1 needs the length to enter its decode loop.
+    // Dynamic lh1/lh2 need the length to enter their decode loops.
     drive::<Lh1>(DecoderConfig::with_len(n), payload);
+    drive::<Lh2>(DecoderConfig::with_len(n), payload);
 });
