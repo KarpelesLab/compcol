@@ -50,6 +50,7 @@
 //! - Encoder-side static-dictionary transforms beyond `Identity` /
 //!   `UppercaseFirst` (ASCII). The decoder handles all 121 transforms.
 
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -1851,6 +1852,9 @@ pub struct Decoder {
     /// is the second-most-recent), used to look up literal contexts.
     p1: u8,
     p2: u8,
+    /// The compressed meta-block being decoded, once its header is read
+    /// and until its last command is done.
+    meta_block: Option<Box<MetaBlock>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1892,6 +1896,7 @@ impl Decoder {
             total_out: 0,
             p1: 0,
             p2: 0,
+            meta_block: None,
         }
     }
 
@@ -2029,8 +2034,12 @@ impl Decoder {
         match self.try_process_meta_block() {
             Ok(()) => Ok(true),
             Err(Error::UnexpectedEnd) => {
-                // Roll back to where we were so a later call retries.
-                self.bit_pos = start_bit_pos;
+                // Roll back to where we were so a later call retries —
+                // unless a compressed meta-block is part-way through, in
+                // which case `bit_pos` already marks where it resumes.
+                if self.meta_block.is_none() {
+                    self.bit_pos = start_bit_pos;
+                }
                 Ok(false)
             }
             Err(e) => Err(e),
@@ -2047,7 +2056,7 @@ impl Decoder {
         let raw = core::mem::take(&mut self.raw);
         let r = self.try_process_meta_block_in(&raw);
         self.raw = raw;
-        if r.is_ok() {
+        if r.is_ok() || (r == Err(Error::UnexpectedEnd) && self.meta_block.is_some()) {
             self.compact_raw();
         }
         r
@@ -2068,6 +2077,9 @@ impl Decoder {
             ));
         }
         let mut src = BitSource::at(raw, self.bit_pos);
+        if let Some(mb) = self.meta_block.take() {
+            return self.continue_meta_block(&mut src, mb);
+        }
         let initial_pos = self.bit_pos;
         let is_last = src.read_bit()? != 0;
         let mut is_last_empty = false;
@@ -2172,46 +2184,50 @@ impl Decoder {
         }
 
         // ─── compressed meta-block ───
-        // Decode in one shot. For simplicity, our parsing routines
-        // consume bytes from `self.raw` via the `BitSource`, and the
-        // outer caller handles UnexpectedEnd by rolling back bit_pos.
-        // Snapshot the global ring buffer / context state so a partial
-        // decode (UnexpectedEnd mid-way) doesn't leave behind side
-        // effects on the next retry.
-        let snap = (
-            self.dist_ring,
-            self.ring_idx,
-            self.p1,
-            self.p2,
-            self.total_out,
-            self.out.len(),
-        );
-        if let Err(e) = self.decode_compressed_meta_block(&mut src, mlen) {
-            if core::option_env!("BROTLI_DEBUG").is_some() {
-                self.dbg_msgs.push(alloc::format!(
-                    "decode_compressed_meta_block ERR: {:?}, mlen={}, src.position()={}",
-                    e,
-                    mlen,
-                    src.position()
-                ));
+        // Its tables are read in one go (they are bounded in size), and
+        // running out of input there rewinds to the meta-block's start
+        // for a retry. The command loop after them can stop anywhere and
+        // resume where it stopped.
+        let mb = match Self::read_meta_block_header(&mut src, mlen, is_last) {
+            Ok(mb) => Box::new(mb),
+            Err(e) => {
+                if core::option_env!("BROTLI_DEBUG").is_some() {
+                    self.dbg_msgs.push(alloc::format!(
+                        "read_meta_block_header ERR: {:?}, mlen={}, src.position()={}",
+                        e,
+                        mlen,
+                        src.position()
+                    ));
+                }
+                self.bit_pos = initial_pos;
+                return Err(e);
             }
-            if e == Error::UnexpectedEnd {
-                // Roll back. The caller will retry with more bytes.
-                self.dist_ring = snap.0;
-                self.ring_idx = snap.1;
-                self.p1 = snap.2;
-                self.p2 = snap.3;
-                self.total_out = snap.4;
-                self.out.truncate(snap.5);
+        };
+        self.continue_meta_block(&mut src, mb)
+    }
+
+    /// Run (or resume) the command loop of `mb`. If input runs out, keep it
+    /// in `self.meta_block` with `bit_pos` at the unit to decode next.
+    fn continue_meta_block(
+        &mut self,
+        src: &mut BitSource<'_>,
+        mut mb: Box<MetaBlock>,
+    ) -> Result<(), Error> {
+        match self.run_meta_block(src, &mut mb) {
+            Ok(()) => {
+                self.bit_pos = src.position();
+                if mb.is_last {
+                    self.state = DecState::Done;
+                }
+                Ok(())
             }
-            self.bit_pos = initial_pos;
-            return Err(e);
+            Err(Error::UnexpectedEnd) => {
+                self.bit_pos = src.position();
+                self.meta_block = Some(mb);
+                Err(Error::UnexpectedEnd)
+            }
+            Err(e) => Err(e),
         }
-        self.bit_pos = src.position();
-        if is_last {
-            self.state = DecState::Done;
-        }
-        Ok(())
     }
 
     /// Emit one literal byte to the output and rotate p1/p2.
@@ -2556,14 +2572,14 @@ impl Decoder {
         Ok(BLOCK_LEN_BASE[sym as usize] + extra)
     }
 
-    /// Decode the body of a compressed meta-block: read all per-block
-    /// tables, then run the literal/copy command loop until `mlen`
-    /// bytes have been emitted.
-    fn decode_compressed_meta_block(
-        &mut self,
+    /// Read the tables at the head of a compressed meta-block (block-type
+    /// groups, distance parameters, context modes and maps, prefix codes)
+    /// and return the decode state positioned at its first command.
+    fn read_meta_block_header(
         src: &mut BitSource<'_>,
         mlen: u32,
-    ) -> Result<(), Error> {
+        is_last: bool,
+    ) -> Result<MetaBlock, Error> {
         // 1) Block-type / block-count groups for L, I, D.
         let group_l = read_block_group(src)?;
         let group_i = read_block_group(src)?;
@@ -2615,130 +2631,143 @@ impl Decoder {
             htree_d.push(Self::read_prefix_code(src, num_dist_codes)?);
         }
 
-        // When there is a single literal Huffman tree the context map is
-        // all zeroes, so literal decoding can skip the per-byte context
-        // lookup entirely (the tree index is constant 0).
-        let single_literal_tree = ntreesl == 1;
+        Ok(MetaBlock {
+            is_last,
+            mlen,
+            emitted: 0,
+            cur_l: BlockCursor::new(&group_l),
+            cur_i: BlockCursor::new(&group_i),
+            cur_d: BlockCursor::new(&group_d),
+            group_l,
+            group_i,
+            group_d,
+            npostfix,
+            ndirect,
+            num_dist_codes,
+            cmodes,
+            cmapl,
+            cmapd,
+            htree_l,
+            htree_i,
+            htree_d,
+            // When there is a single literal Huffman tree the context map
+            // is all zeroes, so literal decoding can skip the per-byte
+            // context lookup entirely (the tree index is constant 0).
+            single_literal_tree: ntreesl == 1,
+            in_command: false,
+            insert_left: 0,
+            copy_len: 0,
+            use_last_dist: false,
+        })
+    }
 
-        // ─── decoding loop ───
-        let mut emitted: u32 = 0;
-        let mut block_type_l: u32 = 0;
-        let mut block_type_i: u32 = 0;
-        let mut block_type_d: u32 = 0;
-        // "Previous block type" trackers, used for block-type code value 0
-        // (use prev) and value 1 (use prev+1 mod NBLTYPES).
-        let mut prev_block_type_l: u32 = 1;
-        let mut prev_block_type_i: u32 = 1;
-        let mut prev_block_type_d: u32 = 1;
-        let mut block_len_l: u32 = group_l.first_count;
-        let mut block_len_i: u32 = group_i.first_count;
-        let mut block_len_d: u32 = group_d.first_count;
+    /// Run the command loop of a compressed meta-block until `mlen` bytes
+    /// have been emitted.
+    ///
+    /// Resumable: the loop advances in units (an insert-and-copy symbol
+    /// with its extra bits, one literal, one distance with the copy it
+    /// drives), and a unit that runs out of input is undone — its block
+    /// cursor and bit position restored — before `UnexpectedEnd` is
+    /// returned, so `mb` and `src.position()` describe the next unit to
+    /// decode. Output from finished units stays in `self.out`. A meta-block
+    /// arriving in pieces is thus decoded once, not again from its start
+    /// on every call (quadratic, and unbounded: zero-length dictionary
+    /// references let one meta-block take any number of bytes).
+    fn run_meta_block(&mut self, src: &mut BitSource<'_>, mb: &mut MetaBlock) -> Result<(), Error> {
+        let postfix_mask: u32 = (1u32 << mb.npostfix) - 1;
 
-        let postfix_mask: u32 = (1u32 << npostfix) - 1;
-
-        // Local helper: advance block-type when count reaches zero.
-        macro_rules! maybe_switch {
-            ($len:ident, $bt:ident, $prev:ident, $group:expr) => {
-                if $len == 0 {
-                    let g = &$group;
-                    let nbl = g.nbltypes;
-                    // When NBLTYPES == 1 the type/count trees are absent and
-                    // there is only one block type, so there is never a switch.
-                    // The block-length counter decrements once per command (IC)
-                    // or per literal/distance, and a command can emit zero
-                    // output bytes (e.g. a dictionary reference whose transform
-                    // omits the whole word), so after `first_count` (1<<24) such
-                    // commands the counter can reach 0. Reload it to an
-                    // effectively-infinite value instead of unwrapping the
-                    // `None` trees (which would panic).
-                    match (g.type_tree.as_ref(), g.count_tree.as_ref()) {
-                        (Some(type_tree), Some(count_tree)) => {
-                            let code = type_tree.decode(src)?;
-                            let next_type = if code == 0 {
-                                $prev
-                            } else if code == 1 {
-                                ($bt + 1) % nbl
-                            } else {
-                                code - 2
-                            };
-                            if next_type >= nbl {
-                                return Err(Error::Corrupt);
-                            }
-                            $prev = $bt;
-                            $bt = next_type;
-                            $len = Self::read_block_count(src, count_tree)?;
-                        }
-                        _ => {
-                            // Single block type: never switch, just keep going.
-                            $len = u32::MAX;
-                        }
-                    }
+        loop {
+            if !mb.in_command {
+                if mb.emitted >= mb.mlen {
+                    return Ok(());
                 }
-            };
-        }
-
-        while emitted < mlen {
-            // Block-type switch for IC if needed.
-            maybe_switch!(block_len_i, block_type_i, prev_block_type_i, group_i);
-            block_len_i -= 1;
-
-            // Decode the IC command symbol.
-            let cmd_sym = htree_i[block_type_i as usize].decode(src)?;
-            if cmd_sym >= NUM_COMMAND_SYMBOLS {
-                return Err(Error::Corrupt);
+                // Decode the IC command symbol, switching block type first
+                // if needed.
+                let pos = src.position();
+                let saved = mb.cur_i;
+                if let Err(e) = Self::read_command(src, mb) {
+                    mb.cur_i = saved;
+                    src.set_position(pos);
+                    return Err(e);
+                }
             }
-            let (ins_code, copy_code, use_last_dist) = decode_ic_command(cmd_sym);
 
-            let ins_extra = src.read_bits(INS_EXTRA[ins_code as usize])?;
-            let insert_len = INS_BASE[ins_code as usize] + ins_extra;
-            let copy_extra = src.read_bits(COPY_EXTRA[copy_code as usize])?;
-            let copy_len = COPY_BASE[copy_code as usize] + copy_extra;
-
-            // Emit `insert_len` literals.
-            if single_literal_tree {
+            // Emit the command's `insert_len` literals. The loop state
+            // lives in locals (kept in registers across `emit_literal`);
+            // if input runs out mid-literal, the literals done so far are
+            // stored back and the one in progress is undone.
+            let mlen = mb.mlen;
+            let mut emitted = mb.emitted;
+            let mut left = mb.insert_left;
+            let mut cur = mb.cur_l;
+            macro_rules! out_of_input {
+                ($saved:expr, $pos:expr, $e:expr) => {{
+                    mb.emitted = emitted;
+                    mb.insert_left = left;
+                    mb.cur_l = $saved;
+                    src.set_position($pos);
+                    return Err($e);
+                }};
+            }
+            if mb.single_literal_tree {
                 // Single literal Huffman tree: the context map is all
                 // zeroes, so the per-byte context computation and the
                 // `cmapl` lookup are dead work — the tree index is always
-                // 0. (Block-type switches still drive `block_len_l`, but
-                // they never change which tree we use here.)
-                let tree = &htree_l[0];
-                for _ in 0..insert_len {
+                // 0. (Block-type switches still drive the literal block
+                // counter, but they never change which tree we use here.)
+                let tree = &mb.htree_l[0];
+                while left > 0 {
                     if emitted >= mlen {
                         return Err(Error::Corrupt);
                     }
-                    maybe_switch!(block_len_l, block_type_l, prev_block_type_l, group_l);
-                    block_len_l -= 1;
-                    let sym = tree.decode(src)?;
+                    let pos = src.position();
+                    let saved = cur;
+                    let sym = match cur.step(&mb.group_l, src).and_then(|()| tree.decode(src)) {
+                        Ok(s) => s,
+                        Err(e) => out_of_input!(saved, pos, e),
+                    };
                     if sym > 255 {
                         return Err(Error::Corrupt);
                     }
                     self.emit_literal(sym as u8);
                     emitted += 1;
+                    left -= 1;
                 }
             } else {
-                for _ in 0..insert_len {
+                while left > 0 {
                     if emitted >= mlen {
                         return Err(Error::Corrupt);
                     }
-                    maybe_switch!(block_len_l, block_type_l, prev_block_type_l, group_l);
-                    block_len_l -= 1;
+                    let pos = src.position();
+                    let saved = cur;
+                    if let Err(e) = cur.step(&mb.group_l, src) {
+                        out_of_input!(saved, pos, e);
+                    }
                     let cid =
-                        context::literal_context(cmodes[block_type_l as usize], self.p1, self.p2);
-                    let tree_idx = cmapl[(64 * block_type_l + cid as u32) as usize] as usize;
-                    let sym = htree_l[tree_idx].decode(src)?;
+                        context::literal_context(mb.cmodes[cur.ty as usize], self.p1, self.p2);
+                    let tree_idx = mb.cmapl[(64 * cur.ty + cid as u32) as usize] as usize;
+                    let sym = match mb.htree_l[tree_idx].decode(src) {
+                        Ok(s) => s,
+                        Err(e) => out_of_input!(saved, pos, e),
+                    };
                     if sym > 255 {
                         return Err(Error::Corrupt);
                     }
                     self.emit_literal(sym as u8);
                     emitted += 1;
+                    left -= 1;
                 }
             }
+            mb.emitted = emitted;
+            mb.insert_left = 0;
+            mb.cur_l = cur;
 
-            if emitted >= mlen {
+            if mb.emitted >= mb.mlen {
                 // Last command is allowed to have copy_len that would
                 // exceed mlen if insert filled it; in that case no copy
                 // is emitted.
-                break;
+                mb.in_command = false;
+                return Ok(());
             }
 
             // Decode distance. For short codes the ring may be
@@ -2747,34 +2776,22 @@ impl Decoder {
             // ring push until we know whether this resolves to a
             // back-reference (push) or a static-dictionary reference
             // (no push).
-            let (distance, is_short_or_direct) = if use_last_dist {
+            let copy_len = mb.copy_len;
+            let (distance, is_short_or_direct) = if mb.use_last_dist {
                 (self.last_dist() as u32, true)
             } else {
-                maybe_switch!(block_len_d, block_type_d, prev_block_type_d, group_d);
-                block_len_d -= 1;
-                let cid = context::distance_context(copy_len) as u32;
-                let tree_idx = cmapd[(4 * block_type_d + cid) as usize] as usize;
-                let dcode = htree_d[tree_idx].decode(src)?;
-                if dcode >= num_dist_codes {
-                    return Err(Error::Corrupt);
-                }
-                if dcode < 16 {
-                    // Short codes update the ring immediately per spec.
-                    (decode_short_distance(self, dcode)?, true)
-                } else if dcode < 16 + ndirect {
-                    // Direct distance.
-                    (dcode - 15, false)
-                } else {
-                    let v = dcode - ndirect - 16;
-                    let ndistbits = 1 + (v >> (npostfix + 1));
-                    let dextra = src.read_bits(ndistbits)?;
-                    let hcode = v >> npostfix;
-                    let lcode = v & postfix_mask;
-                    let offset = ((2 + (hcode & 1)) << ndistbits) - 4;
-                    let dist = ((offset + dextra) << npostfix) + lcode + ndirect + 1;
-                    (dist, false)
+                let pos = src.position();
+                let saved = mb.cur_d;
+                match self.read_distance(src, mb, postfix_mask) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        mb.cur_d = saved;
+                        src.set_position(pos);
+                        return Err(e);
+                    }
                 }
             };
+            mb.in_command = false;
 
             // Compute max-distance: min(window_size - 16, total_out so far).
             // `total_out` is a usize accumulated over the whole stream; a plain
@@ -2786,27 +2803,82 @@ impl Decoder {
                 (self.window_size.saturating_sub(16) as usize).min(self.total_out) as u32;
             if distance <= max_dist {
                 // Normal back-reference. Non-short distances are
-                // pushed to the ring here.
+                // pushed to the ring here. Reject a copy running past the
+                // meta-block before producing it (it can be ~16 MiB).
+                if copy_len > mb.mlen - mb.emitted {
+                    return Err(Error::Corrupt);
+                }
                 if !is_short_or_direct {
                     self.push_dist(distance as i32);
                 }
                 self.emit_copy(distance, copy_len)?;
-                emitted += copy_len;
-                if emitted > mlen {
-                    return Err(Error::Corrupt);
-                }
+                mb.emitted += copy_len;
             } else {
                 // Static dictionary reference (§8). Distances that
                 // resolve to dictionary entries are NOT pushed onto the
                 // ring buffer.
                 let n = self.emit_dictionary(distance, copy_len, max_dist)?;
-                emitted += n;
-                if emitted > mlen {
+                mb.emitted += n;
+                if mb.emitted > mb.mlen {
                     return Err(Error::Corrupt);
                 }
             }
         }
+    }
+
+    /// Read one insert-and-copy symbol and its extra bits into `mb`.
+    fn read_command(src: &mut BitSource<'_>, mb: &mut MetaBlock) -> Result<(), Error> {
+        mb.cur_i.step(&mb.group_i, src)?;
+        let cmd_sym = mb.htree_i[mb.cur_i.ty as usize].decode(src)?;
+        if cmd_sym >= NUM_COMMAND_SYMBOLS {
+            return Err(Error::Corrupt);
+        }
+        let (ins_code, copy_code, use_last_dist) = decode_ic_command(cmd_sym);
+
+        let ins_extra = src.read_bits(INS_EXTRA[ins_code as usize])?;
+        let copy_extra = src.read_bits(COPY_EXTRA[copy_code as usize])?;
+        mb.insert_left = INS_BASE[ins_code as usize] + ins_extra;
+        mb.copy_len = COPY_BASE[copy_code as usize] + copy_extra;
+        mb.use_last_dist = use_last_dist;
+        mb.in_command = true;
         Ok(())
+    }
+
+    /// Read a distance code and its extra bits. Returns the distance and
+    /// whether it came from a short or direct code. Every bit is read
+    /// before a short code updates the ring, so running out of input
+    /// leaves the ring untouched.
+    fn read_distance(
+        &mut self,
+        src: &mut BitSource<'_>,
+        mb: &mut MetaBlock,
+        postfix_mask: u32,
+    ) -> Result<(u32, bool), Error> {
+        mb.cur_d.step(&mb.group_d, src)?;
+        let cid = context::distance_context(mb.copy_len) as u32;
+        let tree_idx = mb.cmapd[(4 * mb.cur_d.ty + cid) as usize] as usize;
+        let dcode = mb.htree_d[tree_idx].decode(src)?;
+        if dcode >= mb.num_dist_codes {
+            return Err(Error::Corrupt);
+        }
+        let ndirect = mb.ndirect;
+        let npostfix = mb.npostfix;
+        if dcode < 16 {
+            // Short codes update the ring immediately per spec.
+            Ok((decode_short_distance(self, dcode)?, true))
+        } else if dcode < 16 + ndirect {
+            // Direct distance.
+            Ok((dcode - 15, false))
+        } else {
+            let v = dcode - ndirect - 16;
+            let ndistbits = 1 + (v >> (npostfix + 1));
+            let dextra = src.read_bits(ndistbits)?;
+            let hcode = v >> npostfix;
+            let lcode = v & postfix_mask;
+            let offset = ((2 + (hcode & 1)) << ndistbits) - 4;
+            let dist = ((offset + dextra) << npostfix) + lcode + ndirect + 1;
+            Ok((dist, false))
+        }
     }
 
     /// Resolve a distance code that overshoots the back-reference window
@@ -3015,6 +3087,7 @@ fn inverse_mtf(v: &mut [u8]) {
 /// insert-copy, distance). When NBLTYPES = 1, the type/count trees are
 /// absent and only `first_count` matters (and equals `1<<24` to
 /// effectively disable block-switch).
+#[derive(Debug)]
 struct BlockGroup {
     nbltypes: u32,
     type_tree: Option<HuffmanDecoder>,
@@ -3044,6 +3117,102 @@ fn read_block_group(src: &mut BitSource<'_>) -> Result<BlockGroup, Error> {
             first_count: 1u32 << 24,
         })
     }
+}
+
+/// Where a category (literal, insert-copy, distance) stands in its run
+/// of blocks: the current block type, the one before it, and how many
+/// symbols are left in the current block.
+#[derive(Debug, Clone, Copy)]
+struct BlockCursor {
+    len: u32,
+    ty: u32,
+    prev: u32,
+}
+
+impl BlockCursor {
+    fn new(group: &BlockGroup) -> Self {
+        // "Previous block type" starts at 1, used for block-type code
+        // value 0 (use prev) and value 1 (use prev+1 mod NBLTYPES).
+        Self {
+            len: group.first_count,
+            ty: 0,
+            prev: 1,
+        }
+    }
+
+    /// Count one symbol of this category, first switching block type when
+    /// the current block is used up.
+    #[inline]
+    fn step(&mut self, group: &BlockGroup, src: &mut BitSource<'_>) -> Result<(), Error> {
+        if self.len == 0 {
+            // When NBLTYPES == 1 the type/count trees are absent and
+            // there is only one block type, so there is never a switch.
+            // The block-length counter decrements once per command (IC)
+            // or per literal/distance, and a command can emit zero
+            // output bytes (e.g. a dictionary reference whose transform
+            // omits the whole word), so after `first_count` (1<<24) such
+            // commands the counter can reach 0. Reload it to an
+            // effectively-infinite value instead of unwrapping the
+            // `None` trees (which would panic).
+            match (group.type_tree.as_ref(), group.count_tree.as_ref()) {
+                (Some(type_tree), Some(count_tree)) => {
+                    let nbl = group.nbltypes;
+                    let code = type_tree.decode(src)?;
+                    let next_type = if code == 0 {
+                        self.prev
+                    } else if code == 1 {
+                        (self.ty + 1) % nbl
+                    } else {
+                        code - 2
+                    };
+                    if next_type >= nbl {
+                        return Err(Error::Corrupt);
+                    }
+                    self.len = Decoder::read_block_count(src, count_tree)?;
+                    self.prev = self.ty;
+                    self.ty = next_type;
+                }
+                _ => {
+                    // Single block type: never switch, just keep going.
+                    self.len = u32::MAX;
+                }
+            }
+        }
+        self.len -= 1;
+        Ok(())
+    }
+}
+
+/// A compressed meta-block being decoded: its tables, and where the
+/// command loop stands, kept across calls while its bytes arrive.
+#[derive(Debug)]
+struct MetaBlock {
+    is_last: bool,
+    mlen: u32,
+    emitted: u32,
+    group_l: BlockGroup,
+    group_i: BlockGroup,
+    group_d: BlockGroup,
+    cur_l: BlockCursor,
+    cur_i: BlockCursor,
+    cur_d: BlockCursor,
+    npostfix: u32,
+    ndirect: u32,
+    num_dist_codes: u32,
+    cmodes: Vec<ContextMode>,
+    cmapl: Vec<u8>,
+    cmapd: Vec<u8>,
+    htree_l: Vec<HuffmanDecoder>,
+    htree_i: Vec<HuffmanDecoder>,
+    htree_d: Vec<HuffmanDecoder>,
+    single_literal_tree: bool,
+    /// An insert-and-copy symbol has been read and its command is not
+    /// finished: `insert_left` literals are still to come, then (unless
+    /// the meta-block fills first) the copy of `copy_len` bytes.
+    in_command: bool,
+    insert_left: u32,
+    copy_len: u32,
+    use_last_dist: bool,
 }
 
 impl Default for Decoder {
@@ -3090,7 +3259,11 @@ impl RawDecoder for Decoder {
                         }
                         // Loop to drain any newly-queued output.
                     }
-                    Ok(false) => break,
+                    Ok(false) => {
+                        // A part-decoded meta-block may have queued output.
+                        written += self.drain_out_into(&mut output[written..]);
+                        break;
+                    }
                     Err(e) => return Err(self.poison(e)),
                 },
                 DecState::Done => {
@@ -3206,5 +3379,6 @@ impl RawDecoder for Decoder {
         self.total_out = 0;
         self.p1 = 0;
         self.p2 = 0;
+        self.meta_block = None;
     }
 }

@@ -796,3 +796,34 @@ fn roundtrip_above_old_buggy_size_with_full_buffer() {
         assert_eq!(out, input, "n={n}");
     }
 }
+
+#[test]
+fn decoder_resumes_inside_a_meta_block() {
+    // A meta-block whose bytes arrive in pieces is decoded as they come
+    // (once used to restart from its first command on every call:
+    // quadratic). Output from the commands already received shows up
+    // before the meta-block is complete, and the result must not depend
+    // on where the input is cut, including mid-symbol.
+    let input: Vec<u8> = (0..60_000u32)
+        .map(|i| b"etaoin shrdlu"[(i.wrapping_mul(2_654_435_761) >> 20) as usize % 13])
+        .collect();
+    for quality in [1, 6, 11] {
+        let encoded = encode_at_quality(&input, quality);
+        for in_chunk in [1, 7, 1000] {
+            let decoded = decode_chunked(&encoded, in_chunk, 4096).unwrap();
+            assert!(decoded == input, "quality {quality} in {in_chunk}");
+        }
+
+        let mut dec = Decoder::new();
+        let mut out = vec![0u8; input.len()];
+        let half = encoded.len() / 2;
+        let (p, status) = dec.decode(&encoded[..half], &mut out).unwrap();
+        assert_eq!(status, Status::InputEmpty);
+        assert!(
+            p.written > 0,
+            "quality {quality}: no output from half the stream"
+        );
+        assert!(out[..p.written] == input[..p.written]);
+        assert_eq!(dec.finish(&mut out).unwrap_err(), Error::UnexpectedEnd);
+    }
+}
