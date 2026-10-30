@@ -1,9 +1,8 @@
 //! Integration tests for the LZFSE decoder.
 //!
-//! LZFSE is decoder-only in this crate (encoder always returns
-//! [`Error::Unsupported`]). These tests:
+//! Decoder-side tests (the encoder has its own file, `lzfse_encoder.rs`):
 //!
-//! - confirm the algorithm metadata and Encoder-side Unsupported contract;
+//! - confirm the algorithm metadata;
 //! - decode a hand-built minimal stream (`bvx-` literal block + `bvx$`);
 //! - decode a hand-built `bvxn` (LZVN) fixture (literals-only `bvxn` for
 //!   the ASCII string "hello world", and a 100-byte run);
@@ -18,8 +17,8 @@
 
 #![cfg(feature = "lzfse")]
 
-use compcol::lzfse::{Decoder, Encoder, Lzfse};
-use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Status};
+use compcol::lzfse::{Decoder, Lzfse};
+use compcol::{Algorithm, Decoder as _, Error, Status};
 
 // ─── helpers ─────────────────────────────────────────────────────────────
 
@@ -126,33 +125,6 @@ fn lzfse_algorithm_factory_produces_codec() {
 #[test]
 fn decoder_new_does_not_panic() {
     let _ = Decoder::new();
-}
-
-// ─── encoder is permanently unsupported ──────────────────────────────────
-
-#[test]
-fn encoder_encode_is_unsupported() {
-    let mut enc = Encoder::new();
-    let mut out = [0u8; 16];
-    assert_eq!(
-        enc.encode(b"hello", &mut out).unwrap_err(),
-        Error::Unsupported
-    );
-}
-
-#[test]
-fn encoder_finish_is_unsupported() {
-    let mut enc = Encoder::new();
-    let mut out = [0u8; 16];
-    assert_eq!(enc.finish(&mut out).unwrap_err(), Error::Unsupported);
-}
-
-#[test]
-fn encoder_reset_is_a_no_op() {
-    let mut enc = Encoder::new();
-    enc.reset();
-    let mut out = [0u8; 4];
-    assert_eq!(enc.encode(b"x", &mut out).unwrap_err(), Error::Unsupported);
 }
 
 // ─── empty / pure-EOS streams ────────────────────────────────────────────
@@ -464,14 +436,27 @@ mod factory {
     }
 
     #[test]
-    fn boxed_encoder_is_unsupported() {
-        use compcol::Error;
+    fn boxed_encoder_round_trips() {
+        let data = b"boxed lzfse encoder, boxed lzfse encoder".repeat(300);
         let mut enc = factory::encoder_by_name("lzfse").unwrap();
-        let mut out = [0u8; 16];
-        assert_eq!(
-            enc.encode(b"hello", &mut out).unwrap_err(),
-            Error::Unsupported
-        );
+        let mut packed = Vec::new();
+        let mut buf = vec![0u8; 1 << 16];
+        let (p, _) = enc.encode(&data, &mut buf).unwrap();
+        assert_eq!(p.consumed, data.len());
+        packed.extend_from_slice(&buf[..p.written]);
+        loop {
+            let (p, s) = enc.finish(&mut buf).unwrap();
+            packed.extend_from_slice(&buf[..p.written]);
+            if s == compcol::Status::StreamEnd {
+                break;
+            }
+        }
+        assert!(packed.len() < data.len() / 10);
+        let mut dec = factory::decoder_by_name("lzfse").unwrap();
+        let mut out = vec![0u8; data.len() + 1];
+        let (p, s) = dec.decode(&packed, &mut out).unwrap();
+        assert_eq!(s, compcol::Status::StreamEnd);
+        assert_eq!(&out[..p.written], &data[..]);
     }
 
     #[test]
