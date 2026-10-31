@@ -653,6 +653,230 @@ const GOLDEN_2T4K: [u8; 21] = [
     0xC3, 0x8A, 0x1D, 0x23, 0xFC, 0x1F,
 ];
 
+// ─── raw entry point (no header; flags + size from the ZIP entry) ────────
+
+/// Framed header length; the raw payload is everything after it.
+const HDR: usize = 5;
+
+/// One framed stream per existing fixture shape, covering all four
+/// window × tree combinations: `(large_window, lit_tree, framed_stream)`.
+fn raw_cases() -> Vec<(bool, bool, Vec<u8>)> {
+    let lits = |p: &[u8]| -> Vec<Tok> { p.iter().map(|&b| Tok::Lit(b)).collect() };
+    let t64 = uniform_64_tree();
+    let t256 = uniform_256_tree();
+    let mut cases = Vec::new();
+
+    // 2 trees, 4 KiB.
+    cases.push((
+        false,
+        false,
+        build_stream(false, false, &[], &t64, &t64, &lits(b"hello world"), 11),
+    ));
+    let abc = vec![
+        Tok::Lit(b'a'),
+        Tok::Lit(b'b'),
+        Tok::Lit(b'c'),
+        Tok::Match(3, 3),
+    ];
+    cases.push((
+        false,
+        false,
+        build_stream(false, false, &[], &t64, &t64, &abc, 6),
+    ));
+    let mut hw = lits(b"hello world ");
+    hw.push(Tok::Match(12, 11));
+    cases.push((
+        false,
+        false,
+        build_stream(false, false, &[], &t64, &t64, &hw, 23),
+    ));
+    cases.push((false, false, GOLDEN_2T4K.to_vec()));
+
+    // 2 trees, 8 KiB.
+    let mut far = vec![Tok::Lit(b'x')];
+    far.extend((0..200).map(|_| Tok::Lit(0)));
+    far.push(Tok::Match(201, 4));
+    cases.push((
+        true,
+        false,
+        build_stream(true, false, &[], &t64, &t64, &far, 205),
+    ));
+
+    // 3 trees, 4 KiB.
+    cases.push((
+        false,
+        true,
+        build_stream(false, true, &t256, &t64, &t64, &lits(b"abcdefghi"), 9),
+    ));
+    let the = vec![
+        Tok::Lit(b't'),
+        Tok::Lit(b'h'),
+        Tok::Lit(b'e'),
+        Tok::Lit(b'_'),
+        Tok::Match(4, 7),
+    ];
+    cases.push((
+        false,
+        true,
+        build_stream(false, true, &t256, &t64, &t64, &the, 11),
+    ));
+
+    // 3 trees, 8 KiB (length-extra byte).
+    let run = vec![Tok::Lit(b'A'), Tok::Match(1, 199)];
+    cases.push((
+        true,
+        true,
+        build_stream(true, true, &t256, &t64, &t64, &run, 200),
+    ));
+    cases
+}
+
+fn framed_len(stream: &[u8]) -> u64 {
+    u32::from_le_bytes([stream[1], stream[2], stream[3], stream[4]]) as u64
+}
+
+fn gp_flags_for(large_window: bool, lit_tree: bool) -> u16 {
+    (if large_window { 0b010 } else { 0 }) | (if lit_tree { 0b100 } else { 0 })
+}
+
+#[test]
+fn raw_matches_framed_for_all_cases_and_chunkings() {
+    for (large, lit, stream) in raw_cases() {
+        let expected = decode_oneshot(&stream).unwrap();
+        let n = framed_len(&stream);
+        let payload = &stream[HDR..];
+        for &(ic, oc) in &[(1, 1), (1, 7), (3, 2), (7, 64), (payload.len(), 4096)] {
+            let mut dec = Decoder::raw(large, lit, n);
+            let out = decode_chunked_with(&mut dec, payload, ic, oc).unwrap();
+            assert_eq!(out, expected, "large={large} lit={lit} chunks=({ic},{oc})");
+        }
+    }
+}
+
+#[test]
+fn raw_reports_stream_end_and_ignores_trailing_bytes() {
+    for (large, lit, stream) in raw_cases() {
+        let expected = decode_oneshot(&stream).unwrap();
+        let mut payload = stream[HDR..].to_vec();
+        payload.extend_from_slice(&[0xAB; 32]);
+        let mut dec = Decoder::raw(large, lit, framed_len(&stream));
+        let mut out = vec![0u8; 4096];
+        let (p, status) = dec.decode(&payload, &mut out).unwrap();
+        assert_eq!(status, Status::StreamEnd);
+        assert_eq!(&out[..p.written], &expected[..]);
+    }
+}
+
+#[test]
+fn raw_from_gp_flags_maps_bits_1_and_2() {
+    for (large, lit, stream) in raw_cases() {
+        let expected = decode_oneshot(&stream).unwrap();
+        let n = framed_len(&stream);
+        // Unrelated GP bits (encryption, data descriptor, UTF-8, …) are ignored.
+        for extra in [0u16, 0xFFF9] {
+            let flags = gp_flags_for(large, lit) | extra;
+            let mut dec = Decoder::raw_from_gp_flags(flags, n);
+            let out = decode_chunked_with(&mut dec, &stream[HDR..], 1, 3).unwrap();
+            assert_eq!(out, expected, "flags={flags:#06x}");
+        }
+    }
+}
+
+#[test]
+fn raw_truncation_errors_like_framed() {
+    for (large, lit, stream) in raw_cases() {
+        let n = framed_len(&stream);
+        for cut in 0..stream.len() - HDR {
+            let framed = decode_oneshot(&stream[..HDR + cut]);
+            let mut dec = Decoder::raw(large, lit, n);
+            let raw = decode_chunked_with(&mut dec, &stream[HDR..HDR + cut], 1, 5);
+            assert_eq!(raw, framed, "large={large} lit={lit} cut={cut}");
+        }
+    }
+}
+
+#[test]
+fn raw_empty_input_is_unexpected_end() {
+    let mut dec = Decoder::raw(false, false, 1);
+    let mut out = [0u8; 4];
+    assert_eq!(dec.finish(&mut out).unwrap_err(), Error::UnexpectedEnd);
+}
+
+#[test]
+fn raw_zero_length_decodes_to_empty() {
+    for lit in [false, true] {
+        let t64 = uniform_64_tree();
+        let t256 = uniform_256_tree();
+        let stream = build_stream(
+            false,
+            lit,
+            if lit { &t256 } else { &[] },
+            &t64,
+            &t64,
+            &[],
+            0,
+        );
+        let mut dec = Decoder::raw(false, lit, 0);
+        let mut out = [0u8; 4];
+        let (p, status) = dec.decode(&stream[HDR..], &mut out).unwrap();
+        assert_eq!((p.written, status), (0, Status::StreamEnd));
+    }
+}
+
+#[test]
+fn raw_reset_keeps_raw_mode() {
+    for (large, lit, stream) in raw_cases() {
+        let expected = decode_oneshot(&stream).unwrap();
+        let payload = &stream[HDR..];
+        let mut dec = Decoder::raw(large, lit, framed_len(&stream));
+        assert_eq!(
+            decode_chunked_with(&mut dec, payload, 4, 16).unwrap(),
+            expected
+        );
+        dec.reset();
+        assert_eq!(
+            decode_chunked_with(&mut dec, payload, 1, 1).unwrap(),
+            expected
+        );
+        // Reset mid-stream, then decode from scratch.
+        let mut buf = [0u8; 2];
+        let _ = dec.decode(&payload[..payload.len() / 2], &mut buf).unwrap();
+        dec.reset();
+        assert_eq!(
+            decode_chunked_with(&mut dec, payload, 9, 4096).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn framed_reset_stays_framed() {
+    let stream = GOLDEN_2T4K;
+    let mut dec = Decoder::new();
+    assert_eq!(
+        decode_chunked_with(&mut dec, &stream, 2, 3).unwrap(),
+        b"abcabc"
+    );
+    dec.reset();
+    assert_eq!(
+        decode_chunked_with(&mut dec, &stream, 2, 3).unwrap(),
+        b"abcabc"
+    );
+}
+
+#[test]
+fn raw_length_is_not_truncated_to_u32() {
+    // Six bytes of payload but a declared size of 4 GiB + 6: the decoder
+    // must keep asking for input rather than stop at 6 (u32 wrap).
+    let stream = GOLDEN_2T4K;
+    let mut dec = Decoder::raw(false, false, (1u64 << 32) + 6);
+    let mut out = [0u8; 64];
+    let (p, status) = dec.decode(&stream[HDR..], &mut out).unwrap();
+    assert_eq!(&out[..p.written], b"abcabc");
+    assert_ne!(status, Status::StreamEnd);
+    assert_eq!(dec.finish(&mut out).unwrap_err(), Error::UnexpectedEnd);
+}
+
 // ─── factory (only if the feature is enabled) ────────────────────────────
 
 #[cfg(feature = "factory")]

@@ -9,8 +9,8 @@
 //! so far. Decoded bytes go into the sliding window and are drained from
 //! the window into the caller's output as the window fills.
 //!
-//! The decoder is finite: it stops as soon as the header's
-//! `uncompressed_length` bytes have been emitted. Trailing input is
+//! The decoder is finite: it stops as soon as `uncompressed_len` bytes
+//! (from the 5-byte header, or from [`Decoder::raw`]) have been emitted. Trailing input is
 //! ignored. Reaching end-of-input before completing a symbol while
 //! `output_left > 0` is reported as [`Error::UnexpectedEnd`] from
 //! `raw_finish`.
@@ -182,7 +182,7 @@ const fn reverse_bits(mut v: u32, n: u32) -> u32 {
 struct Header {
     large_window: bool,
     lit_tree: bool,
-    uncompressed_len: u32,
+    uncompressed_len: u64,
 }
 
 impl Header {
@@ -193,7 +193,7 @@ impl Header {
         }
         let large_window = (f & 0b0000_0001) != 0;
         let lit_tree = (f & 0b0000_0010) != 0;
-        let uncompressed_len = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
+        let uncompressed_len = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as u64;
         Ok(Self {
             large_window,
             lit_tree,
@@ -227,6 +227,10 @@ enum Phase {
 /// Streaming PKZIP Implode decoder.
 pub struct Decoder {
     phase: Phase,
+
+    /// Parameters supplied out-of-band by [`Decoder::raw`]; `None` for
+    /// the framed (5-byte header) mode. Kept so `reset` can restore it.
+    raw: Option<Header>,
 
     // Header.
     header_buf: [u8; HEADER_LEN],
@@ -263,7 +267,7 @@ pub struct Decoder {
     // Output budget remaining: starts at `uncompressed_len` and counts
     // down as we emit bytes to the window. When zero, we transition to
     // Done.
-    output_left: u32,
+    output_left: u64,
 }
 
 impl Default for Decoder {
@@ -273,8 +277,11 @@ impl Default for Decoder {
 }
 
 impl Decoder {
+    /// Framed decoder: expects the 5-byte header (flag byte + `u32` LE
+    /// length) described in the [module docs](super) before the payload.
     pub fn new() -> Self {
         Self {
+            raw: None,
             phase: Phase::AwaitHeader,
             header_buf: [0u8; HEADER_LEN],
             header_pos: 0,
@@ -290,6 +297,55 @@ impl Decoder {
             pending_len: 0,
             output_left: 0,
         }
+    }
+
+    /// Raw decoder for a bare Implode payload — exactly the bytes a ZIP
+    /// entry stores, with no header. The parameters come from the ZIP
+    /// entry: `large_window` is general-purpose flag bit 1 (8 KiB window
+    /// instead of 4 KiB), `lit_tree` is bit 2 (three Shannon–Fano trees,
+    /// i.e. a literal tree is present), and `uncompressed_len` is the
+    /// entry's uncompressed size (ZIP64 sizes fit).
+    ///
+    /// The stream ends once `uncompressed_len` bytes have been produced;
+    /// trailing input is ignored, as in framed mode.
+    pub fn raw(large_window: bool, lit_tree: bool, uncompressed_len: u64) -> Self {
+        let mut d = Self::new();
+        d.raw = Some(Header {
+            large_window,
+            lit_tree,
+            uncompressed_len,
+        });
+        d.start_raw();
+        d
+    }
+
+    /// Same as [`Decoder::raw`], taking the window and tree flags from a
+    /// ZIP entry's general-purpose bit flag word (bits 1 and 2; all other
+    /// bits are ignored).
+    pub fn raw_from_gp_flags(gp_flags: u16, uncompressed_len: u64) -> Self {
+        Self::raw(
+            gp_flags & 0b010 != 0,
+            gp_flags & 0b100 != 0,
+            uncompressed_len,
+        )
+    }
+
+    /// Skip the header phase using the out-of-band parameters, if any.
+    fn start_raw(&mut self) {
+        if let Some(hdr) = self.raw {
+            self.enter_trees(hdr);
+        }
+    }
+
+    /// Install a header (parsed or out-of-band) and move to tree reading.
+    fn enter_trees(&mut self, hdr: Header) {
+        self.output_left = hdr.uncompressed_len;
+        self.header = Some(hdr);
+        self.phase = if hdr.lit_tree {
+            Phase::AwaitLitTree
+        } else {
+            Phase::AwaitLenTree
+        };
     }
 
     // ─── helpers ────────────────────────────────────────────────────
@@ -409,8 +465,9 @@ impl Decoder {
         // wire when produced by a real Implode encoder (the trees come
         // before any compressed bit), but per APPNOTE they appear at
         // the start of the file *as bytes*; we already require the
-        // payload to begin byte-aligned (the framing places the codec
-        // immediately after the 5-byte header). All bit reads must
+        // payload to begin byte-aligned (framed mode places the codec
+        // immediately after the 5-byte header; raw mode starts at byte
+        // 0 of the caller's input). All bit reads must
         // therefore be byte-aligned at this point. We assert that and
         // read whole bytes via the buffered input directly.
         debug_assert_eq!(self.bit_pos & 7, 0);
@@ -546,7 +603,7 @@ impl Decoder {
         // window" as reading the implicit-zero pre-window. With a window
         // pre-filled with zeros and a sliding `window_pos` this works
         // naturally — we just need to never overflow the output budget.
-        if len > self.output_left {
+        if len as u64 > self.output_left {
             return Err(Error::Corrupt);
         }
         let count = len as usize;
@@ -554,7 +611,7 @@ impl Decoder {
         let mut src = (self.window_pos + WINDOW_SIZE - dist) & mask;
         // Bookkeeping that `emit_byte` would do per byte, applied once.
         self.pending_len += count;
-        self.output_left -= count as u32;
+        self.output_left -= count as u64;
 
         if dist == 1 {
             // Distance-1 run: one repeated byte.
@@ -637,13 +694,7 @@ impl RawDecoder for Decoder {
                         });
                     }
                     let hdr = Header::parse(&self.header_buf)?;
-                    self.output_left = hdr.uncompressed_len;
-                    self.header = Some(hdr);
-                    self.phase = if hdr.lit_tree {
-                        Phase::AwaitLitTree
-                    } else {
-                        Phase::AwaitLenTree
-                    };
+                    self.enter_trees(hdr);
                     // Empty file shortcut: an explicitly zero-length
                     // payload still carries the tree descriptors per the
                     // wire format, so we don't fast-path to Done here.
@@ -775,6 +826,7 @@ impl RawDecoder for Decoder {
         self.pending_start = 0;
         self.pending_len = 0;
         self.output_left = 0;
+        self.start_raw();
     }
 }
 

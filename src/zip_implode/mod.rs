@@ -40,9 +40,36 @@
 //! The framing is exactly the two pieces of metadata the algorithm
 //! needs from a ZIP entry's general-purpose flags and uncompressed-size
 //! field — nothing else. Callers that already have a ZIP entry's GP-flag
-//! word in hand can derive `F` directly: `((gp_flags >> 1) & 1) << 1 |
-//! ((gp_flags >> 2) & 1)`. Most callers, though, will simply construct
-//! the header from the two booleans.
+//! word in hand can derive `F` directly: `(gp_flags >> 1) & 0b11` (GP
+//! bit 1 → `large_window`, GP bit 2 → `lit_tree`). The `u32` length caps
+//! framed streams at 4 GiB; use the raw entry point for larger entries.
+//!
+//! ## Raw entry point (no header)
+//!
+//! A ZIP reader already has the flags and the size from the entry's
+//! headers, so it can skip the framing and feed the stored bytes as-is
+//! with [`Decoder::raw`] (`large_window`, `lit_tree`, `u64` length) or
+//! [`Decoder::raw_from_gp_flags`] (the GP-flag word and length). Parsing
+//! the ZIP headers themselves is out of scope for this crate. End of
+//! stream, trailing input and truncation behave exactly as in framed
+//! mode, and `reset` keeps the raw parameters.
+//!
+//! ```
+//! use compcol::zip_implode::Decoder;
+//! use compcol::{Decoder as _, Status};
+//!
+//! // 2 trees, 4 KiB window, uncompressed size 6 ("abcabc").
+//! let stored = [
+//!     0x03, 0xF5, 0xF5, 0xF5, 0xF5, // length tree
+//!     0x03, 0xF5, 0xF5, 0xF5, 0xF5, // distance tree
+//!     0xC3, 0x8A, 0x1D, 0x23, 0xFC, 0x1F,
+//! ];
+//! let mut dec = Decoder::raw_from_gp_flags(0, 6);
+//! let mut out = [0u8; 16];
+//! let (p, status) = dec.decode(&stored, &mut out).unwrap();
+//! assert_eq!(status, Status::StreamEnd);
+//! assert_eq!(&out[..p.written], b"abcabc");
+//! ```
 //!
 //! ## Bitstream conventions
 //!
