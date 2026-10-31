@@ -52,23 +52,51 @@ impl Adler32 {
         Self { a: 1, b: 0 }
     }
 
-    /// Update with a chunk of bytes. RFC 1950 specifies `mod 65521`; we run
-    /// in `u32` and reduce after at most 5552 bytes so neither accumulator
-    /// can overflow (5552 * 255 + 65520 < 2^32).
-    pub fn update(&mut self, mut data: &[u8]) {
+    /// Update with a chunk of bytes. RFC 1950 specifies `mod 65521`; we
+    /// reduce after at most 5552 bytes (zlib's `NMAX`) so no accumulator can
+    /// overflow.
+    pub fn update(&mut self, data: &[u8]) {
+        // 5552 = 347 * 16: every chunk but the last is whole 16-byte blocks.
         const NMAX: usize = 5552;
         const MOD: u32 = 65521;
-        while !data.is_empty() {
-            let chunk_len = data.len().min(NMAX);
-            let (chunk, rest) = data.split_at(chunk_len);
-            for &byte in chunk {
-                self.a = self.a.wrapping_add(byte as u32);
-                self.b = self.b.wrapping_add(self.a);
+        const W: usize = 16;
+        let (mut a, mut b) = (self.a, self.b);
+        for chunk in data.chunks(NMAX) {
+            let (blocks, tail) = chunk.as_chunks::<W>();
+            if !blocks.is_empty() {
+                // Sixteen independent lanes (vectorisable): `sums[j]` adds
+                // up byte `j` of every block, and `acc[j]` adds up the
+                // `sums[j]` seen before each block. Over `k` blocks, byte
+                // `j` of block `i` then weighs `16 * (k - 1 - i)` in
+                // `16 * acc` and `16 - j` in the final fold below — together
+                // the `n - pos` weight it has in `b` over these `n` bytes.
+                let mut sums = [0u32; W];
+                let mut acc = [0u32; W];
+                for block in blocks {
+                    for j in 0..W {
+                        acc[j] += sums[j];
+                        sums[j] += u32::from(block[j]);
+                    }
+                }
+                let n = (blocks.len() * W) as u64;
+                let mut sa = 0u64;
+                let mut sb = 0u64;
+                for j in 0..W {
+                    sa += u64::from(sums[j]);
+                    sb += W as u64 * u64::from(acc[j]) + (W - j) as u64 * u64::from(sums[j]);
+                }
+                b = ((u64::from(b) + n * u64::from(a) + sb) % u64::from(MOD)) as u32;
+                a = ((u64::from(a) + sa) % u64::from(MOD)) as u32;
             }
-            self.a %= MOD;
-            self.b %= MOD;
-            data = rest;
+            for &byte in tail {
+                a += u32::from(byte);
+                b += a;
+            }
+            a %= MOD;
+            b %= MOD;
         }
+        self.a = a;
+        self.b = b;
     }
 
     /// The checksum of everything fed so far, as `b << 16 | a`.
@@ -126,29 +154,31 @@ impl Crc32 {
     /// calls yields the same result as one call over the concatenation.
     pub fn update(&mut self, data: &[u8]) {
         let mut s = self.state;
+        let t = &CRC32_TABLES;
 
-        // Slice-by-8: consume eight bytes per iteration using eight
-        // precomputed tables. This shortens the per-byte dependency chain
-        // and branch/load count versus the byte-at-a-time loop while
-        // producing identical CRCs.
-        let (chunks, remainder) = data.as_chunks::<8>();
+        // Slice-by-16: consume sixteen bytes per iteration using sixteen
+        // precomputed tables. The sixteen lookups are independent, so the
+        // per-byte dependency chain is much shorter than byte-at-a-time
+        // while producing identical CRCs.
+        let (chunks, remainder) = data.as_chunks::<16>();
         for c in chunks {
-            let lo = u32::from_le_bytes([c[0], c[1], c[2], c[3]]) ^ s;
-            let hi = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
-            s = CRC32_TABLE8[7][(lo & 0xFF) as usize]
-                ^ CRC32_TABLE8[6][((lo >> 8) & 0xFF) as usize]
-                ^ CRC32_TABLE8[5][((lo >> 16) & 0xFF) as usize]
-                ^ CRC32_TABLE8[4][(lo >> 24) as usize]
-                ^ CRC32_TABLE8[3][(hi & 0xFF) as usize]
-                ^ CRC32_TABLE8[2][((hi >> 8) & 0xFF) as usize]
-                ^ CRC32_TABLE8[1][((hi >> 16) & 0xFF) as usize]
-                ^ CRC32_TABLE8[0][(hi >> 24) as usize];
+            let w0 = u32::from_le_bytes([c[0], c[1], c[2], c[3]]) ^ s;
+            let w1 = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+            let w2 = u32::from_le_bytes([c[8], c[9], c[10], c[11]]);
+            let w3 = u32::from_le_bytes([c[12], c[13], c[14], c[15]]);
+            let x = |w: u32, k: usize| {
+                t[k + 3][(w & 0xFF) as usize]
+                    ^ t[k + 2][((w >> 8) & 0xFF) as usize]
+                    ^ t[k + 1][((w >> 16) & 0xFF) as usize]
+                    ^ t[k][(w >> 24) as usize]
+            };
+            s = x(w0, 12) ^ x(w1, 8) ^ x(w2, 4) ^ x(w3, 0);
         }
 
-        // Tail: fewer than 8 bytes remain.
+        // Tail: fewer than 16 bytes remain.
         for &b in remainder {
             let idx = ((s ^ b as u32) & 0xFF) as usize;
-            s = (s >> 8) ^ CRC32_TABLE8[0][idx];
+            s = (s >> 8) ^ t[0][idx];
         }
         self.state = s;
     }
@@ -187,18 +217,18 @@ impl Default for Crc32 {
     }
 }
 
-/// Slice-by-8 tables, built at compile time. `CRC32_TABLE8[0]` is the
-/// standard 256-entry CRC-32 table; `CRC32_TABLE8[n]` for `n >= 1` advances
-/// the CRC by an extra byte position, so eight bytes can be folded per
-/// iteration. See Intel's "Slicing-by-8" technique.
+/// Slice-by-16 tables, built at compile time. `CRC32_TABLES[0]` is the
+/// standard 256-entry CRC-32 table; `CRC32_TABLES[n]` for `n >= 1` advances
+/// the CRC by an extra byte position, so sixteen bytes can be folded per
+/// iteration. See Intel's "Slicing-by-8" technique, here doubled.
 #[cfg(any(
     all(feature = "gzip", not(feature = "embed")),
     feature = "rar3",
     feature = "checksum",
     test
 ))]
-const CRC32_TABLE8: [[u32; 256]; 8] = {
-    let mut tables = [[0u32; 256]; 8];
+static CRC32_TABLES: [[u32; 256]; 16] = {
+    let mut tables = [[0u32; 256]; 16];
 
     // Base table (slice 0): the standard reflected CRC-32 step.
     let mut i = 0usize;
@@ -220,7 +250,7 @@ const CRC32_TABLE8: [[u32; 256]; 8] = {
     // Each subsequent table folds in one more zero byte:
     // table[n][i] = (table[n-1][i] >> 8) ^ table[0][table[n-1][i] & 0xFF].
     let mut n = 1usize;
-    while n < 8 {
+    while n < 16 {
         let mut j = 0usize;
         while j < 256 {
             let prev = tables[n - 1][j];
@@ -278,5 +308,63 @@ mod tests {
             chunked.update(chunk);
         }
         assert_eq!(whole.finalize(), chunked.finalize());
+    }
+
+    /// Pseudo-random bytes, with long runs of 0xFF to stress the Adler-32
+    /// accumulators' overflow bounds.
+    fn test_bytes(n: usize) -> alloc::vec::Vec<u8> {
+        let mut s: u32 = 0x1234_5678;
+        (0..n)
+            .map(|i| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                if (i / 7000) % 2 == 1 {
+                    0xFF
+                } else {
+                    (s >> 24) as u8
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn adler32_matches_bytewise_reference() {
+        let data = test_bytes(40_000);
+        for &len in &[0usize, 1, 15, 16, 17, 5551, 5552, 5553, 11_104, 40_000] {
+            let (mut a, mut b) = (1u32, 0u32);
+            for &x in &data[..len] {
+                a = (a + u32::from(x)) % 65521;
+                b = (b + a) % 65521;
+            }
+            let mut fast = Adler32::new();
+            fast.update(&data[..len]);
+            assert_eq!(fast.finalize(), (b << 16) | a, "len {len}");
+            // Same in odd-sized pieces.
+            let mut split = Adler32::new();
+            for piece in data[..len].chunks(4097) {
+                split.update(piece);
+            }
+            assert_eq!(split.finalize(), (b << 16) | a, "split len {len}");
+        }
+    }
+
+    #[test]
+    fn crc32_matches_bitwise_reference() {
+        let data = test_bytes(1000);
+        for len in [0usize, 1, 7, 15, 16, 17, 31, 32, 33, 1000] {
+            let mut r = 0xFFFF_FFFFu32;
+            for &x in &data[..len] {
+                r ^= u32::from(x);
+                for _ in 0..8 {
+                    r = if r & 1 != 0 {
+                        0xEDB8_8320 ^ (r >> 1)
+                    } else {
+                        r >> 1
+                    };
+                }
+            }
+            let mut c = Crc32::new();
+            c.update(&data[..len]);
+            assert_eq!(c.finalize(), !r, "len {len}");
+        }
     }
 }
