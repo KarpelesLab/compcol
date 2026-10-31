@@ -2,8 +2,9 @@
 //!
 //! Streaming encoder + decoder behind a shared [`crate::Algorithm`]
 //! implementation. The encoder uses LZ77 (hash-chain match finder, lazy
-//! matching) followed by length-limited dynamic Huffman coding via the
-//! Larmore–Hirschberg package-merge algorithm. The decoder handles all
+//! matching) followed by optimal dynamic Huffman coding (Moffat–Katajainen,
+//! or Larmore–Hirschberg package-merge when the 15-bit limit binds). The
+//! decoder handles all
 //! three block types (stored, fixed-Huffman, dynamic-Huffman) defined by
 //! RFC 1951.
 //!

@@ -15,7 +15,7 @@ pub const HASH_BITS: u32 = 15;
 pub const HASH_SIZE: usize = 1 << HASH_BITS;
 
 /// Sentinel value meaning "no entry".
-const NIL: u32 = u32::MAX;
+pub const NIL: u32 = u32::MAX;
 
 /// Size of the `prev` ring buffer. Must be a power of two ≥ WINDOW_SIZE so
 /// any in-window absolute position maps uniquely.
@@ -26,11 +26,26 @@ const PREV_MASK: usize = PREV_SIZE - 1;
 const MIN_HASH_BITS: u32 = 8;
 const MAX_HASH_BITS: u32 = HASH_BITS;
 
-/// Hash function over three bytes, zlib's shift-and-XOR shape. `shift` is
-/// `ceil(hash_bits / 3)`; for the default 15-bit table it is 5.
+/// Length of the common prefix of `a` and `b`. Compares eight bytes at a
+/// time (one unaligned load per side, XOR, count trailing zeros).
 #[inline(always)]
-fn hash3(b0: u8, b1: u8, b2: u8, shift: u32) -> u32 {
-    ((b0 as u32) << (2 * shift)) ^ ((b1 as u32) << shift) ^ (b2 as u32)
+pub fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    let (a, b) = (&a[..n], &b[..n]);
+    let mut len = 0usize;
+    for (ca, cb) in a.as_chunks::<8>().0.iter().zip(b.as_chunks::<8>().0) {
+        let x = u64::from_le_bytes(*ca);
+        let y = u64::from_le_bytes(*cb);
+        let diff = x ^ y;
+        if diff != 0 {
+            return len + (diff.trailing_zeros() / 8) as usize;
+        }
+        len += 8;
+    }
+    while len < n && a[len] == b[len] {
+        len += 1;
+    }
+    len
 }
 
 pub struct MatchFinder {
@@ -49,9 +64,7 @@ pub struct MatchFinder {
     /// (`inflateInit2(-12)`), which rejects any back-reference farther than
     /// 4096 bytes.
     max_distance: usize,
-    /// `head.len() - 1`.
-    hash_mask: u32,
-    /// Shift used by [`hash3`] for this table size.
+    /// `32 - hash_bits`: the multiplicative hash keeps the top bits.
     hash_shift: u32,
 }
 
@@ -77,208 +90,182 @@ impl MatchFinder {
             head: Box::new([NIL; HASH_SIZE]),
             prev: Box::new([NIL; PREV_SIZE]),
             max_distance: max_distance.clamp(1, WINDOW_SIZE),
-            hash_mask: (1u32 << hash_bits) - 1,
-            hash_shift: hash_bits.div_ceil(3),
+            hash_shift: 32 - hash_bits,
         }
     }
 
     /// Forget every position recorded so far.
     pub fn reset(&mut self) {
-        let used = self.hash_mask as usize + 1;
-        for h in self.head[..used].iter_mut() {
-            *h = NIL;
-        }
-        for p in self.prev.iter_mut() {
-            *p = NIL;
-        }
+        let used = 1usize << (32 - self.hash_shift);
+        self.head[..used].fill(NIL);
+        self.prev.fill(NIL);
     }
 
-    /// Splice the 3-byte sequence starting at absolute position `abs_pos`
-    /// (whose bytes are `b0`, `b1`, `b2`) into the hash chain. The caller
-    /// guarantees the three bytes are available.
-    #[inline]
-    pub fn insert(&mut self, abs_pos: u32, b0: u8, b1: u8, b2: u8) {
-        let idx = (hash3(b0, b1, b2, self.hash_shift) & self.hash_mask) as usize & (HASH_SIZE - 1);
-        self.prev[(abs_pos as usize) & PREV_MASK] = self.head[idx];
+    /// Hash of the three bytes at `window[rel..]`; the caller guarantees
+    /// `rel + 3 <= window.len()`.
+    #[inline(always)]
+    fn hash(&self, window: &[u8], rel: usize) -> usize {
+        let v = match window.get(rel..rel + 4) {
+            Some(s) => u32::from_le_bytes(s.try_into().unwrap()),
+            None => {
+                u32::from(window[rel])
+                    | (u32::from(window[rel + 1]) << 8)
+                    | (u32::from(window[rel + 2]) << 16)
+            }
+        };
+        self.hash24(v)
+    }
+
+    /// Multiplicative hash of the low 24 bits of `v` (the next three bytes,
+    /// little-endian), spread over the top `hash_bits` bits. Always
+    /// `< HASH_SIZE`.
+    #[inline(always)]
+    fn hash24(&self, v: u32) -> usize {
+        ((v << 8).wrapping_mul(0x9E37_79B1) >> self.hash_shift) as usize & (HASH_SIZE - 1)
+    }
+
+    /// Splice the 3-byte sequence at `window[rel..]` (absolute position
+    /// `abs_pos`) into its hash chain and return the previous chain head
+    /// (the most recent earlier position with the same hash, or [`NIL`]).
+    /// The caller guarantees `rel + 3 <= window.len()`.
+    #[inline(always)]
+    pub fn insert(&mut self, window: &[u8], rel: usize, abs_pos: u32) -> u32 {
+        let idx = self.hash(window, rel);
+        self.link(idx, abs_pos)
+    }
+
+    #[inline(always)]
+    fn link(&mut self, idx: usize, abs_pos: u32) -> u32 {
+        let old = self.head[idx];
+        self.prev[(abs_pos as usize) & PREV_MASK] = old;
         self.head[idx] = abs_pos;
+        old
     }
 
-    /// Find the longest prior match for `window[rel..]`, where `window`
-    /// holds at least the deflate sliding window's worth of recent bytes
-    /// plus the current lookahead, and `rel` is the index inside `window`
-    /// corresponding to absolute position `abs_pos`.
-    ///
-    /// `max_chain` caps how many hash-chain links we walk before giving up;
-    /// `nice_match` is the length at which we stop searching for a longer
-    /// candidate. When `have_good` is true we already hold a "good enough"
-    /// match elsewhere and quarter the chain budget — this is the lazy-match
-    /// speed-up.
-    ///
-    /// Returns `Some((length, distance))` with `length ≥ MIN_MATCH` if a
-    /// match was found within the 32 KiB deflate window, else `None`.
+    /// Insert every position in `window[from..to]` that has three bytes
+    /// available. `abs_base` is the absolute position of `window[0]`.
     #[inline]
-    pub fn find_match(
+    pub fn insert_range(&mut self, window: &[u8], from: usize, to: usize, abs_base: u64) {
+        let to = to.min(window.len().saturating_sub(2));
+        if from >= to {
+            return;
+        }
+        let mut abs = (abs_base + from as u64) as u32;
+        // Positions with four bytes available: one load each.
+        let fast_end = to.min(window.len() - 3);
+        if from < fast_end {
+            for w in window[from..fast_end + 3].windows(4) {
+                let v = u32::from_le_bytes(w.try_into().unwrap());
+                let idx = self.hash24(v);
+                self.link(idx, abs);
+                abs = abs.wrapping_add(1);
+            }
+        }
+        for k in fast_end.max(from)..to {
+            self.insert(window, k, abs);
+            abs = abs.wrapping_add(1);
+        }
+    }
+
+    /// Find the longest match for `window[rel..]` (absolute position
+    /// `abs_pos`) that is longer than `best_len`, walking the hash chain
+    /// from `cand` (the head returned by [`insert`](Self::insert) for this
+    /// position).
+    ///
+    /// `max_chain` caps how many chain links are walked; the search stops as
+    /// soon as a match of `nice_match` bytes is found. Returns
+    /// `(length, distance)`; `length` is `0` when nothing longer than
+    /// `best_len` (and at least `MIN_MATCH`) was found.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn longest_match(
         &self,
         window: &[u8],
         rel: usize,
         abs_pos: u32,
-        have_good: bool,
+        mut cand: u32,
+        best_len: usize,
         max_chain: usize,
         nice_match: usize,
-    ) -> Option<(u16, u16)> {
-        // Hot loop. The structure mirrors zlib's `longest_match`. Key
-        // micro-optimisations (all branch- and load-count reductions; no
-        // unsafe used):
-        //
-        //   • The chain walk's `cur >= abs_pos` filter is removed by
-        //     observing that when we splice the current position into the
-        //     hash chain *before* calling `find_match`, the head of the
-        //     chain we follow is by construction strictly less than
-        //     `abs_pos` — but the encoder does insert at `pos` first, so
-        //     we use `self.head[idx]` (which is the just-inserted self)'s
-        //     prev to start. Keeping the explicit filter for safety since
-        //     callers can also call without inserting first.
-        //   • The "tail byte fast reject" compares `window[cur_rel+best_len]`
-        //     vs `window[rel+best_len]` (one byte) before extending — and
-        //     we also reject when `best_len > 0` and the byte at
-        //     `best_len-1` doesn't match by comparing a u16 pair.
-        //   • The extension loop reads 4 bytes at a time via slice-to-array
-        //     (LLVM lowers the array load to one unaligned 32-bit load) and
-        //     uses XOR + trailing-zero count to find the first differing
-        //     byte. This skips the per-byte loop body's branch entirely.
-
-        if rel + MIN_MATCH > window.len() {
-            return None;
-        }
-        let idx = (hash3(
-            window[rel],
-            window[rel + 1],
-            window[rel + 2],
-            self.hash_shift,
-        ) & self.hash_mask) as usize
-            & (HASH_SIZE - 1);
-
-        let max_dist = self.max_distance.min(abs_pos as usize);
+    ) -> (usize, usize) {
         let max_len = MAX_MATCH.min(window.len() - rel);
-        if max_len < MIN_MATCH {
-            return None;
+        let mut best_len = best_len.max(MIN_MATCH - 1);
+        if best_len >= max_len {
+            return (0, 0);
         }
+        let nice = nice_match.min(max_len);
+        let max_dist = self.max_distance.min(abs_pos as usize) as u32;
+        let cur = &window[rel..rel + max_len];
+        let mut best_dist = 0usize;
+        let mut chain_left = max_chain;
+        // Quick reject: a candidate can only beat the current best if the
+        // four bytes ending at offset `best_len` match too (just the first
+        // three while nothing has been found and `best_len` is 2; the
+        // window then needs a fourth byte, which only the last three bytes
+        // of the input lack — no reject there).
+        let (mut scan_off, mut scan_mask) = scan_window(best_len);
+        if max_len < 4 {
+            scan_mask = 0;
+        }
+        let mut scan_end = load4(window, rel + scan_off) & scan_mask;
 
-        let mut best_len: usize = 0;
-        let mut best_dist: usize = 0;
-
-        let mut cur = self.head[idx];
-        // If we already have a "good" match, quarter the chain budget.
-        let mut chain_left = if have_good { max_chain / 4 } else { max_chain };
-
-        // Snapshot the two bytes at `rel + best_len - 1 .. rel + best_len + 1`
-        // for the fast tail reject. We refresh these whenever `best_len`
-        // changes. Initially `best_len == 0` so the tail reject doesn't apply.
-        // We use `[u8; 2]` so the comparison is a single u16 load.
-        let mut tail_pair: [u8; 2] = [0, 0];
-
-        while cur != NIL && chain_left > 0 {
-            let cur_abs = cur as usize;
-            // Stale entries: ignore positions ≥ our own.
-            if cur_abs >= abs_pos as usize {
-                cur = self.prev[cur_abs & PREV_MASK];
-                chain_left -= 1;
-                continue;
-            }
-            let dist = abs_pos as usize - cur_abs;
-            if dist > max_dist {
+        loop {
+            // NIL and stale (not-yet-behind-us) entries give a distance of 0
+            // or one beyond `max_dist`, ending the walk like a too-far one.
+            let dist = abs_pos.wrapping_sub(cand);
+            if dist.wrapping_sub(1) >= max_dist {
                 break;
             }
-            let cur_rel = rel - dist; // safe: dist ≤ rel because the candidate is in-window
-
-            // Fast tail reject. If we have a current best of length `best_len`,
-            // the candidate can only improve it if both the byte at
-            // `best_len-1` (which equalled the rel byte for the previous best)
-            // and at `best_len` (which is the new byte we need to match)
-            // line up. The pair compare is one u16 load on each side.
-            if best_len >= MIN_MATCH && best_len < max_len {
-                // Need bytes at cur_rel + best_len - 1 and cur_rel + best_len.
-                // Both are in bounds because:
-                //   • cur_rel + best_len - 1 < cur_rel + max_len ≤ window.len()
-                //   • cur_rel + best_len < cur_rel + max_len ≤ window.len()
-                // and the prior cheap-reject below ensures cur_rel + best_len < window.len()
-                // because we previously matched up to best_len bytes from this
-                // run's best candidate. We still require cur_rel + best_len + 1 ≤ window.len().
-                let cand_pair: [u8; 2] =
-                    [window[cur_rel + best_len - 1], window[cur_rel + best_len]];
-                if cand_pair != tail_pair {
-                    cur = self.prev[cur_abs & PREV_MASK];
-                    chain_left -= 1;
-                    continue;
+            let next = self.prev[cand as usize & PREV_MASK];
+            // `dist <= rel` because the window keeps the full history the
+            // finder can reach.
+            let cpos = rel - dist as usize;
+            if load4(window, cpos + scan_off) & scan_mask == scan_end {
+                let len = common_prefix(&window[cpos..cpos + max_len], cur);
+                if len > best_len {
+                    best_len = len;
+                    best_dist = dist as usize;
+                    if len >= nice {
+                        break;
+                    }
+                    (scan_off, scan_mask) = scan_window(best_len);
+                    scan_end = load4(window, rel + scan_off) & scan_mask;
                 }
             }
-
-            // Extend the match from the start, eight bytes at a time first
-            // (u64 load + XOR + trailing_zeros) for the bulk, then byte-wise
-            // for the tail.
-            //
-            // Loop invariant: `len` is the number of bytes confirmed to
-            // match starting at `cur_rel`/`rel`.
-            let mut len = 0usize;
-
-            // 8-byte chunks: read [u8; 8] from both sides as native-endian u64
-            // — LLVM lowers slice-to-array (`<[u8; N]>::try_from`) plus
-            // `u64::from_ne_bytes` to a single unaligned 64-bit load, and the
-            // first-differing-byte search becomes a `xor` + `trailing_zeros`.
-            while len + 8 <= max_len {
-                // SAFETY (no unsafe): the slice indexing is bounds-checked
-                // and LLVM removes the check when it sees the prior
-                // `len + 8 <= max_len` guard. Each side resolves to one
-                // unaligned 8-byte load.
-                let a: [u8; 8] = window[cur_rel + len..cur_rel + len + 8].try_into().unwrap();
-                let b: [u8; 8] = window[rel + len..rel + len + 8].try_into().unwrap();
-                let av = u64::from_ne_bytes(a);
-                let bv = u64::from_ne_bytes(b);
-                let diff = av ^ bv;
-                if diff == 0 {
-                    len += 8;
-                } else {
-                    // First differing byte is at trailing_zeros() / 8 (LE)
-                    // or leading_zeros() / 8 (BE).
-                    #[cfg(target_endian = "little")]
-                    let add = (diff.trailing_zeros() / 8) as usize;
-                    #[cfg(target_endian = "big")]
-                    let add = (diff.leading_zeros() / 8) as usize;
-                    len += add;
-                    break;
-                }
-            }
-            // Tail: any remaining bytes (0..=7) compared byte by byte.
-            while len < max_len && window[cur_rel + len] == window[rel + len] {
-                len += 1;
-            }
-
-            if len >= MIN_MATCH && len > best_len {
-                best_len = len;
-                best_dist = dist;
-                if best_len >= nice_match {
-                    break;
-                }
-                // Refresh the tail pair for the new best_len. We only refresh
-                // when best_len ≥ MIN_MATCH (which is true here) and we need
-                // both rel + best_len - 1 and rel + best_len to be valid
-                // indices into `window`. The first is fine (best_len ≥ 3).
-                // The second is needed only when best_len < max_len, which
-                // is checked at the next loop's reject guard.
-                if best_len < max_len {
-                    tail_pair = [window[rel + best_len - 1], window[rel + best_len]];
-                }
-            }
-
-            cur = self.prev[cur_abs & PREV_MASK];
             chain_left -= 1;
+            if chain_left == 0 {
+                break;
+            }
+            cand = next;
         }
 
-        if best_len >= MIN_MATCH {
-            Some((best_len as u16, best_dist as u16))
+        if best_dist != 0 {
+            (best_len, best_dist)
         } else {
-            None
+            (0, 0)
         }
+    }
+}
+
+/// Offset and mask of the quick-reject window for a current best of
+/// `best_len` bytes (`2 <= best_len < max_len`): the four bytes ending at
+/// offset `best_len`, or the first three while `best_len` is 2.
+#[inline(always)]
+fn scan_window(best_len: usize) -> (usize, u32) {
+    if best_len >= 3 {
+        (best_len - 3, u32::MAX)
+    } else {
+        (0, 0x00FF_FFFF)
+    }
+}
+
+/// Little-endian `u32` at `s[i..i + 4]`, or 0 past the end (callers mask
+/// such reads away).
+#[inline(always)]
+fn load4(s: &[u8], i: usize) -> u32 {
+    match s.get(i..i + 4) {
+        Some(b) => u32::from_le_bytes(b.try_into().unwrap()),
+        None => 0,
     }
 }
 

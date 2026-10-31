@@ -20,12 +20,12 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use crate::bits::{BitWriter, reverse_bits};
+use crate::bits::reverse_bits;
 use crate::error::Error;
 use crate::huffman::{canonical_codes_from_lengths, length_limited_huffman};
 use crate::traits::{Flush, Progress, RawEncoder, RawProgress, Status};
 
-use super::lz77::MatchFinder;
+use super::lz77::{MatchFinder, NIL};
 use super::tables::{
     CODE_LENGTH_ORDER, DIST_BASE, DIST_EXTRA, END_OF_BLOCK, FIXED_DIST_LENGTHS, FIXED_LIT_LENGTHS,
     LENGTH_BASE, LENGTH_EXTRA, MAX_MATCH, MIN_MATCH, WINDOW_SIZE,
@@ -178,9 +178,10 @@ impl EncoderConfig {
 }
 
 /// Internal expansion of [`EncoderConfig::level`] into the match-finder
-/// tuning knobs the LZ77 pass actually consults. The table mirrors zlib's
+/// tuning knobs the LZ77 pass actually consults. The shape follows zlib's
 /// `configuration_table`: higher levels widen the chain budget and raise
-/// the "nice match" / "good match" thresholds, trading CPU for ratio.
+/// the "nice match" / "good match" / "lazy" thresholds, trading CPU for
+/// ratio.
 #[derive(Debug, Clone, Copy)]
 struct LevelParams {
     /// Maximum number of hash-chain links the match finder walks.
@@ -193,6 +194,9 @@ struct LevelParams {
     /// Whether to perform lazy matching at all. Levels 1..=3 skip it
     /// entirely (greedy parsing) to save the per-position probe.
     use_lazy: bool,
+    /// Lazy parsing only: a match at least this long is committed without
+    /// probing the next position (zlib's `max_lazy`).
+    max_lazy: usize,
 }
 
 impl LevelParams {
@@ -203,66 +207,24 @@ impl LevelParams {
         // infallible matches zlib's behaviour of silently snapping Z_BEST_*
         // values into range.
         let level = level.clamp(1, 9);
-        // Mirrors zlib's configuration_table: (good_length, max_lazy/nice,
-        // nice_length, max_chain) tuned per level. We collapse the
-        // greedy-vs-lazy switch into a single `use_lazy` flag; zlib does
-        // the same internally via `func == fast`.
-        match level {
-            1 => Self {
-                max_chain: 4,
-                nice_match: 8,
-                good_match: 4,
-                use_lazy: false,
-            },
-            2 => Self {
-                max_chain: 8,
-                nice_match: 16,
-                good_match: 5,
-                use_lazy: false,
-            },
-            3 => Self {
-                max_chain: 32,
-                nice_match: 32,
-                good_match: 6,
-                use_lazy: false,
-            },
-            4 => Self {
-                max_chain: 16,
-                nice_match: 16,
-                good_match: 4,
-                use_lazy: true,
-            },
-            5 => Self {
-                max_chain: 32,
-                nice_match: 32,
-                good_match: 8,
-                use_lazy: true,
-            },
-            6 => Self {
-                max_chain: 128,
-                nice_match: 128,
-                good_match: 16,
-                use_lazy: true,
-            },
-            7 => Self {
-                max_chain: 256,
-                nice_match: 128,
-                good_match: 32,
-                use_lazy: true,
-            },
-            8 => Self {
-                max_chain: 1024,
-                nice_match: 258,
-                good_match: 32,
-                use_lazy: true,
-            },
+        let (max_chain, nice_match, good_match, use_lazy, max_lazy) = match level {
+            1 => (4, 8, 4, false, MAX_MATCH),
+            2 => (8, 16, 5, false, MAX_MATCH),
+            3 => (32, 32, 6, false, MAX_MATCH),
+            4 => (16, 16, 4, true, MAX_MATCH),
+            5 => (32, 32, 8, true, MAX_MATCH),
+            6 => (128, 128, 8, true, 32),
+            7 => (256, 128, 8, true, 32),
+            8 => (1024, 258, 32, true, MAX_MATCH),
             // 9 (and clamp-from-above)
-            _ => Self {
-                max_chain: 4096,
-                nice_match: 258,
-                good_match: 32,
-                use_lazy: true,
-            },
+            _ => (4096, 258, 32, true, MAX_MATCH),
+        };
+        Self {
+            max_chain,
+            nice_match,
+            good_match,
+            use_lazy,
+            max_lazy,
         }
     }
 }
@@ -323,9 +285,9 @@ const fn compute_canonical_reversed<const N: usize>(lengths: &[u8; N]) -> [u32; 
     out
 }
 
-/// Maps a match length in 3..=258 to its base code (subtract 257 to get
-/// `LENGTH_BASE`/`LENGTH_EXTRA` index). Built at compile time.
-const LENGTH_CODE_OFFSET: [u8; 256] = {
+/// Maps a match length in 3..=258 (indexed `length - 3`) to its length code
+/// minus 257 (the `LENGTH_BASE`/`LENGTH_EXTRA` index). Built at compile time.
+const LENGTH_CODE: [u8; 256] = {
     let mut t = [0u8; 256];
     let mut len = MIN_MATCH;
     while len <= MAX_MATCH {
@@ -339,51 +301,150 @@ const LENGTH_CODE_OFFSET: [u8; 256] = {
     t
 };
 
-/// Maps a distance in 1..=512 to its base code. For distances above 512 we
-/// fall through to a short linear scan. Built at compile time. Indexed
-/// `[distance - 1]`.
-const SMALL_DIST_CODE: [u8; 512] = {
+/// zlib's `_dist_code` layout: entries `0..256` give the code of distances
+/// `1..=256` (indexed `distance - 1`); entries `256..512` give the code of
+/// larger distances, indexed `256 + ((distance - 1) >> 7)`. Built at compile
+/// time.
+const DIST_CODE: [u8; 512] = {
     let mut t = [0u8; 512];
-    let mut d = 1u16;
-    while d <= 512 {
+    let mut i = 0usize;
+    while i < 512 {
+        // Smallest distance mapping to this slot.
+        let d = if i < 256 { i + 1 } else { ((i - 256) << 7) + 1 };
         let mut c = 0usize;
-        while c < 29 && DIST_BASE[c + 1] <= d {
+        while c < 29 && (DIST_BASE[c + 1] as usize) <= d {
             c += 1;
         }
-        t[(d - 1) as usize] = c as u8;
-        d += 1;
+        t[i] = c as u8;
+        i += 1;
     }
     t
 };
 
+/// Distance code (`0..30`) for a distance in `1..=32768`.
 #[inline(always)]
-fn length_to_code(length: u16) -> (u16, u16, u8) {
-    let l = (length as usize) - MIN_MATCH;
-    let c = LENGTH_CODE_OFFSET[l] as usize;
-    let code = c as u16 + 257;
-    let extra_value = length - LENGTH_BASE[c];
-    let extra_bits = LENGTH_EXTRA[c];
-    (code, extra_value, extra_bits)
+fn dist_code(distance: usize) -> usize {
+    let d = distance - 1;
+    let i = if d < 256 { d } else { 256 + (d >> 7) };
+    DIST_CODE[i & 511] as usize
+}
+
+// ─── packed symbol stream ────────────────────────────────────────────────
+//
+// Each LZ77 symbol of the current block is one `u32`: a literal is its byte
+// value (`< 256`); a match is `distance << 8 | (length - 3)`, which is
+// always `>= 256` since `distance >= 1`.
+
+#[inline(always)]
+fn sym_literal(byte: u8) -> u32 {
+    u32::from(byte)
 }
 
 #[inline(always)]
-fn distance_to_code(distance: u16) -> (u16, u16, u8) {
-    // Fast path: distances 1..=512 cover the bulk of real inputs (32 KiB
-    // window, but English text and binary structures tend to back-reference
-    // recent bytes) — one table lookup, no branches.
-    let c = if distance <= 512 {
-        SMALL_DIST_CODE[(distance - 1) as usize] as usize
-    } else {
-        // 30 candidates; small enough for a linear scan from the top.
-        let mut c = 29usize;
-        while c > 0 && distance < DIST_BASE[c] {
-            c -= 1;
+fn sym_match(length: usize, distance: usize) -> u32 {
+    ((distance as u32) << 8) | (length - MIN_MATCH) as u32
+}
+
+/// Unpack a match symbol into `(length - 3, distance)`.
+#[inline(always)]
+fn sym_unpack(s: u32) -> (usize, usize) {
+    ((s & 0xFF) as usize, (s >> 8) as usize)
+}
+
+/// Appends LZ77 symbols to the block and tallies their Huffman
+/// frequencies on the fly.
+struct SymSink<'a> {
+    syms: &'a mut Vec<u32>,
+    lit_freq: &'a mut [u32; 286],
+    dist_freq: &'a mut [u32; 30],
+}
+
+impl SymSink<'_> {
+    #[inline(always)]
+    fn literal(&mut self, byte: u8) {
+        self.syms.push(sym_literal(byte));
+        self.lit_freq[byte as usize] += 1;
+    }
+
+    #[inline(always)]
+    fn matched(&mut self, length: usize, distance: usize) {
+        self.syms.push(sym_match(length, distance));
+        self.lit_freq[257 + LENGTH_CODE[(length - MIN_MATCH) & 0xFF] as usize] += 1;
+        self.dist_freq[dist_code(distance)] += 1;
+    }
+}
+
+// ─── bit writer ──────────────────────────────────────────────────────────
+
+/// LSB-first bit writer with a 64-bit accumulator that spills four bytes at
+/// a time. Outside the symbol-emission loops it holds fewer than 8 bits
+/// (whole bytes are always pushed to the output), so the caller can tell
+/// how far the stream is from a byte boundary.
+#[derive(Debug, Clone, Default)]
+struct BitWriter {
+    acc: u64,
+    nbits: u32,
+}
+
+impl BitWriter {
+    const fn new() -> Self {
+        Self { acc: 0, nbits: 0 }
+    }
+
+    /// Append the low `n` bits of `bits` (`n <= 32`, no bits set above
+    /// `n`). May leave up to 31 bits buffered; call [`flush_bytes`] after a
+    /// run of `put`s.
+    ///
+    /// [`flush_bytes`]: Self::flush_bytes
+    #[inline(always)]
+    fn put(&mut self, bits: u32, n: u32, out: &mut Vec<u8>) {
+        debug_assert!(n <= 32 && self.nbits < 32);
+        debug_assert!(n == 32 || bits >> n == 0);
+        self.acc |= u64::from(bits) << self.nbits;
+        self.nbits += n;
+        if self.nbits >= 32 {
+            out.extend_from_slice(&(self.acc as u32).to_le_bytes());
+            self.acc >>= 32;
+            self.nbits -= 32;
         }
-        c
-    };
-    let extra_value = distance - DIST_BASE[c];
-    let extra_bits = DIST_EXTRA[c];
-    (c as u16, extra_value, extra_bits)
+    }
+
+    /// Push every whole buffered byte to `out`.
+    #[inline]
+    fn flush_bytes(&mut self, out: &mut Vec<u8>) {
+        while self.nbits >= 8 {
+            out.push(self.acc as u8);
+            self.acc >>= 8;
+            self.nbits -= 8;
+        }
+    }
+
+    /// Append `n <= 32` LSB-first bits of `value` (higher bits ignored),
+    /// then push whole bytes to `out`.
+    fn write(&mut self, value: u32, n: u32, out: &mut Vec<u8>) {
+        let masked = if n >= 32 {
+            value
+        } else {
+            value & ((1u32 << n) - 1)
+        };
+        self.put(masked, n, out);
+        self.flush_bytes(out);
+    }
+
+    /// Pad with zero bits to the next byte boundary, flushing everything.
+    fn align(&mut self, out: &mut Vec<u8>) {
+        self.flush_bytes(out);
+        if self.nbits > 0 {
+            out.push(self.acc as u8);
+        }
+        self.acc = 0;
+        self.nbits = 0;
+    }
+
+    /// Bits buffered past the last whole byte (`< 8` between blocks).
+    const fn pending_bits(&self) -> u32 {
+        self.nbits
+    }
 }
 
 // ─── flush modes ─────────────────────────────────────────────────────────
@@ -413,14 +474,6 @@ pub(crate) fn flush_result(p: RawProgress) -> (Progress, Status) {
         },
         status,
     )
-}
-
-// ─── per-block symbol stream ─────────────────────────────────────────────
-
-#[derive(Clone, Copy)]
-enum Symbol {
-    Literal(u8),
-    Match { length: u16, distance: u16 },
 }
 
 // ─── code-length RLE encoding (RFC 1951 §3.2.7) ──────────────────────────
@@ -509,7 +562,7 @@ fn rle_encode_lengths_into(lengths: &[u8], out: &mut Vec<ClSymbol>) {
 /// frequency histograms and code lengths: Σ freq·len over the lit/length
 /// alphabet plus Σ freq·len over the distance alphabet. The extra-bits term
 /// (length/distance suffix bits) is independent of the chosen Huffman
-/// encoding and is accumulated once during the LZ77 pass.
+/// encoding and is computed once per block by [`extra_bits_total`].
 #[inline]
 fn huffman_cost_from_histogram(
     lit_freq: &[u32; 286],
@@ -527,27 +580,218 @@ fn huffman_cost_from_histogram(
     bits
 }
 
+/// Total length/distance extra bits of a block, from its histograms.
+fn extra_bits_total(lit_freq: &[u32; 286], dist_freq: &[u32; 30]) -> u64 {
+    let mut bits = 0u64;
+    for c in 0..29 {
+        bits += lit_freq[257 + c] as u64 * LENGTH_EXTRA[c] as u64;
+    }
+    for c in 0..30 {
+        bits += dist_freq[c] as u64 * DIST_EXTRA[c] as u64;
+    }
+    bits
+}
+
 /// Slow reference version: walk the symbol stream and sum bit costs. Kept
 /// for debug-assert cross-checks against `huffman_cost_from_histogram` +
 /// the precomputed extra-bits total. Dead-code-eliminated in release.
 #[allow(dead_code)]
-fn payload_cost_bits(symbols: &[Symbol], lit_lengths: &[u8], dist_lengths: &[u8]) -> u64 {
+fn payload_cost_bits(symbols: &[u32], lit_lengths: &[u8], dist_lengths: &[u8]) -> u64 {
     let mut bits: u64 = 0;
-    for s in symbols {
-        match s {
-            Symbol::Literal(b) => {
-                bits += lit_lengths[*b as usize] as u64;
-            }
-            Symbol::Match { length, distance } => {
-                let (lc, _, leb) = length_to_code(*length);
-                bits += lit_lengths[lc as usize] as u64 + leb as u64;
-                let (dc, _, deb) = distance_to_code(*distance);
-                bits += dist_lengths[dc as usize] as u64 + deb as u64;
-            }
+    for &s in symbols {
+        if s < 256 {
+            bits += lit_lengths[s as usize] as u64;
+        } else {
+            let (l, d) = sym_unpack(s);
+            let lc = LENGTH_CODE[l] as usize;
+            bits += lit_lengths[257 + lc] as u64 + LENGTH_EXTRA[lc] as u64;
+            let dc = dist_code(d);
+            bits += dist_lengths[dc] as u64 + DIST_EXTRA[dc] as u64;
         }
     }
     bits += lit_lengths[END_OF_BLOCK as usize] as u64;
     bits
+}
+
+/// Write `syms` followed by end-of-block with the given canonical codes
+/// (`*_rev` already bit-reversed for LSB-first output) and code lengths.
+/// `payload_bits` is the exact size of what gets written (as computed from
+/// the histograms), used to size the output up front.
+#[allow(clippy::too_many_arguments)]
+fn emit_symbols(
+    syms: &[u32],
+    lit_rev: &[u32],
+    lit_len: &[u8],
+    dist_rev: &[u32],
+    dist_len: &[u8],
+    payload_bits: u64,
+    bw: &mut BitWriter,
+    out: &mut Vec<u8>,
+) {
+    // Per-symbol packed `bits | nbits << 32` tables: literals carry their
+    // code; lengths carry code + extra bits pre-combined; distances carry
+    // the code, the extra value being added per symbol.
+    let mut lit_tbl = [0u64; 256];
+    for (i, e) in lit_tbl.iter_mut().enumerate() {
+        *e = u64::from(lit_rev[i]) | (u64::from(lit_len[i]) << 32);
+    }
+    let mut len_tbl = [0u64; 256];
+    for (l, e) in len_tbl.iter_mut().enumerate() {
+        let c = LENGTH_CODE[l] as usize;
+        let cl = u32::from(lit_len[257 + c]);
+        let extra = (l + MIN_MATCH) as u32 - u32::from(LENGTH_BASE[c]);
+        let bits = lit_rev[257 + c] | (extra << cl);
+        *e = u64::from(bits) | (u64::from(cl + u32::from(LENGTH_EXTRA[c])) << 32);
+    }
+    let mut dist_tbl = [(0u64, 0u32, 0u32); 32];
+    for (c, e) in dist_tbl.iter_mut().take(30).enumerate() {
+        *e = (
+            u64::from(dist_rev[c]),
+            u32::from(dist_len[c]),
+            u32::from(dist_len[c]) + u32::from(DIST_EXTRA[c]),
+        );
+    }
+
+    // Branch-free writer over a pre-sized buffer: each step stores the whole
+    // 64-bit accumulator, then advances by the whole bytes it held. The
+    // accumulator never holds more than 7 + 48 bits.
+    let start = out.len();
+    out.resize(start + (payload_bits / 8) as usize + 16, 0);
+    let buf = &mut out[start..];
+    let mut pos = 0usize;
+    let mut acc = bw.acc;
+    let mut nbits = bw.nbits;
+    {
+        let mut put = |bits: u64, n: u32| {
+            acc |= bits << nbits;
+            nbits += n;
+            buf[pos..pos + 8].copy_from_slice(&acc.to_le_bytes());
+            let whole = nbits >> 3;
+            pos += whole as usize;
+            acc >>= whole << 3;
+            nbits &= 7;
+        };
+
+        for &s in syms {
+            if s < 256 {
+                let e = lit_tbl[s as usize];
+                put(e & 0xFFFF_FFFF, (e >> 32) as u32);
+            } else {
+                let (l, d) = sym_unpack(s);
+                let e = len_tbl[l];
+                let ln = (e >> 32) as u32;
+                let dc = dist_code(d);
+                let (code, cl, dn) = dist_tbl[dc];
+                let extra = (d as u64 - u64::from(DIST_BASE[dc])) << cl;
+                put((e & 0xFFFF_FFFF) | ((code | extra) << ln), ln + dn);
+            }
+        }
+        let eob = END_OF_BLOCK as usize;
+        put(u64::from(lit_rev[eob]), u32::from(lit_len[eob]));
+    }
+    out.truncate(start + pos);
+    bw.acc = acc;
+    bw.nbits = nbits;
+}
+
+// ─── Huffman code lengths ────────────────────────────────────────────────
+
+/// Optimal code lengths for `freqs`, at most `max_len` bits, into `out`
+/// (same length as `freqs`; `0` for unused symbols, `1` for a lone used
+/// symbol).
+///
+/// Builds an unconstrained minimum-redundancy code with Moffat and
+/// Katajainen's in-place algorithm (sort, then linear time, no
+/// allocation). Only when that code is deeper than `max_len` — rare for
+/// deflate's 15-bit limit — it falls back to the package-merge
+/// [`length_limited_huffman`]. Both give codes of the same, optimal, total
+/// size when the limit does not bind.
+fn huffman_lengths(freqs: &[u32], max_len: u8, out: &mut [u8]) {
+    debug_assert_eq!(freqs.len(), out.len());
+    debug_assert!(freqs.len() <= 512);
+    out.fill(0);
+    // (frequency << 9 | symbol), sorted ascending: ties broken by symbol.
+    let mut keys = [0u64; 512];
+    let mut n = 0usize;
+    for (i, &f) in freqs.iter().enumerate() {
+        if f > 0 {
+            keys[n] = (u64::from(f) << 9) | i as u64;
+            n += 1;
+        }
+    }
+    match n {
+        0 => return,
+        1 => {
+            out[(keys[0] & 511) as usize] = 1;
+            return;
+        }
+        _ => {}
+    }
+    let keys = &mut keys[..n];
+    keys.sort_unstable();
+
+    // In-place minimum-redundancy code (Moffat & Katajainen 1995). `a`
+    // starts as the sorted weights and ends as the code lengths.
+    let mut a = [0u64; 512];
+    let a = &mut a[..n];
+    for (w, &k) in a.iter_mut().zip(keys.iter()) {
+        *w = k >> 9;
+    }
+    // Phase 1: build the tree; internal nodes overwrite the weights and
+    // store their parent's index.
+    a[0] += a[1];
+    let (mut root, mut leaf) = (0usize, 2usize);
+    for next in 1..n - 1 {
+        // First child.
+        if leaf >= n || a[root] < a[leaf] {
+            a[next] = a[root];
+            a[root] = next as u64;
+            root += 1;
+        } else {
+            a[next] = a[leaf];
+            leaf += 1;
+        }
+        // Second child.
+        if leaf >= n || (root < next && a[root] < a[leaf]) {
+            a[next] += a[root];
+            a[root] = next as u64;
+            root += 1;
+        } else {
+            a[next] += a[leaf];
+            leaf += 1;
+        }
+    }
+    // Phase 2: internal node depths.
+    a[n - 2] = 0;
+    for next in (0..n - 2).rev() {
+        a[next] = a[a[next] as usize] + 1;
+    }
+    // Phase 3: leaf depths, deepest first from index 0.
+    let (mut avail, mut used, mut depth) = (1i64, 0i64, 0u64);
+    let mut root = n as isize - 2;
+    let mut next = n as isize - 1;
+    while avail > 0 {
+        while root >= 0 && a[root as usize] == depth {
+            used += 1;
+            root -= 1;
+        }
+        while avail > used {
+            a[next as usize] = depth;
+            next -= 1;
+            avail -= 1;
+        }
+        avail = 2 * used;
+        depth += 1;
+        used = 0;
+    }
+
+    if a[0] > u64::from(max_len) {
+        out.copy_from_slice(&length_limited_huffman(freqs, max_len));
+        return;
+    }
+    for (&k, &len) in keys.iter().zip(a.iter()) {
+        out[(k & 511) as usize] = len as u8;
+    }
 }
 
 // ─── encoder state ───────────────────────────────────────────────────────
@@ -568,11 +812,12 @@ pub struct Encoder {
     /// Absolute byte position corresponding to `window[0]`.
     window_start_abs: u64,
     match_finder: Box<MatchFinder>,
-    /// Pending symbols for the current block.
-    block_symbols: Vec<Symbol>,
-    /// Pending raw bytes (literals + match-expansion) for the current block,
-    /// kept so we can fall back to a stored encoding cheaply.
-    block_bytes: Vec<u8>,
+    /// Pending symbols for the current block, packed (see `sym_match`).
+    block_symbols: Vec<u32>,
+    /// Index in `window` where the current block's bytes start; the block
+    /// covers `window[block_start..cursor]`, which is what a stored
+    /// encoding copies.
+    block_start: usize,
     bit_writer: BitWriter,
     out_buffer: Vec<u8>,
     out_pos: usize,
@@ -646,7 +891,7 @@ impl Encoder {
                 mem_level as u32 + 7,
             )),
             block_symbols: Vec::new(),
-            block_bytes: Vec::new(),
+            block_start: 0,
             bit_writer: BitWriter::new(),
             out_buffer: Vec::new(),
             out_pos: 0,
@@ -730,25 +975,18 @@ impl Encoder {
         }
         self.window.extend_from_slice(&self.dictionary);
         let n = self.window.len();
-        for pos in 0..n.saturating_sub(2) {
-            self.match_finder.insert(
-                pos as u32,
-                self.window[pos],
-                self.window[pos + 1],
-                self.window[pos + 2],
-            );
-        }
+        self.match_finder.insert_range(&self.window, 0, n, 0);
         self.cursor = n;
     }
 
     /// Drain accumulated block bytes into the caller's output. Returns true
     /// when the current `out_buffer` has been fully forwarded.
     fn drain(&mut self, output: &mut [u8], written: &mut usize) -> bool {
-        while self.out_pos < self.out_buffer.len() && *written < output.len() {
-            output[*written] = self.out_buffer[self.out_pos];
-            self.out_pos += 1;
-            *written += 1;
-        }
+        let avail = &self.out_buffer[self.out_pos..];
+        let n = avail.len().min(output.len() - *written);
+        output[*written..*written + n].copy_from_slice(&avail[..n]);
+        self.out_pos += n;
+        *written += n;
         self.out_pos >= self.out_buffer.len()
     }
 
@@ -768,212 +1006,104 @@ impl Encoder {
     }
 
     /// Run LZ77 over `window[cursor..end]`, appending the result to
-    /// `block_symbols` and `block_bytes`. Advances `cursor`. Uses greedy
-    /// parsing when `params.use_lazy` is false (low levels) and gzip-style
-    /// lazy matching otherwise.
+    /// `block_symbols` (and the frequency histograms). Advances `cursor`.
+    /// Uses greedy parsing when `params.use_lazy` is false (low levels) and
+    /// zlib-style lazy matching otherwise.
     fn lz77_pass(&mut self, end: usize) {
-        let abs_base = self.window_start_abs;
-        let max_chain = self.params.max_chain;
-        let nice_match = self.params.nice_match;
-        let good_match = self.params.good_match;
-        let use_lazy = self.params.use_lazy;
+        let p = self.params;
         // Z_FILTERED: matches shorter than this are treated as no match.
         let min_len = if self.strategy == Strategy::Filtered {
             6
         } else {
             MIN_MATCH
         };
+        let abs_base = self.window_start_abs;
+        let window = &self.window[..];
+        let wlen = window.len();
+        let mf = &mut *self.match_finder;
+        let mut sink = SymSink {
+            syms: &mut self.block_symbols,
+            lit_freq: &mut self.lit_freq,
+            dist_freq: &mut self.dist_freq,
+        };
         let mut pos = self.cursor;
 
-        // Lazy-matching state: at any iteration we may have a "pending"
-        // best match starting at `prev_match_start` that we haven't
-        // committed yet — we hold it back to see if the next position
-        // offers something strictly better. With greedy parsing
-        // (`use_lazy = false`) this branch is never taken.
-        let mut have_pending = false;
-        let mut prev_match_len: usize = 0;
-        let mut prev_match_dist: usize = 0;
-        let mut prev_match_start: usize = 0;
+        // Lazy-matching state: a match of `prev_len` bytes (0 = none)
+        // starting at `pos - 1` that we hold back to see whether the match
+        // at `pos` is strictly longer. Never set under greedy parsing.
+        let mut prev_len = 0usize;
+        let mut prev_dist = 0usize;
 
         while pos < end {
-            // Splice the 3-gram starting at `pos` into the hash chain.
-            if pos + 3 <= self.window.len() {
-                let abs = abs_base + pos as u64;
-                self.match_finder.insert(
-                    abs as u32,
-                    self.window[pos],
-                    self.window[pos + 1],
-                    self.window[pos + 2],
-                );
-            }
-
-            // Find the best match at `pos`.
-            let cur = if pos + MIN_MATCH <= end {
-                let abs = abs_base + pos as u64;
-                // If we already hold a long-enough pending match, the
-                // lookahead probe gets a smaller chain budget.
-                let have_good = have_pending && prev_match_len >= good_match;
-                self.match_finder
-                    .find_match(
-                        &self.window,
-                        pos,
-                        abs as u32,
-                        have_good,
-                        max_chain,
-                        nice_match,
-                    )
-                    .map(|(l, d)| (l as usize, d as usize))
-                    .filter(|&(l, _)| l >= min_len)
+            let abs = (abs_base + pos as u64) as u32;
+            // Splice `pos` into its hash chain; `cand` is the chain head.
+            let cand = if pos + MIN_MATCH <= wlen {
+                mf.insert(window, pos, abs)
             } else {
-                None
+                NIL
             };
 
-            if have_pending {
-                // We have a match from `prev_match_start`. Decide whether
-                // to keep it or drop it in favour of `cur`.
-                let strictly_better = match cur {
-                    Some((cl, _)) => cl > prev_match_len,
-                    None => false,
+            let mut cur_len = 0usize;
+            let mut cur_dist = 0usize;
+            if cand != NIL && pos + MIN_MATCH <= end && prev_len < p.max_lazy {
+                // Only a match strictly longer than the pending one helps;
+                // a long-enough pending match quarters the chain budget.
+                let (floor, chain) = if prev_len > 0 {
+                    let c = if prev_len >= p.good_match {
+                        p.max_chain / 4
+                    } else {
+                        p.max_chain
+                    };
+                    (prev_len, c)
+                } else {
+                    (min_len - 1, p.max_chain)
                 };
-                if strictly_better {
-                    // Emit a literal at the previous position, advance one
-                    // byte, and replace pending with `cur`.
-                    let lit = self.window[prev_match_start];
-                    self.block_symbols.push(Symbol::Literal(lit));
-                    self.block_bytes.push(lit);
-                    // Drop the old pending; the new pending is `cur` at `pos`.
-                    let (cl, cd) = cur.unwrap();
-                    prev_match_len = cl;
-                    prev_match_dist = cd;
-                    prev_match_start = pos;
-                    have_pending = true;
+                (cur_len, cur_dist) =
+                    mf.longest_match(window, pos, abs, cand, floor, chain.max(1), p.nice_match);
+            }
+
+            if prev_len > 0 {
+                if cur_len > prev_len {
+                    // Better match one byte later: the held-back position
+                    // becomes a literal and `cur` is the new pending match.
+                    sink.literal(window[pos - 1]);
+                    prev_len = cur_len;
+                    prev_dist = cur_dist;
                     pos += 1;
                 } else {
-                    // Commit the pending match. Insert every interior
-                    // position of the match so later code can reference
-                    // into the middle, then jump past it.
-                    self.block_symbols.push(Symbol::Match {
-                        length: prev_match_len as u16,
-                        distance: prev_match_dist as u16,
-                    });
-                    self.block_bytes.extend_from_slice(
-                        &self.window[prev_match_start..prev_match_start + prev_match_len],
-                    );
-                    // Insert positions [prev_match_start+1 .. prev_match_start+prev_match_len)
-                    // We already inserted `prev_match_start` and `pos` (=prev_match_start+1).
-                    // So insert from `pos+1` upward.
-                    let match_end = prev_match_start + prev_match_len;
-                    let mut k = pos + 1;
-                    while k < match_end {
-                        if k + 3 <= self.window.len() {
-                            let abs = abs_base + k as u64;
-                            self.match_finder.insert(
-                                abs as u32,
-                                self.window[k],
-                                self.window[k + 1],
-                                self.window[k + 2],
-                            );
-                        }
-                        k += 1;
-                    }
+                    // Commit the pending match (it started at `pos - 1`;
+                    // `pos - 1` and `pos` are already in the chains).
+                    sink.matched(prev_len, prev_dist);
+                    let match_end = pos - 1 + prev_len;
+                    mf.insert_range(window, pos + 1, match_end, abs_base);
                     pos = match_end;
-                    have_pending = false;
+                    prev_len = 0;
                 }
-            } else if let Some((cl, cd)) = cur {
-                if !use_lazy {
-                    // Greedy: commit this match immediately, no lookahead probe.
-                    self.block_symbols.push(Symbol::Match {
-                        length: cl as u16,
-                        distance: cd as u16,
-                    });
-                    self.block_bytes
-                        .extend_from_slice(&self.window[pos..pos + cl]);
-                    let match_end = pos + cl;
-                    let mut k = pos + 1;
-                    while k < match_end {
-                        if k + 3 <= self.window.len() {
-                            let abs = abs_base + k as u64;
-                            self.match_finder.insert(
-                                abs as u32,
-                                self.window[k],
-                                self.window[k + 1],
-                                self.window[k + 2],
-                            );
-                        }
-                        k += 1;
-                    }
-                    pos = match_end;
+            } else if cur_len > 0 {
+                if p.use_lazy && cur_len < p.max_lazy {
+                    // Hold it back and probe the next position.
+                    prev_len = cur_len;
+                    prev_dist = cur_dist;
+                    pos += 1;
                 } else {
-                    // Lazy: hold this match back as pending; try one more
-                    // position to see if a longer match is available.
-                    prev_match_len = cl;
-                    prev_match_dist = cd;
-                    prev_match_start = pos;
-                    have_pending = true;
-                    // If the match is already at MAX_MATCH there is no point
-                    // probing further; commit immediately.
-                    if cl >= MAX_MATCH {
-                        self.block_symbols.push(Symbol::Match {
-                            length: cl as u16,
-                            distance: cd as u16,
-                        });
-                        self.block_bytes
-                            .extend_from_slice(&self.window[pos..pos + cl]);
-                        let match_end = pos + cl;
-                        let mut k = pos + 1;
-                        while k < match_end {
-                            if k + 3 <= self.window.len() {
-                                let abs = abs_base + k as u64;
-                                self.match_finder.insert(
-                                    abs as u32,
-                                    self.window[k],
-                                    self.window[k + 1],
-                                    self.window[k + 2],
-                                );
-                            }
-                            k += 1;
-                        }
-                        pos = match_end;
-                        have_pending = false;
-                    } else {
-                        pos += 1;
-                    }
+                    sink.matched(cur_len, cur_dist);
+                    let match_end = pos + cur_len;
+                    mf.insert_range(window, pos + 1, match_end, abs_base);
+                    pos = match_end;
                 }
             } else {
-                // No match here. Emit a literal.
-                let lit = self.window[pos];
-                self.block_symbols.push(Symbol::Literal(lit));
-                self.block_bytes.push(lit);
+                sink.literal(window[pos]);
                 pos += 1;
             }
         }
 
         // Flush pending at end-of-block.
-        if have_pending {
-            // Commit the held-back match even though we ran out of lookahead.
-            self.block_symbols.push(Symbol::Match {
-                length: prev_match_len as u16,
-                distance: prev_match_dist as u16,
-            });
-            self.block_bytes.extend_from_slice(
-                &self.window[prev_match_start..prev_match_start + prev_match_len],
-            );
-            let match_end = prev_match_start + prev_match_len;
-            // All positions in [prev_match_start, end) were already inserted
-            // by the main loop. We only need to splice in the tail [end, match_end).
-            let mut k = end;
-            while k < match_end {
-                if k + 3 <= self.window.len() {
-                    let abs = abs_base + k as u64;
-                    self.match_finder.insert(
-                        abs as u32,
-                        self.window[k],
-                        self.window[k + 1],
-                        self.window[k + 2],
-                    );
-                }
-                k += 1;
-            }
+        if prev_len > 0 {
+            // Commit the held-back match even though we ran out of
+            // lookahead. Positions up to `pos - 1` are in the chains.
+            sink.matched(prev_len, prev_dist);
+            let match_end = pos - 1 + prev_len;
+            mf.insert_range(window, pos, match_end, abs_base);
             pos = match_end;
         }
 
@@ -984,8 +1114,10 @@ impl Encoder {
     fn literal_pass(&mut self, end: usize) {
         let bytes = &self.window[self.cursor..end];
         self.block_symbols
-            .extend(bytes.iter().map(|&b| Symbol::Literal(b)));
-        self.block_bytes.extend_from_slice(bytes);
+            .extend(bytes.iter().map(|&b| sym_literal(b)));
+        for &b in bytes {
+            self.lit_freq[b as usize] += 1;
+        }
         self.cursor = end;
     }
 
@@ -993,29 +1125,28 @@ impl Encoder {
     fn rle_pass(&mut self, end: usize) {
         // Index of the first window byte a match may copy from.
         let floor_rel = self.history_floor.saturating_sub(self.window_start_abs) as usize;
+        let window = &self.window[..];
+        let mut sink = SymSink {
+            syms: &mut self.block_symbols,
+            lit_freq: &mut self.lit_freq,
+            dist_freq: &mut self.dist_freq,
+        };
         let mut pos = self.cursor;
         while pos < end {
             if pos > floor_rel {
-                let prev = self.window[pos - 1];
-                let max = MAX_MATCH.min(self.window.len() - pos);
-                let mut len = 0usize;
-                while len < max && self.window[pos + len] == prev {
-                    len += 1;
-                }
+                let prev = window[pos - 1];
+                let max = MAX_MATCH.min(window.len() - pos);
+                let len = window[pos..pos + max]
+                    .iter()
+                    .position(|&b| b != prev)
+                    .unwrap_or(max);
                 if len >= MIN_MATCH {
-                    self.block_symbols.push(Symbol::Match {
-                        length: len as u16,
-                        distance: 1,
-                    });
-                    self.block_bytes
-                        .extend_from_slice(&self.window[pos..pos + len]);
+                    sink.matched(len, 1);
                     pos += len;
                     continue;
                 }
             }
-            let lit = self.window[pos];
-            self.block_symbols.push(Symbol::Literal(lit));
-            self.block_bytes.push(lit);
+            sink.literal(window[pos]);
             pos += 1;
         }
         self.cursor = pos;
@@ -1053,16 +1184,8 @@ impl Encoder {
     /// length/distance extra-bits sum precomputed during the LZ77 pass;
     /// it's the same regardless of which Huffman encoding is chosen.
     fn build_dynamic(&mut self, extra_bits_total: u64) -> (u64, u64) {
-        let lit_lengths_vec = length_limited_huffman(&self.lit_freq, 15);
-        let dist_lengths_vec = length_limited_huffman(&self.dist_freq, 15);
-
-        // Reset and fill the persistent code-length arrays. The vecs from
-        // length_limited_huffman are sized to the input frequency table, so
-        // they're exactly 286 / 30 entries.
-        debug_assert_eq!(lit_lengths_vec.len(), 286);
-        debug_assert_eq!(dist_lengths_vec.len(), 30);
-        self.lit_lengths.copy_from_slice(&lit_lengths_vec);
-        self.dist_lengths.copy_from_slice(&dist_lengths_vec);
+        huffman_lengths(&self.lit_freq, 15, &mut self.lit_lengths);
+        huffman_lengths(&self.dist_freq, 15, &mut self.dist_lengths);
 
         // Trim trailing zeros for HLIT/HDIST.
         let mut hlit_count = 286usize;
@@ -1089,9 +1212,7 @@ impl Encoder {
         for s in &self.rle_buf {
             self.cl_freq[s.sym as usize] += 1;
         }
-        let cl_lengths_vec = length_limited_huffman(&self.cl_freq, 7);
-        debug_assert_eq!(cl_lengths_vec.len(), 19);
-        self.cl_lengths.copy_from_slice(&cl_lengths_vec);
+        huffman_lengths(&self.cl_freq, 7, &mut self.cl_lengths);
 
         // HCLEN: trim trailing zeros in CODE_LENGTH_ORDER permutation.
         let mut hclen_count = 19usize;
@@ -1162,49 +1283,28 @@ impl Encoder {
         // (pending + 3) mod 8. Pad to next byte → add (8 - that) mod 8 bits.
         let after_header = (pending + 3) & 7;
         let pad = (8 - after_header) & 7;
-        3 + pad + 32 + (self.block_bytes.len() as u64) * 8
+        3 + pad + 32 + ((self.cursor - self.block_start) as u64) * 8
     }
 
     /// Encode the accumulated block to `out_buffer` using the fixed Huffman tables.
-    fn emit_fixed_block(&mut self, bfinal: bool) {
+    /// `payload_bits` bounds the size of the symbol data.
+    fn emit_fixed_block(&mut self, bfinal: bool, payload_bits: u64) {
         let bw = &mut self.bit_writer;
         let out = &mut self.out_buffer;
 
         bw.write(if bfinal { 1 } else { 0 }, 1, out);
         bw.write(1, 2, out); // BTYPE = 01 (fixed Huffman)
 
-        // Use the precomputed reversed-code tables. These are computed once
-        // at module load and don't depend on the block content.
-        let lit_rev = &FIXED_LIT_REV;
-        let lit_len_tbl = &FIXED_LIT_LENGTHS;
-        let dist_rev = &FIXED_DIST_REV;
-        let dist_len_tbl = &FIXED_DIST_LENGTHS;
-
-        for s in &self.block_symbols {
-            match s {
-                Symbol::Literal(b) => {
-                    let bi = *b as usize;
-                    bw.write(lit_rev[bi], lit_len_tbl[bi] as u32, out);
-                }
-                Symbol::Match { length, distance } => {
-                    let (lc, lex, leb) = length_to_code(*length);
-                    let lci = lc as usize;
-                    bw.write(lit_rev[lci], lit_len_tbl[lci] as u32, out);
-                    if leb > 0 {
-                        bw.write(lex as u32, leb as u32, out);
-                    }
-                    let (dc, dex, deb) = distance_to_code(*distance);
-                    let dci = dc as usize;
-                    bw.write(dist_rev[dci], dist_len_tbl[dci] as u32, out);
-                    if deb > 0 {
-                        bw.write(dex as u32, deb as u32, out);
-                    }
-                }
-            }
-        }
-        // End-of-block (symbol 256).
-        let eob = END_OF_BLOCK as usize;
-        bw.write(lit_rev[eob], lit_len_tbl[eob] as u32, out);
+        emit_symbols(
+            &self.block_symbols,
+            &FIXED_LIT_REV,
+            &FIXED_LIT_LENGTHS,
+            &FIXED_DIST_REV,
+            &FIXED_DIST_LENGTHS,
+            payload_bits,
+            bw,
+            out,
+        );
 
         if bfinal {
             bw.align(out);
@@ -1229,10 +1329,7 @@ impl Encoder {
         // Pad to byte boundary so the LEN/NLEN bytes are aligned.
         bw.align(out);
         // LEN = 0, NLEN = 0xFFFF, no payload.
-        out.push(0x00);
-        out.push(0x00);
-        out.push(0xFF);
-        out.push(0xFF);
+        out.extend_from_slice(&[0x00, 0x00, 0xFF, 0xFF]);
     }
 
     /// Encode the accumulated block as a stored (uncompressed) block.
@@ -1244,16 +1341,12 @@ impl Encoder {
         bw.write(0, 2, out); // BTYPE = 00
         bw.align(out); // pad to byte boundary
 
-        let len = self.block_bytes.len() as u16;
-        let nlen = !len;
-        out.push((len & 0xff) as u8);
-        out.push((len >> 8) as u8);
-        out.push((nlen & 0xff) as u8);
-        out.push((nlen >> 8) as u8);
-        out.extend_from_slice(&self.block_bytes);
-        // Stored blocks naturally end on a byte boundary; if this is the
-        // final block we don't need an additional align.
-        let _ = bfinal;
+        let bytes = &self.window[self.block_start..self.cursor];
+        let len = bytes.len() as u16;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(bytes);
+        // Stored blocks naturally end on a byte boundary.
     }
 
     /// Encode the accumulated block as a dynamic-Huffman block.
@@ -1261,7 +1354,8 @@ impl Encoder {
     /// Consumes the dynamic-header preparation stashed on `self` by the
     /// preceding [`build_dynamic`] call (lit/dist/cl lengths, RLE, HLIT /
     /// HDIST / HCLEN counts) — they're already in scratch fields, no recompute.
-    fn emit_dynamic_block(&mut self, bfinal: bool) {
+    /// `payload_bits` bounds the size of the symbol data.
+    fn emit_dynamic_block(&mut self, bfinal: bool, payload_bits: u64) {
         let hlit_count = self.hlit_count;
         let hdist_count = self.hdist_count;
         let hclen_count = self.hclen_count;
@@ -1270,14 +1364,11 @@ impl Encoder {
         let hclen = (hclen_count - 4) as u8;
 
         // Pre-reverse the Huffman codes once so the inner emission loop is
-        // a single `bw.write(rev, len, out)` per symbol.
+        // a single `bw.put(rev, len, out)` per symbol.
         let lit_codes = canonical_codes_from_lengths(&self.lit_lengths);
         let dist_codes = canonical_codes_from_lengths(&self.dist_lengths);
         let cl_codes = canonical_codes_from_lengths(&self.cl_lengths);
 
-        // Build per-symbol (reversed_code, length) tables for the two main
-        // alphabets. This converts the inner emission loop from three loads
-        // + a reverse_bits to two loads.
         let mut lit_rev = [0u32; 286];
         for i in 0..hlit_count {
             let l = self.lit_lengths[i] as u32;
@@ -1323,37 +1414,16 @@ impl Encoder {
             }
         }
 
-        for s in &self.block_symbols {
-            match s {
-                Symbol::Literal(b) => {
-                    let bi = *b as usize;
-                    debug_assert!(
-                        self.lit_lengths[bi] > 0,
-                        "literal {} has zero-length Huffman code",
-                        bi
-                    );
-                    bw.write(lit_rev[bi], self.lit_lengths[bi] as u32, out);
-                }
-                Symbol::Match { length, distance } => {
-                    let (lc, lex, leb) = length_to_code(*length);
-                    let lci = lc as usize;
-                    bw.write(lit_rev[lci], self.lit_lengths[lci] as u32, out);
-                    if leb > 0 {
-                        bw.write(lex as u32, leb as u32, out);
-                    }
-                    let (dc, dex, deb) = distance_to_code(*distance);
-                    let dci = dc as usize;
-                    bw.write(dist_rev[dci], self.dist_lengths[dci] as u32, out);
-                    if deb > 0 {
-                        bw.write(dex as u32, deb as u32, out);
-                    }
-                }
-            }
-        }
-
-        // End-of-block.
-        let eob = END_OF_BLOCK as usize;
-        bw.write(lit_rev[eob], self.lit_lengths[eob] as u32, out);
+        emit_symbols(
+            &self.block_symbols,
+            &lit_rev,
+            &self.lit_lengths,
+            &dist_rev,
+            &self.dist_lengths,
+            payload_bits,
+            bw,
+            out,
+        );
 
         if bfinal {
             bw.align(out);
@@ -1371,41 +1441,27 @@ impl Encoder {
         }
 
         self.block_symbols.clear();
-        self.block_bytes.clear();
+        self.block_symbols
+            .reserve(end_rel.saturating_sub(self.cursor) + 1);
+        self.block_start = self.cursor;
+        self.lit_freq = [0u32; 286];
+        self.dist_freq = [0u32; 30];
 
+        // The passes tally the frequency histograms as they go.
         match self.strategy {
             Strategy::HuffmanOnly => self.literal_pass(end_rel),
             Strategy::Rle => self.rle_pass(end_rel),
             _ => self.lz77_pass(end_rel),
         }
-
-        // Tally frequencies into the persistent scratch arrays and accumulate
-        // the length/distance extra-bits total in the same pass. The extra-bits
-        // sum is independent of which Huffman encoding is chosen, so it's added
-        // equally to both the dynamic and fixed cost estimates.
-        for f in self.lit_freq.iter_mut() {
-            *f = 0;
-        }
-        for f in self.dist_freq.iter_mut() {
-            *f = 0;
-        }
-        let mut extra_bits_total: u64 = 0;
-        for s in &self.block_symbols {
-            match s {
-                Symbol::Literal(b) => self.lit_freq[*b as usize] += 1,
-                Symbol::Match { length, distance } => {
-                    let (lc, _, leb) = length_to_code(*length);
-                    self.lit_freq[lc as usize] += 1;
-                    let (dc, _, deb) = distance_to_code(*distance);
-                    self.dist_freq[dc as usize] += 1;
-                    extra_bits_total += leb as u64 + deb as u64;
-                }
-            }
-        }
         self.lit_freq[END_OF_BLOCK as usize] += 1;
 
+        // The extra-bits sum is independent of which Huffman encoding is
+        // chosen, so it's added equally to the dynamic and fixed estimates.
+        let extra_bits_total = extra_bits_total(&self.lit_freq, &self.dist_freq);
+
         if self.strategy == Strategy::Fixed {
-            self.emit_fixed_block(bfinal);
+            let fixed_total = self.fixed_cost_bits(extra_bits_total);
+            self.emit_fixed_block(bfinal, fixed_total);
             self.maybe_slide();
             return;
         }
@@ -1420,7 +1476,7 @@ impl Encoder {
         let fixed_total = self.fixed_cost_bits(extra_bits_total);
 
         // Compute stored cost — only valid when the block fits in u16.
-        let stored_total = if self.block_bytes.len() <= u16::MAX as usize {
+        let stored_total = if self.cursor - self.block_start <= u16::MAX as usize {
             self.stored_cost_bits()
         } else {
             u64::MAX
@@ -1430,9 +1486,10 @@ impl Encoder {
         if stored_total <= dynamic_total && stored_total <= fixed_total {
             self.emit_stored_block(bfinal);
         } else if fixed_total <= dynamic_total {
-            self.emit_fixed_block(bfinal);
+            self.emit_fixed_block(bfinal, fixed_total);
         } else {
-            self.emit_dynamic_block(bfinal);
+            self.out_buffer.reserve((dynamic_total / 8) as usize + 16);
+            self.emit_dynamic_block(bfinal, dyn_payload_bits);
         }
 
         self.maybe_slide();
@@ -1560,7 +1617,7 @@ impl RawEncoder for Encoder {
         self.window_start_abs = 0;
         self.match_finder.reset();
         self.block_symbols.clear();
-        self.block_bytes.clear();
+        self.block_start = 0;
         self.bit_writer = BitWriter::new();
         self.out_buffer.clear();
         self.out_pos = 0;

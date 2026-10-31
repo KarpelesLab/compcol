@@ -79,16 +79,16 @@ impl BitReader {
 
 /// LSB-first bit writer that appends to a caller-supplied byte sink.
 ///
-/// Used by the deflate encoder. Each `write` shifts up to 32 LSB-first bits
+/// Used by the deflate64 encoder. Each `write` shifts up to 32 LSB-first bits
 /// into the accumulator then drains any whole bytes into the output `Vec`.
-#[cfg(feature = "alloc")]
+#[cfg(feature = "deflate64")]
 #[derive(Debug, Clone, Default)]
 pub struct BitWriter {
     acc: u64,
     nbits: u32,
 }
 
-#[cfg(feature = "alloc")]
+#[cfg(feature = "deflate64")]
 impl BitWriter {
     pub const fn new() -> Self {
         Self { acc: 0, nbits: 0 }
