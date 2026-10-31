@@ -29,7 +29,7 @@ pub mod lz77;
 #[cfg(not(feature = "embed"))]
 pub use decoder::{Decoder, DecoderConfig};
 #[cfg(not(feature = "embed"))]
-pub use encoder::{Encoder, EncoderConfig};
+pub use encoder::{Encoder, EncoderConfig, Strategy};
 
 // The `embed` build: the same names, small. See `crate::embed`.
 #[cfg(feature = "embed")]

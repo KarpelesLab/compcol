@@ -40,7 +40,7 @@ Compression tuning:
     -l, --level N           Compression level for the encoder
                             (ignored on decompress and on algorithms
                             without a level knob):
-                              deflate/zlib/gzip: 1..=9, default 6
+                              deflate/zlib/gzip: 0..=9, default 6 (0 = stored)
                               lzma/xz:           0..=9, default 6
                               zstd:              1..=22, default 3
                               brotli quality:    0..=11, default 6

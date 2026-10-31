@@ -18,7 +18,7 @@
 //! - Decoder ignores MTIME/XFL/OS and any optional metadata; it parses but
 //!   doesn't expose the filename or comment.
 //! - Encoder always emits a minimal 10-byte header (FLG = 0); the XFL byte
-//!   is filled in from [`EncoderConfig::level`] per RFC 1952 §2.3.1.
+//!   is filled in from the level (and strategy) per RFC 1952 §2.3.1.
 //! - Multi-member streams (RFC 1952 §2.2, produced by `cat a.gz b.gz`,
 //!   `logrotate`, etc.) are decoded as one: the decoder restarts at the
 //!   header phase whenever another member follows a trailer. Any other

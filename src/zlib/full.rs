@@ -5,29 +5,37 @@ use alloc::vec::Vec;
 
 use crate::checksum::Adler32;
 use crate::deflate;
+use crate::deflate::Strategy;
+use crate::deflate::encoder::{FlushKind, flush_result};
 use crate::error::Error;
-use crate::traits::{Flush, RawDecoder, RawEncoder, RawProgress};
+use crate::traits::{Flush, Progress, RawDecoder, RawEncoder, RawProgress, Status};
 
-/// CMF byte with CM=8 (deflate) and CINFO=7 (32 KiB window).
-const HEADER_CMF: u8 = 0x78;
+/// CM=8 (deflate) in the low nibble of CMF.
+const CM_DEFLATE: u8 = 0x08;
+/// FDICT bit of FLG.
+const FDICT: u8 = 0x20;
 
 /// Tunables for the zlib encoder.
 ///
 /// `level` controls the speed/ratio trade-off of the inner deflate encoder:
-/// `1` is fastest and produces the largest output, `9` is slowest and produces
-/// the smallest output. The default of `6` mirrors zlib's default. Values
-/// outside `1..=9` are clamped at encoder construction time (matching
-/// deflate's behaviour and zlib's `Z_BEST_*` snap-to-range semantics).
+/// `0` stores the data uncompressed, `1` is the fastest compressing level and
+/// `9` the slowest and smallest. The default of `6` mirrors zlib's default.
+/// Values above `9` act as `9`.
+///
+/// For strategy, window bits, memory level and a preset dictionary, use
+/// [`Encoder::with_deflate_config`] and [`Encoder::with_dictionary`].
 ///
 /// The chosen level is also reflected in the zlib header's two-bit `FLEVEL`
 /// field, per RFC 1950 §2.2:
-/// - level `1`         → FLEVEL = 0 (fastest)
+/// - levels `0..=1`    → FLEVEL = 0 (fastest)
 /// - levels `2..=5`    → FLEVEL = 1 (fast)
 /// - level `6`         → FLEVEL = 2 (default)
 /// - levels `7..=9`    → FLEVEL = 3 (maximum)
+///
+/// As in zlib, the huffman-only, RLE and fixed strategies also give FLEVEL 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncoderConfig {
-    /// Compression level in `1..=9`.
+    /// Compression level in `0..=9` (`0` = stored blocks only).
     pub level: u8,
 }
 
@@ -37,25 +45,45 @@ impl Default for EncoderConfig {
     }
 }
 
-/// Compute the two zlib header bytes for a given compression level.
+/// Build the zlib header: CMF, FLG and, with a dictionary, the 4-byte
+/// big-endian DICTID. Returns the bytes and how many of them are used.
 ///
-/// Returns `(CMF, FLG)` where FLG is built from `FLEVEL << 6` plus the
-/// FCHECK bits required to make `CMF*256 + FLG` divisible by 31 (RFC 1950
-/// §2.2). FDICT is always 0.
-fn header_bytes(level: u8) -> (u8, u8) {
-    let level = level.clamp(1, 9);
-    let flevel: u8 = match level {
-        1 => 0,
-        2..=5 => 1,
-        6 => 2,
-        _ => 3, // 7..=9
+/// FLG carries FLEVEL (from level and strategy, as zlib picks it), FDICT,
+/// and the FCHECK bits that make `CMF*256 + FLG` a multiple of 31
+/// (RFC 1950 §2.2).
+fn header_bytes(
+    level: u8,
+    strategy: Strategy,
+    window_bits: u8,
+    dictid: Option<u32>,
+) -> ([u8; 6], u8) {
+    let flevel: u8 = if level < 2
+        || matches!(
+            strategy,
+            Strategy::HuffmanOnly | Strategy::Rle | Strategy::Fixed
+        ) {
+        0
+    } else {
+        match level {
+            2..=5 => 1,
+            6 => 2,
+            _ => 3, // 7..=9
+        }
     };
-    let cmf = HEADER_CMF;
-    // FCHECK = -(CMF*256 + FLEVEL<<6) mod 31, packed into the low 5 bits of FLG.
-    let partial = ((cmf as u32) << 8) | ((flevel as u32) << 6);
+    let cmf = ((window_bits - 8) << 4) | CM_DEFLATE;
+    let fdict = if dictid.is_some() { FDICT } else { 0 };
+    // FCHECK = -(CMF*256 + FLG without FCHECK) mod 31.
+    let partial = ((cmf as u32) << 8) | ((flevel as u32) << 6) | fdict as u32;
     let fcheck = (31 - (partial % 31)) % 31;
-    let flg = (flevel << 6) | (fcheck as u8);
-    (cmf, flg)
+    let flg = (flevel << 6) | fdict | (fcheck as u8);
+    let mut out = [cmf, flg, 0, 0, 0, 0];
+    match dictid {
+        Some(id) => {
+            out[2..].copy_from_slice(&id.to_be_bytes());
+            (out, 6)
+        }
+        None => (out, 2),
+    }
 }
 
 /// Configuration for the zlib decoder.
@@ -378,11 +406,15 @@ enum EncPhase {
 pub struct Encoder {
     inner: deflate::Encoder,
     adler: Adler32,
-    /// The two header bytes (CMF, FLG) we emit at the start of the stream;
-    /// derived from `config.level` at construction time and persisted across
-    /// `reset` so configuration survives.
-    header: [u8; 2],
+    /// The header bytes (CMF, FLG, optional DICTID) we emit at the start of
+    /// the stream; persisted across `reset` so configuration survives.
+    header: [u8; 6],
+    header_len: u8,
     header_idx: u8,
+    /// Window bits for CINFO, from the deflate config's `max_distance`.
+    window_bits: u8,
+    /// Adler-32 of the preset dictionary, if one is set.
+    dictid: Option<u32>,
     trailer: [u8; 4],
     trailer_idx: u8,
     phase: EncPhase,
@@ -395,33 +427,92 @@ impl Encoder {
     }
 
     /// Build an encoder with explicit configuration. `config.level` is
-    /// clamped to `1..=9` internally and propagated through to the inner
-    /// deflate encoder; the zlib header's FLEVEL bits are set accordingly.
+    /// passed to the inner deflate encoder (above 9 acts as 9); the zlib
+    /// header's FLEVEL bits are set accordingly.
     pub fn with_config(config: EncoderConfig) -> Self {
-        let (cmf, flg) = header_bytes(config.level);
-        Self {
-            inner: deflate::Encoder::with_config(deflate::EncoderConfig {
-                level: config.level,
-                ..deflate::EncoderConfig::default()
-            }),
+        Self::with_deflate_config(deflate::EncoderConfig::default().with_level(config.level))
+    }
+
+    /// Build an encoder from a full deflate configuration: level, strategy,
+    /// memory level and window (`max_distance`, e.g. set with
+    /// [`deflate::EncoderConfig::with_window_bits`]). The header's CINFO
+    /// is the smallest window (at least 512 bytes) that covers
+    /// `max_distance`.
+    pub fn with_deflate_config(config: deflate::EncoderConfig) -> Self {
+        let window_bits = config.window_bits();
+        let mut e = Self {
+            inner: deflate::Encoder::with_config(config),
             adler: Adler32::new(),
-            header: [cmf, flg],
+            header: [0u8; 6],
+            header_len: 2,
             header_idx: 0,
+            window_bits,
+            dictid: None,
             trailer: [0u8; 4],
             trailer_idx: 0,
             phase: EncPhase::Header,
+        };
+        e.rebuild_header();
+        e
+    }
+
+    /// Use `dictionary` as a preset dictionary: sets FDICT and writes its
+    /// Adler-32 as DICTID (RFC 1950), and lets matches refer into it. The
+    /// decoder needs the same bytes ([`DecoderConfig::dictionary`]). An
+    /// empty dictionary means none. Kept across resets; calling this resets
+    /// the encoder, so do it before encoding.
+    #[must_use]
+    pub fn with_dictionary(mut self, dictionary: &[u8]) -> Self {
+        self.dictid = if dictionary.is_empty() {
+            None
+        } else {
+            let mut a = Adler32::new();
+            a.update(dictionary);
+            Some(a.finalize())
+        };
+        self.inner = self.inner.with_dictionary(dictionary);
+        self.rebuild_header();
+        self.raw_reset();
+        self
+    }
+
+    /// Change level and strategy mid-stream; see
+    /// [`deflate::Encoder::set_params`]. FLEVEL follows the change only if
+    /// the header has not been written yet.
+    pub fn set_params(&mut self, level: u8, strategy: Strategy) {
+        self.inner.set_params(level, strategy);
+        if self.header_idx == 0 {
+            self.rebuild_header();
         }
     }
 
-    /// Push the 2 header bytes one at a time as output room becomes available.
+    /// zlib's `Z_PARTIAL_FLUSH`; see [`deflate::Encoder::flush_partial`].
+    pub fn flush_partial(&mut self, output: &mut [u8]) -> Result<(Progress, Status), Error> {
+        self.flush_kind(output, FlushKind::Partial)
+            .map(flush_result)
+    }
+
+    /// zlib's `Z_BLOCK`; see [`deflate::Encoder::flush_block`].
+    pub fn flush_block(&mut self, output: &mut [u8]) -> Result<(Progress, Status), Error> {
+        self.flush_kind(output, FlushKind::Block).map(flush_result)
+    }
+
+    fn rebuild_header(&mut self) {
+        let (level, strategy) = self.inner.level_and_strategy();
+        let (header, len) = header_bytes(level, strategy, self.window_bits, self.dictid);
+        self.header = header;
+        self.header_len = len;
+    }
+
+    /// Push the header bytes one at a time as output room becomes available.
     /// Returns true if the header has been fully emitted.
     fn drain_header(&mut self, output: &mut [u8], written: &mut usize) -> bool {
-        while self.header_idx < 2 && *written < output.len() {
+        while self.header_idx < self.header_len && *written < output.len() {
             output[*written] = self.header[self.header_idx as usize];
             *written += 1;
             self.header_idx += 1;
         }
-        self.header_idx == 2
+        self.header_idx == self.header_len
     }
 
     fn drain_trailer(&mut self, output: &mut [u8], written: &mut usize) -> bool {
@@ -548,6 +639,16 @@ impl RawEncoder for Encoder {
     }
 
     fn raw_flush(&mut self, output: &mut [u8], mode: Flush) -> Result<RawProgress, Error> {
+        let kind = match mode {
+            Flush::Sync => FlushKind::Sync,
+            Flush::Full => FlushKind::Full,
+        };
+        self.flush_kind(output, kind)
+    }
+}
+
+impl Encoder {
+    fn flush_kind(&mut self, output: &mut [u8], kind: FlushKind) -> Result<RawProgress, Error> {
         let mut written = 0usize;
 
         // Make sure the 2-byte header has been written before any deflate
@@ -570,7 +671,7 @@ impl RawEncoder for Encoder {
             return Err(Error::Corrupt);
         }
 
-        let p = self.inner.raw_flush(&mut output[written..], mode)?;
+        let p = self.inner.raw_flush_kind(&mut output[written..], kind)?;
         written += p.written;
         Ok(RawProgress {
             consumed: 0,

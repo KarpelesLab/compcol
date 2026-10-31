@@ -203,7 +203,7 @@ pub fn encoder_by_name(name: &str) -> Option<Box<dyn Encoder>> {
 /// `lzma`, `xz`, `zstd`, `brotli`) the level is plumbed into the
 /// `EncoderConfig` and clamped to that algorithm's valid range:
 ///
-/// * `deflate`/`zlib`/`gzip`: 1..=9, default 6
+/// * `deflate`/`zlib`/`gzip`: 0..=9 (0 = stored blocks only), default 6
 /// * `lzma`/`xz`: 0..=9, default 6
 /// * `zstd`: 1..=22, default 3 (0 also selects the default; the negative
 ///   "fast" levels need [`crate::zstd::EncoderConfig`] directly)
