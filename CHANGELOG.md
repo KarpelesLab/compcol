@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.8](https://github.com/KarpelesLab/compcol/compare/v0.7.7...v0.7.8) - 2026-10-31
+
+### Added
+
+- *(deflate,zlib,gzip)* exact consumption, need-dictionary signal, Z_BLOCK stops ([#165](https://github.com/KarpelesLab/compcol/pull/165))
+- *(deflate,zlib,gzip)* level 0, strategies, mem level, window bits, preset dictionary, partial/block flush ([#164](https://github.com/KarpelesLab/compcol/pull/164))
+- *(ppmd)* PPMd variant I decoder for ZIP method 98 ([#163](https://github.com/KarpelesLab/compcol/pull/163))
+- *(lzma)* ZIP method 14 entry encoder and decoder ([#161](https://github.com/KarpelesLab/compcol/pull/161))
+
+### Fixed
+
+- *(deflate)* no dead-code warnings in deflate-only builds ([#168](https://github.com/KarpelesLab/compcol/pull/168))
+
+### Other
+
+- *(deflate,checksum)* table-driven inflate with a fast loop; faster checksums ([#167](https://github.com/KarpelesLab/compcol/pull/167))
+- *(deflate,checksum)* faster deflate encoder and checksums ([#166](https://github.com/KarpelesLab/compcol/pull/166))
+
 ## [0.7.7](https://github.com/KarpelesLab/compcol/compare/v0.7.6...v0.7.7) - 2026-10-31
 
 ### Added
