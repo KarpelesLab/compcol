@@ -74,12 +74,25 @@ impl DecoderConfig {
     }
 }
 
-use super::tables::{
-    CODE_LENGTH_ORDER, DIST_BASE, DIST_EXTRA, END_OF_BLOCK, FIXED_DIST_LENGTHS, FIXED_LIT_LENGTHS,
-    LENGTH_BASE, LENGTH_EXTRA, WINDOW_SIZE,
-};
+use super::inftable::{self, Alphabet, EXC, K_BAD, K_EOB, LIT, Table};
+use super::tables::{CODE_LENGTH_ORDER, FIXED_DIST_LENGTHS, FIXED_LIT_LENGTHS, WINDOW_SIZE};
 
-// ─── per-block work buffers, boxed to keep the enum tiny ────────────────
+/// Root-table widths. 11 bits resolves nearly every literal/length code in
+/// one lookup; distance codes are fewer, so 8 bits does the same for them.
+const LIT_TABLE: usize = 1 << 11;
+const DIST_TABLE: usize = 1 << 8;
+
+/// The fast loop runs while at least this much output room is left: three
+/// literals and a longest match, plus the up-to-15-byte overrun of the
+/// chunked match copy.
+const FAST_OUT_MARGIN: usize = 3 + 258 + 16;
+/// ... and at least this much input: two 8-byte refills per iteration.
+const FAST_IN_MARGIN: usize = 16;
+/// Bytes past the end of the history ring, there only so that the fast
+/// loop's 16-byte chunked copies out of the window may over-read.
+const WINDOW_SLACK: usize = 16;
+
+// ─── per-block work buffers ──────────────────────────────────────────────
 
 struct DynamicLensWork {
     cl_dec: CanonicalDecoder<19>,
@@ -103,10 +116,12 @@ enum DynLenSub {
     RepeatZeroLong,
 }
 
-struct HuffmanBlockWork {
-    lit: CanonicalDecoder<288>,
-    dist: CanonicalDecoder<32>,
-    phase: HuffmanPhase,
+/// The current block's Huffman tables, allocated once per decoder.
+struct Tables {
+    lit: Table<LIT_TABLE>,
+    dist: Table<DIST_TABLE>,
+    /// The tables hold the fixed code (so a run of fixed blocks builds it once).
+    fixed: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -123,8 +138,10 @@ enum HuffmanPhase {
         base_dist: u16,
         extra_bits: u8,
     },
-    /// Copying a match from the sliding window into output.
+    /// Copying a match into the output.
     EmittingMatch { distance: u16, remaining: u16 },
+    /// A literal decoded with no output room for it.
+    PendingLiteral(u8),
 }
 
 enum DecState {
@@ -145,20 +162,32 @@ enum DecState {
         cl_lens: [u8; 19],
     },
     DynamicCodeLengthsData(Box<DynamicLensWork>),
-    HuffmanBlock(Box<HuffmanBlockWork>),
+    HuffmanBlock(HuffmanPhase),
     Done,
+}
+
+/// How the fast loop stopped.
+enum FastExit {
+    /// Too little input or output room left; carry on symbol by symbol.
+    Margin,
+    /// The block's end-of-block code was decoded.
+    EndOfBlock,
 }
 
 pub struct Decoder {
     bit_reader: BitReader,
     /// Circular history buffer of `win_cap` bytes (heap-allocated to the
-    /// configured window size, ≤ 32 KiB).
+    /// configured window size, ≤ 32 KiB, plus [`WINDOW_SLACK`]). It holds the output of earlier
+    /// calls: within a call, matches read the bytes written so far straight
+    /// from the caller's output, and the window is brought up to date as
+    /// the call returns.
     window: Box<[u8]>,
     /// Ring capacity = the sliding-window size = the maximum legal match
     /// distance. `1..=WINDOW_SIZE`.
     win_cap: usize,
     window_pos: usize,
     window_size: usize, // 0..=win_cap; how many valid bytes lie behind window_pos
+    tables: Box<Tables>,
     state: DecState,
     last_block: bool,
     poisoned: bool,
@@ -255,10 +284,15 @@ impl Decoder {
         let cap = cap.clamp(1, WINDOW_SIZE);
         Self {
             bit_reader: BitReader::new(),
-            window: alloc::vec![0u8; cap].into_boxed_slice(),
+            window: alloc::vec![0u8; cap + WINDOW_SLACK].into_boxed_slice(),
             win_cap: cap,
             window_pos: 0,
             window_size: 0,
+            tables: Box::new(Tables {
+                lit: Table::new(),
+                dist: Table::new(),
+                fixed: false,
+            }),
             state: DecState::BlockHeader,
             last_block: false,
             poisoned: false,
@@ -288,23 +322,9 @@ impl Decoder {
     /// (anything older is unreachable from a deflate back-reference).
     /// Replaces any prior window contents.
     pub(crate) fn load_dictionary(&mut self, dict: &[u8]) {
-        let take = dict.len().min(self.win_cap);
-        let start = dict.len() - take;
-        let bytes = &dict[start..];
-        // Reset window state, then write the dictionary as if it had been
-        // emitted by a prior decode pass. `window_pos` ends up just past
-        // the last dictionary byte, which is where future emit_byte calls
-        // will continue from — matching the relative-distance semantics
-        // that deflate back-references rely on.
         self.window_pos = 0;
         self.window_size = 0;
-        for &b in bytes {
-            self.window[self.window_pos] = b;
-            self.window_pos = (self.window_pos + 1) % self.win_cap;
-            if self.window_size < self.win_cap {
-                self.window_size += 1;
-            }
-        }
+        self.push_history(dict);
     }
 
     /// Reset the bit reader and block-decode state but **keep** the
@@ -338,23 +358,60 @@ impl Decoder {
         }
     }
 
-    /// Write one byte to both the sliding window and the caller's output.
-    #[inline]
-    fn emit_byte(&mut self, byte: u8, output: &mut [u8], written: &mut usize) {
-        debug_assert!(*written < output.len());
-        output[*written] = byte;
-        *written += 1;
-        self.window[self.window_pos] = byte;
-        // `win_cap` is a runtime value, so `% win_cap` would lower to an
-        // integer division; a single wrap branch is far cheaper on the
-        // per-literal hot path.
-        self.window_pos += 1;
-        if self.window_pos == self.win_cap {
-            self.window_pos = 0;
+    /// Append `data` to the history ring, keeping its last `win_cap` bytes.
+    fn push_history(&mut self, data: &[u8]) {
+        let cap = self.win_cap;
+        let data = &data[data.len().saturating_sub(cap)..];
+        let n = data.len();
+        if n == 0 {
+            return;
         }
-        if self.window_size < self.win_cap {
-            self.window_size += 1;
+        let first = n.min(cap - self.window_pos);
+        self.window[self.window_pos..self.window_pos + first].copy_from_slice(&data[..first]);
+        self.window[..n - first].copy_from_slice(&data[first..]);
+        self.window_pos += n;
+        if self.window_pos >= cap {
+            self.window_pos -= cap;
         }
+        self.window_size = (self.window_size + n).min(cap);
+    }
+
+    /// Copy up to `len` bytes of the match at `distance` into
+    /// `output[*written..]` (as many as fit); returns how many. `distance`
+    /// must be within the history: the window plus `output[..*written]`.
+    fn copy_match(
+        &self,
+        output: &mut [u8],
+        written: &mut usize,
+        distance: usize,
+        len: usize,
+    ) -> usize {
+        let n = len.min(output.len() - *written);
+        let mut done = 0;
+        if distance > *written {
+            // The start of the match lies in the window, `back` bytes
+            // before its end.
+            let back = distance - *written;
+            let take = back.min(n);
+            let mut src = if self.window_pos >= back {
+                self.window_pos - back
+            } else {
+                self.window_pos + self.win_cap - back
+            };
+            while done < take {
+                let span = (take - done).min(self.win_cap - src);
+                output[*written + done..*written + done + span]
+                    .copy_from_slice(&self.window[src..src + span]);
+                done += span;
+                src += span;
+                if src == self.win_cap {
+                    src = 0;
+                }
+            }
+        }
+        copy_overlapping(output, *written + done, distance, n - done);
+        *written += n;
+        n
     }
 
     /// Mark the decoder as poisoned and return the given error.
@@ -384,15 +441,124 @@ impl Decoder {
     fn unfeed(&mut self, stopped: bool, consumed: &mut usize) {
         let blocked_on_output = match &self.state {
             DecState::Done | DecState::Stored { .. } => true,
-            DecState::HuffmanBlock(work) => {
-                matches!(work.phase, HuffmanPhase::EmittingMatch { .. })
-            }
+            DecState::HuffmanBlock(phase) => matches!(
+                phase,
+                HuffmanPhase::EmittingMatch { .. } | HuffmanPhase::PendingLiteral(_)
+            ),
             _ => stopped,
         };
         if blocked_on_output {
             let n = self.bit_reader.unfeed_whole_bytes() as usize;
             debug_assert!(n <= *consumed);
             *consumed -= n.min(*consumed);
+        }
+    }
+}
+
+/// Copy `n` bytes to `out[dst..]` from `distance` bytes back, byte by byte
+/// in effect (the source may overlap the destination). Exact: writes
+/// nothing past `dst + n`.
+fn copy_overlapping(out: &mut [u8], dst: usize, distance: usize, n: usize) {
+    if n == 0 {
+        return;
+    }
+    let src = dst - distance;
+    if distance >= n {
+        out.copy_within(src..src + n, dst);
+    } else if distance == 1 {
+        let b = out[src];
+        out[dst..dst + n].fill(b);
+    } else {
+        // `[src, dst + done)` repeats with period `distance`, so its start
+        // can be copied forward a growing span at a time.
+        let mut done = 0;
+        while done < n {
+            let span = (distance + done).min(n - done);
+            out.copy_within(src..src + span, dst + done);
+            done += span;
+        }
+    }
+}
+
+/// The fast loop's match copy: like [`copy_overlapping`] but it copies in
+/// whole chunks, so it may write up to 32 bytes from `dst` for a short
+/// match and up to 15 bytes past `dst + n` for a long one; the caller
+/// guarantees that room.
+#[inline(always)]
+fn copy_match_fast(out: &mut [u8], dst: usize, distance: usize, n: usize) {
+    let mut s = dst - distance;
+    let mut d = dst;
+    let end = dst + n;
+    if distance >= 16 {
+        // Most matches are short: 16 bytes, then another 16, unrolled so
+        // their lengths do not cost a loop exit; then a loop.
+        let chunk: [u8; 16] = out[s..s + 16].try_into().unwrap();
+        out[d..d + 16].copy_from_slice(&chunk);
+        if n > 16 {
+            let chunk: [u8; 16] = out[s + 16..s + 32].try_into().unwrap();
+            out[d + 16..d + 32].copy_from_slice(&chunk);
+        }
+        if n > 32 {
+            s += 32;
+            d += 32;
+            loop {
+                let chunk: [u8; 16] = out[s..s + 16].try_into().unwrap();
+                out[d..d + 16].copy_from_slice(&chunk);
+                s += 16;
+                d += 16;
+                if d >= end {
+                    break;
+                }
+            }
+        }
+    } else if distance >= 8 {
+        let chunk: [u8; 8] = out[s..s + 8].try_into().unwrap();
+        out[d..d + 8].copy_from_slice(&chunk);
+        if n > 8 {
+            let chunk: [u8; 8] = out[s + 8..s + 16].try_into().unwrap();
+            out[d + 8..d + 16].copy_from_slice(&chunk);
+        }
+        if n > 16 {
+            s += 16;
+            d += 16;
+            loop {
+                let chunk: [u8; 8] = out[s..s + 8].try_into().unwrap();
+                out[d..d + 8].copy_from_slice(&chunk);
+                s += 8;
+                d += 8;
+                if d >= end {
+                    break;
+                }
+            }
+        }
+    } else if distance == 1 {
+        let chunk = [out[s]; 16];
+        loop {
+            out[d..d + 16].copy_from_slice(&chunk);
+            d += 16;
+            if d >= end {
+                break;
+            }
+        }
+    } else {
+        // Short period: lay down the first 8 bytes one at a time, then copy
+        // 8 at a time from a multiple of the period that is at least 8 back.
+        for i in 0..8 {
+            out[d + i] = out[s + i];
+        }
+        if n > 8 {
+            let period = distance * 8usize.div_ceil(distance);
+            d += 8;
+            s = d - period;
+            loop {
+                let chunk: [u8; 8] = out[s..s + 8].try_into().unwrap();
+                out[d..d + 8].copy_from_slice(&chunk);
+                s += 8;
+                d += 8;
+                if d >= end {
+                    break;
+                }
+            }
         }
     }
 }
@@ -435,6 +601,7 @@ impl RawDecoder for Decoder {
             }
         }
         self.unfeed(stopped, &mut consumed);
+        self.push_history(&output[..written]);
 
         Ok(RawProgress {
             // Report completion so the bridge maps this to `Status::StreamEnd`.
@@ -483,6 +650,181 @@ impl RawDecoder for Decoder {
 }
 
 impl Decoder {
+    /// Decode literal/length/distance codes straight from `input` while at
+    /// least [`FAST_IN_MARGIN`] input bytes and [`FAST_OUT_MARGIN`] output
+    /// bytes remain, with no per-field bookkeeping: the bit buffer is
+    /// refilled 8 bytes at a time and every field of a match is decoded in
+    /// one go. Decodes exactly what the symbol-by-symbol path would.
+    #[inline(never)]
+    fn fast_huffman(
+        &mut self,
+        input: &[u8],
+        consumed: &mut usize,
+        output: &mut [u8],
+        written: &mut usize,
+    ) -> Result<FastExit, Error> {
+        let (mut acc, mut nbits) = self.bit_reader.parts();
+        let mut ip = *consumed;
+        let mut op = *written;
+        let lit = &self.tables.lit;
+        let dist_t = &self.tables.dist;
+        let history = self.window_size;
+        let win_cap = self.win_cap;
+        let mut exit = FastExit::Margin;
+        let mut err = None;
+
+        // Refill to at least 56 bits. Bytes are taken whole; the bits of the
+        // next byte that also land in `acc` above `nbits` are the same ones
+        // the following refill ORs in, so they do no harm, and are cleared
+        // by `set_parts` on the way out.
+        macro_rules! refill {
+            () => {
+                if nbits < 56 {
+                    let w = u64::from_le_bytes(input[ip..ip + 8].try_into().unwrap());
+                    acc |= w << nbits;
+                    ip += ((63 - nbits) >> 3) as usize;
+                    nbits |= 56;
+                }
+            };
+        }
+        macro_rules! consume {
+            ($n:expr) => {{
+                let n = $n;
+                acc >>= n;
+                nbits -= n;
+            }};
+        }
+
+        // `e` is always the entry for the bits at the bottom of `acc`,
+        // looked up as soon as the previous field is dropped so the table
+        // load overlaps the work in between (a match copy, say). It is
+        // only acted on once the loop has checked its margins, and dropped
+        // unused when the loop ends, so the slow path decodes it again.
+        if input.len() - ip < FAST_IN_MARGIN {
+            return Ok(exit);
+        }
+        refill!();
+        let mut e = lit.lookup(acc);
+        while input.len() - ip >= FAST_IN_MARGIN && output.len() - op >= FAST_OUT_MARGIN {
+            refill!();
+            let mut saved = acc;
+            // Up to two literals per refill (15 bits each at most); the
+            // lookup after them sees at least 26 bits, enough for any code.
+            if e & LIT != 0 {
+                consume!(inftable::total_len(e));
+                let byte = inftable::value(e) as u8;
+                saved = acc;
+                e = lit.lookup(acc);
+                output[op] = byte;
+                op += 1;
+                if e & LIT != 0 {
+                    consume!(inftable::total_len(e));
+                    let byte = inftable::value(e) as u8;
+                    e = lit.lookup(acc);
+                    output[op] = byte;
+                    op += 1;
+                    continue;
+                }
+            }
+            if e & EXC != 0 {
+                // At least 41 bits are left, more than any code, so an
+                // unmatched code is an error now, as on the slow path.
+                let k = inftable::kind(e);
+                if k == K_EOB {
+                    consume!(inftable::total_len(e));
+                    exit = FastExit::EndOfBlock;
+                } else if k == K_BAD {
+                    err = Some(Error::Corrupt);
+                } else {
+                    err = Some(Error::InvalidHuffmanTree);
+                }
+                break;
+            }
+            // Length: code plus up to 5 extra bits, leaving at least 21 —
+            // enough to look up the distance code before refilling.
+            consume!(inftable::total_len(e));
+            let length = (inftable::value(e) + inftable::extra_value(e, saved)) as usize;
+            let de = dist_t.lookup(acc);
+            refill!();
+            if de & EXC != 0 {
+                err = Some(if inftable::kind(de) == K_BAD {
+                    Error::Corrupt
+                } else {
+                    Error::InvalidHuffmanTree
+                });
+                break;
+            }
+            // Distance: code plus up to 13 extra bits (28 at most), leaving
+            // at least 28 for the next lookup.
+            saved = acc;
+            consume!(inftable::total_len(de));
+            let distance = (inftable::value(de) + inftable::extra_value(de, saved)) as usize;
+            e = lit.lookup(acc);
+            if distance > history + op || distance > win_cap {
+                err = Some(Error::InvalidDistance);
+                break;
+            }
+            if distance <= op {
+                copy_match_fast(output, op, distance, length);
+                op += length;
+            } else {
+                op = self.copy_from_window(output, op, distance, length);
+            }
+        }
+        if let Some(e) = err {
+            return Err(self.poison(e));
+        }
+        self.bit_reader.set_parts(acc, nbits);
+        *consumed = ip;
+        *written = op;
+        if let FastExit::EndOfBlock = exit {
+            self.transition_after_block();
+        }
+        Ok(exit)
+    }
+
+    /// The fast loop's copy of a match that starts in the window (the
+    /// output of earlier calls), out of line to keep the loop tight.
+    /// Returns the new output position.
+    #[inline(never)]
+    fn copy_from_window(
+        &self,
+        output: &mut [u8],
+        op: usize,
+        distance: usize,
+        length: usize,
+    ) -> usize {
+        let win_cap = self.win_cap;
+        // The match starts `back` bytes before the end of the window.
+        let back = distance - op;
+        let src = if back <= self.window_pos {
+            self.window_pos - back
+        } else {
+            self.window_pos + win_cap - back
+        };
+        if length <= back && src + length <= win_cap {
+            // Wholly inside the window and not wrapping: chunked,
+            // over-reading into the window's slack.
+            let mut s = src;
+            let mut d = op;
+            let end = op + length;
+            loop {
+                let chunk: [u8; 16] = self.window[s..s + 16].try_into().unwrap();
+                output[d..d + 16].copy_from_slice(&chunk);
+                s += 16;
+                d += 16;
+                if d >= end {
+                    break;
+                }
+            }
+            end
+        } else {
+            let mut w = op;
+            self.copy_match(output, &mut w, distance, length);
+            w
+        }
+    }
+
     /// Advance the state machine by one substep. Returns `Ok(true)` if forward
     /// progress was made (state advanced), `Ok(false)` if blocked.
     fn step(
@@ -513,16 +855,15 @@ impl Decoder {
                 match btype {
                     0 => self.state = DecState::StoredAlign,
                     1 => {
-                        // Fixed-Huffman block: build the static tables once per block.
-                        let lit = CanonicalDecoder::<288>::from_lengths(&FIXED_LIT_LENGTHS)
-                            .map_err(|e| self.poison(e))?;
-                        let dist = CanonicalDecoder::<32>::from_lengths(&FIXED_DIST_LENGTHS)
-                            .map_err(|e| self.poison(e))?;
-                        self.state = DecState::HuffmanBlock(Box::new(HuffmanBlockWork {
-                            lit,
-                            dist,
-                            phase: HuffmanPhase::NextSymbol,
-                        }));
+                        // Fixed-Huffman block: the static tables, built once
+                        // for a run of fixed blocks.
+                        if !self.tables.fixed {
+                            let t = &mut *self.tables;
+                            t.lit.build(&FIXED_LIT_LENGTHS, Alphabet::LitLen)?;
+                            t.dist.build(&FIXED_DIST_LENGTHS, Alphabet::Dist)?;
+                            t.fixed = true;
+                        }
+                        self.state = DecState::HuffmanBlock(HuffmanPhase::NextSymbol);
                     }
                     2 => self.state = DecState::DynamicHeader,
                     _ => return Err(self.poison(Error::InvalidBlockType)),
@@ -561,18 +902,22 @@ impl Decoder {
                     && self.bit_reader.bits_available() >= 8
                     && *written < output.len()
                 {
-                    let b = self.bit_reader.peek(8) as u8;
+                    output[*written] = self.bit_reader.peek(8) as u8;
+                    *written += 1;
                     self.bit_reader.drop_bits(8);
-                    self.emit_byte(b, output, written);
                     remaining -= 1;
                     progress = true;
                 }
                 // Then copy raw input bytes directly.
-                while remaining > 0 && *consumed < input.len() && *written < output.len() {
-                    let b = input[*consumed];
-                    *consumed += 1;
-                    self.emit_byte(b, output, written);
-                    remaining -= 1;
+                let n = (remaining as usize)
+                    .min(input.len() - *consumed)
+                    .min(output.len() - *written);
+                if n > 0 {
+                    output[*written..*written + n]
+                        .copy_from_slice(&input[*consumed..*consumed + n]);
+                    *written += n;
+                    *consumed += n;
+                    remaining -= n as u32;
                     progress = true;
                 }
                 if remaining == 0 {
@@ -701,10 +1046,9 @@ impl Decoder {
                                 return Err(self.poison(Error::Corrupt));
                             }
                             let v = work.prev_len;
-                            for _ in 0..n {
-                                work.lengths[work.pos as usize] = v;
-                                work.pos += 1;
-                            }
+                            let p = work.pos as usize;
+                            work.lengths[p..p + n].fill(v);
+                            work.pos += n as u16;
                             work.sub = DynLenSub::Symbol;
                             progress = true;
                         }
@@ -717,10 +1061,9 @@ impl Decoder {
                             if work.pos as usize + n > total {
                                 return Err(self.poison(Error::Corrupt));
                             }
-                            for _ in 0..n {
-                                work.lengths[work.pos as usize] = 0;
-                                work.pos += 1;
-                            }
+                            let p = work.pos as usize;
+                            work.lengths[p..p + n].fill(0);
+                            work.pos += n as u16;
                             work.prev_len = 0;
                             work.sub = DynLenSub::Symbol;
                             progress = true;
@@ -734,10 +1077,9 @@ impl Decoder {
                             if work.pos as usize + n > total {
                                 return Err(self.poison(Error::Corrupt));
                             }
-                            for _ in 0..n {
-                                work.lengths[work.pos as usize] = 0;
-                                work.pos += 1;
-                            }
+                            let p = work.pos as usize;
+                            work.lengths[p..p + n].fill(0);
+                            work.pos += n as u16;
                             work.prev_len = 0;
                             work.sub = DynLenSub::Symbol;
                             progress = true;
@@ -750,77 +1092,68 @@ impl Decoder {
                     return Ok(progress);
                 }
 
-                // Both length arrays are filled; build the two block-Huffman decoders.
-                // lit_lengths is positions 0..hlit_count, padded to 288 with zeros.
-                let mut lit_lens = [0u8; 288];
-                lit_lens[..work.hlit_count as usize]
-                    .copy_from_slice(&work.lengths[..work.hlit_count as usize]);
-
-                let mut dist_lens = [0u8; 32];
-                let dist_src_start = work.hlit_count as usize;
-                let dist_src_end = dist_src_start + work.hdist_count as usize;
-                dist_lens[..work.hdist_count as usize]
-                    .copy_from_slice(&work.lengths[dist_src_start..dist_src_end]);
-
-                let lit =
-                    CanonicalDecoder::<288>::from_lengths(&lit_lens).map_err(|e| self.poison(e))?;
-                let dist =
-                    CanonicalDecoder::<32>::from_lengths(&dist_lens).map_err(|e| self.poison(e))?;
-                self.state = DecState::HuffmanBlock(Box::new(HuffmanBlockWork {
-                    lit,
-                    dist,
-                    phase: HuffmanPhase::NextSymbol,
-                }));
+                // Both length arrays are filled; build the two block tables.
+                let hlit = work.hlit_count as usize;
+                let hdist = work.hdist_count as usize;
+                let t = &mut *self.tables;
+                t.fixed = false;
+                let r = t
+                    .lit
+                    .build(&work.lengths[..hlit], Alphabet::LitLen)
+                    .and_then(|()| {
+                        t.dist
+                            .build(&work.lengths[hlit..hlit + hdist], Alphabet::Dist)
+                    });
+                r.map_err(|e| self.poison(e))?;
+                self.state = DecState::HuffmanBlock(HuffmanPhase::NextSymbol);
                 Ok(true)
             }
 
-            DecState::HuffmanBlock(mut work) => {
+            DecState::HuffmanBlock(mut phase) => {
                 let mut progress = false;
                 loop {
-                    match work.phase {
+                    match phase {
                         HuffmanPhase::NextSymbol => {
-                            match work.lit.decode(&mut self.bit_reader) {
-                                Ok(Some(sym)) => {
+                            if input.len() - *consumed >= FAST_IN_MARGIN
+                                && output.len() - *written >= FAST_OUT_MARGIN
+                            {
+                                let before = (*consumed, *written, self.bit_reader.parts());
+                                let exit = self.fast_huffman(input, consumed, output, written)?;
+                                if before != (*consumed, *written, self.bit_reader.parts()) {
                                     progress = true;
-                                    if sym < END_OF_BLOCK {
-                                        // Literal byte
-                                        if *written >= output.len() {
-                                            // No room — stash the decoded literal back.
-                                            // Trick: re-push the byte via a special phase.
-                                            // Easier: just keep work in NextSymbol and the byte
-                                            // is "lost"... no, that's wrong. We need to remember.
-                                            // Use a dedicated phase for "pending literal".
-                                            // For simplicity we emit only when there's room.
-                                            // Since we already consumed the bits, store the
-                                            // literal in a stash slot. But our enum doesn't have
-                                            // that yet. Let's add a Match-phase trick instead:
-                                            // model a 1-byte literal as a self-copy with d=0?
-                                            // No. Add a pending-literal phase.
-                                            work.phase = HuffmanPhase::EmittingMatch {
-                                                distance: u16::MAX, // sentinel: literal
-                                                remaining: sym,
-                                            };
-                                            self.state = DecState::HuffmanBlock(work);
-                                            return Ok(progress);
-                                        }
-                                        self.emit_byte(sym as u8, output, written);
-                                    } else if sym == END_OF_BLOCK {
-                                        self.transition_after_block();
-                                        return Ok(true);
-                                    } else if sym < 286 {
-                                        let idx = (sym - 257) as usize;
-                                        let base_length = LENGTH_BASE[idx];
-                                        let extra_bits = LENGTH_EXTRA[idx];
-                                        work.phase = HuffmanPhase::LengthExtra {
-                                            base_length,
-                                            extra_bits,
-                                        };
-                                    } else {
-                                        return Err(self.poison(Error::Corrupt));
-                                    }
                                 }
+                                if let FastExit::EndOfBlock = exit {
+                                    return Ok(true);
+                                }
+                            }
+                            let (bits, avail) = self.bit_reader.parts();
+                            let e = match self.tables.lit.decode_short(bits, avail) {
+                                Ok(Some(e)) => e,
                                 Ok(None) => break,
                                 Err(e) => return Err(self.poison(e)),
+                            };
+                            self.bit_reader.drop_bits(inftable::code_len(e));
+                            progress = true;
+                            if e & LIT != 0 {
+                                let byte = inftable::value(e) as u8;
+                                if *written >= output.len() {
+                                    // No room: hold the literal until the
+                                    // next call.
+                                    phase = HuffmanPhase::PendingLiteral(byte);
+                                    break;
+                                }
+                                output[*written] = byte;
+                                *written += 1;
+                            } else if e & EXC == 0 {
+                                phase = HuffmanPhase::LengthExtra {
+                                    base_length: inftable::value(e) as u16,
+                                    extra_bits: inftable::extra_bits(e) as u8,
+                                };
+                            } else if inftable::kind(e) == K_EOB {
+                                self.transition_after_block();
+                                return Ok(true);
+                            } else {
+                                return Err(self.poison(Error::Corrupt));
                             }
                         }
                         HuffmanPhase::LengthExtra {
@@ -830,35 +1163,29 @@ impl Decoder {
                             if self.bit_reader.bits_available() < extra_bits as u32 {
                                 break;
                             }
-                            let extra = if extra_bits == 0 {
-                                0
-                            } else {
-                                self.bit_reader.peek(extra_bits as u32) as u16
-                            };
+                            let extra = self.bit_reader.peek(extra_bits as u32) as u16;
                             self.bit_reader.drop_bits(extra_bits as u32);
                             let length = base_length + extra;
-                            work.phase = HuffmanPhase::DistanceSymbol { length };
+                            phase = HuffmanPhase::DistanceSymbol { length };
                             progress = true;
                         }
                         HuffmanPhase::DistanceSymbol { length } => {
-                            match work.dist.decode(&mut self.bit_reader) {
-                                Ok(Some(sym)) => {
-                                    progress = true;
-                                    if sym >= 30 {
-                                        return Err(self.poison(Error::Corrupt));
-                                    }
-                                    let idx = sym as usize;
-                                    let base_dist = DIST_BASE[idx];
-                                    let extra_bits = DIST_EXTRA[idx];
-                                    work.phase = HuffmanPhase::DistanceExtra {
-                                        length,
-                                        base_dist,
-                                        extra_bits,
-                                    };
-                                }
+                            let (bits, avail) = self.bit_reader.parts();
+                            let e = match self.tables.dist.decode_short(bits, avail) {
+                                Ok(Some(e)) => e,
                                 Ok(None) => break,
                                 Err(e) => return Err(self.poison(e)),
+                            };
+                            self.bit_reader.drop_bits(inftable::code_len(e));
+                            progress = true;
+                            if e & EXC != 0 {
+                                return Err(self.poison(Error::Corrupt));
                             }
+                            phase = HuffmanPhase::DistanceExtra {
+                                length,
+                                base_dist: inftable::value(e) as u16,
+                                extra_bits: inftable::extra_bits(e) as u8,
+                            };
                         }
                         HuffmanPhase::DistanceExtra {
                             length,
@@ -868,28 +1195,21 @@ impl Decoder {
                             if self.bit_reader.bits_available() < extra_bits as u32 {
                                 break;
                             }
-                            let extra = if extra_bits == 0 {
-                                0
-                            } else {
-                                self.bit_reader.peek(extra_bits as u32) as u16
-                            };
+                            let extra = self.bit_reader.peek(extra_bits as u32) as u16;
                             self.bit_reader.drop_bits(extra_bits as u32);
                             let distance = base_dist + extra;
-                            // Reject distance 0, distances reaching before the
-                            // start of produced output, and — for a reduced
-                            // window — anything beyond the configured size
-                            // (`window_size` is itself capped at `win_cap`, so
-                            // the second test only bites before the window has
-                            // filled; the explicit `win_cap` check documents the
-                            // small-window rejection that mirrors zlib's
-                            // `inflateInit2(-wbits)` Z_DATA_ERROR).
+                            // Reject distances reaching before the start of
+                            // the output (the window plus what this call has
+                            // written), and — for a reduced window — anything
+                            // beyond the configured size, which mirrors zlib's
+                            // `inflateInit2(-wbits)` Z_DATA_ERROR.
                             if distance == 0
-                                || (distance as usize) > self.window_size
+                                || (distance as usize) > self.window_size + *written
                                 || (distance as usize) > self.win_cap
                             {
                                 return Err(self.poison(Error::InvalidDistance));
                             }
-                            work.phase = HuffmanPhase::EmittingMatch {
+                            phase = HuffmanPhase::EmittingMatch {
                                 distance,
                                 remaining: length,
                             };
@@ -897,135 +1217,40 @@ impl Decoder {
                         }
                         HuffmanPhase::EmittingMatch {
                             distance,
-                            mut remaining,
+                            remaining,
                         } => {
-                            // Sentinel: distance == u16::MAX means we're emitting a single
-                            // pending literal whose value is `remaining` (0..=255).
-                            if distance == u16::MAX {
-                                if *written >= output.len() {
-                                    work.phase = HuffmanPhase::EmittingMatch {
-                                        distance,
-                                        remaining,
-                                    };
-                                    break;
-                                }
-                                let byte = remaining as u8;
-                                self.emit_byte(byte, output, written);
-                                progress = true;
-                                work.phase = HuffmanPhase::NextSymbol;
-                                continue;
-                            }
-                            // Copy the match run in contiguous, non-wrapping
-                            // chunks, advancing `window_pos`/`*written` per
-                            // chunk instead of doing two modulos per byte.
-                            //
-                            // Two cases inside the loop:
-                            //   • Non-overlapping (`src + chunk <= window_pos`):
-                            //     one `copy_from_slice` to output and one
-                            //     `copy_within` in the ring.
-                            //   • Overlapping (`distance < remaining`, e.g. a
-                            //     run of zeros at distance 1): the source region
-                            //     grows as we write. We materialise it with an
-                            //     *expanding* `copy_within` — first `d` bytes,
-                            //     then doubling the produced span each step —
-                            //     which `copy_within` vectorises, then mirror
-                            //     the produced bytes to the output in one go.
-                            let d = distance as usize;
-                            while remaining > 0 && *written < output.len() {
-                                let out_room = output.len() - *written;
-                                // `src` sits `d` bytes behind `window_pos`.
-                                let src = if self.window_pos >= d {
-                                    self.window_pos - d
-                                } else {
-                                    self.window_pos + self.win_cap - d
-                                };
-                                let dst_room = self.win_cap - self.window_pos;
-                                let src_room = self.win_cap - src;
-                                // Bytes we can produce before the source read or
-                                // destination write wraps the ring, or we run
-                                // out of output / remaining run.
-                                let span = (remaining as usize)
-                                    .min(out_room)
-                                    .min(dst_room)
-                                    .min(src_room);
-                                if span == 0 {
-                                    break;
-                                }
-
-                                if d >= span {
-                                    // Non-overlapping within this span: source
-                                    // is fully behind the destination and does
-                                    // not wrap (bounded by src_room above).
-                                    let wp = self.window_pos;
-                                    self.window.copy_within(src..src + span, wp);
-                                    output[*written..*written + span]
-                                        .copy_from_slice(&self.window[wp..wp + span]);
-                                    *written += span;
-                                    self.window_pos = wp + span;
-                                } else if src + d == self.window_pos {
-                                    // Overlapping with a contiguous source:
-                                    // `src` is exactly `d` bytes before
-                                    // `window_pos` and neither wraps. Replicate
-                                    // the d-byte pattern forward into
-                                    // `[start, start+span)` by doubling — each
-                                    // step copies an already-materialised prefix
-                                    // of length ≤ d onto the next slot, which
-                                    // `copy_within` vectorises.
-                                    let start = self.window_pos; // == src + d
-                                    let mut produced = 0usize;
-                                    while produced < span {
-                                        let copy = d.min(span - produced);
-                                        self.window.copy_within(
-                                            src + produced..src + produced + copy,
-                                            start + produced,
-                                        );
-                                        produced += copy;
-                                    }
-                                    output[*written..*written + span]
-                                        .copy_from_slice(&self.window[start..start + span]);
-                                    *written += span;
-                                    self.window_pos = start + span;
-                                } else {
-                                    // Rare: overlapping match whose source wraps
-                                    // the ring (window_pos < d). Fall back to a
-                                    // byte-wise replication for just this span.
-                                    let start = self.window_pos;
-                                    for i in 0..span {
-                                        let s = if start + i >= d {
-                                            start + i - d
-                                        } else {
-                                            start + i + self.win_cap - d
-                                        };
-                                        let b = self.window[s];
-                                        self.window[start + i] = b;
-                                        output[*written] = b;
-                                        *written += 1;
-                                    }
-                                    self.window_pos = start + span;
-                                }
-
-                                if self.window_pos == self.win_cap {
-                                    self.window_pos = 0;
-                                }
-                                if self.window_size < self.win_cap {
-                                    self.window_size = (self.window_size + span).min(self.win_cap);
-                                }
-                                remaining -= span as u16;
+                            let n = self.copy_match(
+                                output,
+                                written,
+                                distance as usize,
+                                remaining as usize,
+                            );
+                            if n > 0 {
                                 progress = true;
                             }
+                            let remaining = remaining - n as u16;
                             if remaining == 0 {
-                                work.phase = HuffmanPhase::NextSymbol;
+                                phase = HuffmanPhase::NextSymbol;
                             } else {
-                                work.phase = HuffmanPhase::EmittingMatch {
+                                phase = HuffmanPhase::EmittingMatch {
                                     distance,
                                     remaining,
                                 };
                                 break;
                             }
                         }
+                        HuffmanPhase::PendingLiteral(byte) => {
+                            if *written >= output.len() {
+                                break;
+                            }
+                            output[*written] = byte;
+                            *written += 1;
+                            progress = true;
+                            phase = HuffmanPhase::NextSymbol;
+                        }
                     }
                 }
-                self.state = DecState::HuffmanBlock(work);
+                self.state = DecState::HuffmanBlock(phase);
                 Ok(progress)
             }
         }
