@@ -58,6 +58,18 @@ impl BitReader {
         self.drop_bits(drop);
     }
 
+    /// Drop the whole bytes still held, keeping only the partial byte's
+    /// unread bits. Returns how many bytes were dropped: they are the last
+    /// ones fed, so the caller can hand them back to its input.
+    // Only the heap-backed deflate decoder uses this.
+    #[allow(dead_code)]
+    pub fn unfeed_whole_bytes(&mut self) -> u32 {
+        let bytes = self.nbits / 8;
+        self.nbits %= 8;
+        self.acc &= (1u64 << self.nbits) - 1;
+        bytes
+    }
+
     /// Erase all pending state.
     pub fn reset(&mut self) {
         self.acc = 0;

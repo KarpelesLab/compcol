@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use crate::bits::BitReader;
 use crate::error::Error;
 use crate::huffman::CanonicalDecoder;
-use crate::traits::{RawDecoder, RawProgress};
+use crate::traits::{Progress, RawDecoder, RawProgress, Status};
 
 /// Configuration for the deflate decoder.
 ///
@@ -162,6 +162,11 @@ pub struct Decoder {
     state: DecState,
     last_block: bool,
     poisoned: bool,
+    /// Set by [`Decoder::decode_block`] for the duration of the call: stop
+    /// as soon as a block ends.
+    stop_at_block: bool,
+    /// A block ended during the current call.
+    block_ended: bool,
     /// The configured preset dictionary (its last `win_cap` bytes), kept so
     /// that `reset` can seed the window with it again.
     dictionary: Box<[u8]>,
@@ -179,11 +184,9 @@ impl Decoder {
     /// Align the bit reader to a byte boundary and return any whole bytes
     /// still sitting in its accumulator.
     ///
-    /// The deflate decoder eagerly pulls bytes into its bit reader to
-    /// minimise per-bit overhead, so when a deflate stream embedded in a
-    /// container ends, the next-bytes-of-input have likely already been
-    /// pre-buffered. Container wrappers call this to recover them as the
-    /// first bytes of their trailer.
+    /// Once the stream has ended this returns nothing: the decoder already
+    /// leaves every byte after the final block unconsumed, so a container's
+    /// trailer can be read straight from the input.
     pub fn drain_trailing_bytes(&mut self) -> alloc::vec::Vec<u8> {
         self.bit_reader.align_to_byte();
         let mut out = alloc::vec::Vec::new();
@@ -196,6 +199,53 @@ impl Decoder {
 
     pub fn new() -> Self {
         Self::with_window_capacity(WINDOW_SIZE)
+    }
+
+    /// Like [`decode`](crate::Decoder::decode), but returns as soon as a
+    /// deflate block ends, like zlib's `inflate(Z_BLOCK)`.
+    ///
+    /// The final block is not a stop of its own: its end is the end of the
+    /// stream ([`Status::StreamEnd`]). After a stop,
+    /// [`at_block_boundary`](Self::at_block_boundary) is true and the input
+    /// is consumed exactly up to the byte holding the block's last bit;
+    /// [`unused_bits`](Self::unused_bits) says how many bits of that byte
+    /// belong to the next block. The status is `InputEmpty` or `OutputFull`
+    /// as usual; call again to decode the next block.
+    pub fn decode_block(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<(Progress, Status), Error> {
+        self.stop_at_block = true;
+        let r = crate::Decoder::decode(self, input, output);
+        self.stop_at_block = false;
+        r
+    }
+
+    pub(crate) fn set_stop_at_block(&mut self, stop: bool) {
+        self.stop_at_block = stop;
+    }
+
+    /// True when the next thing to read is a block header: before the
+    /// first block, or between two blocks.
+    pub fn at_block_boundary(&self) -> bool {
+        matches!(self.state, DecState::BlockHeader)
+    }
+
+    /// True once the header of the final block (`BFINAL = 1`) has been
+    /// read; it stays true after the stream ends.
+    pub fn in_final_block(&self) -> bool {
+        self.last_block
+    }
+
+    /// Bits taken from the input but not decoded yet. Below 8 — the unused
+    /// bits of the last consumed byte, as in zlib's `data_type & 7` — after
+    /// [`decode_block`](Self::decode_block) stops, once the stream has
+    /// ended, and when `decode` returns holding output it had no room for.
+    /// When `decode` returns for want of input it can be more: the start of
+    /// a field that is not complete yet.
+    pub fn unused_bits(&self) -> u32 {
+        self.bit_reader.bits_available()
     }
 
     /// Build a decoder whose sliding window holds `cap` bytes (clamped to
@@ -212,6 +262,8 @@ impl Decoder {
             state: DecState::BlockHeader,
             last_block: false,
             poisoned: false,
+            stop_at_block: false,
+            block_ended: false,
             dictionary: Box::default(),
         }
     }
@@ -273,6 +325,7 @@ impl Decoder {
         self.state = DecState::BlockHeader;
         self.last_block = false;
         self.poisoned = false;
+        self.block_ended = false;
     }
 
     /// Pull bytes from `input[*consumed..]` into the bit reader, stopping
@@ -315,6 +368,31 @@ impl Decoder {
             self.state = DecState::Done;
         } else {
             self.state = DecState::BlockHeader;
+            self.block_ended = true;
+        }
+    }
+
+    /// Hand back the whole bytes still in the bit reader when the decoder
+    /// returns for any reason other than waiting on input: the stream
+    /// ended, a block ended under `decode_block`, or the output is full.
+    /// This keeps `consumed` exact at the end of the stream.
+    ///
+    /// The bytes held are always the last ones fed in this call: a call
+    /// starts either with fewer than 8 bits (handed back last time) or with
+    /// bits that all belong to the pending field, so those are used up
+    /// before anything else.
+    fn unfeed(&mut self, stopped: bool, consumed: &mut usize) {
+        let blocked_on_output = match &self.state {
+            DecState::Done | DecState::Stored { .. } => true,
+            DecState::HuffmanBlock(work) => {
+                matches!(work.phase, HuffmanPhase::EmittingMatch { .. })
+            }
+            _ => stopped,
+        };
+        if blocked_on_output {
+            let n = self.bit_reader.unfeed_whole_bytes() as usize;
+            debug_assert!(n <= *consumed);
+            *consumed -= n.min(*consumed);
         }
     }
 }
@@ -332,24 +410,31 @@ impl RawDecoder for Decoder {
         }
         let mut consumed = 0usize;
         let mut written = 0usize;
+        self.block_ended = false;
+        let mut stopped = false;
 
         loop {
-            let initial_consumed = consumed;
-            let initial_written = written;
-            self.refill(input, &mut consumed);
-
             // Reached Done? Caller should now call finish(); return whatever progress we made.
             if matches!(self.state, DecState::Done) {
                 break;
             }
 
+            let initial_consumed = consumed;
+            let initial_written = written;
+            self.refill(input, &mut consumed);
+
             let made_progress = self.step(input, &mut consumed, output, &mut written)?;
 
+            if self.block_ended && self.stop_at_block {
+                stopped = true;
+                break;
+            }
             // If nothing changed, we're blocked on more input, more output, or both.
             if !made_progress && consumed == initial_consumed && written == initial_written {
                 break;
             }
         }
+        self.unfeed(stopped, &mut consumed);
 
         Ok(RawProgress {
             // Report completion so the bridge maps this to `Status::StreamEnd`.
@@ -393,6 +478,7 @@ impl RawDecoder for Decoder {
         self.state = DecState::BlockHeader;
         self.last_block = false;
         self.poisoned = false;
+        self.block_ended = false;
     }
 }
 
@@ -490,7 +576,9 @@ impl Decoder {
                     progress = true;
                 }
                 if remaining == 0 {
+                    // Ending the block is progress too, even an empty one.
                     self.transition_after_block();
+                    progress = true;
                 } else {
                     self.state = DecState::Stored { remaining };
                 }

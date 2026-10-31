@@ -37,7 +37,8 @@ pub enum Error {
     /// bytes actually produced.
     TrailerMismatch,
     /// The stream uses an option or compression method this build does not
-    /// implement (e.g. zlib `CM != 8`, zlib `FDICT = 1`, gzip reserved flags).
+    /// implement (e.g. zlib `CM != 8`, gzip reserved flags, zlib `FDICT = 1`
+    /// in the `embed` build).
     Unsupported,
     /// A [`LimitedDecoder`](crate::limit::LimitedDecoder) wrapper aborted
     /// because the decompressed output would have exceeded the configured
@@ -45,6 +46,13 @@ pub enum Error {
     /// (small compressed input expanding to gigabytes); see
     /// [`crate::limit`] for the wrapper.
     OutputLimitExceeded,
+    /// A zlib stream has `FDICT` set and no preset dictionary was
+    /// configured, like zlib's `Z_NEED_DICT`. The decoder is not poisoned:
+    /// read the wanted dictionary's Adler-32 with
+    /// `zlib::Decoder::dictionary_id`, pass the dictionary to
+    /// `zlib::Decoder::set_dictionary` and carry on with the input that
+    /// follows. The call returning this consumed nothing.
+    NeedDictionary,
 }
 
 impl fmt::Display for Error {
@@ -63,6 +71,7 @@ impl fmt::Display for Error {
             Error::OutputLimitExceeded => {
                 f.write_str("decompressed output would exceed the configured limit")
             }
+            Error::NeedDictionary => f.write_str("a preset dictionary is needed"),
         }
     }
 }

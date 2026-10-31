@@ -429,12 +429,24 @@ fn corrupt_header_bad_check_rejected() {
 fn fdict_header_rejected() {
     // CMF=0x78, FLG=0xBB → bit 5 (FDICT) set; check 0x78BB % 31 = 0:
     //   0x78BB = 30907; 30907 / 31 = 997; remainder 0 ✓
-    // We don't carry a preset dictionary so this must be rejected.
+    // No preset dictionary is configured: the `embed` build rejects the
+    // stream, the full one asks for the dictionary once DICTID is read.
     let stream = hex("78bbdeadbeef");
     let mut dec = Decoder::new();
     let mut buf = [0u8; 16];
-    let err = dec.decode(&stream, &mut buf).unwrap_err();
-    assert_eq!(err, Error::Unsupported);
+    #[cfg(feature = "embed")]
+    {
+        let err = dec.decode(&stream, &mut buf).unwrap_err();
+        assert_eq!(err, Error::Unsupported);
+    }
+    #[cfg(not(feature = "embed"))]
+    {
+        let (p, _) = dec.decode(&stream, &mut buf).unwrap();
+        assert_eq!(p.consumed, 6);
+        assert_eq!(dec.dictionary_id(), Some(0xdeadbeef));
+        let err = dec.decode(&[], &mut buf).unwrap_err();
+        assert_eq!(err, Error::NeedDictionary);
+    }
 }
 
 // ─── algorithm-trait entry points ───────────────────────────────────────
@@ -616,16 +628,19 @@ fn zlib_decoder_fdict_decodes_with_matching_dictionary() {
     assert_eq!(out, FDICT_PAYLOAD);
 }
 
-/// FDICT=1 stream with NO configured dictionary errors as Unsupported.
-/// Preserves the pre-#22 behaviour: streams the decoder was always
-/// unable to handle still surface the same way.
+/// FDICT=1 stream with NO configured dictionary: the full decoder asks for
+/// it with `NeedDictionary`; the `embed` build, which has no preset
+/// dictionaries, rejects the stream as Unsupported.
 #[test]
-fn zlib_decoder_fdict_without_dictionary_is_unsupported() {
+fn zlib_decoder_fdict_without_dictionary_needs_dictionary() {
     let encoded = hex("78f981ac10482bc1a238b3182204569c9887a2431100c4ce11cb");
 
     let dec = Decoder::new();
     let err = drain_full(dec, &encoded).unwrap_err();
+    #[cfg(feature = "embed")]
     assert!(matches!(err, Error::Unsupported), "got {err:?}");
+    #[cfg(not(feature = "embed"))]
+    assert!(matches!(err, Error::NeedDictionary), "got {err:?}");
 }
 
 /// FDICT=1 stream with the WRONG dictionary errors as ChecksumMismatch
@@ -748,13 +763,9 @@ fn finish_drains_pending_output_into_a_small_buffer() {
         consumed += p.consumed;
         ended = status == Status::StreamEnd;
     }
-    // (The `embed` decoder takes its input a step at a time, so it never
-    // gets ahead of its output like this.)
-    #[cfg(not(feature = "embed"))]
-    assert!(
-        out.len() < plain.len(),
-        "the decoder should still hold output"
-    );
+    // The trailer is only consumed once the deflate data has been decoded,
+    // so the decoders no longer get this far ahead of their output; the
+    // `finish` loop must still be harmless.
     while !ended {
         let (p, status) = dec.finish(&mut small).unwrap();
         out.extend_from_slice(&small[..p.written]);

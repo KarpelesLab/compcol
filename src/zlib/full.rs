@@ -95,9 +95,9 @@ fn header_bytes(
 /// as [`Error::ChecksumMismatch`]. Streams with `FDICT=0` ignore
 /// `dictionary` entirely.
 ///
-/// An empty dictionary (the default) preserves the older configless
-/// behaviour: `FDICT=0` streams decode normally, `FDICT=1` streams error
-/// out as [`Error::Unsupported`].
+/// With an empty dictionary (the default), an `FDICT=1` stream stops with
+/// [`Error::NeedDictionary`] once its `DICTID` is read; supply the
+/// dictionary then with [`Decoder::set_dictionary`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DecoderConfig {
     /// Bytes to seed the underlying deflate window with when the stream's
@@ -113,6 +113,9 @@ enum DecPhase {
     Header,
     /// FDICT=1: reading the 4-byte big-endian DICTID (Adler-32 of dict).
     DictId,
+    /// FDICT=1 with no dictionary configured: waiting for
+    /// [`Decoder::set_dictionary`].
+    NeedDict,
     /// Streaming the deflate payload.
     Deflate,
     /// Collecting the 4-byte Adler-32 trailer.
@@ -134,13 +137,11 @@ pub struct Decoder {
     /// `DICTID` bytes collected when `FDICT=1`.
     dictid: [u8; 4],
     dictid_idx: u8,
-    /// First trailer bytes recovered from the deflate decoder's bit-reader
-    /// after the deflate stream ended.
-    trailer_carryover: Vec<u8>,
-    trailer_carryover_idx: usize,
     trailer: [u8; 4],
     trailer_idx: u8,
     phase: DecPhase,
+    /// Set by [`Decoder::decode_block`] for the duration of the call.
+    stop_at_block: bool,
     poisoned: bool,
 }
 
@@ -154,11 +155,10 @@ impl Decoder {
             dictionary: Vec::new(),
             dictid: [0u8; 4],
             dictid_idx: 0,
-            trailer_carryover: Vec::new(),
-            trailer_carryover_idx: 0,
             trailer: [0u8; 4],
             trailer_idx: 0,
             phase: DecPhase::Header,
+            stop_at_block: false,
             poisoned: false,
         }
     }
@@ -171,6 +171,82 @@ impl Decoder {
         let mut d = Self::new();
         d.dictionary = config.dictionary;
         d
+    }
+
+    /// The stream's `DICTID` (the Adler-32 of its preset dictionary), once
+    /// the header has been read and has `FDICT` set; `None` otherwise.
+    pub fn dictionary_id(&self) -> Option<u32> {
+        if self.dictid_idx == 4 {
+            Some(u32::from_be_bytes(self.dictid))
+        } else {
+            None
+        }
+    }
+
+    /// True while the decoder waits for [`set_dictionary`](Self::set_dictionary):
+    /// the stream has `FDICT` set, its `DICTID` has been read and no
+    /// dictionary was configured. Calls to `decode` or `finish` return
+    /// [`Error::NeedDictionary`] until then.
+    pub fn needs_dictionary(&self) -> bool {
+        self.phase == DecPhase::NeedDict
+    }
+
+    /// Supply the preset dictionary an `FDICT` stream asked for, like
+    /// zlib's `inflateSetDictionary`, then carry on decoding.
+    ///
+    /// Only valid while [`needs_dictionary`](Self::needs_dictionary) is
+    /// true; otherwise returns [`Error::Unsupported`]. A dictionary whose
+    /// Adler-32 is not the stream's `DICTID` is refused with
+    /// [`Error::ChecksumMismatch`], and the decoder keeps waiting for the
+    /// right one.
+    pub fn set_dictionary(&mut self, dictionary: &[u8]) -> Result<(), Error> {
+        if self.phase != DecPhase::NeedDict {
+            return Err(Error::Unsupported);
+        }
+        if adler32(dictionary) != u32::from_be_bytes(self.dictid) {
+            return Err(Error::ChecksumMismatch);
+        }
+        self.inner.load_dictionary(dictionary);
+        self.phase = DecPhase::Deflate;
+        Ok(())
+    }
+
+    /// Like [`decode`](crate::Decoder::decode), but returns at deflate
+    /// block boundaries, like zlib's `inflate(Z_BLOCK)`: once right after
+    /// the header (before the first block), then after each block but the
+    /// last. See [`deflate::Decoder::decode_block`].
+    pub fn decode_block(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<(Progress, Status), Error> {
+        self.stop_at_block = true;
+        self.inner.set_stop_at_block(true);
+        let r = crate::Decoder::decode(self, input, output);
+        self.stop_at_block = false;
+        self.inner.set_stop_at_block(false);
+        r
+    }
+
+    /// True when the header has been read and the deflate data sits at a
+    /// block boundary (before the first block, or between two blocks).
+    pub fn at_block_boundary(&self) -> bool {
+        self.phase == DecPhase::Deflate && self.inner.at_block_boundary()
+    }
+
+    /// True once the header of the final deflate block has been read.
+    pub fn in_final_block(&self) -> bool {
+        self.inner.in_final_block()
+    }
+
+    /// Bits of the deflate data taken from the input but not decoded yet;
+    /// see [`deflate::Decoder::unused_bits`]. 0 outside the deflate data.
+    pub fn unused_bits(&self) -> u32 {
+        if self.phase == DecPhase::Deflate {
+            self.inner.unused_bits()
+        } else {
+            0
+        }
     }
 
     fn poison(&mut self, e: Error) -> Error {
@@ -193,51 +269,31 @@ impl Decoder {
         }
         let fdict = (flg & 0x20) != 0;
         if fdict {
-            if self.dictionary.is_empty() {
-                // FDICT set but no dictionary was configured. Mirrors the
-                // old behaviour where every FDICT=1 stream errored, just
-                // worded more precisely.
-                return Err(self.poison(Error::Unsupported));
-            }
             Ok(DecPhase::DictId)
         } else {
             Ok(DecPhase::Deflate)
         }
     }
 
-    /// Validate the on-wire `DICTID` against the configured dictionary's
-    /// Adler-32 and, on match, seed the underlying deflate window.
-    fn validate_dictid_and_seed(&mut self) -> Result<(), Error> {
-        let on_wire = u32::from_be_bytes(self.dictid);
-        let mut sum = Adler32::new();
-        sum.update(&self.dictionary);
-        if sum.finalize() != on_wire {
+    /// With a configured dictionary, check it against the on-wire `DICTID`
+    /// and seed the deflate window; without one, wait for
+    /// [`set_dictionary`](Self::set_dictionary).
+    fn after_dictid(&mut self) -> Result<DecPhase, Error> {
+        if self.dictionary.is_empty() {
+            return Ok(DecPhase::NeedDict);
+        }
+        if adler32(&self.dictionary) != u32::from_be_bytes(self.dictid) {
             return Err(self.poison(Error::ChecksumMismatch));
         }
         self.inner.load_dictionary(&self.dictionary);
-        Ok(())
+        Ok(DecPhase::Deflate)
     }
+}
 
-    /// Pull the next trailer byte from the carry-over buffer or, if empty,
-    /// from `input`. Returns `Some(byte_came_from_input)` on success
-    /// (where the bool says whether the input slice was advanced),
-    /// or `None` if neither source has a byte ready.
-    fn next_trailer_byte(&mut self, input: &[u8], consumed: &mut usize) -> Option<bool> {
-        if self.trailer_carryover_idx < self.trailer_carryover.len() {
-            let b = self.trailer_carryover[self.trailer_carryover_idx];
-            self.trailer_carryover_idx += 1;
-            self.trailer[self.trailer_idx as usize] = b;
-            self.trailer_idx += 1;
-            Some(false)
-        } else if *consumed < input.len() {
-            self.trailer[self.trailer_idx as usize] = input[*consumed];
-            *consumed += 1;
-            self.trailer_idx += 1;
-            Some(true)
-        } else {
-            None
-        }
-    }
+fn adler32(data: &[u8]) -> u32 {
+    let mut sum = Adler32::new();
+    sum.update(data);
+    sum.finalize()
 }
 
 impl Default for Decoder {
@@ -253,10 +309,16 @@ impl RawDecoder for Decoder {
         }
         let mut consumed = 0usize;
         let mut written = 0usize;
+        let progress = |consumed, written, done| RawProgress {
+            consumed,
+            written,
+            done,
+        };
 
         loop {
             let initial_consumed = consumed;
             let initial_written = written;
+            let initial_phase = self.phase;
 
             match self.phase {
                 DecPhase::Header => {
@@ -268,11 +330,7 @@ impl RawDecoder for Decoder {
                     if self.header_idx == 2 {
                         self.phase = self.validate_header()?;
                     } else {
-                        return Ok(RawProgress {
-                            consumed,
-                            written,
-                            done: false,
-                        });
+                        return Ok(progress(consumed, written, false));
                     }
                 }
                 DecPhase::DictId => {
@@ -282,15 +340,18 @@ impl RawDecoder for Decoder {
                         consumed += 1;
                     }
                     if self.dictid_idx == 4 {
-                        self.validate_dictid_and_seed()?;
-                        self.phase = DecPhase::Deflate;
+                        self.phase = self.after_dictid()?;
                     } else {
-                        return Ok(RawProgress {
-                            consumed,
-                            written,
-                            done: false,
-                        });
+                        return Ok(progress(consumed, written, false));
                     }
+                }
+                DecPhase::NeedDict => {
+                    // Report the bytes taken so far first; the error comes
+                    // from a call that consumes nothing, so no count is lost.
+                    if consumed > 0 || written > 0 {
+                        return Ok(progress(consumed, written, false));
+                    }
+                    return Err(Error::NeedDictionary);
                 }
                 DecPhase::Deflate => {
                     let before_written = written;
@@ -303,26 +364,23 @@ impl RawDecoder for Decoder {
                     self.adler.update(&output[before_written..written]);
 
                     if self.inner.is_complete() {
-                        self.trailer_carryover = self.inner.drain_trailing_bytes();
-                        self.trailer_carryover_idx = 0;
+                        // The deflate decoder leaves every byte after its
+                        // final block unconsumed: the trailer follows.
                         self.phase = DecPhase::Trailer;
-                    } else if p.consumed == 0 && p.written == 0 {
-                        return Ok(RawProgress {
-                            consumed,
-                            written,
-                            done: false,
-                        });
+                    } else if (p.consumed == 0 && p.written == 0)
+                        || (self.stop_at_block && self.inner.at_block_boundary())
+                    {
+                        return Ok(progress(consumed, written, false));
                     }
                 }
                 DecPhase::Trailer => {
-                    while self.trailer_idx < 4 {
-                        if self.next_trailer_byte(input, &mut consumed).is_none() {
-                            return Ok(RawProgress {
-                                consumed,
-                                written,
-                                done: false,
-                            });
-                        }
+                    while self.trailer_idx < 4 && consumed < input.len() {
+                        self.trailer[self.trailer_idx as usize] = input[consumed];
+                        self.trailer_idx += 1;
+                        consumed += 1;
+                    }
+                    if self.trailer_idx < 4 {
+                        return Ok(progress(consumed, written, false));
                     }
                     let expected = u32::from_be_bytes(self.trailer);
                     if expected != self.adler.finalize() {
@@ -336,23 +394,26 @@ impl RawDecoder for Decoder {
                     // stream with trailing bytes after the adler32 returning
                     // `OutputFull` with nothing consumed and nothing written,
                     // spinning any caller that loops until StreamEnd.
-                    return Ok(RawProgress {
-                        consumed,
-                        written,
-                        done: true,
-                    });
+                    return Ok(progress(consumed, written, true));
                 }
             }
 
-            if consumed == initial_consumed && written == initial_written {
-                // The trailer can complete from `trailer_carryover` without
-                // consuming caller input, so this guard can also be the exit
-                // taken once the stream is finished.
-                return Ok(RawProgress {
+            // zlib's `Z_BLOCK` also stops right after the header.
+            if self.stop_at_block
+                && self.phase == DecPhase::Deflate
+                && initial_phase != DecPhase::Deflate
+            {
+                return Ok(progress(consumed, written, false));
+            }
+            if consumed == initial_consumed
+                && written == initial_written
+                && self.phase == initial_phase
+            {
+                return Ok(progress(
                     consumed,
                     written,
-                    done: matches!(self.phase, DecPhase::Done),
-                });
+                    matches!(self.phase, DecPhase::Done),
+                ));
             }
         }
     }
@@ -360,6 +421,9 @@ impl RawDecoder for Decoder {
     fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
+        }
+        if self.phase == DecPhase::NeedDict {
+            return Err(Error::NeedDictionary);
         }
         // Try to advance with empty input — useful when the caller fed all
         // bytes via decode() but didn't realise the trailer hadn't been
@@ -385,8 +449,6 @@ impl RawDecoder for Decoder {
         self.adler.reset();
         self.header_idx = 0;
         self.dictid_idx = 0;
-        self.trailer_carryover.clear();
-        self.trailer_carryover_idx = 0;
         self.trailer_idx = 0;
         self.phase = DecPhase::Header;
         self.poisoned = false;

@@ -30,6 +30,9 @@
 //!   member instead and reports `StreamEnd` right after its trailer.
 //! - The decoder checks the optional header CRC (FHCRC) and fails with
 //!   `ChecksumMismatch` when it is wrong.
+//! - The decoder never counts bytes after the last trailer as consumed, and
+//!   `Decoder::decode_block` stops at deflate block boundaries like zlib's
+//!   `inflate(Z_BLOCK)`.
 //!
 //! With the `embed` feature, `Encoder` and `Decoder` are the allocation-free
 //! variants instead, alongside one-shot `decompress`, `decompressed_len` and

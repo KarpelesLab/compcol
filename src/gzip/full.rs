@@ -85,8 +85,6 @@ pub struct Decoder {
     aux_idx: u8,        // index inside the current sub-phase
     aux_xlen: u16,      // FEXTRA length captured from the 2-byte XLEN
     aux_remaining: u32, // bytes left to skip in the current sub-phase
-    trailer_carryover: alloc::vec::Vec<u8>,
-    trailer_carryover_idx: usize,
     trailer: [u8; 8],
     trailer_idx: u8,
     /// CRC-32 of the current member's header bytes, for FHCRC.
@@ -95,6 +93,8 @@ pub struct Decoder {
     hcrc_field: [u8; 2],
     /// Decode concatenated members as one stream (default `true`).
     multi_member: bool,
+    /// Set by [`Decoder::decode_block`] for the duration of the call.
+    stop_at_block: bool,
     phase: DecPhase,
     poisoned: bool,
 }
@@ -111,13 +111,12 @@ impl Decoder {
             aux_idx: 0,
             aux_xlen: 0,
             aux_remaining: 0,
-            trailer_carryover: alloc::vec::Vec::new(),
-            trailer_carryover_idx: 0,
             trailer: [0u8; 8],
             trailer_idx: 0,
             hcrc: Crc32::new(),
             hcrc_field: [0u8; 2],
             multi_member: true,
+            stop_at_block: false,
             phase: DecPhase::FixedHeader,
             poisoned: false,
         }
@@ -134,6 +133,45 @@ impl Decoder {
     pub fn with_multi_member(mut self, multi_member: bool) -> Self {
         self.multi_member = multi_member;
         self
+    }
+
+    /// Like [`decode`](crate::Decoder::decode), but returns at deflate
+    /// block boundaries, like zlib's `inflate(Z_BLOCK)`: once right after
+    /// each member's header (before its first block), then after each
+    /// block but the last. See [`deflate::Decoder::decode_block`].
+    pub fn decode_block(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<(Progress, Status), Error> {
+        self.stop_at_block = true;
+        self.inner.set_stop_at_block(true);
+        let r = crate::Decoder::decode(self, input, output);
+        self.stop_at_block = false;
+        self.inner.set_stop_at_block(false);
+        r
+    }
+
+    /// True when a member's header has been read and its deflate data sits
+    /// at a block boundary (before the first block, or between two blocks).
+    pub fn at_block_boundary(&self) -> bool {
+        self.phase == DecPhase::Deflate && self.inner.at_block_boundary()
+    }
+
+    /// True once the header of the current member's final deflate block
+    /// has been read.
+    pub fn in_final_block(&self) -> bool {
+        self.inner.in_final_block()
+    }
+
+    /// Bits of the deflate data taken from the input but not decoded yet;
+    /// see [`deflate::Decoder::unused_bits`]. 0 outside the deflate data.
+    pub fn unused_bits(&self) -> u32 {
+        if self.phase == DecPhase::Deflate {
+            self.inner.unused_bits()
+        } else {
+            0
+        }
     }
 
     fn poison(&mut self, e: Error) -> Error {
@@ -213,6 +251,7 @@ impl RawDecoder for Decoder {
         loop {
             let initial_consumed = consumed;
             let initial_written = written;
+            let initial_phase = self.phase;
 
             match self.phase {
                 DecPhase::FixedHeader => {
@@ -366,10 +405,12 @@ impl RawDecoder for Decoder {
                     self.isize_count = self.isize_count.wrapping_add(new_bytes.len() as u32);
 
                     if self.inner.is_complete() {
-                        self.trailer_carryover = self.inner.drain_trailing_bytes();
-                        self.trailer_carryover_idx = 0;
+                        // The deflate decoder leaves every byte after its
+                        // final block unconsumed: the trailer follows.
                         self.phase = DecPhase::Trailer;
-                    } else if p.consumed == 0 && p.written == 0 {
+                    } else if (p.consumed == 0 && p.written == 0)
+                        || (self.stop_at_block && self.inner.at_block_boundary())
+                    {
                         return Ok(RawProgress {
                             consumed,
                             written,
@@ -379,11 +420,7 @@ impl RawDecoder for Decoder {
                 }
                 DecPhase::Trailer => {
                     while self.trailer_idx < 8 {
-                        let byte = if self.trailer_carryover_idx < self.trailer_carryover.len() {
-                            let b = self.trailer_carryover[self.trailer_carryover_idx];
-                            self.trailer_carryover_idx += 1;
-                            b
-                        } else if consumed < input.len() {
+                        let byte = if consumed < input.len() {
                             let b = input[consumed];
                             consumed += 1;
                             b
@@ -456,8 +493,6 @@ impl RawDecoder for Decoder {
                         self.aux_idx = 0;
                         self.aux_xlen = 0;
                         self.aux_remaining = 0;
-                        self.trailer_carryover.clear();
-                        self.trailer_carryover_idx = 0;
                         self.trailer_idx = 0;
                         self.hcrc.reset();
                         self.phase = DecPhase::FixedHeader;
@@ -490,7 +525,21 @@ impl RawDecoder for Decoder {
                 }
             }
 
-            if consumed == initial_consumed && written == initial_written {
+            // zlib's `Z_BLOCK` also stops right after the header.
+            if self.stop_at_block
+                && self.phase == DecPhase::Deflate
+                && initial_phase != DecPhase::Deflate
+            {
+                return Ok(RawProgress {
+                    consumed,
+                    written,
+                    done: false,
+                });
+            }
+            if consumed == initial_consumed
+                && written == initial_written
+                && self.phase == initial_phase
+            {
                 return Ok(RawProgress {
                     consumed,
                     written,
@@ -529,8 +578,6 @@ impl RawDecoder for Decoder {
         self.aux_idx = 0;
         self.aux_xlen = 0;
         self.aux_remaining = 0;
-        self.trailer_carryover.clear();
-        self.trailer_carryover_idx = 0;
         self.trailer_idx = 0;
         self.hcrc.reset();
         self.phase = DecPhase::FixedHeader;
