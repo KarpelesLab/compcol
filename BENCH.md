@@ -230,6 +230,46 @@ buffer, with length/distance codes and extra bits merged into one write.
    style CLEAR-on-ratio-degradation lands Random at 1.24, identical to
    system `compress -cf`.
 
+## Deflate / zlib / gzip decoding vs zlib
+
+The `deflate` / `zlib` / `gzip` decode rows in the table above predate
+the 2026-10 table-driven inflate (fast loop, decoding straight into the
+caller's buffer) and the faster Adler-32 / CRC-32. Measured on
+2026-10-31 on an Apple M5 Max (macOS 26) against the system zlib 1.2.12
+through Python's `zlib.decompress` on the same inputs, each compressed by
+zlib at the given level. Decimal MB/s of decompressed output, best of 15,
+whole stream decoded into one buffer:
+
+| Input (size) | Format | Level | Before | Now | zlib | Now / zlib |
+|---|---|---|---|---|---|---|
+| `/usr/share/dict/words` (2.5 MB) | raw deflate | 1 | 197 | 923 | 1007 | 0.92 |
+| | raw deflate | 6 | 223 | 898 | 878 | 1.02 |
+| | raw deflate | 9 | 224 | 902 | 885 | 1.02 |
+| Rust sources (3.8 MB) | raw deflate | 1 | 249 | 1235 | 1536 | 0.80 |
+| | raw deflate | 6 | 313 | 1534 | 1685 | 0.91 |
+| | raw deflate | 9 | 328 | 1559 | 1691 | 0.92 |
+| Mach-O binaries (4.3 MB) | raw deflate | 1 | 226 | 862 | 931 | 0.93 |
+| | raw deflate | 6 | 242 | 975 | 1029 | 0.95 |
+| | raw deflate | 9 | 248 | 1003 | 1037 | 0.97 |
+| Runs (4 MB) | raw deflate | 1 | 964 | 4663 | 5061 | 0.92 |
+| | raw deflate | 6 | 6888 | 25196 | 22668 | 1.11 |
+| | raw deflate | 9 | 15607 | 37122 | 27706 | 1.34 |
+| words | zlib (Adler-32) | 6 | 218 | 866 | 857 | 1.01 |
+| Rust sources | zlib | 6 | 291 | 1392 | 1574 | 0.88 |
+| binaries | zlib | 6 | 232 | 908 | 985 | 0.92 |
+| runs | zlib | 6 | 2513 | 12844 | 11392 | 1.13 |
+| words | gzip (CRC-32) | 6 | 211 | 793 | 848 | 0.94 |
+| Rust sources | gzip | 6 | 276 | 1214 | 1627 | 0.75 |
+| binaries | gzip | 6 | 221 | 817 | 1027 | 0.80 |
+| runs | gzip | 6 | 1863 | 5259 | 15404 | 0.34 |
+
+With 64 KiB output buffers (the usual streaming loop) ours runs 5–10%
+below the whole-buffer numbers (zlib through Python's `decompressobj`,
+which adds interpreter overhead, drops 13–40%). The remaining gzip gap
+is CRC-32: the system zlib uses the ARMv8 CRC instructions, which safe
+Rust cannot reach, so ours is a four-way interleaved slice-by-8 at
+~7 GB/s (Adler-32 vectorises to ~20 GB/s).
+
 ## Caveats
 
 - All numbers outside the deflate-vs-zlib section reflect a **single
