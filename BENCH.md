@@ -196,9 +196,9 @@ level-0/strategy work, before the speed pass.
 
 Output sizes moved by at most +0.1% at any level 1–9 on these inputs
 (most shrank; level 1 by up to 2.6%). The zlib and gzip wrappers add
-the trailer checksums: Adler-32 now runs at ~7.7 GB/s and CRC-32 at
-~4.3 GB/s on this host, so e.g. rust level 6 encodes at ~88 MB/s in
-all three containers.
+the trailer checksums, which are cheap next to the encoder (Adler-32
+~20 GB/s, CRC-32 ~7 GB/s on this host, see the decoding section), so
+e.g. rust level 6 encodes at ~88 MB/s in all three containers.
 
 What changed: a multiplicative 3-byte hash (fewer collisions, shorter
 chains); a chain walk that starts from the head returned by the insert,
