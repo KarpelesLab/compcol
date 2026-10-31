@@ -251,6 +251,8 @@ impl Decoder {
         r
     }
 
+    // Only the zlib/gzip wrappers call this.
+    #[cfg_attr(not(any(feature = "zlib", feature = "gzip")), allow(dead_code))]
     pub(crate) fn set_stop_at_block(&mut self, stop: bool) {
         self.stop_at_block = stop;
     }

@@ -167,6 +167,8 @@ impl EncoderConfig {
 
     /// Window bits matching `max_distance`: the smallest `bits` in `9..=15`
     /// with `1 << bits >= max_distance`. Used for the zlib `CINFO` field.
+    // Only the zlib wrapper calls this.
+    #[cfg_attr(not(feature = "zlib"), allow(dead_code))]
     pub(crate) fn window_bits(&self) -> u8 {
         let d = self.max_distance.clamp(1, WINDOW_SIZE);
         let mut bits = 9u8;
@@ -964,6 +966,8 @@ impl Encoder {
     }
 
     /// Clamped level and strategy, for container headers.
+    // Only the zlib/gzip wrappers call this.
+    #[cfg_attr(not(any(feature = "zlib", feature = "gzip")), allow(dead_code))]
     pub(crate) fn level_and_strategy(&self) -> (u8, Strategy) {
         (self.level, self.strategy)
     }
