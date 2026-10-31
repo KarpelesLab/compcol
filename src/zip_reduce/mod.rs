@@ -33,8 +33,9 @@
 //!
 //! The raw Reduce payload as produced by PKZIP carries neither a
 //! compression factor nor an uncompressed length — both live in the ZIP
-//! central directory. This crate's [`Decoder`] therefore consumes a
-//! minimal 5-byte container header it can drive itself:
+//! central directory. [`Decoder::new`] (and [`ZipReduce`]'s default
+//! decoder) therefore consumes a minimal 5-byte container header it can
+//! drive itself (see below for the header-less [`Decoder::raw`]):
 //!
 //! ```text
 //!     +--------+---------------------+---------------------------+
@@ -50,9 +51,14 @@
 //!   to 32 × 8 bits of follower bytes, indexed `255..=0`), followed by
 //!   the LZ77-encoded byte stream.
 //!
-//! Callers extracting Reduce-compressed entries from real PKZIP archives
-//! should prepend this 5-byte header before feeding bytes to
-//! [`crate::Decoder::decode`].
+//! ## Raw ZIP entry data
+//!
+//! Callers extracting Reduce-compressed entries from real ZIP archives
+//! already have the factor and size from the entry header. Use
+//! [`Decoder::raw`] with `factor = method - 1` (see [`factor_for_method`])
+//! and the entry's uncompressed size (a `u64`, so ZIP64 sizes work), then
+//! feed the stored entry bytes unchanged — no header is expected. It ends
+//! exactly like the framed form once `uncompressed_len` bytes are out.
 //!
 //! ## Scope
 //!
@@ -88,6 +94,16 @@ impl Algorithm for ZipReduce {
     }
     fn decoder_with(_: ()) -> Decoder {
         Decoder::new()
+    }
+}
+
+/// Map a ZIP compression method (2..=5) to its Reduce factor (1..=4).
+///
+/// Returns `None` for any other method.
+pub const fn factor_for_method(method: u16) -> Option<u8> {
+    match method {
+        2..=5 => Some((method - 1) as u8),
+        _ => None,
     }
 }
 
@@ -240,7 +256,8 @@ struct PendingMatch {
 /// Where the decoder currently is in the wire framing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    /// Waiting for the 5-byte container header (factor + ucl).
+    /// Waiting for the 5-byte container header (factor + ucl). Never
+    /// entered by a decoder built with [`Decoder::raw`].
     Header,
     /// Reading the 256 follower sets at the start of the raw payload.
     FollowerSets,
@@ -257,7 +274,10 @@ pub struct Decoder {
     // -- framing --------------------------------------------------------
     phase: Phase,
     factor: u8,
-    uncomp_len: u32,
+    uncomp_len: u64,
+    /// `Some((factor, uncomp_len))` for a [`Decoder::raw`] decoder: no
+    /// header is parsed and `reset` restores these values.
+    raw: Option<(u8, u64)>,
 
     // -- byte-buffered input (bit reader is positioned within this) ----
     input_buf: Vec<u8>,
@@ -276,7 +296,7 @@ pub struct Decoder {
     /// the absolute index of `out[0]` in the full output stream; the total
     /// number of bytes produced so far is `window_base + out.len()`.
     /// Retaining the whole stream (up to the attacker-controlled 4-byte
-    /// `uncomp_len`, ~4 GiB) would be a decompression-bomb / OOM vector.
+    /// `uncomp_len`) would be a decompression-bomb / OOM vector.
     out: Vec<u8>,
     /// Absolute index (in the full output stream) of `out[0]` — i.e. the
     /// number of leading bytes already dropped from the sliding window.
@@ -305,6 +325,7 @@ impl Decoder {
             phase: Phase::Header,
             factor: 0,
             uncomp_len: 0,
+            raw: None,
             input_buf: Vec::new(),
             bits: BitReader::new(),
             next_fset: 255,
@@ -315,6 +336,55 @@ impl Decoder {
             prev_byte: 0,
             pending: None,
         }
+    }
+
+    /// Construct a decoder for a bare Reduce payload, as stored in a ZIP
+    /// entry, with no header in front of it.
+    ///
+    /// `factor` is the ZIP method minus one (methods 2..=5 → factors
+    /// 1..=4, see [`factor_for_method`]) and `uncompressed_len` is the
+    /// entry's uncompressed size. A factor outside `1..=4` returns
+    /// [`Error::BadHeader`], as the framed form does.
+    ///
+    /// ```
+    /// use compcol::zip_reduce::{factor_for_method, Decoder};
+    /// use compcol::Error;
+    ///
+    /// let factor = factor_for_method(5).unwrap(); // ZIP method 5
+    /// assert_eq!(factor, 4);
+    /// let _dec = Decoder::raw(factor, 2048)?;
+    /// assert_eq!(Decoder::raw(0, 10).err(), Some(Error::BadHeader));
+    /// # Ok::<(), Error>(())
+    /// ```
+    pub fn raw(factor: u8, uncompressed_len: u64) -> Result<Self, Error> {
+        if !(1..=4).contains(&factor) {
+            return Err(Error::BadHeader);
+        }
+        let mut dec = Self::new();
+        dec.raw = Some((factor, uncompressed_len));
+        dec.start_payload(factor, uncompressed_len);
+        Ok(dec)
+    }
+
+    /// Set up the payload state for `factor` / `ucl` and move to the
+    /// follower-set phase. The bit reader starts at byte 0 of `input_buf`.
+    fn start_payload(&mut self, factor: u8, ucl: u64) {
+        self.factor = factor;
+        self.uncomp_len = ucl;
+        self.bits = BitReader::new();
+        // Pre-size the sliding window. `out` is now a bounded window (we
+        // drop the consumed prefix in `slide_window`), so we never need
+        // more than the window's worth of capacity regardless of how large
+        // the attacker-controlled `uncomp_len` claims to be. Cap the
+        // reservation at 1 MiB — comfortably above the largest window
+        // (max_dist ≈ 64 KiB plus the buffer-ahead margin) for any factor.
+        let cap = ucl.min(1024 * 1024) as usize;
+        self.out = Vec::with_capacity(cap);
+        self.window_base = 0;
+        // Build follower-sets vector lazily filled by `read_follower_sets`.
+        self.fsets = vec![FollowerSet::empty(); 256];
+        self.next_fset = 255;
+        self.phase = Phase::FollowerSets;
     }
 
     /// Parse the 5-byte container header from the front of `input_buf`
@@ -334,26 +404,10 @@ impl Decoder {
             self.input_buf[3],
             self.input_buf[4],
         ]);
-        self.factor = factor;
-        self.uncomp_len = ucl;
-        // Drop the header from input_buf and advance the bit reader.
+        // Drop the header from input_buf; the bit reader starts at the
+        // first payload byte.
         self.input_buf.drain(0..5);
-        // Bit reader hasn't started yet so this is a no-op aside from
-        // resetting the rebase accounting.
-        self.bits = BitReader::new();
-        // Pre-size the sliding window. `out` is now a bounded window (we
-        // drop the consumed prefix in `slide_window`), so we never need
-        // more than the window's worth of capacity regardless of how large
-        // the attacker-controlled `uncomp_len` claims to be. Cap the
-        // reservation at 1 MiB — comfortably above the largest window
-        // (max_dist ≈ 64 KiB plus the buffer-ahead margin) for any factor.
-        let cap = (ucl as usize).min(1024 * 1024);
-        self.out = Vec::with_capacity(cap);
-        self.window_base = 0;
-        // Build follower-sets vector lazily filled by `read_follower_sets`.
-        self.fsets = vec![FollowerSet::empty(); 256];
-        self.next_fset = 255;
-        self.phase = Phase::FollowerSets;
+        self.start_payload(factor, u64::from(ucl));
         Ok(())
     }
 
@@ -488,7 +542,7 @@ impl Decoder {
                 };
                 self.out.push(b);
                 pm.remaining -= 1;
-                if (self.produced() as u32) >= self.uncomp_len && pm.remaining > 0 {
+                if self.produced() as u64 >= self.uncomp_len && pm.remaining > 0 {
                     return Err(Error::Corrupt);
                 }
             }
@@ -497,7 +551,7 @@ impl Decoder {
         let v_len_bits: u32 = (8 - self.factor) as u32;
         let len_mask: u32 = (1u32 << v_len_bits) - 1;
 
-        while (self.produced() as u32) < self.uncomp_len {
+        while (self.produced() as u64) < self.uncomp_len {
             // Periodically drain to the caller, drop the consumed prefix of
             // the window, and stop early if we've buffered too far ahead.
             self.flush_emit(output, written);
@@ -570,8 +624,8 @@ impl Decoder {
             let dist_hi = (v as usize) >> v_len_bits;
             let dist = dist_hi * 256 + w as usize + 1;
 
-            let remaining_out = (self.uncomp_len as usize) - self.produced();
-            if len > remaining_out {
+            let remaining_out = self.uncomp_len - self.produced() as u64;
+            if len as u64 > remaining_out {
                 return Err(Error::Corrupt);
             }
 
@@ -740,7 +794,7 @@ impl RawDecoder for Decoder {
 
         // Edge case: zero-length stream. The follower-set header is
         // still present and parsed; we go straight to Done.
-        if (self.produced() as u32) >= self.uncomp_len && matches!(self.phase, Phase::Body) {
+        if self.produced() as u64 >= self.uncomp_len && matches!(self.phase, Phase::Body) {
             self.phase = Phase::Done;
         }
 
@@ -754,7 +808,7 @@ impl RawDecoder for Decoder {
             }
             // Forward any leftover internal-buffer bytes to the caller.
             self.flush_emit(output, &mut written);
-            if (self.produced() as u32) >= self.uncomp_len && self.emit_cursor == self.produced() {
+            if self.produced() as u64 >= self.uncomp_len && self.emit_cursor == self.produced() {
                 self.phase = Phase::Done;
             }
         }
@@ -782,7 +836,7 @@ impl RawDecoder for Decoder {
                 }
             }
             self.flush_emit(output, &mut written);
-            if (self.produced() as u32) >= self.uncomp_len && self.emit_cursor == self.produced() {
+            if self.produced() as u64 >= self.uncomp_len && self.emit_cursor == self.produced() {
                 self.phase = Phase::Done;
             }
         }
@@ -818,6 +872,10 @@ impl RawDecoder for Decoder {
         self.emit_cursor = 0;
         self.prev_byte = 0;
         self.pending = None;
+        // A raw decoder stays raw, with the same factor and length.
+        if let Some((factor, ucl)) = self.raw {
+            self.start_payload(factor, ucl);
+        }
     }
 }
 
