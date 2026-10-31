@@ -30,7 +30,7 @@ use crate::error::Error;
 use crate::traits::{Flush, RawEncoder, RawProgress};
 
 use super::bits::BitWriter;
-use super::bwt::bwt_forward;
+use super::bwt::{DEFAULT_WORK_FACTOR, bwt_forward_with};
 use super::crc::Crc32;
 use super::huffman::{MAX_CODE_LEN, build_canonical_codes, build_canonical_lengths};
 use super::mtf::mtf_forward_reduced;
@@ -77,6 +77,8 @@ enum Phase {
 
 pub struct Encoder {
     config: EncoderConfig,
+    /// libbzip2's `workFactor`, set by [`Encoder::with_work_factor`].
+    work_factor: u8,
     /// The current block after RLE-1 (libbzip2's `block[0..nblock]`).
     /// Runs enter it only once they end, so it never holds the run in
     /// progress.
@@ -114,6 +116,7 @@ impl Encoder {
         config.level = config.level.clamp(1, 9);
         Self {
             config,
+            work_factor: DEFAULT_WORK_FACTOR,
             block: Vec::new(),
             block_crc: Crc32::new(),
             in_ch: 0,
@@ -125,6 +128,27 @@ impl Encoder {
             bw: None,
             phase: Phase::Accepting,
         }
+    }
+
+    /// Set libbzip2's work factor (`workFactor` of `BZ2_bzCompressInit`,
+    /// PHP's `bzcompress($data, $blocksize, $work_factor)`).
+    ///
+    /// It decides how long the block sort tries its fast algorithm on
+    /// repetitive data before switching to the fallback one. 0 means the
+    /// default, 30; values above 250 are clamped to 250 (libbzip2 rejects
+    /// them with `BZ_PARAM_ERROR`). As in libbzip2, values above 100 act
+    /// like 100. The output stays byte-identical to libbzip2 at the same
+    /// work factor; on repetitive blocks it can differ between work
+    /// factors.
+    ///
+    /// Call it before encoding. [`reset`](crate::Encoder::reset) keeps it.
+    pub fn with_work_factor(mut self, work_factor: u8) -> Self {
+        self.work_factor = if work_factor == 0 {
+            DEFAULT_WORK_FACTOR
+        } else {
+            work_factor.min(250)
+        };
+        self
     }
 
     /// Post-RLE-1 size at which a block is closed (libbzip2's
@@ -210,7 +234,7 @@ impl Encoder {
         self.combined_crc = self.combined_crc.rotate_left(1) ^ block_crc;
 
         // Steps 2 and 3: RLE-1 already happened on the way in; BWT.
-        let (l_column, origin) = bwt_forward(&rle1);
+        let (l_column, origin) = bwt_forward_with(&rle1, self.work_factor);
         // Keep the allocation for the next block.
         self.block = rle1;
         self.block.clear();

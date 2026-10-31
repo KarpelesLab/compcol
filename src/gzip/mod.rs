@@ -26,6 +26,10 @@
 //!   trailing bytes unconsumed. Since only the next byte tells, `decode`
 //!   cannot report `StreamEnd` right at the end of the input; `finish`
 //!   does.
+//!   `Decoder::new().with_multi_member(false)` stops after the first
+//!   member instead and reports `StreamEnd` right after its trailer.
+//! - The decoder checks the optional header CRC (FHCRC) and fails with
+//!   `ChecksumMismatch` when it is wrong.
 //!
 //! With the `embed` feature, `Encoder` and `Decoder` are the allocation-free
 //! variants instead, alongside one-shot `decompress`, `decompressed_len` and

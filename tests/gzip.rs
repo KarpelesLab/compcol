@@ -441,12 +441,25 @@ fn decode_with_all_optional_fields() {
     assert_eq!(decoded, b"hello");
 }
 
+/// The FHCRC value for the header bytes in `hdr`: the low 16 bits of
+/// their CRC-32 (RFC 1952 §2.3.1), little-endian.
+fn header_crc(hdr: &[u8]) -> [u8; 2] {
+    let mut crc = !0u32; // CRC-32 (IEEE, reflected)
+    for &b in hdr {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+        }
+    }
+    (!crc as u16).to_le_bytes()
+}
+
 #[test]
 fn decode_with_fhcrc_field() {
-    // gzip stream of "hello" with only FHCRC set (FLG = 0x02). The 2-byte
-    // header-CRC field is skipped, not validated.
+    // gzip stream of "hello" with only FHCRC set (FLG = 0x02).
     let mut stream = vec![0x1F, 0x8B, 0x08, 0x02, 0, 0, 0, 0, 0, 0x03];
-    stream.extend_from_slice(&[0x12, 0x34]); // FHCRC (skipped)
+    let hcrc = header_crc(&stream);
+    stream.extend_from_slice(&hcrc); // FHCRC
     stream.extend_from_slice(&hex("cb48cdc9c90700"));
     stream.extend_from_slice(&[0x86, 0xa6, 0x10, 0x36, 0x05, 0x00, 0x00, 0x00]);
     let decoded = decode_chunked(&stream, 1024, 1024).unwrap();
@@ -462,7 +475,8 @@ fn decode_with_fextra_and_fhcrc_fields() {
     let mut stream = vec![0x1F, 0x8B, 0x08, 0x06, 0, 0, 0, 0, 0, 0x03];
     stream.extend_from_slice(&[0x04, 0x00]); // XLEN = 4
     stream.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // extra data
-    stream.extend_from_slice(&[0x12, 0x34]); // FHCRC (skipped)
+    let hcrc = header_crc(&stream);
+    stream.extend_from_slice(&hcrc); // FHCRC
     stream.extend_from_slice(&hex("cb48cdc9c90700"));
     stream.extend_from_slice(&[0x86, 0xa6, 0x10, 0x36, 0x05, 0x00, 0x00, 0x00]);
     let decoded = decode_chunked(&stream, 1024, 1024).unwrap();
@@ -478,7 +492,8 @@ fn decode_with_all_optional_fields_and_fhcrc() {
     stream.extend_from_slice(&[1, 2, 3]);
     stream.extend_from_slice(b"name.txt\0");
     stream.extend_from_slice(b"some comment\0");
-    stream.extend_from_slice(&[0x56, 0x78]); // FHCRC (skipped)
+    let hcrc = header_crc(&stream);
+    stream.extend_from_slice(&hcrc); // FHCRC
     stream.extend_from_slice(&hex("cb48cdc9c90700"));
     stream.extend_from_slice(&[0x86, 0xa6, 0x10, 0x36, 0x05, 0x00, 0x00, 0x00]);
     let decoded = decode_chunked(&stream, 1024, 1024).unwrap();
@@ -774,4 +789,93 @@ fn second_member_with_corrupted_crc_errors() {
     combined.extend_from_slice(&b);
     let err = decode_chunked(&combined, 64, 64).unwrap_err();
     assert_eq!(err, Error::ChecksumMismatch);
+}
+
+// ─── FHCRC and single-member decoding (standard decoder only) ──────────
+
+/// A gzip member of `payload` whose header carries FEXTRA, FNAME, FCOMMENT
+/// and FHCRC. `corrupt_hcrc` flips a bit of the header CRC.
+#[cfg(not(feature = "embed"))]
+fn member_with_hcrc(payload: &[u8], corrupt_hcrc: bool) -> Vec<u8> {
+    let plain = encode_all(payload);
+    let mut hdr = vec![0x1F, 0x8B, 8, 0b0001_1110, 1, 2, 3, 4, 0, 3];
+    hdr.extend_from_slice(&[3, 0, b'a', b'b', b'c']); // XLEN = 3
+    hdr.extend_from_slice(b"name.txt\0");
+    hdr.extend_from_slice(b"a comment\0");
+    let mut hcrc = header_crc(&hdr);
+    if corrupt_hcrc {
+        hcrc[0] ^= 1;
+    }
+    hdr.extend_from_slice(&hcrc);
+    hdr.extend_from_slice(&plain[10..]); // deflate body + trailer
+    hdr
+}
+
+#[cfg(not(feature = "embed"))]
+#[test]
+fn header_crc_checked() {
+    let payload = b"header crc protected payload, header crc protected payload";
+    let good = member_with_hcrc(payload, false);
+    for chunk in [1, 3, 7, 4096] {
+        assert_eq!(
+            decode_chunked(&good, chunk, 4096).unwrap(),
+            payload,
+            "chunk {chunk}"
+        );
+        assert_eq!(
+            decode_chunked(&member_with_hcrc(payload, true), chunk, 4096).unwrap_err(),
+            Error::ChecksumMismatch,
+            "chunk {chunk}"
+        );
+    }
+    // The CRC restarts for each member.
+    let mut two = good.clone();
+    two.extend_from_slice(&good);
+    let mut expect = payload.to_vec();
+    expect.extend_from_slice(payload);
+    assert_eq!(decode_chunked(&two, 5, 4096).unwrap(), expect);
+}
+
+#[cfg(not(feature = "embed"))]
+#[test]
+fn single_member_stops_after_first_trailer() {
+    let first = encode_all(b"first member");
+    let second = encode_all(b"second member");
+    let mut stream = first.clone();
+    stream.extend_from_slice(&second);
+
+    let mut dec = Decoder::new().with_multi_member(false);
+    let mut buf = [0u8; 256];
+    let (p, status) = dec.decode(&stream, &mut buf).unwrap();
+    assert_eq!(status, Status::StreamEnd);
+    assert_eq!(&buf[..p.written], b"first member");
+    assert_eq!(
+        p.consumed,
+        first.len(),
+        "bytes after the member stay unconsumed"
+    );
+
+    // Byte at a time, the end is reported on the trailer's last byte.
+    let mut dec = Decoder::new().with_multi_member(false);
+    let mut out = Vec::new();
+    for (i, b) in stream.iter().enumerate() {
+        let (p, status) = dec.decode(core::slice::from_ref(b), &mut buf).unwrap();
+        out.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            assert_eq!(i + 1, first.len());
+            break;
+        }
+    }
+    assert_eq!(out, b"first member");
+
+    // The default still decodes both members, and reset keeps the setting.
+    assert_eq!(
+        decode_chunked(&stream, 4096, 4096).unwrap(),
+        b"first membersecond member"
+    );
+    let mut dec = Decoder::new().with_multi_member(false);
+    let _ = dec.decode(&stream, &mut buf).unwrap();
+    dec.reset();
+    let (p, status) = dec.decode(&stream, &mut buf).unwrap();
+    assert_eq!((status, p.consumed), (Status::StreamEnd, first.len()));
 }

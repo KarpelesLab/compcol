@@ -299,7 +299,10 @@ impl Decoder {
             self.phase = Phase::StreamCrc;
             Ok(true)
         } else {
-            Err(Error::BadHeader)
+            // A bad stream magic ("BZh") is a header error, a bad block
+            // magic is corrupt data: libbzip2 reports BZ_DATA_ERROR_MAGIC
+            // and BZ_DATA_ERROR respectively.
+            Err(Error::Corrupt)
         }
     }
 
