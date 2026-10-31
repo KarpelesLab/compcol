@@ -163,6 +163,54 @@ after 1 warmup.
 - `lzma` is **1.01×** on Random — the greedy/optimal parser emits
   marginally larger output than the reference on incompressible data.
 
+## Deflate encoder vs in-process zlib (2026-10)
+
+The snapshot above times the system tools as subprocesses. This table
+compares the raw deflate encoder against zlib called **in-process**
+(Python's `zlib.compressobj(level, DEFLATED, -15)`, system zlib 1.2.12),
+on a different host: Apple M5 Max, macOS. Each row is the best of 5
+runs over a 4 MB input (words: `/usr/share/dict/words`, 2.5 MB; rust:
+this crate's `src/**/*.rs` concatenated; mixed: `/bin/zsh`,
+`/usr/bin/ssh` and `/bin/bash` concatenated; lorem: one 120-byte
+sentence repeated; random: `/dev/urandom`). Our encoder streams into a
+64 KiB output buffer. "Before" is the encoder as of v0.7.7 plus the
+level-0/strategy work, before the speed pass.
+
+| Input | Level | Before: size | Before: MB/s | After: size | After: MB/s | zlib: size | zlib: MB/s | After / zlib speed |
+|---|---|---|---|---|---|---|---|---|
+| words | 1 | 794984 | 148.7 | 793690 | 264.0 | 901742 | 190.0 | 1.39× |
+| words | 6 | 759754 | 30.9 | 759623 | 43.0 | 754211 | 33.3 | 1.29× |
+| words | 9 | 759666 | 14.2 | 759666 | 15.7 | 754271 | 14.3 | 1.10× |
+| rust | 1 | 1121787 | 141.9 | 1092160 | 303.8 | 1166315 | 222.9 | 1.36× |
+| rust | 6 | 948438 | 55.5 | 948378 | 89.4 | 943056 | 70.1 | 1.28× |
+| rust | 9 | 942202 | 17.9 | 942202 | 21.3 | 934739 | 18.0 | 1.18× |
+| mixed | 1 | 1975095 | 88.4 | 1958677 | 177.9 | 2008434 | 123.3 | 1.44× |
+| mixed | 6 | 1880291 | 33.8 | 1879457 | 59.0 | 1894491 | 38.0 | 1.55× |
+| mixed | 9 | 1870112 | 12.6 | 1870110 | 16.4 | 1883868 | 14.1 | 1.16× |
+| lorem | 1 | 16914 | 814.2 | 16914 | 1958 | 27300 | 1559 | 1.26× |
+| lorem | 6 | 16914 | 817.2 | 16914 | 1910 | 13680 | 701.8 | 2.72× |
+| lorem | 9 | 16914 | 820.6 | 16914 | 1962 | 13680 | 704.9 | 2.78× |
+| random | 1 | 4001225 | 83.7 | 4001225 | 117.6 | 4001220 | 88.9 | 1.32× |
+| random | 6 | 4001225 | 82.2 | 4001225 | 116.3 | 4001225 | 88.0 | 1.32× |
+| random | 9 | 4001225 | 80.5 | 4001225 | 115.1 | 4001225 | 87.8 | 1.31× |
+
+Output sizes moved by at most +0.1% at any level 1–9 on these inputs
+(most shrank; level 1 by up to 2.6%). The zlib and gzip wrappers add
+the trailer checksums: Adler-32 now runs at ~7.7 GB/s and CRC-32 at
+~4.3 GB/s on this host, so e.g. rust level 6 encodes at ~88 MB/s in
+all three containers.
+
+What changed: a multiplicative 3-byte hash (fewer collisions, shorter
+chains); a chain walk that starts from the head returned by the insert,
+rejects candidates on the four bytes ending at the current best length,
+and only looks for matches longer than the pending lazy one; zlib's
+`max_lazy` cut-off at levels 6–7; literal/length and distance
+histograms tallied during the LZ77 pass (no second pass, no per-block
+copy of the block bytes for the stored fallback); an in-place
+Moffat–Katajainen Huffman builder (package-merge only when a code would
+exceed 15 bits); and a branch-free 64-bit bit writer over a pre-sized
+buffer, with length/distance codes and extra bits merged into one write.
+
 ## Known issues surfaced by the bench
 
 1. **`brotli` random-input encode is ~2.7 MB/s.** The quality-6
@@ -184,8 +232,8 @@ after 1 warmup.
 
 ## Caveats
 
-- All numbers reflect a **single host** (Linux 6.12 / Intel Core
-  i9-14900K). Throughputs scale with the host's L1/L2 sizes and DRAM
+- All numbers outside the deflate-vs-zlib section reflect a **single
+  host** (Linux 6.12 / Intel Core i9-14900K). Throughputs scale with the host's L1/L2 sizes and DRAM
   bandwidth; the **Δ ratios** are more portable than the absolute
   MB/s numbers.
 - Reference timings are **single-shot subprocesses**: each median
