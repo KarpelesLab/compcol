@@ -17,6 +17,7 @@
 //! |--------|------------------------------------------------------------|
 //! | 0..6   | bits to consume: code length plus extra bits (0 for a      |
 //! |        | subtable pointer or an unused slot)                        |
+//! | 7      | subtable pointer (with [`EXC`])                            |
 //! | 8..12  | code length, or a subtable pointer's index width           |
 //! | 12..14 | kind of an exceptional entry (see `K_*`)                   |
 //! | 14     | [`LIT`]: a literal byte                                    |
@@ -34,8 +35,10 @@ pub(super) const LIT: u32 = 1 << 14;
 /// Anything that is neither a literal nor a length/distance.
 pub(super) const EXC: u32 = 1 << 15;
 const K_MASK: u32 = 3 << 12;
+/// A root entry pointing to a subtable (combined with [`EXC`]). Bit 7
+/// is outside the consumed-bits field and lets `lookup` test it alone.
+const SUB: u32 = 1 << 7;
 /// Exceptional kinds (combined with [`EXC`]).
-const K_SUB: u32 = 0;
 pub(super) const K_EOB: u32 = 1 << 12;
 /// A symbol the code assigns but deflate reserves (literal/length 286 and
 /// 287, distance 30 and 31): decoding it means the stream is corrupt.
@@ -142,7 +145,7 @@ impl<const SIZE: usize> Table<SIZE> {
     #[inline(always)]
     pub(super) fn lookup(&self, bits: u64) -> u32 {
         let e = self.root[(bits as usize) & (SIZE - 1)];
-        if e & (EXC | K_MASK) == (EXC | K_SUB) {
+        if e & SUB != 0 {
             self.sub_entry(e, bits)
         } else {
             e
@@ -269,7 +272,7 @@ impl<const SIZE: usize> Table<SIZE> {
             let width = long[end - 1].1 as u32 - Self::BITS;
             let start = self.sub.len();
             self.sub.resize(start + (1 << width), UNUSED);
-            self.root[prefix as usize] = EXC | K_SUB | (start as u32) << 16 | width << 8;
+            self.root[prefix as usize] = EXC | SUB | (start as u32) << 16 | width << 8;
             for &(rev, len, sym) in &long[g..end] {
                 let e = entry(payload(sym as usize), len as u32);
                 let step = 1usize << (len as u32 - Self::BITS);

@@ -700,12 +700,14 @@ impl Decoder {
         // load overlaps the work in between (a match copy, say). It is
         // only acted on once the loop has checked its margins, and dropped
         // unused when the loop ends, so the slow path decodes it again.
-        if input.len() - ip < FAST_IN_MARGIN {
+        if input.len() - ip < FAST_IN_MARGIN || output.len() - op < FAST_OUT_MARGIN {
             return Ok(exit);
         }
         refill!();
         let mut e = lit.lookup(acc);
-        while input.len() - ip >= FAST_IN_MARGIN && output.len() - op >= FAST_OUT_MARGIN {
+        let in_end = input.len() - FAST_IN_MARGIN;
+        let out_end = output.len() - FAST_OUT_MARGIN;
+        while ip <= in_end && op <= out_end {
             refill!();
             let mut saved = acc;
             // Up to two literals per refill (15 bits each at most); the
