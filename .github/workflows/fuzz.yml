@@ -36,6 +36,7 @@ jobs:
           - decoder_bzip2
           - decoder_amiga_lzx
           - decoder_ppmd
+          - decoder_ppmd_zip
           - decoder_xpress_huffman
           - decoder_lznt1
           - decoder_xpress
