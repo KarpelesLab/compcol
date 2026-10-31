@@ -46,12 +46,19 @@ use alloc::vec::Vec;
 /// Returns `(L, origin)` where `L` is the BWT output (same length as
 /// `input`) and `origin` is the row index of the original (unrotated)
 /// string in the sorted rotation matrix.
+#[cfg(test)]
 pub(crate) fn bwt_forward(input: &[u8]) -> (Vec<u8>, u32) {
+    bwt_forward_with(input, DEFAULT_WORK_FACTOR)
+}
+
+/// [`bwt_forward`] at an explicit libbzip2 work factor (`1..=250`; 0
+/// means the default, 30). See [`block_sort`].
+pub(crate) fn bwt_forward_with(input: &[u8], work_factor: u8) -> (Vec<u8>, u32) {
     let n = input.len();
     if n == 0 {
         return (Vec::new(), 0);
     }
-    let ptr = block_sort(input);
+    let ptr = block_sort(input, work_factor);
     let mut l = Vec::with_capacity(n);
     let mut origin = 0u32;
     for (i, &p) in ptr.iter().enumerate() {
@@ -82,11 +89,24 @@ const N_RADIX: i32 = 2;
 const N_QSORT: i32 = 12;
 /// libbzip2's default work factor (`bzip2 -9`, `BZ2_bzBuffToBuffCompress`
 /// with `workFactor = 0`).
-const WORK_FACTOR: i32 = 30;
+pub(crate) const DEFAULT_WORK_FACTOR: u8 = 30;
 
 /// Sort the rotations of `block`, returning the start of each in
 /// ascending order (libbzip2's `ptr`).
-fn block_sort(block: &[u8]) -> Vec<u32> {
+///
+/// `work_factor` is libbzip2's `workFactor`: 0 picks the default (30),
+/// and like `BZ2_blockSort` the value is then clamped to `1..=100`.
+/// Lower values give up on `mainSort` sooner. For blocks whose
+/// rotations are not all distinct (periodic input) the two sorts can
+/// order equal rotations differently, so the work factor can change
+/// the output bytes, just as it does in libbzip2.
+fn block_sort(block: &[u8], work_factor: u8) -> Vec<u32> {
+    let wf = if work_factor == 0 {
+        DEFAULT_WORK_FACTOR
+    } else {
+        work_factor
+    };
+    let wf = i32::from(wf).clamp(1, 100);
     let nblock = block.len();
     let mut ptr = vec![0u32; nblock];
     if nblock < 10000 {
@@ -96,7 +116,7 @@ fn block_sort(block: &[u8]) -> Vec<u32> {
         blk.extend_from_slice(block);
         blk.resize(nblock + N_OVERSHOOT, 0);
         let mut quadrant = vec![0u16; nblock + N_OVERSHOOT];
-        let mut budget = nblock as i32 * ((WORK_FACTOR - 1) / 3);
+        let mut budget = nblock as i32 * ((wf - 1) / 3);
         main_sort(
             &mut ptr,
             &mut blk,

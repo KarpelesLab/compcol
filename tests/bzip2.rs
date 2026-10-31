@@ -468,6 +468,89 @@ fn cross_validate_with_system_bunzip2() {
     assert_eq!(out.stdout, input);
 }
 
+// ─── work factor ────────────────────────────────────────────────────────
+
+/// A 1000-byte pseudo-random unit repeated to 20000 bytes: a block whose
+/// equal rotations libbzip2 orders differently at work factor 1 (where
+/// it falls back to `fallbackSort`) and at the default 30.
+fn work_factor_sensitive_input() -> Vec<u8> {
+    let mut x: u32 = 0x1234_5678;
+    let unit: Vec<u8> = (0..1000)
+        .map(|_| {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (x >> 16) as u8
+        })
+        .collect();
+    unit.iter().cycle().take(20_000).copied().collect()
+}
+
+fn encode_with_work_factor(input: &[u8], wf: u8) -> Vec<u8> {
+    let mut enc = Encoder::with_config(EncoderConfig { level: 9 }).with_work_factor(wf);
+    encode_chunked(&mut enc, input, 4096, 4096)
+}
+
+#[test]
+fn work_factor_round_trips_and_steers_the_sort() {
+    let input = work_factor_sensitive_input();
+    let default = encode_with_work_factor(&input, 30);
+    // 0 means "default", as in libbzip2.
+    assert_eq!(encode_with_work_factor(&input, 0), default);
+    let low = encode_with_work_factor(&input, 1);
+    assert_ne!(low, default, "work factor 1 should take the fallback sort");
+    for (wf, enc) in [(1, &low), (30, &default)] {
+        assert_eq!(decode_chunked(enc, 4096, 4096).unwrap(), input, "wf {wf}");
+    }
+    // Above 100 behaves like 100; above 250 is clamped.
+    assert_eq!(
+        encode_with_work_factor(&input, 255),
+        encode_with_work_factor(&input, 100)
+    );
+}
+
+/// Byte-identity with libbzip2 at several work factors, via Python
+/// ctypes and the system libbz2. Skips when either is unavailable.
+#[cfg(feature = "std")]
+#[test]
+fn work_factor_matches_system_libbz2() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    const SCRIPT: &str = r#"
+import ctypes, ctypes.util, sys
+name = ctypes.util.find_library("bz2")
+if not name:
+    sys.exit(77)
+lib = ctypes.CDLL(name)
+data = sys.stdin.buffer.read()
+wf = int(sys.argv[1])
+cap = ctypes.c_uint(len(data) * 2 + 1000)
+buf = ctypes.create_string_buffer(cap.value)
+if lib.BZ2_bzBuffToBuffCompress(buf, ctypes.byref(cap), data, len(data), 9, 0, wf) != 0:
+    sys.exit(1)
+sys.stdout.buffer.write(buf.raw[:cap.value])
+"#;
+    let input = work_factor_sensitive_input();
+    for wf in [1u8, 5, 30, 100] {
+        let child = Command::new("python3")
+            .args(["-I", "-c", SCRIPT, &wf.to_string()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else {
+            eprintln!("python3 not available; skipping");
+            return;
+        };
+        child.stdin.take().unwrap().write_all(&input).unwrap();
+        let out = child.wait_with_output().unwrap();
+        if !out.status.success() {
+            eprintln!("libbz2 not reachable from python3; skipping");
+            return;
+        }
+        assert_eq!(encode_with_work_factor(&input, wf), out.stdout, "wf {wf}");
+    }
+}
+
 // ─── decoder error rejection ───────────────────────────────────────────
 
 #[test]
@@ -490,6 +573,16 @@ fn bad_header_rejected() {
     let mut buf = [0u8; 16];
     let err = dec.decode(stream, &mut buf).unwrap_err();
     assert_eq!(err, Error::BadHeader);
+}
+
+#[test]
+fn bad_block_magic_is_corrupt_not_bad_header() {
+    // libbzip2 tells a bad stream magic (BZ_DATA_ERROR_MAGIC) from a bad
+    // block magic (BZ_DATA_ERROR); we map them to BadHeader and Corrupt.
+    let mut encoded = encode_all(b"a block whose magic gets damaged");
+    encoded[4] ^= 0x01; // first byte of the "1AY&SY" block magic
+    let err = decode_chunked(&encoded, 4096, 4096).unwrap_err();
+    assert_eq!(err, Error::Corrupt);
 }
 
 #[test]

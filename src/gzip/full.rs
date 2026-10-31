@@ -55,7 +55,7 @@ enum DecPhase {
     Name,
     /// Skipping bytes of the comment until a NUL is seen.
     Comment,
-    /// Skipping the 2-byte header-CRC trailer (validation deferred — v1).
+    /// Reading the 2-byte header CRC (FHCRC) and checking it.
     HeaderCrc,
     /// Streaming the deflate payload.
     Deflate,
@@ -85,6 +85,12 @@ pub struct Decoder {
     trailer_carryover_idx: usize,
     trailer: [u8; 8],
     trailer_idx: u8,
+    /// CRC-32 of the current member's header bytes, for FHCRC.
+    hcrc: Crc32,
+    /// The FHCRC field as read so far.
+    hcrc_field: [u8; 2],
+    /// Decode concatenated members as one stream (default `true`).
+    multi_member: bool,
     phase: DecPhase,
     poisoned: bool,
 }
@@ -105,9 +111,25 @@ impl Decoder {
             trailer_carryover_idx: 0,
             trailer: [0u8; 8],
             trailer_idx: 0,
+            hcrc: Crc32::new(),
+            hcrc_field: [0u8; 2],
+            multi_member: true,
             phase: DecPhase::FixedHeader,
             poisoned: false,
         }
+    }
+
+    /// Choose whether concatenated members (RFC 1952 §2.2, `cat a.gz
+    /// b.gz`) decode as one stream. Default `true`, like `gzip -d`.
+    ///
+    /// With `false` the decoder stops after the first member, like
+    /// zlib's `inflate` with `windowBits` 16+: `decode` returns
+    /// `StreamEnd` as soon as the trailer is read and leaves every byte
+    /// after it unconsumed, so the caller can tell exactly where the
+    /// member ended. [`reset`](crate::Decoder::reset) keeps the setting.
+    pub fn with_multi_member(mut self, multi_member: bool) -> Self {
+        self.multi_member = multi_member;
+        self
     }
 
     fn poison(&mut self, e: Error) -> Error {
@@ -197,6 +219,7 @@ impl RawDecoder for Decoder {
                     }
                     if self.header_idx == 10 {
                         self.validate_fixed_header()?;
+                        self.hcrc.update(&self.header_bytes);
                         self.phase = self.next_after(DecPhase::FixedHeader);
                         self.aux_idx = 0;
                     } else {
@@ -212,6 +235,7 @@ impl RawDecoder for Decoder {
                     while self.aux_idx < 2 && consumed < input.len() {
                         let b = input[consumed];
                         consumed += 1;
+                        self.hcrc.update(&[b]);
                         if self.aux_idx == 0 {
                             self.aux_xlen = b as u16;
                         } else {
@@ -231,10 +255,10 @@ impl RawDecoder for Decoder {
                     }
                 }
                 DecPhase::ExtraData => {
-                    while self.aux_remaining > 0 && consumed < input.len() {
-                        consumed += 1;
-                        self.aux_remaining -= 1;
-                    }
+                    let take = (input.len() - consumed).min(self.aux_remaining as usize);
+                    self.hcrc.update(&input[consumed..consumed + take]);
+                    consumed += take;
+                    self.aux_remaining -= take as u32;
                     if self.aux_remaining == 0 {
                         self.phase = self.next_after(DecPhase::ExtraData);
                         // ExtraLen leaves `aux_idx == 2`; HeaderCrc reuses the
@@ -253,6 +277,7 @@ impl RawDecoder for Decoder {
                     }
                 }
                 DecPhase::Name => {
+                    let start = consumed;
                     let mut found_nul = false;
                     while consumed < input.len() {
                         let b = input[consumed];
@@ -262,6 +287,7 @@ impl RawDecoder for Decoder {
                             break;
                         }
                     }
+                    self.hcrc.update(&input[start..consumed]);
                     if found_nul {
                         self.phase = self.next_after(DecPhase::Name);
                         // See ExtraData arm: HeaderCrc shares `aux_idx`.
@@ -277,6 +303,7 @@ impl RawDecoder for Decoder {
                     }
                 }
                 DecPhase::Comment => {
+                    let start = consumed;
                     let mut found_nul = false;
                     while consumed < input.len() {
                         let b = input[consumed];
@@ -286,6 +313,7 @@ impl RawDecoder for Decoder {
                             break;
                         }
                     }
+                    self.hcrc.update(&input[start..consumed]);
                     if found_nul {
                         self.phase = self.next_after(DecPhase::Comment);
                         // See ExtraData arm: HeaderCrc shares `aux_idx`.
@@ -301,12 +329,17 @@ impl RawDecoder for Decoder {
                     }
                 }
                 DecPhase::HeaderCrc => {
-                    // Skip 2 bytes — we don't validate the header CRC in v1.
+                    // RFC 1952 §2.3.1: the two least significant bytes
+                    // of the CRC-32 of every header byte before it.
                     while self.aux_idx < 2 && consumed < input.len() {
+                        self.hcrc_field[self.aux_idx as usize] = input[consumed];
                         consumed += 1;
                         self.aux_idx += 1;
                     }
                     if self.aux_idx == 2 {
+                        if u16::from_le_bytes(self.hcrc_field) != self.hcrc.finalize() as u16 {
+                            return Err(self.poison(Error::ChecksumMismatch));
+                        }
                         self.phase = DecPhase::Deflate;
                     } else {
                         return Ok(RawProgress {
@@ -381,8 +414,13 @@ impl RawDecoder for Decoder {
                     // RFC 1952 §2.2: multiple members can be concatenated.
                     // Park in BetweenMembers; whether the next byte starts
                     // another member or signals end-of-stream is decided
-                    // on the next iteration / call.
-                    self.phase = DecPhase::BetweenMembers;
+                    // on the next iteration / call. A single-member
+                    // decoder ends here.
+                    self.phase = if self.multi_member {
+                        DecPhase::BetweenMembers
+                    } else {
+                        DecPhase::Done
+                    };
                 }
                 DecPhase::BetweenMembers => {
                     if consumed >= input.len() {
@@ -417,6 +455,7 @@ impl RawDecoder for Decoder {
                         self.trailer_carryover.clear();
                         self.trailer_carryover_idx = 0;
                         self.trailer_idx = 0;
+                        self.hcrc.reset();
                         self.phase = DecPhase::FixedHeader;
                         continue;
                     }
@@ -489,6 +528,7 @@ impl RawDecoder for Decoder {
         self.trailer_carryover.clear();
         self.trailer_carryover_idx = 0;
         self.trailer_idx = 0;
+        self.hcrc.reset();
         self.phase = DecPhase::FixedHeader;
         self.poisoned = false;
     }
