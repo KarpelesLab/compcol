@@ -29,7 +29,38 @@
 //! analogous to legacy `.lzma`'s "alone" framing (which uses an 8-byte
 //! length). If you are extracting a method-1 entry from a real ZIP, splice
 //! the length you already have from the central directory in front of the
-//! raw payload and feed the result to this decoder.
+//! raw payload and feed the result to this decoder — or skip the header
+//! entirely with [`Decoder::raw`], below.
+//!
+//! ## Raw ZIP entries
+//!
+//! [`Decoder::raw`] takes the uncompressed size (a `u64`, so ZIP64 sizes
+//! fit) up front and consumes the bare method-1 payload, exactly the bytes
+//! a ZIP archive stores for the entry. End-of-stream handling is the same
+//! as the framed path: the decoder reports `StreamEnd` once
+//! `uncompressed_len` bytes have been produced. Parsing the ZIP local or
+//! central header to get that size is the caller's job.
+//!
+//! ```
+//! use compcol::zip_shrink::Decoder;
+//! use compcol::{Decoder as _, Status};
+//!
+//! // Bytes of a method-1 entry (from after its local header), and the
+//! // uncompressed size taken from the ZIP header.
+//! let entry: &[u8] = &[
+//!     0x68, 0xca, 0xb0, 0x61, 0xf3, 0x06, 0xc4, 0x9d, 0x37, 0x72, 0xd8, 0x90, 0x01,
+//! ];
+//! let uncompressed_size: u64 = 11;
+//!
+//! let mut dec = Decoder::raw(uncompressed_size);
+//! let mut out = [0u8; 64];
+//! let (p, _) = dec.decode(entry, &mut out).unwrap();
+//! let mut n = p.written;
+//! let (p, status) = dec.finish(&mut out[n..]).unwrap();
+//! n += p.written;
+//! assert_eq!(status, Status::StreamEnd);
+//! assert_eq!(&out[..n], b"hello world");
+//! ```
 //!
 //! ## Scope
 //!
@@ -128,9 +159,13 @@ impl RawEncoder for Encoder {
 pub struct Decoder {
     // ── framing ──
     /// Header bytes parsed so far (0..4). Once 4, `target_len` is set.
+    /// A raw decoder starts (and resets) at 4.
     header_pos: u8,
-    /// Decoded length declared by the header (u32 LE).
+    /// Decoded length: declared by the header (u32 LE), or given to
+    /// [`Decoder::raw`].
     target_len: u64,
+    /// `Some(len)` for a raw (headerless) decoder; kept across resets.
+    raw_len: Option<u64>,
 
     // ── bit reader state ──
     bit_acc: u32,
@@ -184,6 +219,8 @@ impl Default for Decoder {
 }
 
 impl Decoder {
+    /// Decoder for the framed format: a 4-byte LE uncompressed length,
+    /// then the Shrink payload.
     pub fn new() -> Self {
         let mut parent = vec![FREE; HSIZE];
         let mut value = vec![0u8; HSIZE];
@@ -197,6 +234,7 @@ impl Decoder {
         Self {
             header_pos: 0,
             target_len: 0,
+            raw_len: None,
             bit_acc: 0,
             bit_count: 0,
             in_buf: Vec::new(),
@@ -215,6 +253,25 @@ impl Decoder {
             completed: false,
             pending_control: false,
         }
+    }
+
+    /// Decoder for a bare ZIP method-1 payload with no header.
+    ///
+    /// `uncompressed_len` is the entry's uncompressed size from the ZIP
+    /// local or central header (or its ZIP64 extra field). Feed the
+    /// entry's compressed bytes as-is. [`reset`](crate::Decoder::reset)
+    /// keeps the decoder in raw mode with the same length.
+    pub fn raw(uncompressed_len: u64) -> Self {
+        let mut d = Self::new();
+        d.raw_len = Some(uncompressed_len);
+        d.header_pos = 4;
+        d.target_len = uncompressed_len;
+        d
+    }
+
+    /// Bytes still owed to the caller, clamped to `usize`.
+    fn remaining(&self) -> usize {
+        usize::try_from(self.target_len.saturating_sub(self.out_pos)).unwrap_or(usize::MAX)
     }
 
     /// Compact the input buffer once we have consumed a healthy prefix —
@@ -493,8 +550,7 @@ impl RawDecoder for Decoder {
         self.pump()?;
 
         // Drain to the caller, capped at target_len.
-        let remaining_target = self.target_len.saturating_sub(self.out_pos);
-        let cap = output.len().min(remaining_target as usize);
+        let cap = output.len().min(self.remaining());
         if cap > 0 && self.emit_head < self.emit_buf.len() {
             let n = self.drain_emit(&mut output[..cap]);
             written += n;
@@ -532,8 +588,7 @@ impl RawDecoder for Decoder {
             self.pump()?;
         }
 
-        let remaining_target = self.target_len.saturating_sub(self.out_pos);
-        let cap = output.len().min(remaining_target as usize);
+        let cap = output.len().min(self.remaining());
         if cap > 0 && self.emit_head < self.emit_buf.len() {
             let n = self.drain_emit(&mut output[..cap]);
             written += n;
@@ -561,8 +616,16 @@ impl RawDecoder for Decoder {
     }
 
     fn raw_reset(&mut self) {
-        self.header_pos = 0;
-        self.target_len = 0;
+        match self.raw_len {
+            Some(n) => {
+                self.header_pos = 4;
+                self.target_len = n;
+            }
+            None => {
+                self.header_pos = 0;
+                self.target_len = 0;
+            }
+        }
         self.bit_acc = 0;
         self.bit_count = 0;
         self.in_buf.clear();

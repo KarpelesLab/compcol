@@ -75,7 +75,7 @@ flag accept; *Ext* is what `factory::extension(name)` returns.
 | LZNT1 (NTFS native compression) | `lznt1` | `lznt1` | `.lznt1` | full | full (per [MS-XCA] §2.5; 4 KiB-chunked LZ77, no entropy coding) | hand-built fixtures |
 | Stac LZS (RFC 1974) | `lzs` | `lzs` | `.lzs` | full (2 KiB window, MSB-first) | full | hand-crafted RFC 1974 fixtures |
 | LZHAM | `lzham` | `lzham` | `.lzham` | `Unsupported` | `LZH0` container header only; payload `Unsupported` (undocumented bitstream) | — |
-| PKZIP Shrink (ZIP method 1) | `zip_shrink` | `zip-shrink` | `.shrunk` | `Unsupported` (decode-only) | full (dynamic LZW + partial clear; 4-byte length header) | reference-encoder fixtures, validated with Info-ZIP `unzip` |
+| PKZIP Shrink (ZIP method 1) | `zip_shrink` | `zip-shrink` | `.shrunk` | `Unsupported` (decode-only) | full (dynamic LZW + partial clear; 4-byte length header, or `Decoder::raw(len)` for bare ZIP entries) | reference-encoder fixtures, validated with Info-ZIP `unzip` |
 | PKZIP Reduce (ZIP methods 2–5) | `zip_reduce` | `zip-reduce` | `.reduce` | `Unsupported` (decode-only) | full (all four factors; 5-byte factor + length header) | hwzip reference fixtures |
 | PKZIP Implode (ZIP method 6) | `zip_implode` | `zip-implode` | `.implode` | `Unsupported` (decode-only) | full (4/8 KiB window × 2/3 Shannon–Fano trees; 5-byte flag + length header) | in-test fixture builder + golden fixture |
 | LHA / LZH (`-lh1-`/`-lh2-`/`-lh4-`/`-lh5-`/`-lh6-`/`-lh7-`) | `lha` | `lh1` … `lh7` | `.lzh` | full (lh1/lh2 adaptive Huffman; lh4/5/6/7 static Huffman) | full (clean-room from Okumura LZHUF / ar002; lh2 from a written format spec) | LHa for UNIX decodes our lh1/lh2/lh4–lh7 output (when installed); lh2 spec vectors + fixture |
