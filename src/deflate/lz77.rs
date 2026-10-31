@@ -22,16 +22,21 @@ const NIL: u32 = u32::MAX;
 pub const PREV_SIZE: usize = WINDOW_SIZE;
 const PREV_MASK: usize = PREV_SIZE - 1;
 
-/// Hash function over three bytes. zlib uses a rotated XOR; we use the same
-/// shape for deterministic, well-distributed output.
+/// Smallest and largest hash-table sizes (in bits) the finder accepts.
+const MIN_HASH_BITS: u32 = 8;
+const MAX_HASH_BITS: u32 = HASH_BITS;
+
+/// Hash function over three bytes, zlib's shift-and-XOR shape. `shift` is
+/// `ceil(hash_bits / 3)`; for the default 15-bit table it is 5.
 #[inline(always)]
-fn hash3(b0: u8, b1: u8, b2: u8) -> u32 {
-    ((b0 as u32) << 10) ^ ((b1 as u32) << 5) ^ (b2 as u32)
+fn hash3(b0: u8, b1: u8, b2: u8, shift: u32) -> u32 {
+    ((b0 as u32) << (2 * shift)) ^ ((b1 as u32) << shift) ^ (b2 as u32)
 }
 
 pub struct MatchFinder {
     /// `head[hash]` is the absolute position of the most recent occurrence
     /// of the 3-byte sequence with this hash, or NIL.
+    /// Only the first `hash_mask + 1` entries are used.
     head: Box<[u32; HASH_SIZE]>,
     /// `prev[pos & PREV_MASK]` is the absolute position of the previous
     /// occurrence of the same hash before `pos`, or NIL.
@@ -44,6 +49,10 @@ pub struct MatchFinder {
     /// (`inflateInit2(-12)`), which rejects any back-reference farther than
     /// 4096 bytes.
     max_distance: usize,
+    /// `head.len() - 1`.
+    hash_mask: u32,
+    /// Shift used by [`hash3`] for this table size.
+    hash_shift: u32,
 }
 
 impl MatchFinder {
@@ -56,16 +65,27 @@ impl MatchFinder {
     /// `max_distance` bytes. The value is clamped to `1..=WINDOW_SIZE`
     /// (0 is treated as 1; values above the window are capped to it).
     pub fn with_max_distance(max_distance: usize) -> Self {
+        Self::with_hash_bits(max_distance, HASH_BITS)
+    }
+
+    /// Like [`MatchFinder::with_max_distance`], with a hash table of
+    /// `1 << hash_bits` heads (`hash_bits` clamped to `8..=15`). The table
+    /// is always allocated at full size; smaller ones just use a prefix.
+    pub(crate) fn with_hash_bits(max_distance: usize, hash_bits: u32) -> Self {
+        let hash_bits = hash_bits.clamp(MIN_HASH_BITS, MAX_HASH_BITS);
         Self {
             head: Box::new([NIL; HASH_SIZE]),
             prev: Box::new([NIL; PREV_SIZE]),
             max_distance: max_distance.clamp(1, WINDOW_SIZE),
+            hash_mask: (1u32 << hash_bits) - 1,
+            hash_shift: hash_bits.div_ceil(3),
         }
     }
 
     /// Forget every position recorded so far.
     pub fn reset(&mut self) {
-        for h in self.head.iter_mut() {
+        let used = self.hash_mask as usize + 1;
+        for h in self.head[..used].iter_mut() {
             *h = NIL;
         }
         for p in self.prev.iter_mut() {
@@ -78,8 +98,7 @@ impl MatchFinder {
     /// guarantees the three bytes are available.
     #[inline]
     pub fn insert(&mut self, abs_pos: u32, b0: u8, b1: u8, b2: u8) {
-        let h = hash3(b0, b1, b2);
-        let idx = (h as usize) & (HASH_SIZE - 1);
+        let idx = (hash3(b0, b1, b2, self.hash_shift) & self.hash_mask) as usize & (HASH_SIZE - 1);
         self.prev[(abs_pos as usize) & PREV_MASK] = self.head[idx];
         self.head[idx] = abs_pos;
     }
@@ -131,8 +150,13 @@ impl MatchFinder {
         if rel + MIN_MATCH > window.len() {
             return None;
         }
-        let h = hash3(window[rel], window[rel + 1], window[rel + 2]);
-        let idx = (h as usize) & (HASH_SIZE - 1);
+        let idx = (hash3(
+            window[rel],
+            window[rel + 1],
+            window[rel + 2],
+            self.hash_shift,
+        ) & self.hash_mask) as usize
+            & (HASH_SIZE - 1);
 
         let max_dist = self.max_distance.min(abs_pos as usize);
         let max_len = MAX_MATCH.min(window.len() - rel);

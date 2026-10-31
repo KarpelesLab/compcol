@@ -10,6 +10,12 @@
 //! Cross-block matching: the hash chain is keyed by absolute positions and
 //! is **not** reset between blocks, so back-references reach into earlier
 //! blocks (up to the 32 KiB window).
+//!
+//! The zlib `deflateInit2` knobs are covered too: level 0 (stored blocks
+//! only), [`Strategy`], memory level, window size (`max_distance`), a
+//! preset dictionary ([`Encoder::with_dictionary`]), `deflateParams`
+//! ([`Encoder::set_params`]) and the partial / block flushes
+//! ([`Encoder::flush_partial`], [`Encoder::flush_block`]).
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -17,7 +23,7 @@ use alloc::vec::Vec;
 use crate::bits::{BitWriter, reverse_bits};
 use crate::error::Error;
 use crate::huffman::{canonical_codes_from_lengths, length_limited_huffman};
-use crate::traits::{Flush, RawEncoder, RawProgress};
+use crate::traits::{Flush, Progress, RawEncoder, RawProgress, Status};
 
 use super::lz77::MatchFinder;
 use super::tables::{
@@ -36,14 +42,37 @@ const WINDOW_MAX: usize = 2 * WINDOW_SIZE;
 
 // ─── compression level ──────────────────────────────────────────────────
 
+/// Default memory level, as in zlib. Gives a 15-bit hash table and 16 KiB
+/// blocks.
+const DEFAULT_MEM_LEVEL: u8 = 8;
+
+/// How the encoder looks for matches, after zlib's `strategy` argument to
+/// `deflateInit2`. Output differs from zlib's byte for byte, but each
+/// strategy keeps the same limits on what goes into the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Strategy {
+    /// Normal LZ77 + Huffman coding (`Z_DEFAULT_STRATEGY`).
+    #[default]
+    Default,
+    /// Drop short matches (under 6 bytes) and lean on Huffman coding, for
+    /// data like filtered images with small, noisy values (`Z_FILTERED`).
+    Filtered,
+    /// Literals only, no matches (`Z_HUFFMAN_ONLY`).
+    HuffmanOnly,
+    /// Only distance-1 matches, i.e. runs of one byte (`Z_RLE`).
+    Rle,
+    /// Normal matching, but every block uses the fixed Huffman codes
+    /// (`Z_FIXED`).
+    Fixed,
+}
+
 /// Tunables for the deflate encoder.
 ///
-/// `level` controls the speed/ratio trade-off: `1` is fastest and produces
-/// the largest output, `9` is slowest and produces the smallest output. The
-/// default of `6` mirrors zlib's default and is a reasonable starting point
-/// for most use cases.
-///
-/// Values outside `1..=9` are clamped at encoder construction time.
+/// `level` controls the speed/ratio trade-off: `0` stores the data in
+/// uncompressed (stored) blocks, `1` is the fastest compressing level and
+/// `9` the slowest and smallest. The default of `6` mirrors zlib's default.
+/// Values above `9` are treated as `9`.
 ///
 /// `max_distance` caps the LZ77 back-reference distance, in bytes. The full
 /// deflate window is 32 KiB (`WINDOW_SIZE`) and that is the default. Lower
@@ -53,17 +82,30 @@ const WINDOW_MAX: usize = 2 * WINDOW_SIZE;
 /// back-reference farther than 4096 bytes, so set `max_distance: 4096` to
 /// target it. The value is clamped to `1..=WINDOW_SIZE`; it only constrains
 /// the encoder (decoding always supports the full window).
+/// [`EncoderConfig::with_window_bits`] sets it from zlib-style window bits.
+///
+/// `strategy` picks how matches are searched (see [`Strategy`]), and
+/// `mem_level` (`1..=9`, default `8`) is zlib's `memLevel`, taken as a
+/// tuning hint: it sets how much of the hash table is used
+/// (`1 << (mem_level + 7)` entries, at most 32768) and the block size
+/// (`1 << (mem_level + 6)` bytes). Lower values compress worse; they do not
+/// currently shrink the encoder's allocations.
+///
 /// `#[non_exhaustive]`: construct via [`EncoderConfig::default`] and the
 /// `with_*` builders rather than a struct literal, so new tuning knobs can be
 /// added in future without breaking downstream code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct EncoderConfig {
-    /// Compression level in `1..=9`.
+    /// Compression level in `0..=9` (`0` = stored blocks only).
     pub level: u8,
     /// Maximum LZ77 match distance in bytes (clamped to `1..=WINDOW_SIZE`).
     /// Default is `WINDOW_SIZE` (the full 32 KiB window).
     pub max_distance: usize,
+    /// Match-finding strategy. Default is [`Strategy::Default`].
+    pub strategy: Strategy,
+    /// zlib-style memory level in `1..=9` (clamped). Default is `8`.
+    pub mem_level: u8,
 }
 
 impl Default for EncoderConfig {
@@ -71,6 +113,8 @@ impl Default for EncoderConfig {
         Self {
             level: 6,
             max_distance: WINDOW_SIZE,
+            strategy: Strategy::Default,
+            mem_level: DEFAULT_MEM_LEVEL,
         }
     }
 }
@@ -81,7 +125,8 @@ impl EncoderConfig {
         Self::default()
     }
 
-    /// Set the compression level (clamped to `1..=9` at encoder build time).
+    /// Set the compression level: `0` = stored, `1..=9` = compressed
+    /// (values above 9 act as 9).
     #[must_use]
     pub fn with_level(mut self, level: u8) -> Self {
         self.level = level;
@@ -95,6 +140,40 @@ impl EncoderConfig {
     pub fn with_max_distance(mut self, max_distance: usize) -> Self {
         self.max_distance = max_distance;
         self
+    }
+
+    /// Set the window from zlib-style window bits: `max_distance` becomes
+    /// `1 << bits`. `bits` is clamped to `8..=15`, and `8` is treated as `9`
+    /// as zlib does. The zlib container writes the matching `CINFO`.
+    #[must_use]
+    pub fn with_window_bits(mut self, bits: u8) -> Self {
+        self.max_distance = 1usize << bits.clamp(9, 15);
+        self
+    }
+
+    /// Set the match-finding strategy.
+    #[must_use]
+    pub fn with_strategy(mut self, strategy: Strategy) -> Self {
+        self.strategy = strategy;
+        self
+    }
+
+    /// Set zlib's memory level (`1..=9`, clamped at encoder build time).
+    #[must_use]
+    pub fn with_mem_level(mut self, mem_level: u8) -> Self {
+        self.mem_level = mem_level;
+        self
+    }
+
+    /// Window bits matching `max_distance`: the smallest `bits` in `9..=15`
+    /// with `1 << bits >= max_distance`. Used for the zlib `CINFO` field.
+    pub(crate) fn window_bits(&self) -> u8 {
+        let d = self.max_distance.clamp(1, WINDOW_SIZE);
+        let mut bits = 9u8;
+        while (1usize << bits) < d {
+            bits += 1;
+        }
+        bits
     }
 }
 
@@ -117,7 +196,8 @@ struct LevelParams {
 }
 
 impl LevelParams {
-    /// Clamp `level` to `1..=9` and expand to the matching tuning knobs.
+    /// Clamp `level` to `1..=9` and expand to the matching tuning knobs
+    /// (level 0 is handled before the match finder is consulted).
     fn from_level(level: u8) -> Self {
         // Clamp instead of returning Err — keeping the public surface
         // infallible matches zlib's behaviour of silently snapping Z_BEST_*
@@ -306,6 +386,35 @@ fn distance_to_code(distance: u16) -> (u16, u16, u8) {
     (c as u16, extra_value, extra_bits)
 }
 
+// ─── flush modes ─────────────────────────────────────────────────────────
+
+/// Every flush the deflate encoder knows: the two of [`Flush`] plus zlib's
+/// `Z_PARTIAL_FLUSH` and `Z_BLOCK`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlushKind {
+    Sync,
+    Full,
+    Partial,
+    Block,
+}
+
+/// Map a `raw_flush`-style result to the public `(Progress, Status)` pair,
+/// the same way the [`crate::Encoder::flush`] bridge does.
+pub(crate) fn flush_result(p: RawProgress) -> (Progress, Status) {
+    let status = if p.done {
+        Status::InputEmpty
+    } else {
+        Status::OutputFull
+    };
+    (
+        Progress {
+            consumed: 0,
+            written: p.written,
+        },
+        status,
+    )
+}
+
 // ─── per-block symbol stream ─────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
@@ -478,6 +587,18 @@ pub struct Encoder {
     /// Match-finder tuning derived from [`EncoderConfig::level`]. Persisted
     /// across `reset` since configuration is meant to survive resets.
     params: LevelParams,
+    /// Compression level after clamping to `0..=9`; `0` = stored blocks.
+    level: u8,
+    strategy: Strategy,
+    /// Fresh-input bytes per block, from the memory level.
+    block_size: usize,
+    /// Absolute position before which nothing may be referenced (moved
+    /// forward by a full flush). Only the RLE pass needs it; the hash
+    /// chains are cleared instead.
+    history_floor: u64,
+    /// Preset dictionary (its last `WINDOW_SIZE` bytes), primed into the
+    /// window on construction and on every reset.
+    dictionary: Vec<u8>,
 
     // ─── reusable scratch buffers (avoid per-block allocation) ───
     /// Literal/length code frequencies for the current block.
@@ -511,15 +632,19 @@ impl Encoder {
         Self::with_config(EncoderConfig::default())
     }
 
-    /// Build an encoder with explicit configuration. `config.level` is
-    /// clamped to `1..=9` internally — out-of-range values are snapped to
-    /// the nearest valid level rather than rejected.
+    /// Build an encoder with explicit configuration. Levels above 9 act as
+    /// 9 and memory levels are clamped to `1..=9`, rather than rejected.
     pub fn with_config(config: EncoderConfig) -> Self {
+        let mem_level = config.mem_level.clamp(1, 9);
+        let level = config.level.min(9);
         Self {
             window: Vec::with_capacity(WINDOW_MAX),
             cursor: 0,
             window_start_abs: 0,
-            match_finder: Box::new(MatchFinder::with_max_distance(config.max_distance)),
+            match_finder: Box::new(MatchFinder::with_hash_bits(
+                config.max_distance,
+                mem_level as u32 + 7,
+            )),
             block_symbols: Vec::new(),
             block_bytes: Vec::new(),
             bit_writer: BitWriter::new(),
@@ -528,7 +653,12 @@ impl Encoder {
             state: EncState::Accepting,
             final_emitted: false,
             mid_flush: false,
-            params: LevelParams::from_level(config.level),
+            params: LevelParams::from_level(level),
+            level,
+            strategy: config.strategy,
+            block_size: 1 << (mem_level as usize + 6),
+            history_floor: 0,
+            dictionary: Vec::new(),
             lit_freq: [0u32; 286],
             dist_freq: [0u32; 30],
             lit_lengths: [0u8; 286],
@@ -541,6 +671,74 @@ impl Encoder {
             hdist_count: 0,
             hclen_count: 0,
         }
+    }
+
+    /// Use `dictionary` as a preset dictionary (zlib's
+    /// `deflateSetDictionary`): matches may refer back into it, so the
+    /// decoder must be given the same bytes. Only the last 32 KiB matter.
+    /// The dictionary is kept across [`reset`](crate::Encoder::reset).
+    /// Calling this resets the encoder, so do it before encoding.
+    #[must_use]
+    pub fn with_dictionary(mut self, dictionary: &[u8]) -> Self {
+        let keep = dictionary.len().min(WINDOW_SIZE);
+        self.dictionary.clear();
+        self.dictionary
+            .extend_from_slice(&dictionary[dictionary.len() - keep..]);
+        self.raw_reset();
+        self
+    }
+
+    /// Change the level and strategy mid-stream (zlib's `deflateParams`).
+    /// The new settings apply to input not yet compressed into a block; call
+    /// [`flush_block`](Self::flush_block) first to switch at an exact byte
+    /// position. Levels above 9 act as 9.
+    pub fn set_params(&mut self, level: u8, strategy: Strategy) {
+        self.level = level.min(9);
+        self.params = LevelParams::from_level(self.level);
+        self.strategy = strategy;
+    }
+
+    /// Like [`Flush::Sync`] (zlib's `Z_PARTIAL_FLUSH`), but instead of the
+    /// byte-aligning empty stored block it emits an empty fixed-Huffman
+    /// block (10 bits). The peer can decode all input so far; the output is
+    /// not byte-aligned. Call again with fresh output while it returns
+    /// [`Status::OutputFull`]; it returns [`Status::InputEmpty`] when done.
+    pub fn flush_partial(&mut self, output: &mut [u8]) -> Result<(Progress, Status), Error> {
+        self.raw_flush_kind(output, FlushKind::Partial)
+            .map(flush_result)
+    }
+
+    /// Close the current block without any marker or byte alignment
+    /// (zlib's `Z_BLOCK`). Up to 7 bits of the last block stay held back
+    /// until more output is produced, so the peer may not yet be able to
+    /// decode the very end. Same calling pattern as
+    /// [`flush_partial`](Self::flush_partial).
+    pub fn flush_block(&mut self, output: &mut [u8]) -> Result<(Progress, Status), Error> {
+        self.raw_flush_kind(output, FlushKind::Block)
+            .map(flush_result)
+    }
+
+    /// Clamped level and strategy, for container headers.
+    pub(crate) fn level_and_strategy(&self) -> (u8, Strategy) {
+        (self.level, self.strategy)
+    }
+
+    /// Put the preset dictionary (if any) into the window and hash chains.
+    fn prime_dictionary(&mut self) {
+        if self.dictionary.is_empty() {
+            return;
+        }
+        self.window.extend_from_slice(&self.dictionary);
+        let n = self.window.len();
+        for pos in 0..n.saturating_sub(2) {
+            self.match_finder.insert(
+                pos as u32,
+                self.window[pos],
+                self.window[pos + 1],
+                self.window[pos + 2],
+            );
+        }
+        self.cursor = n;
     }
 
     /// Drain accumulated block bytes into the caller's output. Returns true
@@ -559,8 +757,9 @@ impl Encoder {
     fn maybe_slide(&mut self) {
         // We slide once the back-history exceeds WINDOW_SIZE — keeping
         // exactly WINDOW_SIZE bytes of history is enough for any in-window
-        // distance to be reachable.
-        if self.cursor > WINDOW_SIZE {
+        // distance to be reachable. With blocks smaller than the default,
+        // allow more history first so we don't move 32 KiB per tiny block.
+        if self.cursor > WINDOW_SIZE + BLOCK_SIZE.saturating_sub(self.block_size) {
             let drop = self.cursor - WINDOW_SIZE;
             self.window.drain(..drop);
             self.cursor -= drop;
@@ -578,6 +777,12 @@ impl Encoder {
         let nice_match = self.params.nice_match;
         let good_match = self.params.good_match;
         let use_lazy = self.params.use_lazy;
+        // Z_FILTERED: matches shorter than this are treated as no match.
+        let min_len = if self.strategy == Strategy::Filtered {
+            6
+        } else {
+            MIN_MATCH
+        };
         let mut pos = self.cursor;
 
         // Lazy-matching state: at any iteration we may have a "pending"
@@ -618,6 +823,7 @@ impl Encoder {
                         nice_match,
                     )
                     .map(|(l, d)| (l as usize, d as usize))
+                    .filter(|&(l, _)| l >= min_len)
             } else {
                 None
             };
@@ -772,6 +978,71 @@ impl Encoder {
         }
 
         self.cursor = pos;
+    }
+
+    /// Huffman-only pass: every byte of `window[cursor..end]` is a literal.
+    fn literal_pass(&mut self, end: usize) {
+        let bytes = &self.window[self.cursor..end];
+        self.block_symbols
+            .extend(bytes.iter().map(|&b| Symbol::Literal(b)));
+        self.block_bytes.extend_from_slice(bytes);
+        self.cursor = end;
+    }
+
+    /// RLE pass: only distance-1 matches (runs of the previous byte), greedy.
+    fn rle_pass(&mut self, end: usize) {
+        // Index of the first window byte a match may copy from.
+        let floor_rel = self.history_floor.saturating_sub(self.window_start_abs) as usize;
+        let mut pos = self.cursor;
+        while pos < end {
+            if pos > floor_rel {
+                let prev = self.window[pos - 1];
+                let max = MAX_MATCH.min(self.window.len() - pos);
+                let mut len = 0usize;
+                while len < max && self.window[pos + len] == prev {
+                    len += 1;
+                }
+                if len >= MIN_MATCH {
+                    self.block_symbols.push(Symbol::Match {
+                        length: len as u16,
+                        distance: 1,
+                    });
+                    self.block_bytes
+                        .extend_from_slice(&self.window[pos..pos + len]);
+                    pos += len;
+                    continue;
+                }
+            }
+            let lit = self.window[pos];
+            self.block_symbols.push(Symbol::Literal(lit));
+            self.block_bytes.push(lit);
+            pos += 1;
+        }
+        self.cursor = pos;
+    }
+
+    /// Level 0: emit `window[cursor..end]` as stored blocks of at most
+    /// 65535 bytes each; BFINAL goes on the last one only.
+    fn emit_stored_range(&mut self, end: usize, bfinal: bool) {
+        let mut start = self.cursor;
+        loop {
+            let n = (end - start).min(u16::MAX as usize);
+            let last = start + n == end;
+            let bw = &mut self.bit_writer;
+            let out = &mut self.out_buffer;
+            bw.write(u32::from(bfinal && last), 1, out);
+            bw.write(0, 2, out); // BTYPE = 00
+            bw.align(out);
+            let len = n as u16;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.extend_from_slice(&self.window[start..start + n]);
+            start += n;
+            if last {
+                break;
+            }
+        }
+        self.cursor = end;
     }
 
     /// Build code lengths and the dynamic-block header into `self.*` from
@@ -1093,10 +1364,20 @@ impl Encoder {
     /// deflate block (choosing whichever of stored / fixed / dynamic is
     /// cheapest). `bfinal` controls BFINAL on the emitted block.
     fn compress_and_emit_block(&mut self, end_rel: usize, bfinal: bool) {
+        if self.level == 0 {
+            self.emit_stored_range(end_rel, bfinal);
+            self.maybe_slide();
+            return;
+        }
+
         self.block_symbols.clear();
         self.block_bytes.clear();
 
-        self.lz77_pass(end_rel);
+        match self.strategy {
+            Strategy::HuffmanOnly => self.literal_pass(end_rel),
+            Strategy::Rle => self.rle_pass(end_rel),
+            _ => self.lz77_pass(end_rel),
+        }
 
         // Tally frequencies into the persistent scratch arrays and accumulate
         // the length/distance extra-bits total in the same pass. The extra-bits
@@ -1122,6 +1403,12 @@ impl Encoder {
             }
         }
         self.lit_freq[END_OF_BLOCK as usize] += 1;
+
+        if self.strategy == Strategy::Fixed {
+            self.emit_fixed_block(bfinal);
+            self.maybe_slide();
+            return;
+        }
 
         // Compute dynamic-Huffman cost. This also stashes the header preparation
         // (RLE, cl_lengths, hlit/hdist/hclen counts) on `self` so the subsequent
@@ -1189,12 +1476,12 @@ impl RawEncoder for Encoder {
                 consumed += to_copy;
 
                 let lookahead = self.window.len() - self.cursor;
-                if lookahead >= BLOCK_SIZE {
+                if lookahead >= self.block_size {
                     // We have a full block of lookahead. Compress
                     // [cursor, cursor + BLOCK_SIZE). For lazy matching to
                     // see one more byte beyond the end, we leave that
                     // remaining lookahead in the window for the *next* block.
-                    let end_rel = self.cursor + BLOCK_SIZE;
+                    let end_rel = self.cursor + self.block_size;
                     self.compress_and_emit_block(end_rel, false);
                     self.state = EncState::Emitting;
                 } else if to_copy == 0 {
@@ -1243,10 +1530,10 @@ impl RawEncoder for Encoder {
 
             if matches!(self.state, EncState::Accepting) {
                 let remaining = self.window.len() - self.cursor;
-                if remaining >= BLOCK_SIZE {
+                if remaining >= self.block_size {
                     // Emit a non-final block, leave the rest for the next
                     // (final) one.
-                    let end_rel = self.cursor + BLOCK_SIZE;
+                    let end_rel = self.cursor + self.block_size;
                     self.compress_and_emit_block(end_rel, false);
                     self.state = EncState::Emitting;
                 } else {
@@ -1280,9 +1567,27 @@ impl RawEncoder for Encoder {
         self.state = EncState::Accepting;
         self.final_emitted = false;
         self.mid_flush = false;
+        self.history_floor = 0;
+        self.prime_dictionary();
     }
 
     fn raw_flush(&mut self, output: &mut [u8], mode: Flush) -> Result<RawProgress, Error> {
+        let kind = match mode {
+            Flush::Sync => FlushKind::Sync,
+            Flush::Full => FlushKind::Full,
+        };
+        self.raw_flush_kind(output, kind)
+    }
+}
+
+impl Encoder {
+    /// Shared body of every flush mode. `RawProgress.done` means this flush
+    /// call is complete, as for [`RawEncoder::raw_flush`].
+    pub(crate) fn raw_flush_kind(
+        &mut self,
+        output: &mut [u8],
+        kind: FlushKind,
+    ) -> Result<RawProgress, Error> {
         if matches!(self.state, EncState::Done) || self.final_emitted {
             return Err(Error::Corrupt);
         }
@@ -1336,13 +1641,25 @@ impl RawEncoder for Encoder {
                 let end_rel = self.window.len();
                 self.compress_and_emit_block(end_rel, false);
             }
-            self.emit_sync_marker();
-            if matches!(mode, Flush::Full) {
-                // Reset the LZ77 hash chains so subsequent matches cannot
-                // reach back across the flush boundary. The window bytes
-                // themselves stay — they're just no longer reachable via
-                // any chain entry. This mirrors Z_FULL_FLUSH semantics.
-                self.match_finder.reset();
+            match kind {
+                FlushKind::Sync => self.emit_sync_marker(),
+                FlushKind::Full => {
+                    self.emit_sync_marker();
+                    // Reset the LZ77 hash chains so subsequent matches cannot
+                    // reach back across the flush boundary. The window bytes
+                    // themselves stay — they're just no longer reachable via
+                    // any chain entry. This mirrors Z_FULL_FLUSH semantics.
+                    self.match_finder.reset();
+                    self.history_floor = self.window_start_abs + self.cursor as u64;
+                }
+                FlushKind::Partial => {
+                    // Empty fixed-Huffman block: BFINAL=0, BTYPE=01, then
+                    // the 7-bit all-zero code for end-of-block.
+                    let out = &mut self.out_buffer;
+                    self.bit_writer.write(0b010, 3, out);
+                    self.bit_writer.write(0, 7, out);
+                }
+                FlushKind::Block => {}
             }
             self.mid_flush = true;
             self.state = EncState::Emitting;

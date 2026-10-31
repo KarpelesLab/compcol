@@ -425,8 +425,8 @@ fn level_9_no_worse_than_level_1_on_compressible_corpus() {
 
 #[test]
 fn out_of_range_level_is_clamped() {
-    // Level 0 and level 250 should both produce valid streams (clamped to
-    // 1 and 9 respectively) — we don't expose a fallible constructor.
+    // Level 0 (stored) and level 250 (clamped to 9) should both produce
+    // valid streams — we don't expose a fallible constructor.
     let input = b"the rain in spain falls mainly on the plain";
     let mut enc_lo = Encoder::with_config(EncoderConfig::default().with_level(0));
     let enc_lo_out = encode_chunked(&mut enc_lo, input, 4096, 4096);

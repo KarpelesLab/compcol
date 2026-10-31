@@ -45,7 +45,7 @@ flag accept; *Ext* is what `factory::extension(name)` returns.
 | Algorithm | Feature | Name | Ext | Encoder | Decoder | Cross-validation |
 |---|---|---|---|---|---|---|
 | RLE | `rle` | `rle` | `.rle` | full | full | — |
-| Deflate (RFC 1951) | `deflate` | `deflate` | `.deflate` | full (lazy LZ77 + dynamic / fixed / stored Huffman; cross-block matching) | full | `python3 -c "import zlib"` |
+| Deflate (RFC 1951) | `deflate` | `deflate` | `.deflate` | full (lazy LZ77 + dynamic / fixed / stored Huffman; cross-block matching; levels 0–9, zlib strategies, window bits, preset dictionary, partial / block / sync / full flush) | full | `python3 -c "import zlib"` |
 | Deflate64 (PKWARE method 9) | `deflate64` | `deflate64` | `.deflate64` | full (LZ77 + 64 KiB window + extended length/distance codes) | full | `7z a -tzip -mm=deflate64` |
 | Zlib (RFC 1950) | `zlib` | `zlib` | `.zz` | full | full | `python3 -c "import zlib"` |
 | Gzip (RFC 1952) | `gzip` | `gzip` | `.gz` | full | full | `gzip(1)` |
@@ -384,8 +384,8 @@ each algorithm (e.g. `"gz"` for gzip, `"zst"` for zstd). Both
 `names()` and `extension()` are `const fn`.
 
 `encoder_by_name_with_level` plumbs a level into the algorithms that
-have one, clamping to each range: deflate / deflate64 / zlib / gzip
-`1..=9` (default 6), lzma / xz `0..=9` (default 6), zstd `1..=22`
+have one, clamping to each range: deflate / zlib / gzip `0..=9`
+(0 = stored, default 6), deflate64 `1..=9` (default 6), lzma / xz `0..=9` (default 6), zstd `1..=22`
 (default 3), brotli quality `0..=11` (default 6), bzip2 block size
 `1..=9` (default 6), lz4 / lz4-frame `0` = fast greedy, higher = HC
 match finder.
@@ -464,7 +464,7 @@ Compression tuning:
     -l, --level N           Compression level for the encoder
                             (ignored on decompress and on algorithms
                             without a level knob):
-                              deflate/zlib/gzip: 1..=9, default 6
+                              deflate/zlib/gzip: 0..=9, default 6 (0 = stored)
                               lzma/xz:           0..=9, default 6
                               zstd:              1..=22, default 3
                               brotli quality:    0..=11, default 6
