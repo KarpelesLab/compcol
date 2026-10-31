@@ -30,6 +30,8 @@ pub mod decoder;
 #[cfg(not(feature = "embed"))]
 pub mod encoder;
 #[cfg(not(feature = "embed"))]
+mod inftable;
+#[cfg(not(feature = "embed"))]
 pub mod lz77;
 
 #[cfg(not(feature = "embed"))]

@@ -70,6 +70,27 @@ impl BitReader {
         bytes
     }
 
+    /// The raw accumulator and its bit count, for a decoder's hot loop to
+    /// work on in registers. Bits above `nbits` are zero.
+    // Only the heap-backed deflate decoder uses this.
+    #[allow(dead_code)]
+    pub fn parts(&self) -> (u64, u32) {
+        (self.acc, self.nbits)
+    }
+
+    /// Restore state taken by [`parts`](Self::parts). `nbits <= 64`, and
+    /// bits of `acc` above `nbits` are cleared here.
+    #[allow(dead_code)]
+    pub fn set_parts(&mut self, acc: u64, nbits: u32) {
+        debug_assert!(nbits <= 64);
+        self.acc = if nbits >= 64 {
+            acc
+        } else {
+            acc & ((1u64 << nbits) - 1)
+        };
+        self.nbits = nbits;
+    }
+
     /// Erase all pending state.
     pub fn reset(&mut self) {
         self.acc = 0;
