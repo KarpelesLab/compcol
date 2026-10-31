@@ -1,5 +1,6 @@
-//! PPMd — Dmitry Shkarin's PPMII variant H, the format used by 7-Zip
-//! (method `PPMd`), RAR3+ (PPM block mode), and ZIP method 98.
+//! PPMd — Dmitry Shkarin's PPMII: variant H, the format used by 7-Zip
+//! (method `PPMd`) and RAR3+ (PPM block mode), and variant I rev. 1, the
+//! format of ZIP method 98.
 //!
 //! PPMd is a **context-modelling entropy coder** — there is no Lempel-Ziv
 //! matching. The model maintains a tree of symbol-frequency contexts of
@@ -23,6 +24,12 @@
 //!   can desync at the memory-restart point and return [`Error::Corrupt`]
 //!   rather than decoding — it fails closed (never wrong bytes); see the
 //!   `glue_free_blocks` note in `ppmd7`.
+//! - **ZIP method 98 decoder**: [`ZipDecoder`] decodes PPMd variant I
+//!   rev. 1 (`ppmd8`, a port of the LZMA SDK's `Ppmd8.c`) as stored in a
+//!   ZIP entry: a 2-byte header with the order, memory size and restore
+//!   method, then the range-coded data. It streams, and handles both the
+//!   restart and cut-off restore methods, matching 7-Zip when the model
+//!   runs out of memory. The ZIP header supplies the output size.
 //! - **Encoder**: permanently returns [`Error::Unsupported`]. The PPM
 //!   model maintenance plus carry-less range encoder are out of scope; we
 //!   follow the `rar*` precedent and ship the encoder as a stub.
@@ -57,8 +64,9 @@
 //!
 //! - Shkarin 2002 DCC paper "PPM: One step to practicality".
 //! - <https://en.wikipedia.org/wiki/Prediction_by_partial_matching>.
-//! - Igor Pavlov's `Ppmd7.{c,h}`, `Ppmd7Dec.c` in the LZMA SDK
-//!   (public domain).
+//! - Igor Pavlov's `Ppmd7.{c,h}`, `Ppmd7Dec.c`, `Ppmd8.{c,h}`,
+//!   `Ppmd8Dec.c` in the LZMA SDK (public domain).
+//! - PKWARE APPNOTE.TXT §5.10 (ZIP method 98).
 
 #![cfg_attr(docsrs, doc(cfg(feature = "ppmd")))]
 
@@ -69,9 +77,12 @@ use crate::traits::{Algorithm, RawEncoder, RawProgress};
 
 mod decoder;
 mod ppmd7;
+mod ppmd8;
 mod range_dec;
+mod zip;
 
 pub use decoder::Decoder;
+pub use zip::ZipDecoder;
 
 // Re-exported for the RAR3/4 PPMd path; unused when `ppmd` is built alone.
 #[cfg(feature = "rar3")]
