@@ -11,6 +11,11 @@
 //! buffers and the codec preserves its state across `encode`/`decode` calls.
 //! The decoder keeps the 32 KiB sliding window on the heap.
 //!
+//! The decoder reads ahead within a call but never past the end of the
+//! stream: once it reports `StreamEnd`, `consumed` stops at the byte holding
+//! the final block's last bit. `Decoder::decode_block` returns after each
+//! block, like zlib's `inflate(Z_BLOCK)`.
+//!
 //! With the `embed` feature, `Encoder`, `Decoder` and their configs are the
 //! allocation-free variants instead, alongside one-shot `decompress`,
 //! `decompressed_len` and `compress` functions; see `compcol::embed`

@@ -8,13 +8,20 @@
 //! ```
 //! - `CMF`: bits 0-3 = CM (8 = deflate), bits 4-7 = CINFO (`log2(WINDOW)-8`).
 //! - `FLG`: bits 0-4 = FCHECK (chosen so `CMF*256 + FLG` is a multiple of 31),
-//!   bit 5 = FDICT (preset dictionary; then a 4-byte DICTID, the
-//!   big-endian Adler-32 of the dictionary, follows), bits 6-7 = FLEVEL.
+//!   bit 5 = FDICT, bits 6-7 = FLEVEL.
+//! - With FDICT set, a 4-byte big-endian DICTID (the Adler-32 of a preset
+//!   dictionary) follows the header. The decoder uses the dictionary from
+//!   its config, or else stops with `Error::NeedDictionary` until
+//!   `Decoder::set_dictionary` supplies it (zlib's `Z_NEED_DICT`).
 //! - 4-byte big-endian Adler-32 of the **uncompressed** data.
 //!
 //! The encoder writes CINFO from the deflate window
 //! (`Encoder::with_deflate_config`) and FDICT/DICTID when given a
 //! dictionary (`Encoder::with_dictionary`).
+//!
+//! The decoder never counts bytes after the trailer as consumed, and
+//! `Decoder::decode_block` stops at deflate block boundaries like zlib's
+//! `inflate(Z_BLOCK)`.
 //!
 //! With the `embed` feature, `Encoder`, `Decoder` and their configs are the
 //! allocation-free variants instead, alongside one-shot `decompress`,

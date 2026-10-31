@@ -988,43 +988,50 @@ fn trailing_bytes_do_not_stall_decompress_to_vec() {
 /// `UnexpectedEnd` while output was still pending.)
 #[test]
 fn finish_drains_pending_output_into_a_small_buffer() {
-    let plain = b"hello hello hello world ".repeat(200);
-    let mut enc = <Deflate>::encoder();
-    let mut encoded = vec![0u8; plain.len() + 1024];
-    let (p, _) = enc.encode(&plain, &mut encoded).unwrap();
-    let mut len = p.written;
-    loop {
-        let (p, status) = enc.finish(&mut encoded[len..]).unwrap();
-        len += p.written;
-        if status == Status::StreamEnd {
-            break;
+    // Output is still pending once all input is consumed only when the
+    // stream's last bits share a byte with the final match, so try a few
+    // lengths.
+    let mut held = 0;
+    for reps in 190..230 {
+        let plain = b"hello hello hello world ".repeat(reps);
+        let mut enc = <Deflate>::encoder();
+        let mut encoded = vec![0u8; plain.len() + 1024];
+        let (p, _) = enc.encode(&plain, &mut encoded).unwrap();
+        let mut len = p.written;
+        loop {
+            let (p, status) = enc.finish(&mut encoded[len..]).unwrap();
+            len += p.written;
+            if status == Status::StreamEnd {
+                break;
+            }
         }
-    }
-    encoded.truncate(len);
+        encoded.truncate(len);
 
-    let mut dec = <Deflate>::decoder();
-    let mut small = [0u8; 4];
-    let mut out = Vec::new();
-    let mut consumed = 0;
-    let mut ended = false;
-    while consumed < encoded.len() && !ended {
-        let (p, status) = dec.decode(&encoded[consumed..], &mut small).unwrap();
-        out.extend_from_slice(&small[..p.written]);
-        consumed += p.consumed;
-        ended = status == Status::StreamEnd;
+        let mut dec = <Deflate>::decoder();
+        let mut small = [0u8; 4];
+        let mut out = Vec::new();
+        let mut consumed = 0;
+        let mut ended = false;
+        while consumed < encoded.len() && !ended {
+            let (p, status) = dec.decode(&encoded[consumed..], &mut small).unwrap();
+            out.extend_from_slice(&small[..p.written]);
+            consumed += p.consumed;
+            ended = status == Status::StreamEnd;
+        }
+        if out.len() < plain.len() {
+            held += 1;
+        }
+        while !ended {
+            let (p, status) = dec.finish(&mut small).unwrap();
+            out.extend_from_slice(&small[..p.written]);
+            ended = status == Status::StreamEnd;
+            assert!(ended || p.written > 0, "finish stalled");
+        }
+        assert_eq!(out, plain);
     }
     // (The `embed` decoder takes its input a step at a time, so it never
     // gets ahead of its output like this.)
     #[cfg(not(feature = "embed"))]
-    assert!(
-        out.len() < plain.len(),
-        "the decoder should still hold output"
-    );
-    while !ended {
-        let (p, status) = dec.finish(&mut small).unwrap();
-        out.extend_from_slice(&small[..p.written]);
-        ended = status == Status::StreamEnd;
-        assert!(ended || p.written > 0, "finish stalled");
-    }
-    assert_eq!(out, plain);
+    assert!(held > 0, "the decoder should sometimes still hold output");
+    let _ = held;
 }
