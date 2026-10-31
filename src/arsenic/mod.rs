@@ -31,7 +31,7 @@
 //! ## Encoder
 //!
 //! Permanently [`Error::Unsupported`]: StuffIt 5 is a decode-only target in
-//! this crate (matching LZFSE, Quantum, RAR\*, …).
+//! this crate (matching Quantum, RAR\*, …).
 //!
 //! ## Tables
 //!

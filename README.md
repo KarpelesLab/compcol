@@ -65,7 +65,7 @@ flag accept; *Ext* is what `factory::extension(name)` returns.
 | LZX (Microsoft CAB / WIM) | `lzx` | `lzx` | `.lzx` | uncompressed blocks only | full (verbatim + aligned-offset + uncompressed; E8 filter) | — |
 | Amiga LZX (original 1995 Forbes) | `amiga_lzx` | `amiga_lzx` | — | uncompressed blocks only | full (verbatim + aligned + uncompressed; fixed 64 KiB window, no chunk reset, no E8 filter) | — |
 | Quantum (Stac, old CAB) | `quantum` | `quantum` | `.q` | `Unsupported` (no public encoder exists) | full (libmspack-equivalent) | libmspack regression fixtures |
-| LZFSE (Apple) | `lzfse` | `lzfse` | `.lzfse` | `Unsupported` (decoder-only) | `bvx-` raw + `bvxn` (LZVN) + `bvx2` (LZ77 + FSE); `bvx1` returns `Unsupported` | round-trip (bvx2 vs own FSE encoder; no Apple toolchain bundled) |
+| LZFSE (Apple) | `lzfse` | `lzfse` | `.lzfse` | `bvx2` (hash-chain LZ77 + lazy matching + FSE), `bvxn` (LZVN) under 4 KiB, `bvx-` when compression doesn't help; sync/full flush | `bvx-` raw + `bvxn` (LZVN) + `bvx2` (LZ77 + FSE); `bvx1` returns `Unsupported` | Apple `libcompression` (`COMPRESSION_LZFSE`, macOS) both directions; `lzfse_rust` both directions |
 | ADC (Apple DMG) | `adc` | `adc` | `.adc` | LZSS-style greedy match-finder | full | hand-built fixtures |
 | PackBits (Apple / TIFF / PSD) | `packbits` | `packbits` | `.packbits` | full (libtiff-equivalent greedy) | full | PIL TIFF PackBits fixtures |
 | bzip2 | `bzip2` | `bzip2` | `.bz2` | full (byte-identical to libbzip2: RLE-1 + `BZ2_blockSort` BWT + MTF + RLE-2 + dynamic Huffman) | full | `bzip2(1)` both directions |

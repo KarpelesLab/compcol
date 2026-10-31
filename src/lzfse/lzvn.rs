@@ -1,4 +1,4 @@
-//! LZVN block decoder.
+//! LZVN block decoder and encoder.
 //!
 //! Faithful port of Apple's `lzvn_decode_base.c` (BSD-3-Apple), restricted
 //! to the single-call shape this crate uses (the input block is fully
@@ -11,6 +11,7 @@
 use alloc::vec::Vec;
 
 use crate::error::Error;
+use crate::lzfse::encoder::MatchFinder;
 
 /// Decoded opcode classes (one per byte of the 256-entry dispatch table).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -487,4 +488,131 @@ fn lz_copy(
         }
     }
     Ok(())
+}
+
+// ─────────────────────────────── encoder ─────────────────────────────────
+
+/// Largest distance an LZVN opcode can carry (`lrg_d`'s 16-bit field).
+const LZVN_MAX_D: usize = 0xFFFF;
+/// Shortest match worth an opcode.
+const LZVN_MIN_MATCH: usize = 4;
+
+/// Emit `lits` with literal-only opcodes (`sml_l` for 1..=15 bytes, `lrg_l`
+/// for 16..=271).
+fn emit_literals(out: &mut Vec<u8>, mut lits: &[u8]) {
+    while !lits.is_empty() {
+        let n = lits.len().min(271);
+        if n >= 16 {
+            out.push(0xE0);
+            out.push((n - 16) as u8);
+        } else {
+            out.push(0xE0 | n as u8);
+        }
+        out.extend_from_slice(&lits[..n]);
+        lits = &lits[n..];
+    }
+}
+
+/// Emit `m` more bytes of match at the previous distance (`sml_m` for
+/// 1..=15, `lrg_m` for 16..=271).
+fn emit_rep_match(out: &mut Vec<u8>, mut m: usize) {
+    while m > 0 {
+        let n = m.min(271);
+        if n >= 16 {
+            out.push(0xF0);
+            out.push((n - 16) as u8);
+        } else {
+            out.push(0xF0 | n as u8);
+        }
+        m -= n;
+    }
+}
+
+/// Emit `lits` followed by an `m`-byte match at distance `d`, updating
+/// `d_prev`.
+///
+/// The distance opcodes carry up to three literals. Their `LLMMM` fields
+/// share the opcode byte with other opcode classes, so with `L` literals
+/// attached `sml_d`, `lrg_d` and `pre_d` take at most `10 - 2L` match bytes
+/// (the larger combinations are other opcodes or undefined), while `med_d`
+/// takes up to 34; the rest of a longer match follows as `sml_m` / `lrg_m`.
+/// `pre_d` needs at least one literal (`L = 0` collides with the
+/// end-of-stream and no-op opcodes), so a bare repeat-distance match is
+/// coded as `sml_m` / `lrg_m` alone.
+fn emit_match(out: &mut Vec<u8>, lits: &[u8], m: usize, d: usize, d_prev: &mut usize) {
+    debug_assert!(m >= 3 && (1..=LZVN_MAX_D).contains(&d));
+    // Literals beyond the (up to) three a distance opcode can carry.
+    let attached = lits.len() & 3;
+    emit_literals(out, &lits[..lits.len() - attached]);
+    let lits = &lits[lits.len() - attached..];
+    let l = lits.len();
+
+    if d == *d_prev && l == 0 {
+        emit_rep_match(out, m);
+        return;
+    }
+    let short = m.min(10 - 2 * l);
+    let first = if d == *d_prev {
+        // pre_d: LLMMM110
+        out.push(((l as u8) << 6) | (((short - 3) as u8) << 3) | 0b110);
+        short
+    } else if d < 0x600 {
+        // sml_d: LLMMMDDD DDDDDDDD
+        out.push(((l as u8) << 6) | (((short - 3) as u8) << 3) | (d >> 8) as u8);
+        out.push(d as u8);
+        short
+    } else if d < 0x4000 {
+        // med_d: 101LLMMM DDDDDDMM DDDDDDDD
+        let mm = m.min(34);
+        let x = (mm - 3) as u16;
+        out.push(0xA0 | ((l as u8) << 3) | (x >> 2) as u8);
+        out.extend_from_slice(&(((d as u16) << 2) | (x & 3)).to_le_bytes());
+        mm
+    } else {
+        // lrg_d: LLMMM111 DDDDDDDD DDDDDDDD
+        out.push(((l as u8) << 6) | (((short - 3) as u8) << 3) | 0b111);
+        out.extend_from_slice(&(d as u16).to_le_bytes());
+        short
+    };
+    out.extend_from_slice(lits);
+    *d_prev = d;
+    emit_rep_match(out, m - first);
+}
+
+/// Encode `src` as an LZVN payload, end-of-stream opcode included (the body
+/// of a `bvxn` block). Matches never reach outside `src`.
+pub(crate) fn encode_block(src: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len() + src.len() / 16 + 16);
+    let mut mf = MatchFinder::new(12);
+    mf.prepare(src.len());
+    let mut d_prev = 0usize;
+    let mut lit_start = 0usize;
+    let mut p = 0usize;
+    while p + LZVN_MIN_MATCH <= src.len() {
+        let (mut len, mut dist) = mf.find(src, p, 0, LZVN_MAX_D, src.len() - p, 16);
+        if d_prev != 0 && p >= d_prev {
+            let rl = crate::lzfse::encoder::common_len(src, p - d_prev, p, src.len() - p);
+            if rl >= LZVN_MIN_MATCH && rl + 1 >= len {
+                (len, dist) = (rl, d_prev);
+            }
+        }
+        mf.insert(src, p);
+        if len < LZVN_MIN_MATCH {
+            p += 1;
+            continue;
+        }
+        emit_match(&mut out, &src[lit_start..p], len, dist, &mut d_prev);
+        let end = p + len;
+        p += 1;
+        while p < end && p + LZVN_MIN_MATCH <= src.len() {
+            mf.insert(src, p);
+            p += 1;
+        }
+        p = end;
+        lit_start = end;
+    }
+    emit_literals(&mut out, &src[lit_start..]);
+    // End of stream: opcode 0x06 padded to 8 bytes.
+    out.extend_from_slice(&[0x06, 0, 0, 0, 0, 0, 0, 0]);
+    out
 }

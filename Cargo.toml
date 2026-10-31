@@ -149,9 +149,11 @@ lzx     = ["alloc"]
 amiga_lzx = ["alloc"]
 # Quantum (Stac, old CAB format). Decoder-only target.
 quantum = ["alloc"]
-# LZFSE (Apple's LZ77 + Finite State Entropy). Decoder-only target — the
-# encoder permanently returns `Error::Unsupported`. Handles `bvx-` and
-# `bvxn` (LZVN) blocks; `bvx2` blocks return Unsupported in this build.
+# LZFSE (Apple's LZ77 + Finite State Entropy; libcompression's
+# COMPRESSION_LZFSE). Encoder and decoder: the encoder writes `bvx2` (FSE)
+# blocks, `bvxn` (LZVN) for inputs under 4 KiB and `bvx-` where compression
+# doesn't help, like Apple's reference; the decoder reads `bvx-`, `bvxn` and
+# `bvx2` (`bvx1` returns `Unsupported`).
 lzfse   = ["alloc"]
 # ADC (Apple Data Compression) — the LZSS-like codec used in Apple DMG
 # disk images and HFS+ compressed resource forks.
@@ -317,6 +319,9 @@ tokio = { version = "1", default-features = false, optional = true }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "io-util"] }
 # Test-only: the reference the `embed::flate` tests round-trip against.
 flate2 = "1"
+# Test-only: an independent LZFSE implementation (validated against Apple's
+# reference) that cross-checks the `lzfse` encoder on every platform.
+lzfse_rust = "0.2"
 
 [[bin]]
 name             = "compcol"

@@ -39,8 +39,6 @@
 //! Frequency tables in the v2 block header are encoded with the custom
 //! variable-width scheme implemented by [`decode_freq_table`].
 
-#![allow(dead_code)]
-
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -259,6 +257,209 @@ pub(crate) fn decode_freq_table(
         pos += nbits;
     }
     Ok((freqs, pos))
+}
+
+// ───────────────────────────── encoder side ─────────────────────────────
+
+/// Normalize a histogram to frequencies summing exactly to `n_states`
+/// (a power of two), giving every present symbol at least 1.
+///
+/// Each count is scaled by `n_states / total` and rounded to nearest; the
+/// rounding error is then absorbed by the most frequent symbol, which costs
+/// the least (in bits) to perturb. When that symbol cannot absorb an
+/// overshoot without dropping to zero — many forced-to-1 singletons — the
+/// excess is shaved off the largest entries one at a time. A histogram with
+/// no symbols at all yields `freq[0] = n_states` so the table stays valid.
+pub(crate) fn normalize_freq(hist: &[u32], n_states: usize, freq: &mut [u16]) {
+    debug_assert_eq!(hist.len(), freq.len());
+    let total: u64 = hist.iter().map(|&h| h as u64).sum();
+    freq.fill(0);
+    if total == 0 {
+        freq[0] = n_states as u16;
+        return;
+    }
+    let mut assigned: i64 = 0;
+    let mut largest = 0usize;
+    for (i, &h) in hist.iter().enumerate() {
+        if h == 0 {
+            continue;
+        }
+        let scaled = (h as u64 * n_states as u64 + total / 2) / total;
+        let f = scaled.clamp(1, n_states as u64);
+        freq[i] = f as u16;
+        assigned += f as i64;
+        if hist[i] > hist[largest] || hist[largest] == 0 {
+            largest = i;
+        }
+    }
+    let mut diff = n_states as i64 - assigned;
+    if diff == 0 {
+        return;
+    }
+    // Fast path: the most frequent symbol absorbs the whole correction.
+    if diff > 0 || (freq[largest] as i64) + diff >= 1 {
+        freq[largest] = (freq[largest] as i64 + diff) as u16;
+        return;
+    }
+    // Overshoot the largest cannot absorb: decrement the currently largest
+    // entry (> 1) until the sum is right. Bounded by the alphabet size.
+    while diff < 0 {
+        let (idx, _) = freq
+            .iter()
+            .enumerate()
+            .filter(|&(_, &f)| f > 1)
+            .max_by_key(|&(_, &f)| f)
+            .expect("an entry > 1 exists while the sum overshoots");
+        freq[idx] -= 1;
+        diff += 1;
+    }
+}
+
+/// Encode a frequency value with the LZFSE fixed prefix code (the inverse of
+/// [`decode_freq_table`]). Returns `(code, n_bits)`; values above 1047 do not
+/// occur (the largest table has 1024 states).
+pub(crate) fn encode_freq_value(v: u16) -> (u32, u32) {
+    match v {
+        0 => (0b00, 2),
+        1 => (0b10, 2),
+        2 => (0b001, 3),
+        3 => (0b101, 3),
+        4 => (0b00011, 5),
+        5 => (0b01011, 5),
+        6 => (0b10011, 5),
+        7 => (0b11011, 5),
+        8..=23 => (0b0111 | ((v as u32 - 8) << 4), 8),
+        _ => {
+            debug_assert!(v <= 1047);
+            (0b1111 | ((v as u32 - 24) << 4), 14)
+        }
+    }
+}
+
+/// Per-symbol FSE encoder entry: the inverse of the decode table built by
+/// [`build_literal_decoder`] / [`build_lmd_decoder`].
+///
+/// A symbol with frequency `f` owns the `f` consecutive decode slots starting
+/// at `offset`. Its first `j0` slots consume `k` bits and their next-state
+/// ranges tile `[s0, n_states)`; the remaining slots consume `k - 1` bits and
+/// tile `[0, s0)`, where `s0 = (f << k) - n_states`. Encoding a symbol from
+/// encoder state `x` (the decoder's *next* state) therefore emits the low
+/// `k` (or `k - 1`) bits of `x` and moves to the slot whose range holds `x`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct FseEncEntry {
+    /// States below `s0` use `k - 1` bits.
+    s0: i32,
+    k: u8,
+    /// New state for the `k`-bit branch is `delta0 + (x >> k)`.
+    delta0: i32,
+    /// New state for the `(k - 1)`-bit branch is `delta1 + (x >> (k - 1))`.
+    delta1: i32,
+}
+
+/// Build the encoder entries for a normalized frequency table.
+pub(crate) fn build_encoder(freq: &[u16], n_states: usize, table: &mut [FseEncEntry]) {
+    debug_assert!(n_states.is_power_of_two());
+    debug_assert_eq!(freq.len(), table.len());
+    let n = n_states as i32;
+    let log2 = n_states.trailing_zeros() as i32;
+    let mut offset = 0i32;
+    for (e, &f) in table.iter_mut().zip(freq) {
+        if f == 0 {
+            *e = FseEncEntry::default();
+            continue;
+        }
+        let f = f as i32;
+        let k = log2 - (31 - (f as u32).leading_zeros() as i32);
+        let s0 = (f << k) - n;
+        let delta0 = offset - f + (n >> k);
+        // With k == 0 (f == n_states) every state takes the k-bit branch.
+        let delta1 = if k > 0 {
+            offset - f + (n >> (k - 1))
+        } else {
+            0
+        };
+        *e = FseEncEntry {
+            s0,
+            k: k as u8,
+            delta0,
+            delta1,
+        };
+        offset += f;
+    }
+}
+
+/// Encode one symbol from encoder state `x`: returns `(bits, n_bits, new_state)`.
+#[inline]
+pub(crate) fn fse_encode(e: &FseEncEntry, x: u32) -> (u32, u32, u32) {
+    let k = e.k as u32;
+    if (x as i32) < e.s0 {
+        let nb = k - 1;
+        (
+            x & ((1 << nb) - 1),
+            nb,
+            (e.delta1 + (x >> nb) as i32) as u32,
+        )
+    } else {
+        (
+            x & ((1u32 << k) - 1),
+            k,
+            (e.delta0 + (x >> k) as i32) as u32,
+        )
+    }
+}
+
+/// LSB-first bit writer.
+///
+/// For the FSE payload streams ([`BitWriter::new_fse`]) the writer starts
+/// with 8 zero bytes, as Apple's encoder does: the decoder reads the stream
+/// backwards in 8-byte loads and may top its accumulator up from below the
+/// last real bit. Chunks must be pushed in the reverse of the order the
+/// decoder pulls them ([`FseBits`] reads from the top down).
+pub(crate) struct BitWriter {
+    out: Vec<u8>,
+    acc: u64,
+    n: u32,
+}
+
+impl BitWriter {
+    pub(crate) fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            acc: 0,
+            n: 0,
+        }
+    }
+
+    pub(crate) fn new_fse(capacity: usize) -> Self {
+        let mut out = Vec::with_capacity(capacity + 16);
+        out.extend_from_slice(&[0u8; 8]);
+        Self { out, acc: 0, n: 0 }
+    }
+
+    /// Append the low `n_bits` (`<= 32`) bits of `value`.
+    #[inline]
+    pub(crate) fn push(&mut self, value: u32, n_bits: u32) {
+        debug_assert!(n_bits <= 32);
+        debug_assert!(n_bits == 32 || value >> n_bits == 0);
+        self.acc |= (value as u64) << self.n;
+        self.n += n_bits;
+        while self.n >= 8 {
+            self.out.push(self.acc as u8);
+            self.acc >>= 8;
+            self.n -= 8;
+        }
+    }
+
+    /// Flush the partial byte. Returns the bytes and the header's 3-bit
+    /// "bits" field (`7 -` the number of unused high bits of the last byte).
+    pub(crate) fn finish(mut self) -> (Vec<u8>, u32) {
+        let mut unused = 0;
+        if self.n > 0 {
+            self.out.push(self.acc as u8);
+            unused = 8 - self.n;
+        }
+        (self.out, 7 - unused)
+    }
 }
 
 #[cfg(test)]

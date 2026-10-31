@@ -25,7 +25,7 @@
 //!   `glue_free_blocks` note in `ppmd7`.
 //! - **Encoder**: permanently returns [`Error::Unsupported`]. The PPM
 //!   model maintenance plus carry-less range encoder are out of scope; we
-//!   follow the `lzfse`/`rar*` precedent and ship the encoder as a stub.
+//!   follow the `rar*` precedent and ship the encoder as a stub.
 //!
 //! ### Wire framing
 //!

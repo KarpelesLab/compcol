@@ -1,11 +1,9 @@
-//! LZFSE v2 (`bvx2`) block decoder.
+//! LZFSE v2 (`bvx2`) block decoder and encoder.
 //!
-//! ## Status in this build
-//!
-//! **`bvx2` blocks are now decoded.** This is the core LZFSE block type
-//! (LZ77 literal/match commands entropy-coded with Finite State Entropy),
-//! so the `lzfse` decoder handles real compressed payloads here rather than
-//! only the `bvx-` (uncompressed) and `bvxn` (LZVN) block kinds.
+//! `bvx2` is the core LZFSE block type: LZ77 literal/match commands
+//! entropy-coded with Finite State Entropy. [`decode_block`] decodes one;
+//! [`encode_block`] encodes a block from commands chosen by the streaming
+//! encoder's parser (`super::encoder`).
 //!
 //! ## Validation & interop
 //!
@@ -19,10 +17,11 @@
 //!
 //! `tests/lzfse.rs` decodes multi-block `bvx2` fixtures produced by an
 //! independent encoder (`lzfse_rust`, which is validated against Apple's
-//! reference library). Within the crate, the `#[cfg(test)]` encoder
-//! ([`encode_block`]) emits the same format and is used for round-trip
-//! tests over empty / small / text / repetitive / random / multi-block
-//! inputs with skewed, non-dyadic frequency tables.
+//! reference library); `tests/lzfse_encoder.rs` cross-checks this encoder
+//! and decoder against `lzfse_rust` and, on macOS, Apple's `libcompression`
+//! in both directions. The unit tests below round-trip blocks built from an
+//! independent test-only parse over empty / small / text / repetitive /
+//! random / multi-block inputs with skewed, non-dyadic frequency tables.
 //!
 //! ## Wire format reference (v2 header, authoritative)
 //!
@@ -488,219 +487,226 @@ pub(crate) fn decode_block(
     Ok(total)
 }
 
-// ───────────────────────── test-only encoder ─────────────────────────────
+// ─────────────────────────────── encoder ─────────────────────────────────
+
+/// Largest literal run one command's `L` can carry (`L_BASE[19] + 255`).
+pub(crate) const MAX_L_VALUE: u32 = 315;
+/// Largest match length one command's `M` can carry (`M_BASE[19] + 2047`).
+pub(crate) const MAX_M_VALUE: u32 = 2359;
+/// Largest match distance a `D` can carry (`D_BASE[63] + 32767`).
+pub(crate) const MAX_D_VALUE: u32 = 262_139;
+/// Per-block command limit (Apple's `LZFSE_MATCHES_PER_BLOCK`).
+pub(crate) const MAX_MATCHES_PER_BLOCK: usize = MATCHES_PER_BLOCK;
+/// Per-block literal limit (Apple's `LZFSE_LITERALS_PER_BLOCK`), counting
+/// the up-to-3 padding literals the encoder adds.
+pub(crate) const MAX_LITERALS_PER_BLOCK: usize = LITERALS_PER_BLOCK;
+
+/// One LZ77 command: `l` literals, then an `m`-byte match at distance `d`.
+///
+/// A literal-only command has `m == 0`; its `d` is ignored (the encoder
+/// substitutes the previous distance so it costs nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Cmd {
+    pub(crate) l: u32,
+    pub(crate) m: u32,
+    pub(crate) d: u32,
+}
+
+/// Map an L/M/D value to `(symbol, extra_bits_value)`. The bases are
+/// contiguous (`base[s] + 2^extra[s] == base[s + 1]`), so the symbol is the
+/// last base not above `value`.
+#[inline]
+fn map_lmd(value: u32, base: &[i32]) -> (usize, u32) {
+    let s = base.partition_point(|&b| b as u32 <= value) - 1;
+    (s, value - base[s] as u32)
+}
+
+/// Push one L/M/D field: the FSE state bits (high) followed by the value's
+/// `vb` extra bits (low), as the decoder pulls them in one go.
+#[inline]
+fn push_lmd(
+    w: &mut fse::BitWriter,
+    state: &mut u32,
+    enc: &[fse::FseEncEntry],
+    vb: u8,
+    sym: u8,
+    extra: u32,
+) {
+    let (bits, nb, next) = fse::fse_encode(&enc[sym as usize], *state);
+    w.push((bits << vb) | extra, nb + vb as u32);
+    *state = next;
+}
+
+/// Encode one `bvx2` block (magic included) for the commands `cmds` whose
+/// literals, concatenated, are `literals`, appending it to `out`.
+///
+/// Every command must satisfy `l <= MAX_L_VALUE`,
+/// `m <= MAX_M_VALUE`, `1 <= d <= MAX_D_VALUE` when `m > 0`, and the block
+/// must respect the per-block limits (`cmds.len() <= MAX_MATCHES_PER_BLOCK`,
+/// `literals.len() + 3 <= MAX_LITERALS_PER_BLOCK`). `n_raw` is the decoded
+/// size, `sum(l + m)`.
+///
+/// Layout choices mirror Apple's `lzfse_encode_matches`, which its decoder
+/// (and libcompression's) relies on: the literal stream is padded to a
+/// multiple of four literals (the decoder decodes them four at a time), a
+/// block's first command always carries an explicit distance (a repeat
+/// distance `D = 0` is only used from the second command on), and each FSE
+/// payload starts with 8 zero bytes.
+pub(crate) fn encode_block(literals: &[u8], cmds: &[Cmd], n_raw: u32, out: &mut Vec<u8>) {
+    debug_assert!(cmds.len() <= MATCHES_PER_BLOCK);
+    debug_assert!(literals.len() + 3 <= LITERALS_PER_BLOCK);
+
+    // ── Literals, padded to a multiple of 4 by repeating the last one ──
+    let mut lits: Vec<u8> = Vec::with_capacity(literals.len() + 3);
+    lits.extend_from_slice(literals);
+    if let Some(&last) = literals.last() {
+        while !lits.len().is_multiple_of(4) {
+            lits.push(last);
+        }
+    }
+
+    // ── Map commands to symbols; replace repeated distances by D = 0 ──
+    let mut lit_hist = [0u32; N_LIT_SYMBOLS];
+    for &b in &lits {
+        lit_hist[b as usize] += 1;
+    }
+    let mut l_hist = [0u32; N_L_SYMBOLS];
+    let mut m_hist = [0u32; N_M_SYMBOLS];
+    let mut d_hist = [0u32; N_D_SYMBOLS];
+    // (symbol, extra) per stream, per command.
+    let mut mapped: Vec<[(u8, u32); 3]> = Vec::with_capacity(cmds.len());
+    let mut d_prev = 0u32;
+    for (i, c) in cmds.iter().enumerate() {
+        debug_assert!(c.l <= MAX_L_VALUE && c.m <= MAX_M_VALUE);
+        // A literal-only command copies nothing, so any valid distance will
+        // do: reuse the previous one (D = 0 below), or 1 for a block's first
+        // command.
+        let d = if c.m == 0 {
+            if i == 0 { 1 } else { d_prev }
+        } else {
+            c.d
+        };
+        debug_assert!((1..=MAX_D_VALUE).contains(&d));
+        let d_coded = if i > 0 && d == d_prev { 0 } else { d };
+        d_prev = d;
+        let (ls, le) = map_lmd(c.l, &L_BASE);
+        let (ms, me) = map_lmd(c.m, &M_BASE);
+        let (ds, de) = map_lmd(d_coded, &D_BASE);
+        l_hist[ls] += 1;
+        m_hist[ms] += 1;
+        d_hist[ds] += 1;
+        mapped.push([(ls as u8, le), (ms as u8, me), (ds as u8, de)]);
+    }
+
+    let mut lit_freq = [0u16; N_LIT_SYMBOLS];
+    let mut l_freq = [0u16; N_L_SYMBOLS];
+    let mut m_freq = [0u16; N_M_SYMBOLS];
+    let mut d_freq = [0u16; N_D_SYMBOLS];
+    fse::normalize_freq(&lit_hist, LIT_STATES, &mut lit_freq);
+    fse::normalize_freq(&l_hist, L_STATES, &mut l_freq);
+    fse::normalize_freq(&m_hist, M_STATES, &mut m_freq);
+    fse::normalize_freq(&d_hist, D_STATES, &mut d_freq);
+
+    let mut lit_enc = [fse::FseEncEntry::default(); N_LIT_SYMBOLS];
+    let mut l_enc = [fse::FseEncEntry::default(); N_L_SYMBOLS];
+    let mut m_enc = [fse::FseEncEntry::default(); N_M_SYMBOLS];
+    let mut d_enc = [fse::FseEncEntry::default(); N_D_SYMBOLS];
+    fse::build_encoder(&lit_freq, LIT_STATES, &mut lit_enc);
+    fse::build_encoder(&l_freq, L_STATES, &mut l_enc);
+    fse::build_encoder(&m_freq, M_STATES, &mut m_enc);
+    fse::build_encoder(&d_freq, D_STATES, &mut d_enc);
+
+    // ── Literal stream: four interleaved states, encoded back to front ──
+    let mut lit_bits = fse::BitWriter::new_fse(lits.len());
+    let mut lit_states = [0u32; 4];
+    for (idx, &b) in lits.iter().enumerate().rev() {
+        let st = &mut lit_states[idx % 4];
+        let (bits, nb, next) = fse::fse_encode(&lit_enc[b as usize], *st);
+        lit_bits.push(bits, nb);
+        *st = next;
+    }
+    let (lit_payload, literal_bits) = lit_bits.finish();
+
+    // ── LMD stream: the decoder pulls L, M, D per command, front to back,
+    //    so push D, M, L per command, back to front. Each field is the state
+    //    bits (high) followed by the value's extra bits (low). ──
+    let mut lmd_bits = fse::BitWriter::new_fse(cmds.len() * 6);
+    let (mut l_st, mut m_st, mut d_st) = (0u32, 0u32, 0u32);
+    for [(ls, le), (ms, me), (ds, de)] in mapped.iter().rev().copied() {
+        push_lmd(
+            &mut lmd_bits,
+            &mut d_st,
+            &d_enc,
+            D_EXTRA_BITS[ds as usize],
+            ds,
+            de,
+        );
+        push_lmd(
+            &mut lmd_bits,
+            &mut m_st,
+            &m_enc,
+            M_EXTRA_BITS[ms as usize],
+            ms,
+            me,
+        );
+        push_lmd(
+            &mut lmd_bits,
+            &mut l_st,
+            &l_enc,
+            L_EXTRA_BITS[ls as usize],
+            ls,
+            le,
+        );
+    }
+    let (lmd_payload, lmd_bits_field) = lmd_bits.finish();
+
+    // ── Frequency tables: L, M, D, LIT, bit-contiguous ──
+    let mut freq_bits = fse::BitWriter::new();
+    for table in [&l_freq[..], &m_freq[..], &d_freq[..], &lit_freq[..]] {
+        for &f in table {
+            let (code, len) = fse::encode_freq_value(f);
+            freq_bits.push(code, len);
+        }
+    }
+    let (freq_bytes, _) = freq_bits.finish();
+
+    // ── Header ──
+    let header_size = (4 + V2_HEADER_FIXED_BYTES + freq_bytes.len()) as u64;
+    let w0 = (lits.len() as u64)
+        | ((lit_payload.len() as u64) << 20)
+        | ((cmds.len() as u64) << 40)
+        | ((literal_bits as u64) << 60);
+    let w1 = (lit_states[0] as u64)
+        | ((lit_states[1] as u64) << 10)
+        | ((lit_states[2] as u64) << 20)
+        | ((lit_states[3] as u64) << 30)
+        | ((lmd_payload.len() as u64) << 40)
+        | ((lmd_bits_field as u64) << 60);
+    let w2 = header_size | ((l_st as u64) << 32) | ((m_st as u64) << 42) | ((d_st as u64) << 52);
+
+    out.reserve(header_size as usize + lit_payload.len() + lmd_payload.len());
+    out.extend_from_slice(b"bvx2");
+    out.extend_from_slice(&n_raw.to_le_bytes());
+    out.extend_from_slice(&w0.to_le_bytes());
+    out.extend_from_slice(&w1.to_le_bytes());
+    out.extend_from_slice(&w2.to_le_bytes());
+    out.extend_from_slice(&freq_bytes);
+    out.extend_from_slice(&lit_payload);
+    out.extend_from_slice(&lmd_payload);
+}
+
+// ──────────────────────── test-only parse helper ────────────────────────
 //
-// A spec-conformant `bvx2` encoder used only to validate the decoder by
-// round-trip. It uses a greedy LZ parser, the standard quantized (nearest)
-// FSE frequency normalization producing general, non-power-of-two
-// frequencies, encode slots that exactly invert the decoder's general k/k-1
-// FSE table, and the documented header/payload packing.
+// An independent greedy parser (hash chain over 4-byte prefixes) feeding
+// [`encode_block`], so the block encoder and decoder are exercised on their
+// own, separately from the streaming encoder's parser.
 
 #[cfg(test)]
-pub(crate) use test_encoder::encode_block;
-
-#[cfg(test)]
-mod test_encoder {
+mod test_parse {
     use super::*;
 
-    /// One FSE encode slot for a symbol: covers next-state range `[lo, hi]`,
-    /// emits `(next_state - lo)` in `k` bits and moves the encoder's running
-    /// state to table index `t`.
-    struct EncSlot {
-        t: usize,
-        k: u8,
-        lo: i32,
-        hi: i32,
-    }
-
-    /// Build per-symbol encode slots that exactly invert
-    /// `fse::build_literal_decoder` / `build_lmd_decoder`, including the
-    /// general k/k-1 split. Frequencies are arbitrary (`1..=n_states`) and
-    /// must sum to `n_states`; the per-symbol slot set tiles `[0, n_states)`.
-    ///
-    /// Each decode entry maps a current state `t` to a `(next_state, k_bits)`
-    /// pull. The encoder inverts this: given the *next* state `cur` it finds
-    /// the slot whose `[lo, hi]` next-state range contains `cur`, emits
-    /// `cur - lo` in `k` bits and moves the running state to that slot's `t`.
-    /// A slot in the `i < j0` region uses `k` bits, otherwise `k - 1` bits —
-    /// matching the decode table exactly.
-    fn build_enc_slots(freq: &[u16], n_states: usize) -> Vec<Vec<EncSlot>> {
-        let mut slots: Vec<Vec<EncSlot>> = (0..freq.len()).map(|_| Vec::new()).collect();
-        let mut t = 0usize;
-        let log2 = n_states.trailing_zeros() as i32;
-        for (s, &f) in freq.iter().enumerate() {
-            let f = f as usize;
-            if f == 0 {
-                continue;
-            }
-            let floor_log2 = 31 - (f as u32).leading_zeros() as i32;
-            let k = log2 - floor_log2;
-            let j0 = (((2 * n_states) >> k) as i32) - f as i32;
-            for i in 0..f {
-                let (ek, delta) = if (i as i32) < j0 {
-                    (k, ((f as i32 + i as i32) << k) - n_states as i32)
-                } else {
-                    (k - 1, (i as i32 - j0) << (k - 1))
-                };
-                slots[s].push(EncSlot {
-                    t,
-                    k: ek as u8,
-                    lo: delta,
-                    hi: delta + (1i32 << ek) - 1,
-                });
-                t += 1;
-            }
-        }
-        for sl in slots.iter_mut() {
-            sl.sort_by_key(|x| x.lo);
-        }
-        slots
-    }
-
-    /// A bit accumulator producing the reverse FSE stream byte layout that
-    /// [`FseBits`] consumes.
-    ///
-    /// The FSE encoder must walk symbols **in reverse** to chain states
-    /// correctly (each symbol's emitted state is determined by the following
-    /// symbol in the same lane). The caller therefore [`push`](Self::push)es
-    /// `(value, n_bits)` chunks in reverse-of-pull order. [`finish`] packs
-    /// them upward from the bottom of the payload (the first pushed chunk is
-    /// the last one [`FseBits`] pulls, so it sits lowest), behind Apple's
-    /// 8 zero padding bytes, and returns the header's 3-bit field.
-    struct FseSink {
-        /// Each entry is one symbol's `(value, n_bits)`, recorded in
-        /// reverse-of-pull order.
-        chunks: Vec<(u64, u8)>,
-    }
-
-    impl FseSink {
-        fn new() -> Self {
-            Self { chunks: Vec::new() }
-        }
-
-        /// Record `n` bits of `value` for one symbol (reverse-of-pull order).
-        fn push(&mut self, value: u64, n: u8) {
-            self.chunks.push((value, n));
-        }
-
-        /// Serialize to `(payload_bytes, bits_field)`.
-        fn finish(&self) -> (Vec<u8>, u32) {
-            // Apple's encoder starts every payload with 8 zero bytes so its
-            // decoder's 8-byte initial load stays in bounds.
-            let mut pos = 64usize;
-            let total: usize = pos + self.chunks.iter().map(|&(_, n)| n as usize).sum::<usize>();
-            let mut payload = vec![0u8; total.div_ceil(8)];
-            for &(value, n) in &self.chunks {
-                for i in 0..n as usize {
-                    payload[pos / 8] |= (((value >> i) & 1) as u8) << (pos % 8);
-                    pos += 1;
-                }
-            }
-            let unused = payload.len() * 8 - total;
-            (payload, 7 - unused as u32)
-        }
-    }
-
-    /// Encode a frequency value with the LZFSE Huffman-style fixed encoding
-    /// (inverse of `fse::decode_freq_table`).
-    pub(super) fn encode_freq_value(v: u16) -> (u32, u32) {
-        match v {
-            0 => (0b00, 2),
-            1 => (0b10, 2),
-            2 => (0b001, 3),
-            3 => (0b101, 3),
-            4 => (0b00011, 5),
-            5 => (0b01011, 5),
-            6 => (0b10011, 5),
-            7 => (0b11011, 5),
-            8..=23 => (0b0111 | ((v as u32 - 8) << 4), 8),
-            24..=1047 => (0b1111 | ((v as u32 - 24) << 4), 14),
-            _ => panic!("frequency {v} too large to encode"),
-        }
-    }
-
-    /// Normalize a histogram to **general** (arbitrary, not power-of-two)
-    /// frequencies summing exactly to `n_states`, giving every present symbol
-    /// at least 1. This is the standard quantized normalization: scale each
-    /// count by `n_states / total`, round to nearest, force present symbols to
-    /// 1, then correct the running sum by nudging the largest entry (which can
-    /// absorb ±1 changes without dropping a present symbol to 0).
-    ///
-    /// The resulting per-symbol frequencies are deliberately *not* coerced to
-    /// powers of two — the decoder's general k/k-1 table builder handles them
-    /// directly. Singletons and skewed (non-dyadic) distributions are
-    /// produced as-is so the round-trip exercises the general FSE path.
-    pub(super) fn normalize_general(hist: &[u32], n_states: usize) -> Vec<u16> {
-        let n = hist.len();
-        let total: u64 = hist.iter().map(|&h| h as u64).sum();
-        let mut freq = vec![0u16; n];
-        if total == 0 {
-            freq[0] = n_states as u16;
-            return freq;
-        }
-        // Nearest-rounding scale, with a floor of 1 for every present symbol.
-        let mut assigned: i64 = 0;
-        for (i, &h) in hist.iter().enumerate() {
-            if h == 0 {
-                continue;
-            }
-            let scaled = (h as u64 * n_states as u64 + total / 2) / total;
-            let f = scaled.max(1).min(n_states as u64) as i64;
-            freq[i] = f as u16;
-            assigned += f;
-        }
-        let target = n_states as i64;
-        // Correct the sum. Each step adjusts the symbol that can absorb the
-        // change: when overshooting, the largest entry with `f > 1`; when
-        // undershooting, simply the largest entry. This converges because the
-        // largest entry is at least `n_states / n` which exceeds the total
-        // correction magnitude (bounded by `n`).
-        while assigned != target {
-            if assigned > target {
-                let (idx, _) = freq
-                    .iter()
-                    .enumerate()
-                    .filter(|&(_, &f)| f > 1)
-                    .max_by_key(|&(_, &f)| f)
-                    .expect("an entry > 1 exists while overshooting");
-                freq[idx] -= 1;
-                assigned -= 1;
-            } else {
-                let (idx, _) = freq
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|&(_, &f)| f)
-                    .expect("non-empty alphabet");
-                freq[idx] += 1;
-                assigned += 1;
-            }
-        }
-        debug_assert_eq!(assigned, target);
-        freq
-    }
-
-    /// Map an L/M/D value to `(symbol, extra_value)`.
-    fn map_lmd(value: i32, base: &[i32], extra: &[u8]) -> (usize, u32) {
-        for s in 0..base.len() {
-            if base[s] <= value {
-                let hi = base[s] + ((1i64 << extra[s]) - 1) as i32;
-                if value <= hi {
-                    return (s, (value - base[s]) as u32);
-                }
-            }
-        }
-        let s = base.len() - 1;
-        (s, (value - base[s]).max(0) as u32)
-    }
-
-    struct Cmd {
-        l: usize,
-        m: usize,
-        d: usize,
-    }
-
     /// Greedy LZ parse of `data` via a hash chain over 4-byte prefixes.
-    fn lz_parse(data: &[u8]) -> (Vec<u8>, Vec<Cmd>) {
+    pub(crate) fn lz_parse(data: &[u8]) -> (Vec<u8>, Vec<Cmd>) {
         const MIN_MATCH: usize = 4;
         const MAX_MATCH: usize = 2359; // M max encodable
         const MAX_DIST: usize = 262_139; // D max encodable
@@ -753,16 +759,16 @@ mod test_encoder {
                 // literal runs with literal-only (M == 0) commands.
                 while pending_lit > MAX_L {
                     cmds.push(Cmd {
-                        l: MAX_L,
+                        l: MAX_L as u32,
                         m: 0,
                         d: 0,
                     });
                     pending_lit -= MAX_L;
                 }
                 cmds.push(Cmd {
-                    l: pending_lit,
-                    m: best_len,
-                    d: best_dist,
+                    l: pending_lit as u32,
+                    m: best_len as u32,
+                    d: best_dist as u32,
                 });
                 pending_lit = 0;
                 while i < end {
@@ -788,176 +794,14 @@ mod test_encoder {
         // literal-only (M == 0) commands, like Apple's encoder.
         while pending_lit > 0 {
             let l = pending_lit.min(MAX_L);
-            cmds.push(Cmd { l, m: 0, d: 0 });
+            cmds.push(Cmd {
+                l: l as u32,
+                m: 0,
+                d: 0,
+            });
             pending_lit -= l;
         }
         (literals, cmds)
-    }
-
-    /// Encode `data` as a single `bvx2` block (NOT including the 4-byte
-    /// magic, which the caller prepends).
-    pub(crate) fn encode_block(data: &[u8]) -> Vec<u8> {
-        let (literals, cmds) = lz_parse(data);
-
-        let mut lit_hist = vec![0u32; N_LIT_SYMBOLS];
-        for &b in &literals {
-            lit_hist[b as usize] += 1;
-        }
-        let mut l_hist = vec![0u32; N_L_SYMBOLS];
-        let mut m_hist = vec![0u32; N_M_SYMBOLS];
-        let mut d_hist = vec![0u32; N_D_SYMBOLS];
-
-        struct MappedCmd {
-            l_sym: usize,
-            l_extra: u32,
-            m_sym: usize,
-            m_extra: u32,
-            d_sym: usize,
-            d_extra: u32,
-        }
-        let mut mapped = Vec::with_capacity(cmds.len());
-        for c in &cmds {
-            let (l_sym, l_extra) = map_lmd(c.l as i32, &L_BASE, &L_EXTRA_BITS);
-            let (m_sym, m_extra) = map_lmd(c.m as i32, &M_BASE, &M_EXTRA_BITS);
-            let (d_sym, d_extra) = map_lmd(c.d as i32, &D_BASE, &D_EXTRA_BITS);
-            l_hist[l_sym] += 1;
-            m_hist[m_sym] += 1;
-            d_hist[d_sym] += 1;
-            mapped.push(MappedCmd {
-                l_sym,
-                l_extra,
-                m_sym,
-                m_extra,
-                d_sym,
-                d_extra,
-            });
-        }
-
-        let lit_freq = normalize_general(&lit_hist, LIT_STATES);
-        let l_freq = normalize_general(&l_hist, L_STATES);
-        let m_freq = normalize_general(&m_hist, M_STATES);
-        let d_freq = normalize_general(&d_hist, D_STATES);
-
-        let lit_slots = build_enc_slots(&lit_freq, LIT_STATES);
-        let l_slots = build_enc_slots(&l_freq, L_STATES);
-        let m_slots = build_enc_slots(&m_freq, M_STATES);
-        let d_slots = build_enc_slots(&d_freq, D_STATES);
-
-        // ── Encode literals (reverse, 4-way interleaved) ──
-        let n_lit = literals.len();
-        let mut lit_sink = FseSink::new();
-        let mut lit_states = [0i32; 4];
-        for idx in (0..n_lit).rev() {
-            let lane = idx % 4;
-            let sym = literals[idx] as usize;
-            let cur = lit_states[lane];
-            let slot = lit_slots[sym]
-                .iter()
-                .find(|s| cur >= s.lo && cur <= s.hi)
-                .expect("literal slot covers state");
-            lit_sink.push((cur - slot.lo) as u64, slot.k);
-            lit_states[lane] = slot.t as i32;
-        }
-        let literal_state = [
-            lit_states[0] as u32,
-            lit_states[1] as u32,
-            lit_states[2] as u32,
-            lit_states[3] as u32,
-        ];
-        let (lit_payload, literal_bits) = lit_sink.finish();
-
-        // ── Encode LMD (reverse). Decoder pulls L, M, D per command, so to
-        // invert we iterate commands in reverse and push D, then M, then L. ──
-        let mut lmd_sink = FseSink::new();
-        let mut l_st = 0i32;
-        let mut m_st = 0i32;
-        let mut d_st = 0i32;
-        for mc in mapped.iter().rev() {
-            let d_slot = d_slots[mc.d_sym]
-                .iter()
-                .find(|s| d_st >= s.lo && d_st <= s.hi)
-                .expect("d slot");
-            let raw = (((d_st - d_slot.lo) as u64) << D_EXTRA_BITS[mc.d_sym]) | mc.d_extra as u64;
-            lmd_sink.push(raw, d_slot.k + D_EXTRA_BITS[mc.d_sym]);
-            d_st = d_slot.t as i32;
-
-            let m_slot = m_slots[mc.m_sym]
-                .iter()
-                .find(|s| m_st >= s.lo && m_st <= s.hi)
-                .expect("m slot");
-            let raw = (((m_st - m_slot.lo) as u64) << M_EXTRA_BITS[mc.m_sym]) | mc.m_extra as u64;
-            lmd_sink.push(raw, m_slot.k + M_EXTRA_BITS[mc.m_sym]);
-            m_st = m_slot.t as i32;
-
-            let l_slot = l_slots[mc.l_sym]
-                .iter()
-                .find(|s| l_st >= s.lo && l_st <= s.hi)
-                .expect("l slot");
-            let raw = (((l_st - l_slot.lo) as u64) << L_EXTRA_BITS[mc.l_sym]) | mc.l_extra as u64;
-            lmd_sink.push(raw, l_slot.k + L_EXTRA_BITS[mc.l_sym]);
-            l_st = l_slot.t as i32;
-        }
-        let l_state = l_st as u32;
-        let m_state = m_st as u32;
-        let d_state = d_st as u32;
-        let (lmd_payload, lmd_bits) = lmd_sink.finish();
-
-        // ── Pack frequency tables (L, M, D, LIT, bit-contiguous) ──
-        let mut freq_bits: Vec<u8> = Vec::new();
-        for table in [&l_freq, &m_freq, &d_freq, &lit_freq] {
-            for &f in table.iter() {
-                let (code, len) = encode_freq_value(f);
-                for i in 0..len {
-                    freq_bits.push(((code >> i) & 1) as u8);
-                }
-            }
-        }
-        let mut freq_bytes = vec![0u8; freq_bits.len().div_ceil(8)];
-        for (i, &b) in freq_bits.iter().enumerate() {
-            freq_bytes[i / 8] |= b << (i % 8);
-        }
-
-        // ── Assemble the header ──
-        // `header_size` is measured from the start of the block, i.e. it
-        // includes the 4-byte magic that the caller prepends:
-        //   magic(4) + n_raw(4) + 3*u64(24) + freq = 4 + V2_HEADER_FIXED_BYTES + freq.
-        let header_size = (4 + V2_HEADER_FIXED_BYTES + freq_bytes.len()) as u32;
-        let n_raw_bytes = data.len() as u32;
-        let n_literals = n_lit as u32;
-        let n_matches = cmds.len() as u32;
-        let n_literal_payload_bytes = lit_payload.len() as u32;
-        let n_lmd_payload_bytes = lmd_payload.len() as u32;
-
-        let mut w0 = 0u64;
-        w0 |= (n_literals as u64) & 0xFFFFF;
-        w0 |= ((n_literal_payload_bytes as u64) & 0xFFFFF) << 20;
-        w0 |= ((n_matches as u64) & 0xFFFFF) << 40;
-        w0 |= ((literal_bits as u64) & 0x7) << 60;
-
-        let mut w1 = 0u64;
-        w1 |= (literal_state[0] as u64) & 0x3FF;
-        w1 |= ((literal_state[1] as u64) & 0x3FF) << 10;
-        w1 |= ((literal_state[2] as u64) & 0x3FF) << 20;
-        w1 |= ((literal_state[3] as u64) & 0x3FF) << 30;
-        w1 |= ((n_lmd_payload_bytes as u64) & 0xFFFFF) << 40;
-        w1 |= ((lmd_bits as u64) & 0x7) << 60;
-
-        let mut w2 = 0u64;
-        w2 |= (header_size as u64) & 0xFFFFFFFF;
-        w2 |= ((l_state as u64) & 0x3FF) << 32;
-        w2 |= ((m_state as u64) & 0x3FF) << 42;
-        w2 |= ((d_state as u64) & 0x3FF) << 52;
-
-        let mut out =
-            Vec::with_capacity(header_size as usize + lit_payload.len() + lmd_payload.len());
-        out.extend_from_slice(&n_raw_bytes.to_le_bytes());
-        out.extend_from_slice(&w0.to_le_bytes());
-        out.extend_from_slice(&w1.to_le_bytes());
-        out.extend_from_slice(&w2.to_le_bytes());
-        out.extend_from_slice(&freq_bytes);
-        out.extend_from_slice(&lit_payload);
-        out.extend_from_slice(&lmd_payload);
-        out
     }
 }
 
@@ -967,12 +811,24 @@ mod tests {
     use crate::lzfse::decoder::Decoder;
     use crate::traits::{RawDecoder, RawProgress};
 
-    /// Wrap a v2-encoded block (post-magic bytes) into a full `bvx2` block.
+    /// Encode `data` as one full `bvx2` block (magic included).
     fn v2_block(data: &[u8]) -> Vec<u8> {
+        let (literals, cmds) = super::test_parse::lz_parse(data);
         let mut b = Vec::new();
-        b.extend_from_slice(b"bvx2");
-        b.extend_from_slice(&encode_block(data));
+        super::encode_block(&literals, &cmds, data.len() as u32, &mut b);
         b
+    }
+
+    /// Encode `data` as one `bvx2` block, without the 4-byte magic (the
+    /// shape [`decode_block`] takes).
+    fn encode_block(data: &[u8]) -> Vec<u8> {
+        v2_block(data)[4..].to_vec()
+    }
+
+    fn normalize_general(hist: &[u32], n_states: usize) -> Vec<u16> {
+        let mut f = vec![0u16; hist.len()];
+        fse::normalize_freq(hist, n_states, &mut f);
+        f
     }
 
     /// Block-level round-trip: encode then `decode_block`.
@@ -1214,7 +1070,7 @@ mod tests {
     /// command: `n_matches` commands of `L = 0, M = 15, D = 1` expand to
     /// `15 * n_matches` bytes, all materialised before any output drains.
     fn zero_bit_match_block(n_matches: u32) -> Vec<u8> {
-        use super::test_encoder::encode_freq_value;
+        use fse::encode_freq_value;
         let single = |n_symbols: usize, sym: usize, states: u16| {
             let mut f = vec![0u16; n_symbols];
             f[sym] = states;
@@ -1275,7 +1131,6 @@ mod tests {
         // frequencies that sum exactly to n_states and give every present
         // symbol at least 1. A regression that snapped to powers of two would
         // be visible here.
-        use super::test_encoder::normalize_general;
         let hist = [1000u32, 3, 17, 250, 0, 1];
         let freq = normalize_general(&hist, 1024);
         assert_eq!(freq.iter().map(|&f| f as u32).sum::<u32>(), 1024);
@@ -1297,7 +1152,6 @@ mod tests {
     /// the normalized FSE frequencies are non-dyadic. A regression to a
     /// single-`k` decode table would corrupt the result.
     fn rt_assert_non_dyadic_lit(data: &[u8]) {
-        use super::test_encoder::normalize_general;
         // Recompute the literal histogram the way encode_block does, but only
         // over true literals would require the parser; instead assert on a
         // raw-byte histogram, which upper-bounds the literal alphabet and is a
