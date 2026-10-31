@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/KarpelesLab/compcol/compare/v0.7.6...v0.8.0) - 2026-10-31
+
+### Added
+
+- *(zip_shrink,zip_reduce,zip_implode)* raw entry points for bare ZIP entry data ([#160](https://github.com/KarpelesLab/compcol/pull/160))
+- *(bzip2,gzip)* work factor, block-magic error, FHCRC check, single-member gzip ([#159](https://github.com/KarpelesLab/compcol/pull/159))
+- *(lzfse)* LZFSE encoder (bvx2 / bvxn / bvx-) ([#158](https://github.com/KarpelesLab/compcol/pull/158))
+
+### Fixed
+
+- *(brotli)* resume a part-received meta-block instead of re-decoding it ([#154](https://github.com/KarpelesLab/compcol/pull/154))
+
 ## [0.7.6](https://github.com/KarpelesLab/compcol/compare/v0.7.5...v0.7.6) - 2026-10-23
 
 ### Fixed
