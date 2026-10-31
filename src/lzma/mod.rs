@@ -1,9 +1,10 @@
 //! LZMA (Lempel–Ziv–Markov chain Algorithm).
 //!
 //! This build ships **both an encoder and a decoder** for the legacy `.lzma`
-//! (alone) format. The encoder produces a stream that round-trips through
+//! (alone) format, and for LZMA entry data in ZIP archives (method 14, see
+//! below). The encoder produces a stream that round-trips through
 //! our own decoder and decompresses cleanly with external implementations
-//! (Python's stdlib `lzma`, XZ Utils, etc.).
+//! (Python's stdlib `lzma`, XZ Utils, 7-Zip, etc.).
 //!
 //! Wire format (legacy "alone"):
 //! - 1 byte properties (`pp*9*5 + pp*5 + lc`, where `pb`, `lp`, `lc` are the
@@ -12,6 +13,37 @@
 //! - 8 bytes little-endian uncompressed size; `0xFFFF_FFFF_FFFF_FFFF` means
 //!   "unknown" — the stream is terminated by an explicit end-of-stream marker.
 //! - The remainder of the input is a range-coded LZMA payload.
+//!
+//! ZIP method 14 (APPNOTE.TXT §5.8) frames the same payload differently:
+//! 2 bytes LZMA SDK version, 2 bytes LE properties size (5), the 5
+//! properties bytes (props byte + dictionary size), then the range-coded
+//! payload. There is no size field: the uncompressed size is in the ZIP
+//! header, and general-purpose flag bit 1 says the stream ends with an
+//! end-of-stream marker. [`Decoder::zip`] / [`Decoder::zip_from_gp_flags`]
+//! read this form and [`Encoder::zip`] writes it, with or without the
+//! marker ([`Encoder::eos_marker`] gives the flag bit to set). Parsing the
+//! ZIP headers is out of scope; these work on the entry's stored bytes.
+//!
+//! ```
+//! use compcol::lzma::{Decoder, Encoder, EncoderConfig};
+//! use compcol::{Decoder as _, Encoder as _, Status};
+//!
+//! let data = b"hello hello hello";
+//! let mut enc = Encoder::zip(EncoderConfig::default(), false);
+//! let gp_flags: u16 = if enc.eos_marker() { 0x0002 } else { 0 };
+//! let mut entry = vec![0u8; 256];
+//! let (p, _) = enc.encode(data, &mut entry).unwrap();
+//! let mut n = p.written;
+//! let (p, _) = enc.finish(&mut entry[n..]).unwrap();
+//! n += p.written;
+//!
+//! let mut dec = Decoder::zip_from_gp_flags(gp_flags, Some(data.len() as u64));
+//! let mut out = vec![0u8; 64];
+//! let (p1, _) = dec.decode(&entry[..n], &mut out).unwrap();
+//! let (p2, status) = dec.finish(&mut out[p1.written..]).unwrap();
+//! assert_eq!(status, Status::StreamEnd);
+//! assert_eq!(&out[..p1.written + p2.written], data);
+//! ```
 //!
 //! References: 7-Zip / lzma-sdk source (well-commented C reference) and
 //! `xz-utils` (`liblzma/lz/`, `liblzma/rangecoder/`).
@@ -211,6 +243,25 @@ impl RangeDecoder {
         }
     }
 
+    /// End-of-stream check (ZIP mode): normalise once more so the stream's
+    /// last byte is read, then report whether `code == 0`, as a cleanly
+    /// flushed encoder leaves it. `None` means that byte has not arrived.
+    fn finish(&mut self, buf: &[u8], at_eof: bool) -> Result<Option<bool>, Error> {
+        if self.range < RC_TOP_VALUE {
+            if self.pos >= buf.len() {
+                return if at_eof {
+                    Err(Error::UnexpectedEnd)
+                } else {
+                    Ok(None)
+                };
+            }
+            self.range <<= 8;
+            self.code = (self.code << 8) | buf[self.pos] as u32;
+            self.pos += 1;
+        }
+        Ok(Some(self.code == 0))
+    }
+
     /// Decode `count` direct (uniform) bits in a tight loop and return their
     /// accumulated value, **MSB-first** — the bit decoded on iteration 0
     /// becomes the highest bit of the result; the bit decoded last is bit 0.
@@ -371,6 +422,9 @@ struct LzmaCore {
     lit_pos_mask: u32,
     /// Uncompressed length, or `None` for "until EOS marker".
     uncompressed_size: Option<u64>,
+    /// ZIP mode only: the entry's declared size. The stream must end at
+    /// exactly this many bytes, by the marker or by reaching the size.
+    expected_len: Option<u64>,
 
     // Dictionary / sliding window (decoded output buffer).
     dict: Vec<u8>,
@@ -419,6 +473,7 @@ impl LzmaCore {
             pos_mask,
             lit_pos_mask,
             uncompressed_size,
+            expected_len: None,
             dict: vec![0u8; dict_size.max(1)],
             dict_pos: 0,
             dict_full: false,
@@ -680,6 +735,27 @@ impl LzmaCore {
     /// `REQUIRED_INPUT_MAX` bytes buffered; an actual short read yields
     /// `Error::UnexpectedEnd`.
     fn step(&mut self, buf: &[u8], at_eof: bool) -> Result<PacketOutcome, Error> {
+        let outcome = self.step_inner(buf, at_eof)?;
+        // ZIP mode: the stream must end at exactly the declared size. With
+        // a size cap (`uncompressed_size`) matches are cut at the size; with
+        // a required marker nothing may run past it.
+        if let Some(t) = self.expected_len {
+            let bad = match outcome {
+                PacketOutcome::Eos => self.output_pos != t,
+                PacketOutcome::Literal(_) => self.output_pos >= t,
+                PacketOutcome::Match { length } => {
+                    self.uncompressed_size.is_none() && self.output_pos + length as u64 > t
+                }
+                PacketOutcome::NeedInput => false,
+            };
+            if bad {
+                return Err(Error::Corrupt);
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn step_inner(&mut self, buf: &[u8], at_eof: bool) -> Result<PacketOutcome, Error> {
         if self.finished {
             return Ok(PacketOutcome::Eos);
         }
@@ -831,7 +907,8 @@ enum HeaderState {
     Done,
 }
 
-/// Streaming `.lzma` (alone) decoder.
+/// Streaming LZMA decoder: legacy `.lzma` (alone) streams by default, or
+/// ZIP method-14 entry data with [`Decoder::zip`].
 ///
 /// Buffers compressed input in an internal `Vec<u8>`. Decodes in
 /// "one-packet-at-a-time" mode, with the range decoder's state being
@@ -847,7 +924,26 @@ pub struct Decoder {
     pending_match: Option<PendingMatch>,
     pending_literal: Option<u8>,
     header_state: HeaderState,
+    /// ZIP method-14 framing, set by [`Decoder::zip`]; `None` for `.lzma`.
+    zip: Option<ZipParams>,
+    /// Buffered bytes the range decoder had not read when the stream ended.
+    leftover: usize,
 }
+
+/// Out-of-band parameters of a ZIP method-14 entry.
+#[derive(Clone, Copy)]
+struct ZipParams {
+    eos_marker: bool,
+    uncompressed_len: Option<u64>,
+}
+
+/// ZIP entry header: 2 bytes SDK version, 2 bytes LE properties size (5),
+/// then the 5 properties bytes.
+const ZIP_HEADER_LEN: usize = 9;
+
+/// Bytes of caller input copied into `buf` per step in ZIP mode, so the
+/// bytes past the end of the entry can be handed back unconsumed.
+const ZIP_ABSORB_CHUNK: usize = 4096;
 
 struct PendingMatch {
     /// 0-based LZ distance for this match (already stored in `rep0`).
@@ -863,13 +959,52 @@ impl Default for Decoder {
 }
 
 impl Decoder {
+    /// Decoder for a legacy `.lzma` (alone) stream with its 13-byte header.
     pub const fn new() -> Self {
         Self {
             buf: Vec::new(),
             pending_match: None,
             pending_literal: None,
             header_state: HeaderState::Empty,
+            zip: None,
+            leftover: 0,
         }
+    }
+
+    /// Decoder for the data of a ZIP entry stored with method 14 (LZMA):
+    /// a 4-byte header (SDK version, properties size), the 5 LZMA
+    /// properties bytes, then the range-coded stream. ZIP headers are not
+    /// parsed here; feed the entry's stored bytes.
+    ///
+    /// `eos_marker` is general-purpose flag bit 1: the stream ends with an
+    /// end-of-stream marker. `uncompressed_len` is the entry's size, when
+    /// known.
+    ///
+    /// - marker and size: decode `uncompressed_len` bytes, then require the
+    ///   marker.
+    /// - size only: stop after `uncompressed_len` bytes (a marker right
+    ///   after them is read too).
+    /// - marker only, or neither: decode until the marker.
+    ///
+    /// A marker before the declared size, or data past it when the marker
+    /// is required, is [`Error::Corrupt`]. When the stream ends inside a
+    /// [`decode`](crate::Decoder::decode) call the decoder returns
+    /// `StreamEnd` and leaves the bytes after the entry unconsumed (except
+    /// for up to 20 bytes taken by earlier calls when the input arrives in
+    /// very small pieces). `reset` keeps these settings.
+    pub const fn zip(eos_marker: bool, uncompressed_len: Option<u64>) -> Self {
+        let mut d = Self::new();
+        d.zip = Some(ZipParams {
+            eos_marker,
+            uncompressed_len,
+        });
+        d
+    }
+
+    /// Same as [`Decoder::zip`], taking the marker flag from a ZIP entry's
+    /// general-purpose bit flag word (bit 1; other bits are ignored).
+    pub const fn zip_from_gp_flags(gp_flags: u16, uncompressed_len: Option<u64>) -> Self {
+        Self::zip(gp_flags & 0b10 != 0, uncompressed_len)
     }
 
     /// Drop the prefix of `buf` that the range decoder has already consumed,
@@ -883,24 +1018,32 @@ impl Decoder {
             }
         }
     }
-}
 
-impl RawDecoder for Decoder {
-    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
-        let initial_buf_len = self.buf.len();
-        self.buf.extend_from_slice(input);
-        let mut written = 0usize;
-
+    /// Parse the header and initialise the range coder from `buf` as far
+    /// as the buffered bytes allow. Returns `true` once the main loop can
+    /// run (or the stream is already done).
+    fn start(&mut self) -> Result<bool, Error> {
         // ── header parsing ────────────────────────────────────────────
         if matches!(self.header_state, HeaderState::Empty) {
-            if self.buf.len() < 13 {
-                return Ok(RawProgress {
-                    consumed: input.len(),
-                    written: 0,
-                    done: false,
-                });
+            let header_len = if self.zip.is_some() {
+                ZIP_HEADER_LEN
+            } else {
+                13
+            };
+            if self.buf.len() < header_len {
+                return Ok(false);
             }
-            let props = self.buf[0];
+            // ZIP: bytes 0..2 are the SDK version (informational), 2..4
+            // the properties size, which must be 5.
+            let p = if self.zip.is_some() {
+                if u16::from_le_bytes([self.buf[2], self.buf[3]]) != 5 {
+                    return Err(Error::BadHeader);
+                }
+                4
+            } else {
+                0
+            };
+            let props = self.buf[p];
             if props >= 9 * 5 * 5 {
                 return Err(Error::BadHeader);
             }
@@ -915,19 +1058,27 @@ impl RawDecoder for Decoder {
             if lc + lp > 4 {
                 return Err(Error::BadHeader);
             }
-            let dict_size =
-                u32::from_le_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]);
-            let uncompressed_size = u64::from_le_bytes([
-                self.buf[5],
-                self.buf[6],
-                self.buf[7],
-                self.buf[8],
-                self.buf[9],
-                self.buf[10],
-                self.buf[11],
-                self.buf[12],
+            let dict_size = u32::from_le_bytes([
+                self.buf[p + 1],
+                self.buf[p + 2],
+                self.buf[p + 3],
+                self.buf[p + 4],
             ]);
-            self.buf.drain(0..13);
+            let uncompressed_size = if self.zip.is_some() {
+                u64::MAX
+            } else {
+                u64::from_le_bytes([
+                    self.buf[5],
+                    self.buf[6],
+                    self.buf[7],
+                    self.buf[8],
+                    self.buf[9],
+                    self.buf[10],
+                    self.buf[11],
+                    self.buf[12],
+                ])
+            };
+            self.buf.drain(0..header_len);
             self.header_state = HeaderState::HeaderParsed {
                 lc,
                 lp,
@@ -946,52 +1097,100 @@ impl RawDecoder for Decoder {
             uncompressed_size,
         } = self.header_state
         {
-            let unc = if uncompressed_size == u64::MAX {
-                None
-            } else {
-                Some(uncompressed_size)
+            // `unc` caps the output; `expected` is the size the stream
+            // must end at (ZIP only).
+            let (unc, expected) = match self.zip {
+                None if uncompressed_size == u64::MAX => (None, None),
+                None => (Some(uncompressed_size), None),
+                Some(z) if z.eos_marker => (None, z.uncompressed_len),
+                Some(z) => (z.uncompressed_len, z.uncompressed_len),
             };
             let dict_size_eff = (dict_size as u64).clamp(4096, DIC_SIZE_MAX) as usize;
             let mut core = Box::new(LzmaCore::new(lc, lp, pb, dict_size_eff, unc));
+            core.expected_len = expected;
             // Try to initialise; if not enough bytes yet, stay in HeaderParsed.
             if !core.range.init(&self.buf)? {
-                // Rewind: we didn't actually consume the 5 init bytes.
-                self.header_state = HeaderState::HeaderParsed {
-                    lc,
-                    lp,
-                    pb,
-                    dict_size,
-                    uncompressed_size,
-                };
-                return Ok(RawProgress {
-                    consumed: input.len(),
-                    written: 0,
-                    done: false,
-                });
+                return Ok(false);
             }
             self.header_state = HeaderState::Active(core);
             self.compact_buf();
         }
+        Ok(true)
+    }
+
+    /// `raw_decode` for ZIP mode: copies input in bounded chunks and hands
+    /// back the bytes the range decoder did not read when it stops for a
+    /// full output buffer or at the end of the stream.
+    fn zip_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
+        if matches!(self.header_state, HeaderState::Done) {
+            return Ok(RawProgress {
+                consumed: 0,
+                written: 0,
+                done: true,
+            });
+        }
+        let mut taken = 0usize;
+        let mut written = 0usize;
+        loop {
+            let take = (input.len() - taken).min(ZIP_ABSORB_CHUNK);
+            self.buf.extend_from_slice(&input[taken..taken + take]);
+            taken += take;
+            if self.start()? {
+                self.drain_output(output, &mut written, false)?;
+            }
+            let done = matches!(self.header_state, HeaderState::Done);
+            let full = written == output.len()
+                || self.pending_literal.is_some()
+                || self.pending_match.is_some();
+            if !done && !full && taken < input.len() {
+                continue;
+            }
+            // Hand back what the range decoder did not read (only bytes
+            // from this call can be returned).
+            let unread = match &self.header_state {
+                HeaderState::Done => self.leftover,
+                HeaderState::Active(core) if full => self.buf.len() - core.range.pos,
+                _ => 0,
+            };
+            let give = unread.min(taken);
+            self.buf.truncate(self.buf.len() - give);
+            if done {
+                self.leftover -= give;
+            }
+            return Ok(RawProgress {
+                consumed: taken - give,
+                written,
+                done,
+            });
+        }
+    }
+}
+
+impl RawDecoder for Decoder {
+    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
+        if self.zip.is_some() {
+            return self.zip_decode(input, output);
+        }
+        self.buf.extend_from_slice(input);
+        let mut written = 0usize;
+        if !self.start()? {
+            return Ok(RawProgress {
+                consumed: input.len(),
+                written: 0,
+                done: false,
+            });
+        }
 
         // ── main decode loop ──────────────────────────────────────────
-        let result = self.drain_output(output, &mut written, false);
-        // After processing, the caller's input has been fully absorbed into
-        // self.buf. We report `consumed == input.len()` (we've taken it all
-        // into our internal buffer), but compact_buf has already dropped the
-        // prefix that the range decoder finished with.
-        match result {
-            Ok(()) => Ok(RawProgress {
-                consumed: input.len(),
-                written,
-                done: false,
-            }),
-            Err(e) => {
-                // Best effort: restore buf to pre-call state if we wrote
-                // nothing useful. Not strictly required by trait.
-                let _ = initial_buf_len;
-                Err(e)
-            }
-        }
+        // The caller's input has been fully absorbed into self.buf, so we
+        // report `consumed == input.len()`; compact_buf has already dropped
+        // the prefix that the range decoder finished with.
+        self.drain_output(output, &mut written, false)?;
+        Ok(RawProgress {
+            consumed: input.len(),
+            written,
+            done: false,
+        })
     }
 
     fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
@@ -1035,6 +1234,7 @@ impl RawDecoder for Decoder {
         self.pending_match = None;
         self.pending_literal = None;
         self.header_state = HeaderState::Empty;
+        self.leftover = 0;
     }
 }
 
@@ -1138,12 +1338,29 @@ impl Decoder {
             };
 
             // Check finished BEFORE trying to step.
-            if core.finished {
-                self.header_state = HeaderState::Done;
-                return Ok(());
-            }
             if matches!(core.uncompressed_size, Some(t) if core.output_pos >= t) {
                 core.finished = true;
+            }
+            if core.finished {
+                // ZIP: read the stream's last byte and check the coder
+                // ended cleanly, so consumption is exact.
+                if self.zip.is_some() {
+                    match core.range.finish(&self.buf, at_eof)? {
+                        None => return Ok(()),
+                        Some(true) => {}
+                        Some(false) if core.uncompressed_size.is_some() => {
+                            // Size reached but the coder has not ended: an
+                            // end marker may follow even though the flag
+                            // did not say so. Read it (anything else past
+                            // the size is an error).
+                            core.uncompressed_size = None;
+                            core.finished = false;
+                            continue;
+                        }
+                        Some(false) => return Err(Error::Corrupt),
+                    }
+                }
+                self.leftover = self.buf.len() - core.range.pos;
                 self.header_state = HeaderState::Done;
                 return Ok(());
             }
@@ -1233,6 +1450,10 @@ impl Decoder {
                     }
                 }
                 PacketOutcome::Eos => {
+                    if self.zip.is_some() {
+                        // `core.finished` is set; the check above ends it.
+                        continue;
+                    }
                     self.header_state = HeaderState::Done;
                     return Ok(());
                 }

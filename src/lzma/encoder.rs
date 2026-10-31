@@ -1,4 +1,4 @@
-//! Legacy `.lzma` (alone) encoder.
+//! LZMA encoder: legacy `.lzma` (alone) and ZIP method-14 framing.
 //!
 //! Companion to the decoder in `super`. Implements the LZMA range coder,
 //! probability model, and a 3-byte hash-chain greedy match finder.
@@ -10,6 +10,9 @@
 //! - range-coded packet stream
 //! - end-of-stream marker (match dist=0xFFFFFFFF, len=2)
 //! - 5 bytes of range-coder flush.
+//!
+//! [`Encoder::zip`] swaps the header for the 9-byte ZIP method-14 one
+//! (SDK version, properties size, properties) and can leave out the marker.
 //!
 //! Header choices: `lc=3, lp=0, pb=2` (the standard preset, packed to 0x5d);
 //! dictionary size derived from [`EncoderConfig::level`] (at least 4 KiB, and
@@ -49,6 +52,43 @@ const ENC_LC: u32 = 3;
 const ENC_LP: u32 = 0;
 const ENC_PB: u32 = 2;
 const ENC_PROPS_BYTE: u8 = (ENC_PB * 5 + ENC_LP) as u8 * 9 + ENC_LC as u8;
+
+/// LZMA SDK version written at the start of a ZIP method-14 entry
+/// (informational only; readers ignore it).
+const ZIP_SDK_VERSION: [u8; 2] = [9, 20];
+
+/// Which header the stream starts with, and whether it ends with the
+/// end-of-stream marker.
+#[derive(Debug, Clone, Copy)]
+enum Framing {
+    /// `.lzma`: 13-byte header, unknown size, always the marker.
+    Alone,
+    /// ZIP method 14: 9-byte header, marker only when `eos` is set.
+    Zip { eos: bool },
+}
+
+impl Framing {
+    fn eos(self) -> bool {
+        match self {
+            Framing::Alone => true,
+            Framing::Zip { eos } => eos,
+        }
+    }
+
+    fn header(self, dict_size: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(13);
+        if let Framing::Zip { .. } = self {
+            out.extend_from_slice(&ZIP_SDK_VERSION);
+            out.extend_from_slice(&5u16.to_le_bytes());
+        }
+        out.push(ENC_PROPS_BYTE);
+        out.extend_from_slice(&dict_size.to_le_bytes());
+        if let Framing::Alone = self {
+            out.extend_from_slice(&u64::MAX.to_le_bytes());
+        }
+        out
+    }
+}
 
 const MAX_MATCH_LEN: u32 = 273; // 2 + 8 + 8 + 255 (LEN_LOW + LEN_MID + LEN_HIGH)
 
@@ -1351,6 +1391,7 @@ struct LzmaStreamEncoder {
     core: LzmaEncCore,
     hc: HashChain,
     params: LevelParams,
+    framing: Framing,
     dict_size: u32,
     /// Reusable optimal-parser scratch (only used at levels with `opt_window`).
     opt: Optimizer,
@@ -1382,7 +1423,7 @@ struct LzmaStreamEncoder {
 const GUARD_LIMIT: usize = 64 * 1024;
 
 impl LzmaStreamEncoder {
-    fn new(params: LevelParams) -> Self {
+    fn new(params: LevelParams, framing: Framing) -> Self {
         // Advertise (and cap matches at) the level's dictionary size, clamped to
         // the decoder's 4 KiB minimum. Independent of input length so the header
         // can be emitted up front without buffering the whole stream.
@@ -1394,6 +1435,7 @@ impl LzmaStreamEncoder {
             core: LzmaEncCore::new(),
             hc: HashChain::new(dict_size, cap_hint),
             params,
+            framing,
             dict_size,
             opt: Optimizer::new(params.opt_window as usize),
             prob_prices: build_prob_prices(),
@@ -1466,7 +1508,9 @@ impl LzmaStreamEncoder {
             if self.pos < self.appended {
                 self.encode_range(self.appended);
             }
-            self.core.emit_eos_marker();
+            if self.framing.eos() {
+                self.core.emit_eos_marker();
+            }
             self.core.rc.flush();
             self.finished = true;
         }
@@ -1480,6 +1524,7 @@ impl LzmaStreamEncoder {
         let input = &self.win;
         let dict_size = self.dict_size;
         let params = self.params;
+        let eos = self.framing.eos();
 
         let opt_body = {
             let mut core = LzmaEncCore::new();
@@ -1498,7 +1543,9 @@ impl LzmaStreamEncoder {
                 &prices,
                 &mut opt,
             );
-            core.emit_eos_marker();
+            if eos {
+                core.emit_eos_marker();
+            }
             core.rc.flush();
             core.rc.out
         };
@@ -1515,7 +1562,9 @@ impl LzmaStreamEncoder {
                 dict_size,
                 params,
             );
-            core.emit_eos_marker();
+            if eos {
+                core.emit_eos_marker();
+            }
             core.rc.flush();
             core.rc.out
         };
@@ -1526,10 +1575,7 @@ impl LzmaStreamEncoder {
         };
 
         self.finished = true;
-        let mut out = Vec::with_capacity(13 + body.len());
-        out.push(ENC_PROPS_BYTE);
-        out.extend_from_slice(&self.dict_size.to_le_bytes());
-        out.extend_from_slice(&u64::MAX.to_le_bytes());
+        let mut out = self.framing.header(self.dict_size);
         out.extend_from_slice(&body);
         self.header_done = true;
         out
@@ -1588,9 +1634,7 @@ impl LzmaStreamEncoder {
     fn take_output(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         if !self.header_done {
-            out.push(ENC_PROPS_BYTE);
-            out.extend_from_slice(&self.dict_size.to_le_bytes());
-            out.extend_from_slice(&u64::MAX.to_le_bytes());
+            out = self.framing.header(self.dict_size);
             self.header_done = true;
         }
         out.append(&mut self.core.rc.out);
@@ -2008,7 +2052,8 @@ fn replay(
 
 // ─── public streaming Encoder ────────────────────────────────────────────
 
-/// Streaming `.lzma` (alone) encoder with **bounded memory**.
+/// Streaming LZMA encoder with **bounded memory**: `.lzma` (alone) by
+/// default, ZIP method-14 entry data with [`Encoder::zip`].
 ///
 /// Drives an `LzmaStreamEncoder` whose match finder, sliding window, and LZ
 /// history are all `O(dict_size)` — so peak memory is independent of the input
@@ -2041,6 +2086,8 @@ pub struct Encoder {
     /// Match-finder tuning derived from [`EncoderConfig::level`]. Persisted
     /// across `reset` since configuration is meant to survive resets.
     params: LevelParams,
+    /// `.lzma` or ZIP framing; also kept across `reset`.
+    framing: Framing,
 }
 
 impl Default for Encoder {
@@ -2065,13 +2112,37 @@ impl Encoder {
             pending_idx: 0,
             stream_finished: false,
             params: LevelParams::from_level(config.level),
+            framing: Framing::Alone,
         }
+    }
+
+    /// Build an encoder for the data of a ZIP entry stored with method 14
+    /// (LZMA): a 4-byte header (SDK version, properties size), the 5 LZMA
+    /// properties bytes, then the range-coded stream. ZIP headers are not
+    /// written here.
+    ///
+    /// With `eos_marker` the stream ends with an end-of-stream marker and
+    /// the ZIP writer must set general-purpose flag bit 1. Without it the
+    /// stream is 5 bytes shorter and readers stop at the uncompressed size
+    /// from the ZIP header. `config` works as in [`Encoder::with_config`].
+    pub fn zip(config: EncoderConfig, eos_marker: bool) -> Self {
+        let mut e = Self::with_config(config);
+        e.framing = Framing::Zip { eos: eos_marker };
+        e
+    }
+
+    /// Whether the stream ends with an end-of-stream marker: always for
+    /// `.lzma`, and as chosen in [`Encoder::zip`]. For a ZIP entry this is
+    /// general-purpose flag bit 1 (`0x0002`).
+    pub fn eos_marker(&self) -> bool {
+        self.framing.eos()
     }
 
     fn stream(&mut self) -> &mut LzmaStreamEncoder {
         let params = self.params;
+        let framing = self.framing;
         self.stream
-            .get_or_insert_with(|| LzmaStreamEncoder::new(params))
+            .get_or_insert_with(|| LzmaStreamEncoder::new(params, framing))
     }
 
     /// Push staged output bytes from `pending[pending_idx..]` into `output`.
@@ -2218,7 +2289,7 @@ mod tests {
     /// incompressible data) despite the bounded-window design.
     #[test]
     fn stream_encoder_does_not_retain_output() {
-        let mut enc = LzmaStreamEncoder::new(LevelParams::from_level(0));
+        let mut enc = LzmaStreamEncoder::new(LevelParams::from_level(0), Framing::Alone);
         let mut s = 0x1234_5678u64;
         let mut chunk = vec![0u8; 1 << 16];
         let mut produced = 0usize;
