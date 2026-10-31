@@ -421,6 +421,30 @@ fn flush_makes_everything_so_far_decodable() {
     }
 }
 
+/// An `encode` call that ends right at the parse threshold (256 KiB
+/// segment + lookahead) on repetitive data parses a match up to the end
+/// of the buffer. `flush` must still emit the pending commands.
+#[test]
+fn flush_after_parse_reaching_buffer_end() {
+    for mode in [Flush::Sync, Flush::Full] {
+        for data in [vec![0u8; 266_240], text(266_240, 3)] {
+            let mut enc = Encoder::new();
+            let mut out = Vec::new();
+            encode_all(&mut enc, &data, &mut out);
+            flush_all(&mut enc, mode, &mut out);
+            let mut dec = compcol::lzfse::Decoder::new();
+            let mut got = vec![0u8; data.len() + 10];
+            let (p, _) = compcol::Decoder::decode(&mut dec, &out, &mut got).unwrap();
+            assert!(
+                got[..p.written] == data[..],
+                "{mode:?}: {} of {} bytes",
+                p.written,
+                data.len()
+            );
+        }
+    }
+}
+
 // ─── lzfse_rust cross-checks ─────────────────────────────────────────────
 
 #[test]

@@ -546,7 +546,11 @@ impl RawEncoder for Encoder {
 
     fn raw_flush(&mut self, output: &mut [u8], mode: Flush) -> Result<RawProgress, Error> {
         let mut written = 0usize;
-        if !self.finished && self.cur < self.buf.len() {
+        // A match may already run to the end of the buffer, so parsed
+        // commands and literals can be pending with nothing unparsed.
+        let pending =
+            self.cur < self.buf.len() || !self.cmds.is_empty() || self.lit_start < self.cur;
+        if !self.finished && pending {
             // Everything buffered becomes a complete block the peer can
             // decode. Small streams lose the LZVN option from here on.
             self.close_block();
