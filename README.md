@@ -55,7 +55,7 @@ flag accept; *Ext* is what `factory::extension(name)` returns.
 | Snappy | `snappy` | `snappy` | `.sz` | LZ77 hash matcher (raw block format) | full | — |
 | LZW (`compress(1)` `.Z`) | `lzw` | `lzw` | `.lzw` | full | full | `compress(1)` / `uncompress(1)` |
 | LZSS (Okumura `lzss.c` layout) | `lzss` | `lzss` | `.lzss` | hash-chain match finder | full (4-byte length header + raw payload) | fixtures from a port of Okumura's `lzss.c` (`docs/lzss-ref.py`) |
-| LZMA (legacy `.lzma`) | `lzma` | `lzma` | `.lzma` | full | full | `python3 -m lzma` (FORMAT_ALONE) |
+| LZMA (legacy `.lzma`; ZIP method 14 entry data via `Decoder::zip` / `Encoder::zip`) | `lzma` | `lzma` | `.lzma` | full (ZIP form with or without the end marker) | full (ZIP form: end by marker and/or entry size) | `python3 -m lzma` (FORMAT_ALONE); `7zz` and Python `zipfile` (ZIP_LZMA) both directions |
 | xz | `xz` | `xz` | `.xz` | compressed-LZMA2 chunks + uncompressed fallback | full: all LZMA2 reset variants, CRC32/CRC64/SHA-256 checks, Delta/BCJ filter chains, concatenated Streams + Stream Padding | `xz(1)` both directions |
 | Raw LZMA2 (7z coder 21) | `lzma2` | `lzma2` | `.lzma2` | full (raw LZMA2 chunk stream; reuses the xz LZMA2 engine) | full (raw LZMA2 chunk stream; reuses the xz LZMA2 engine) | round-trip + cross-decode via the shared xz LZMA2 codec |
 | Zstandard (RFC 8478) | `zstd` | `zstd` | `.zst` | LZ77 + Huffman literals + FSE_Compressed_Mode sequences + repeat offsets + RLE blocks; optimal parse at high levels | full Compressed_Block + XXH64 content checksum | `zstd(1)` both directions |
