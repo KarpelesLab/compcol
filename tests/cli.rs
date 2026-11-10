@@ -656,6 +656,75 @@ fn in_place_decompress_keeps_non_utf8_name_bytes() {
     assert_eq!(file_contents(&expected), b"non-utf8 name payload");
 }
 
+/// Permission bits of `p`.
+#[cfg(unix)]
+fn mode_of(p: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(p).expect("stat").permissions().mode() & 0o777
+}
+
+#[cfg(unix)]
+fn set_mode(p: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(p, fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+#[cfg(unix)]
+#[test]
+fn output_inherits_input_permissions() {
+    // The output used to be created with the default mode (0666 & !umask),
+    // so compressing a 0600 file produced a world-readable copy of it — and
+    // in-place mode then removed the protected original.
+    for mode in [0o600, 0o640] {
+        let s = Scratch::new("perms");
+        let secret = s.file("secret");
+        fs::write(&secret, b"s3cret\n").unwrap();
+        set_mode(&secret, mode);
+
+        // In-place compress.
+        let (_out, err, code) = run(&["-t", "gzip", secret.to_str().unwrap()]);
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+        let gz = s.file("secret.gz");
+        assert_eq!(mode_of(&gz), mode, "compressed output mode");
+
+        // In-place decompress.
+        let (_out, err, code) = run(&["-d", gz.to_str().unwrap()]);
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+        assert_eq!(mode_of(&secret), mode, "decompressed output mode");
+        assert_eq!(file_contents(&secret), b"s3cret\n");
+
+        // Explicit -o, onto an existing more permissive file with --force.
+        let other = s.file("other.gz");
+        fs::write(&other, b"old").unwrap();
+        set_mode(&other, 0o666);
+        let (_out, err, code) = run(&[
+            "-t",
+            "gzip",
+            "-f",
+            "-o",
+            other.to_str().unwrap(),
+            secret.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+        assert_eq!(mode_of(&other), mode, "--force output mode");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn output_from_stdin_keeps_default_permissions() {
+    // With no input file there is no mode to copy: the output gets whatever
+    // a plainly created file gets under the current umask.
+    let s = Scratch::new("perms_stdin");
+    let reference = s.file("reference");
+    fs::write(&reference, b"x").unwrap();
+    let out = s.file("out.gz");
+
+    let (_out, err, code) = run_with_stdin(&["-t", "gzip", "-o", out.to_str().unwrap()], b"data");
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+    assert_eq!(mode_of(&out), mode_of(&reference));
+}
+
 #[cfg(unix)]
 #[test]
 fn force_refuses_output_hard_linked_to_the_input() {

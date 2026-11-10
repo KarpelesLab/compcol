@@ -387,6 +387,67 @@ fn strip_extension(input: &Path, ext: &str) -> Result<Option<PathBuf>, String> {
     Ok(s.strip_suffix(&suffix).map(PathBuf::from))
 }
 
+/// Permission bits of `f` if it is a regular file, for copying onto the
+/// output. `None` for pipes, devices and the like — and always on platforms
+/// without unix permission bits, where the output keeps its default ACL.
+fn regular_file_mode(f: &File) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        f.metadata()
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = f;
+        None
+    }
+}
+
+/// Open the output file: exclusively (`O_EXCL`) unless `force`, which
+/// truncates an existing file instead.
+///
+/// With `owner_only` (unix; set when the input is a regular file whose mode
+/// will be copied over afterwards) a newly created file starts out as 0600
+/// rather than `0666 & !umask`, so the data is never exposed more widely
+/// than the input was while it is being written. An existing `--force`
+/// target keeps its mode until then.
+fn open_output(path: &Path, force: bool, owner_only: bool) -> io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.write(true);
+    if force {
+        opts.create(true).truncate(true);
+    } else {
+        opts.create_new(true);
+    }
+    #[cfg(unix)]
+    if owner_only {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = owner_only;
+    opts.open(path)
+}
+
+/// Set the permission bits of the open output file to `mode`. Only regular
+/// files are touched (`-f -o /dev/null` must not chmod the device); a no-op
+/// on platforms without unix permission bits.
+fn set_mode(f: &File, mode: u32) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if f.metadata()?.is_file() {
+            f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (f, mode);
+    Ok(())
+}
+
 /// Whether `input` and `output` name the same existing file.
 ///
 /// On unix the device/inode pair is compared, which also catches hard links
@@ -502,7 +563,9 @@ fn run(args: &Args) -> Result<(), RunError> {
     let in_place = args.input.is_some() && !args.stdout && args.output.is_none();
     let should_remove_input = in_place && !args.keep;
 
-    // Reader.
+    // Reader. When the input is a regular file, remember its permission bits
+    // so a file output can be given the same ones (see `open_output`).
+    let mut input_mode: Option<u32> = None;
     let mut reader: Box<dyn Read> = if let Some(p) = &args.input {
         let f = File::open(p).map_err(|e| {
             RunError::Io(io::Error::new(
@@ -510,6 +573,7 @@ fn run(args: &Args) -> Result<(), RunError> {
                 format!("open {}: {e}", p.display()),
             ))
         })?;
+        input_mode = regular_file_mode(&f);
         Box::new(BufReader::new(f))
     } else {
         Box::new(BufReader::new(io::stdin()))
@@ -563,6 +627,7 @@ fn run(args: &Args) -> Result<(), RunError> {
 
     // Writer + the path we'd remove on cleanup if anything goes wrong.
     let stdout = io::stdout();
+    let mut final_mode: Option<(File, u32, PathBuf)> = None;
     let (mut writer, output_path): (Box<dyn Write>, Option<PathBuf>) = match &output {
         Output::Stdout => (Box::new(BufWriter::new(stdout.lock())), None),
         Output::File(p) => {
@@ -590,16 +655,7 @@ fn run(args: &Args) -> Result<(), RunError> {
             // uses create_new, so a successful open there always created the
             // file — it is always safe to clean up.)
             let preexisting = args.force && p.exists();
-            let open_result = if args.force {
-                OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(p)
-            } else {
-                OpenOptions::new().write(true).create_new(true).open(p)
-            };
-            let f = open_result.map_err(|e| {
+            let f = open_output(p, args.force, input_mode.is_some()).map_err(|e| {
                 if !args.force && e.kind() == io::ErrorKind::AlreadyExists {
                     RunError::Usage(format!(
                         "output exists: {} (use -f to overwrite)",
@@ -616,6 +672,15 @@ fn run(args: &Args) -> Result<(), RunError> {
             // left in place (already truncated) rather than deleted out from
             // under the user.
             let cleanup = if preexisting { None } else { Some(p.clone()) };
+            // Keep a second handle so the input's permission bits can be
+            // applied to this very file (not to whatever the path names by
+            // then) once it is completely written. If the handle can't be
+            // duplicated the output simply stays owner-only.
+            if let Some(mode) = input_mode
+                && let Ok(handle) = f.try_clone()
+            {
+                final_mode = Some((handle, mode, p.clone()));
+            }
             (Box::new(BufWriter::new(f)), cleanup)
         }
     };
@@ -636,6 +701,18 @@ fn run(args: &Args) -> Result<(), RunError> {
             let _ = std::fs::remove_file(&p);
         }
         return Err(RunError::Io(e));
+    }
+
+    // The output is complete: hand it the input's permission bits. Failing
+    // to do so leaves it no more accessible than intended (a file we created
+    // is still owner-only), so warn rather than fail the whole run.
+    if let Some((handle, mode, path)) = final_mode
+        && let Err(e) = set_mode(&handle, mode)
+    {
+        eprintln!(
+            "compcol: warning: could not set permissions on {}: {e}",
+            path.display()
+        );
     }
 
     if should_remove_input
