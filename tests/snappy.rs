@@ -384,6 +384,55 @@ fn decoder_rejects_corrupt_offset() {
     let _ = err;
 }
 
+/// Feed `block` to a fresh decoder and return what `finish` says.
+fn decode_result(block: &[u8]) -> Result<Vec<u8>, compcol::Error> {
+    let mut dec = Decoder::new();
+    let mut out = [0u8; 64];
+    let mut consumed = 0;
+    while consumed < block.len() {
+        let (p, _) = dec.decode(&block[consumed..], &mut out)?;
+        consumed += p.consumed;
+    }
+    let mut decoded = Vec::new();
+    loop {
+        let (p, status) = dec.finish(&mut out)?;
+        decoded.extend_from_slice(&out[..p.written]);
+        if status == Status::StreamEnd {
+            return Ok(decoded);
+        }
+        assert!(p.written > 0, "decoder finish stalled");
+    }
+}
+
+#[test]
+fn decoder_rejects_huge_literal_length_without_panicking() {
+    // varint len 10; literal "ab"; then a literal tag (class 63 = 4 length
+    // bytes) declaring len-1 = 0xFFFF_FFFE, i.e. a 4 GiB - 1 literal. On a
+    // 32-bit target `ip + length` and `out.len() + length` used to wrap,
+    // both bounds checks passed and the slice index panicked.
+    let block = [0x0A, 0x04, b'a', b'b', 0xFC, 0xFE, 0xFF, 0xFF, 0xFF];
+    assert!(decode_result(&block).is_err());
+}
+
+#[test]
+fn decoder_rejects_literal_length_that_wraps_to_zero() {
+    // len-1 = 0xFFFF_FFFF: the length is 2^32, which no Snappy block can
+    // hold (the uncompressed length is a u32). It used to wrap to a
+    // zero-length literal and the block decoded "successfully".
+    let block = [0x02, 0x04, b'a', b'b', 0xFC, 0xFF, 0xFF, 0xFF, 0xFF];
+    assert!(decode_result(&block).is_err());
+}
+
+#[test]
+fn decoder_rejects_literal_longer_than_declared_output() {
+    // varint len 2, literal of 3 bytes: more output than the header allows.
+    let block = [0x02, 0x08, b'a', b'b', b'c'];
+    assert_eq!(decode_result(&block), Err(compcol::Error::Corrupt));
+    // And a copy that overshoots the declared length.
+    let block = [0x05, 0x04, b'a', b'b', 0b0000_0001, 0x02];
+    assert_eq!(decode_result(&block), Err(compcol::Error::Corrupt));
+}
+
 #[cfg(feature = "factory")]
 mod factory {
     use compcol::Status;

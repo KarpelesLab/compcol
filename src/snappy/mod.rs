@@ -496,13 +496,20 @@ fn decompress_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
                         len_minus_1 |= (input[ip + i] as u32) << (8 * i);
                     }
                     ip += extra;
-                    len_minus_1.wrapping_add(1)
+                    // A length of 2^32 cannot fit a block whose total
+                    // uncompressed length is a u32; never let it wrap to 0.
+                    len_minus_1.checked_add(1).ok_or(Error::Corrupt)?
                 };
-                let length = length as usize;
-                if ip + length > input_end {
+                // `length` is attacker-controlled and can be close to
+                // `u32::MAX`, so on a 32-bit target `ip + length` and
+                // `out.len() + length` could wrap. Compare against the
+                // space that is left instead (`ip <= input_end` and
+                // `out.len() <= uncompressed_len` always hold here).
+                let length = usize::try_from(length).map_err(|_| Error::Corrupt)?;
+                if length > input_end - ip {
                     return Err(Error::UnexpectedEnd);
                 }
-                if out.len() + length > uncompressed_len {
+                if length > uncompressed_len - out.len() {
                     return Err(Error::Corrupt);
                 }
                 out.extend_from_slice(&input[ip..ip + length]);
@@ -564,7 +571,9 @@ fn copy_from_back(
     if offset == 0 || offset > out.len() {
         return Err(Error::InvalidDistance);
     }
-    if out.len() + length > uncompressed_len {
+    // Subtraction form: `out.len() <= uncompressed_len` is an invariant, so
+    // this cannot wrap the way `out.len() + length` could.
+    if length > uncompressed_len - out.len() {
         return Err(Error::Corrupt);
     }
     let start = out.len() - offset;
