@@ -1388,3 +1388,105 @@ fn endless_block_header_is_rejected() {
         assert!(pos <= 512 << 10, "in_chunk {in_chunk}: read {pos} bytes");
     }
 }
+
+// ─── decoder: RLE-1 undone on the way out ──────────────────────────────
+
+/// However the input and output are cut up, the decoder hands out the
+/// same bytes: across the reference fixtures (plain and randomised
+/// blocks, one block and several), data that is mostly long runs,
+/// concatenated streams and empty ones.
+#[test]
+fn decode_is_independent_of_chunking() {
+    // Runs of every length around the RLE-1 thresholds (4, and the
+    // 255-byte cap), over several level-1 blocks.
+    let mut runs = Vec::new();
+    let mut x: u32 = 7;
+    while runs.len() < 400_000 {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        let byte = b'a' + ((x >> 16) % 3) as u8;
+        let n = match (x >> 8) % 8 {
+            0 => 1 + (x >> 20) % 6,
+            1 => 250 + (x >> 20) % 16,
+            2 => 3000,
+            _ => 1 + (x >> 20) % 3,
+        };
+        runs.extend(std::iter::repeat_n(byte, n as usize));
+    }
+    let runs_1 = encode_level(&runs, 1);
+    let empty = encode_all(b"");
+
+    let mut concatenated = WORDS250K_1.to_vec();
+    concatenated.extend_from_slice(&empty);
+    concatenated.extend_from_slice(include_bytes!("fixtures/bzip2/randomised_small.bz2"));
+    concatenated.extend_from_slice(&empty);
+    concatenated.extend_from_slice(&runs_1);
+
+    let mut empties = empty.clone();
+    empties.extend_from_slice(&empty);
+
+    let streams: [&[u8]; 8] = [
+        WORDS200K_9,
+        WORDS250K_1,
+        include_bytes!("fixtures/bzip2/randomised_small.bz2"),
+        include_bytes!("fixtures/bzip2/randomised_multiblock.bz2"),
+        &runs_1,
+        &empty,
+        &empties,
+        &concatenated,
+    ];
+    for (i, stream) in streams.iter().enumerate() {
+        let want = decode_chunked(stream, stream.len(), 1 << 22).unwrap();
+        for (in_chunk, out_chunk) in [(1, 1 << 16), (stream.len(), 1), (3, 5), (4096, 259)] {
+            let got = decode_chunked(stream, in_chunk, out_chunk).unwrap();
+            assert!(got == want, "stream {i}, {in_chunk}/{out_chunk}");
+        }
+        assert!(decode_documented_loop(stream, 1000).unwrap() == want);
+    }
+    assert!(decode_chunked(&runs_1, runs_1.len(), 1 << 22).unwrap() == runs);
+    assert!(decode_chunked(&empties, 1, 1).unwrap().is_empty());
+}
+
+/// A block's CRC is checked once its last byte has been handed out, and
+/// the stream CRC after that: neither a wrong block CRC nor a wrong
+/// stream CRC goes unreported, whatever the size of the output buffer,
+/// and nothing past the bad block is ever emitted.
+#[test]
+fn crc_mismatches_are_reported_with_small_output_buffers() {
+    let plain = gen_words(250_000);
+    // The CRC of the first of three blocks follows the 4-byte stream
+    // header and the 6-byte block magic.
+    let mut bad_block = WORDS250K_1.to_vec();
+    bad_block[11] ^= 0x10;
+    // The stream CRC is the last 32 bits before at most 7 bits of padding.
+    let mut bad_stream = WORDS250K_1.to_vec();
+    let n = bad_stream.len();
+    bad_stream[n - 3] ^= 0x10;
+
+    for out_chunk in [1usize, 1000, 1 << 20] {
+        for (stream, limit) in [(&bad_block, 99_981), (&bad_stream, plain.len())] {
+            let mut dec = Decoder::new();
+            let mut buf = vec![0u8; out_chunk];
+            let mut got = Vec::new();
+            let mut pos = 0;
+            let err = loop {
+                let r = if pos < stream.len() {
+                    dec.decode(&stream[pos..], &mut buf)
+                } else {
+                    dec.finish(&mut buf)
+                };
+                match r {
+                    Ok((p, status)) => {
+                        got.extend_from_slice(&buf[..p.written]);
+                        pos += p.consumed;
+                        assert_ne!(status, Status::StreamEnd, "accepted a bad CRC");
+                    }
+                    Err(e) => break e,
+                }
+            };
+            assert_eq!(err, Error::ChecksumMismatch, "out_chunk {out_chunk}");
+            assert!(got.len() <= limit && plain.starts_with(&got));
+            // The decoder stays failed.
+            assert!(dec.decode(&[], &mut buf).is_err());
+        }
+    }
+}
