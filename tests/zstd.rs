@@ -4,8 +4,7 @@
 //! loop dispatches on `Status` rather than inferring from byte counts.
 //!
 //! See `src/zstd/mod.rs` for the supported subset (Raw_Block, RLE_Block, and
-//! Compressed_Block on both halves; no Content_Checksum_Flag, no Skippable
-//! frames, no Dictionary_ID).
+//! Compressed_Block on both halves; no Dictionary_ID).
 
 #![cfg(feature = "zstd")]
 
@@ -958,9 +957,8 @@ fn reference_small_window_long_stream() {
         expected
     );
     // A 1 KiB window is within even the tightest configurable limit.
-    let mut dec = Decoder::with_config(compcol::zstd::DecoderConfig {
-        max_window_size: 1024,
-    });
+    let mut dec =
+        Decoder::with_config(compcol::zstd::DecoderConfig::default().with_max_window_size(1024));
     assert_eq!(
         decode_chunked_with(&mut dec, WORDS300K_WLOG10).unwrap(),
         expected
@@ -990,9 +988,7 @@ fn window_size_limit_is_enforced_and_configurable() {
     assert_eq!(decode_chunked(&huge, 64, 64), Err(Error::Unsupported));
 
     // A tighter limit (the RFC 8878 recommended 8 MiB) rejects 16 MiB...
-    let cfg = DecoderConfig {
-        max_window_size: RECOMMENDED_WINDOW_SIZE,
-    };
+    let cfg = DecoderConfig::default().with_max_window_size(RECOMMENDED_WINDOW_SIZE);
     let w16m = frame_with_window_descriptor(14 << 3);
     let mut dec = Decoder::with_config(cfg);
     assert_eq!(
@@ -1088,19 +1084,628 @@ fn encoder_writes_frame_content_size_for_single_block_inputs() {
 }
 
 /// Skippable_Frame magics (`0x184D2A50..=0x184D2A5F`, little-endian on the
-/// wire) are reported as `Unsupported`, not as a bad header.
+/// wire) are skipped: every one of the sixteen, here with an empty payload
+/// ahead of a real frame. (They used to be rejected as `Unsupported`.)
 #[test]
-fn skippable_frame_magic_is_unsupported() {
+fn skippable_frame_magic_is_skipped() {
     for lo in 0x50u8..=0x5F {
-        let frame = [lo, 0x2A, 0x4D, 0x18, 0, 0, 0, 0];
-        let mut dec = Zstd::decoder();
-        let mut out = [0u8; 16];
+        let mut stream = vec![lo, 0x2A, 0x4D, 0x18, 0, 0, 0, 0];
+        stream.extend_from_slice(&build_raw_frame(b"after"));
         assert_eq!(
-            dec.decode(&frame, &mut out).unwrap_err(),
-            Error::Unsupported,
+            decode_chunked(&stream, 4096, 4096).as_deref(),
+            Ok(&b"after"[..]),
             "magic low byte {lo:#x}"
         );
     }
+}
+
+// ─── concatenated and skippable frames ──────────────────────────────────
+
+use compcol::zstd::DecoderConfig;
+
+/// Chunkings every multi-frame stream is decoded with: `(input, output)`
+/// slice sizes, down to one byte at a time on either side.
+const CHUNKINGS: [(usize, usize); 6] = [
+    (1, 1),
+    (1, 4096),
+    (4096, 1),
+    (7, 3),
+    (1 << 20, 1 << 20),
+    (5, 1 << 16),
+];
+
+/// What a decoder made of a stream.
+#[derive(Debug, PartialEq)]
+struct Decoded {
+    out: Vec<u8>,
+    /// Input bytes the decoder reported consumed.
+    consumed: usize,
+    /// Whether `decode` itself reported `StreamEnd` (as opposed to `finish`).
+    ended_in_decode: bool,
+}
+
+/// Feed `encoded` to `dec` in `in_chunk`-byte slices, draining through an
+/// `out_chunk`-byte buffer, until `decode` reports the end or the input
+/// runs out; then `finish`.
+fn drive(
+    dec: &mut Decoder,
+    encoded: &[u8],
+    in_chunk: usize,
+    out_chunk: usize,
+) -> Result<Decoded, Error> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; out_chunk];
+    let mut consumed = 0;
+    let mut ended_in_decode = false;
+    'feed: loop {
+        let end = (consumed + in_chunk).min(encoded.len());
+        loop {
+            let before = consumed;
+            let (p, status) = dec.decode(&encoded[consumed..end], &mut buf)?;
+            out.extend_from_slice(&buf[..p.written]);
+            consumed += p.consumed;
+            match status {
+                Status::StreamEnd => {
+                    ended_in_decode = true;
+                    break 'feed;
+                }
+                Status::InputEmpty => break,
+                Status::OutputFull => {
+                    assert!(
+                        consumed > before || p.written > 0,
+                        "decode asked to be called again without progress"
+                    );
+                }
+            }
+        }
+        assert_eq!(consumed, end, "InputEmpty with input left over");
+        if end == encoded.len() {
+            break;
+        }
+    }
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        assert_eq!(p.consumed, 0);
+        if status == Status::StreamEnd {
+            break;
+        }
+        assert!(p.written > 0, "decoder finish stalled");
+    }
+    Ok(Decoded {
+        out,
+        consumed,
+        ended_in_decode,
+    })
+}
+
+/// Decode `stream` with the default (multi-frame) decoder under every
+/// chunking and check it yields `expected`, consuming everything.
+fn assert_multi_frame(stream: &[u8], expected: &[u8]) {
+    for (in_chunk, out_chunk) in CHUNKINGS {
+        let got = drive(&mut Decoder::new(), stream, in_chunk, out_chunk)
+            .unwrap_or_else(|e| panic!("chunking {in_chunk}/{out_chunk}: {e:?}"));
+        assert!(
+            got.out == expected,
+            "chunking {in_chunk}/{out_chunk}: wrong output ({} bytes, expected {})",
+            got.out.len(),
+            expected.len()
+        );
+        assert_eq!(
+            got.consumed,
+            stream.len(),
+            "chunking {in_chunk}/{out_chunk}"
+        );
+        // The end is only known at `finish`: nothing follows the last frame.
+        assert!(!got.ended_in_decode, "chunking {in_chunk}/{out_chunk}");
+    }
+    assert!(compcol::vec::decompress_to_vec::<Zstd>(stream).unwrap() == expected);
+}
+
+/// A Skippable_Frame: magic `0x184D2A50 + nibble`, the payload's length,
+/// the payload.
+fn skippable_frame(nibble: u8, payload: &[u8]) -> Vec<u8> {
+    let mut f = vec![0x50 | nibble, 0x2A, 0x4D, 0x18];
+    f.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// Trailer of `checksummed_raw_frame(b"hello", ..)`.
+const HELLO_XXH: [u8; 4] = [0xA3, 0x6D, 0x9F, 0x88];
+
+#[test]
+fn two_concatenated_frames_decode_as_one() {
+    let a = gen_words(3_000);
+    let b = lcg_bytes(9, 2_000);
+    let mut stream = encode_at_level(&a, 1);
+    stream.extend_from_slice(&encode_at_level(&b, 19));
+    assert_multi_frame(&stream, &[a, b].concat());
+}
+
+/// Three frames at different levels; the middle one is larger than a block
+/// and carries no Frame_Content_Size, the last one has a content checksum.
+#[test]
+fn three_concatenated_frames_decode_as_one() {
+    let a = mixed_corpus();
+    let b = gen_words(300_000);
+    let frame_b = {
+        // Streamed, so the encoder cannot know the size up front.
+        let mut enc = Encoder::with_config(EncoderConfig { level: 3 });
+        encode_chunked(&mut enc, &b, 1000, 4096)
+    };
+    assert_eq!(frame_b[4] & 0xE0, 0, "frame b: no FCS, not single-segment");
+    let mut stream = encode_at_level(&a, 9);
+    stream.extend_from_slice(&frame_b);
+    stream.extend_from_slice(&checksummed_raw_frame(b"hello", HELLO_XXH));
+    assert_multi_frame(&stream, &[&a[..], &b[..], b"hello"].concat());
+}
+
+#[test]
+fn empty_frames_between_and_around_frames() {
+    let empty = encode_at_level(b"", 3);
+    assert_multi_frame(&[&empty[..], &empty[..]].concat(), b"");
+    let a = encode_at_level(b"first", -5);
+    let b = build_rle_frame(b'z', 300);
+    let stream = [
+        &empty[..],
+        &a[..],
+        &empty[..],
+        &empty[..],
+        &b[..],
+        &empty[..],
+    ]
+    .concat();
+    assert_multi_frame(&stream, &[&b"first"[..], &[b'z'; 300][..]].concat());
+}
+
+#[test]
+fn skippable_frames_before_between_and_after() {
+    let a = gen_words(2_000);
+    let b = lcg_bytes(3, 700);
+    let fa = encode_at_level(&a, 3);
+    let fb = encode_at_level(&b, 1);
+    let expected = [&a[..], &b[..]].concat();
+    // A payload that looks like a frame, to show it is not interpreted.
+    let decoy = build_raw_frame(b"must not appear in the output");
+    let big = lcg_bytes(11, 70_000);
+
+    let before = [&skippable_frame(0, &decoy)[..], &fa[..], &fb[..]].concat();
+    assert_multi_frame(&before, &expected);
+    let between = [&fa[..], &skippable_frame(7, &big)[..], &fb[..]].concat();
+    assert_multi_frame(&between, &expected);
+    let after = [&fa[..], &fb[..], &skippable_frame(0xF, &decoy)[..]].concat();
+    assert_multi_frame(&after, &expected);
+    let everywhere = [
+        &skippable_frame(1, b"")[..],
+        &skippable_frame(2, b"x")[..],
+        &fa[..],
+        &skippable_frame(3, &decoy)[..],
+        &skippable_frame(4, b"")[..],
+        &fb[..],
+        &skippable_frame(5, &big)[..],
+        &skippable_frame(6, b"")[..],
+    ]
+    .concat();
+    assert_multi_frame(&everywhere, &expected);
+    // Nothing but skippable frames: an empty output.
+    let only = [
+        &skippable_frame(0, &decoy)[..],
+        &skippable_frame(1, b"")[..],
+    ]
+    .concat();
+    assert_multi_frame(&only, b"");
+}
+
+/// A Skippable_Frame declaring the largest payload costs no memory: the
+/// decoder counts the bytes down and keeps none.
+#[test]
+fn huge_skippable_frame_is_not_buffered() {
+    let mut stream = vec![0x5A, 0x2A, 0x4D, 0x18, 0xFF, 0xFF, 0xFF, 0xFF];
+    stream.extend_from_slice(&[0u8; 100_000]);
+    let mut dec = Decoder::new();
+    let mut out = [0u8; 64];
+    let (p, status) = dec.decode(&stream, &mut out).unwrap();
+    assert_eq!((p.consumed, p.written), (stream.len(), 0));
+    assert_eq!(status, Status::InputEmpty);
+    // The payload is not all there.
+    assert_eq!(dec.finish(&mut out).unwrap_err(), Error::UnexpectedEnd);
+}
+
+/// Cut a two-frame stream at every byte. Only the cuts at a frame boundary
+/// decode; in particular no cut inside the second frame returns the first
+/// frame's content as if it were everything.
+#[test]
+fn truncated_multi_frame_stream_is_an_error() {
+    let a = gen_words(600);
+    let b = lcg_bytes(21, 300);
+    let fa = encode_at_level(&a, 3);
+    let fb = checksummed_raw_frame(b"hello", HELLO_XXH);
+    let fc = encode_at_level(&b, 5);
+    let skip = skippable_frame(3, b"padding");
+    let stream = [&fa[..], &fb[..], &skip[..], &fc[..]].concat();
+    let b1 = fa.len();
+    let b2 = b1 + fb.len();
+    let b3 = b2 + skip.len();
+    for cut in 0..=stream.len() {
+        for (in_chunk, out_chunk) in [(1, 1), (4096, 4096)] {
+            let got = drive(&mut Decoder::new(), &stream[..cut], in_chunk, out_chunk);
+            let expected: Option<Vec<u8>> = if cut == b1 {
+                Some(a.clone())
+            } else if cut == b2 || cut == b3 {
+                Some([&a[..], b"hello"].concat())
+            } else if cut == stream.len() {
+                Some([&a[..], b"hello", &b[..]].concat())
+            } else {
+                None
+            };
+            match expected {
+                Some(expected) => {
+                    let got = got.unwrap_or_else(|e| panic!("cut {cut}: {e:?}"));
+                    assert!(got.out == expected, "cut {cut}: wrong output");
+                    assert_eq!(got.consumed, cut);
+                }
+                None => assert_eq!(
+                    got.map(|d| d.out.len()),
+                    Err(Error::UnexpectedEnd),
+                    "cut {cut} of {} (boundaries {b1}, {b2}, {b3})",
+                    stream.len()
+                ),
+            }
+        }
+        if cut != b1 && cut != b2 && cut != b3 && cut != stream.len() {
+            assert_eq!(
+                compcol::vec::decompress_to_vec::<Zstd>(&stream[..cut]),
+                Err(Error::UnexpectedEnd),
+                "cut {cut}"
+            );
+        }
+    }
+}
+
+/// Bytes after a frame that do not start another one end the stream and
+/// stay unconsumed, as with the gzip decoder.
+#[test]
+fn trailing_bytes_end_the_stream_unconsumed() {
+    let a = gen_words(900);
+    let fa = encode_at_level(&a, 3);
+    for garbage in [
+        &b"\0\0\0\0\0\0\0\0"[..],
+        b"trailing",
+        &[0xFF],
+        &[0x27, 0xB5, 0x2F, 0xFD],
+    ] {
+        let stream = [&fa[..], garbage].concat();
+        for (in_chunk, out_chunk) in CHUNKINGS {
+            let got = drive(&mut Decoder::new(), &stream, in_chunk, out_chunk).unwrap();
+            assert!(got.out == a);
+            assert_eq!(got.consumed, fa.len(), "chunking {in_chunk}/{out_chunk}");
+            assert!(got.ended_in_decode, "chunking {in_chunk}/{out_chunk}");
+        }
+        assert!(compcol::vec::decompress_to_vec::<Zstd>(&stream).unwrap() == a);
+    }
+}
+
+/// Once the byte after a frame is the first byte of a frame magic, a frame
+/// has to follow: a wrong magic is `BadHeader`, an incomplete one
+/// `UnexpectedEnd`.
+#[test]
+fn bad_or_partial_magic_after_a_frame_is_an_error() {
+    let fa = encode_at_level(b"some content", 3);
+    let cases: [(&[u8], Error); 8] = [
+        (&[0x28, 0xB5, 0x2F, 0xFE], Error::BadHeader),
+        (&[0x28, 0, 0, 0, 0, 0], Error::BadHeader),
+        (b"Paddings", Error::BadHeader),
+        (&[0x50, 0x2A, 0x4D, 0x19, 0, 0, 0, 0], Error::BadHeader),
+        (&[0x28], Error::UnexpectedEnd),
+        (&[0x28, 0xB5, 0x2F], Error::UnexpectedEnd),
+        (&[0x5F, 0x2A], Error::UnexpectedEnd),
+        // A whole skippable magic, half a length.
+        (&[0x50, 0x2A, 0x4D, 0x18, 1, 0], Error::UnexpectedEnd),
+    ];
+    for (tail, error) in cases {
+        let stream = [&fa[..], tail].concat();
+        for (in_chunk, out_chunk) in CHUNKINGS {
+            assert_eq!(
+                drive(&mut Decoder::new(), &stream, in_chunk, out_chunk).map(|d| d.out.len()),
+                Err(error),
+                "tail {tail:02x?}, chunking {in_chunk}/{out_chunk}"
+            );
+        }
+    }
+}
+
+/// Each frame's own checksum and content size are verified.
+#[test]
+fn later_frame_is_verified_on_its_own() {
+    let fa = encode_at_level(&gen_words(500), 3);
+    let bad_sum = checksummed_raw_frame(b"hello", [0xA3, 0x6D, 0x9F, 0x89]);
+    let stream = [
+        &fa[..],
+        &checksummed_raw_frame(b"hello", HELLO_XXH)[..],
+        &bad_sum[..],
+    ]
+    .concat();
+    for (in_chunk, out_chunk) in CHUNKINGS {
+        assert_eq!(
+            drive(&mut Decoder::new(), &stream, in_chunk, out_chunk).map(|d| d.out.len()),
+            Err(Error::ChecksumMismatch)
+        );
+    }
+    // Single-segment frame declaring 6 bytes of content but holding 5,
+    // after a frame of 500: the count starts over with each frame.
+    let mut short = vec![0x28, 0xB5, 0x2F, 0xFD, 0x20, 6];
+    short.extend_from_slice(&[1 | (5 << 3), 0, 0]);
+    short.extend_from_slice(b"hello");
+    let mut exact = short.clone();
+    exact[5] = 5;
+    assert_multi_frame(
+        &[&fa[..], &exact[..]].concat(),
+        &[&gen_words(500)[..], b"hello"].concat(),
+    );
+    assert_eq!(
+        drive(
+            &mut Decoder::new(),
+            &[&fa[..], &short[..]].concat(),
+            4096,
+            4096
+        )
+        .map(|d| d.out.len()),
+        Err(Error::Corrupt)
+    );
+}
+
+/// Length of a frame's header, from its Frame_Header_Descriptor.
+fn frame_header_len(frame: &[u8]) -> usize {
+    let fhd = frame[4];
+    let single_segment = fhd & 0x20 != 0;
+    let dict = [0, 1, 2, 4][(fhd & 3) as usize];
+    let fcs = match fhd >> 6 {
+        0 => usize::from(single_segment),
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    };
+    5 + usize::from(!single_segment) + dict + fcs
+}
+
+/// A frame starts with an empty window: its blocks cannot reach into the
+/// previous frame's data (nor reuse its entropy tables).
+#[test]
+fn frame_cannot_reference_the_previous_one() {
+    // One frame of two blocks, the second a copy of the first — so it is
+    // encoded as a reference to it.
+    let half = lcg_bytes(77, 5_000);
+    let mut enc = Encoder::with_config(EncoderConfig { level: 3 });
+    let mut two_blocks = Vec::new();
+    flush_test_encode(&mut enc, &half, 4096, &mut two_blocks);
+    flush_test_flush(&mut enc, Flush::Sync, 4096, &mut two_blocks);
+    flush_test_encode(&mut enc, &half, 4096, &mut two_blocks);
+    flush_test_finish(&mut enc, 4096, &mut two_blocks);
+    assert_eq!(
+        decode_chunked(&two_blocks, 4096, 4096).unwrap(),
+        [&half[..], &half[..]].concat()
+    );
+
+    // Locate the second block.
+    let header_len = frame_header_len(&two_blocks);
+    assert_eq!(two_blocks[4] & 0x20, 0, "windowed frame expected");
+    let block_at = |pos: usize| {
+        let bh = u32::from_le_bytes([two_blocks[pos], two_blocks[pos + 1], two_blocks[pos + 2], 0]);
+        let size = (bh >> 3) as usize;
+        let wire = if (bh >> 1) & 3 == 1 { 1 } else { size };
+        (bh, pos + 3 + wire)
+    };
+    let (bh1, second) = block_at(header_len);
+    assert_eq!(bh1 & 1, 0, "first block is not the last");
+    let (bh2, second_end) = block_at(second);
+    assert_eq!((bh2 >> 1) & 3, 2, "second block is compressed");
+    assert!(
+        second_end - second < 200,
+        "second block is a back-reference"
+    );
+
+    // The same second block as the only block of a frame of its own.
+    let mut lone = two_blocks[..header_len].to_vec();
+    lone.extend_from_slice(&two_blocks[second..second_end]);
+    lone[header_len] |= 1; // Last_Block
+    assert!(drive(&mut Decoder::new(), &lone, 4096, 4096).is_err());
+
+    // Behind a frame holding exactly the data it refers to, it must fail
+    // the same way.
+    let stream = [&encode_at_level(&half, 3)[..], &lone[..]].concat();
+    for (in_chunk, out_chunk) in CHUNKINGS {
+        assert_eq!(
+            drive(&mut Decoder::new(), &stream, in_chunk, out_chunk).map(|d| d.out.len()),
+            Err(Error::Corrupt),
+            "chunking {in_chunk}/{out_chunk}"
+        );
+    }
+}
+
+/// `decode` cannot tell a frame boundary from the end of the stream until
+/// it sees the next byte; `finish` can.
+#[test]
+fn decode_reports_the_end_only_when_it_can_know() {
+    let fa = encode_at_level(b"first", 3);
+    let fb = encode_at_level(b"second", 3);
+    let mut dec = Decoder::new();
+    let mut out = [0u8; 64];
+    let (p, status) = dec.decode(&fa, &mut out).unwrap();
+    assert_eq!((p.consumed, &out[..p.written]), (fa.len(), &b"first"[..]));
+    assert_eq!(status, Status::InputEmpty);
+    // Still nothing to go by.
+    let (p, status) = dec.decode(&[], &mut out).unwrap();
+    assert_eq!((p.consumed, p.written, status), (0, 0, Status::InputEmpty));
+    let (p, status) = dec.decode(&fb, &mut out).unwrap();
+    assert_eq!((p.consumed, &out[..p.written]), (fb.len(), &b"second"[..]));
+    assert_eq!(status, Status::InputEmpty);
+    let (p, status) = dec.finish(&mut out).unwrap();
+    assert_eq!((p.written, status), (0, Status::StreamEnd));
+    // Terminal from here on: more input is not looked at.
+    let (p, status) = dec.decode(&fb, &mut out).unwrap();
+    assert_eq!((p.consumed, p.written, status), (0, 0, Status::StreamEnd));
+    let (p, status) = dec.finish(&mut out).unwrap();
+    assert_eq!((p.written, status), (0, Status::StreamEnd));
+}
+
+/// With `multi_frame` off the decoder stops at the end of the first frame,
+/// consuming not one byte more, whatever follows.
+#[test]
+fn single_frame_mode_stops_after_the_first_frame() {
+    let config = DecoderConfig::default().with_multi_frame(false);
+    assert!(DecoderConfig::default().multi_frame);
+    let a = gen_words(40_000);
+    let frames = [encode_at_level(&a, 3), {
+        // Streamed: no Frame_Content_Size.
+        let mut enc = Encoder::with_config(EncoderConfig { level: 1 });
+        encode_chunked(&mut enc, &a, 777, 4096)
+    }];
+    let hello = checksummed_raw_frame(b"hello", HELLO_XXH);
+    let tails: [&[u8]; 5] = [
+        b"",
+        &hello,
+        &[0x28],
+        &[0x00; 16],
+        b"container data that follows",
+    ];
+    for frame in &frames {
+        for tail in tails {
+            let stream = [&frame[..], tail].concat();
+            for (in_chunk, out_chunk) in CHUNKINGS {
+                let mut dec = Decoder::with_config(config);
+                let got = drive(&mut dec, &stream, in_chunk, out_chunk).unwrap();
+                assert!(got.out == a, "chunking {in_chunk}/{out_chunk}");
+                assert_eq!(got.consumed, frame.len(), "chunking {in_chunk}/{out_chunk}");
+                // Known at once, without `finish` and without a look ahead.
+                assert!(got.ended_in_decode, "chunking {in_chunk}/{out_chunk}");
+                // And it stays ended.
+                let mut out = [0u8; 16];
+                let (p, status) = dec.decode(&hello, &mut out).unwrap();
+                assert_eq!((p.consumed, p.written, status), (0, 0, Status::StreamEnd));
+            }
+        }
+    }
+
+    // The checksum is part of the frame.
+    let stream = [&hello[..], &hello[..]].concat();
+    for (in_chunk, out_chunk) in CHUNKINGS {
+        let got = drive(
+            &mut Decoder::with_config(config),
+            &stream,
+            in_chunk,
+            out_chunk,
+        )
+        .unwrap();
+        assert_eq!(got.out, b"hello");
+        assert_eq!(got.consumed, hello.len());
+    }
+    // Through the `Algorithm` entry points too.
+    assert_eq!(
+        compcol::vec::decompress_to_vec_with::<Zstd>(&stream, config).unwrap(),
+        b"hello"
+    );
+    assert_eq!(
+        compcol::vec::decompress_to_vec::<Zstd>(&stream).unwrap(),
+        b"hellohello"
+    );
+    let mut dec = Zstd::decoder_with(config);
+    assert_eq!(
+        drive(&mut dec, &stream, 4096, 4096).unwrap().consumed,
+        hello.len()
+    );
+
+    // Skippable frames ahead of the frame are skipped; the one after it is
+    // not touched. A stream of skippable frames alone has no frame.
+    let skip = skippable_frame(2, b"metadata");
+    let stream = [&skip[..], &skip[..], &hello[..], &skip[..]].concat();
+    for (in_chunk, out_chunk) in CHUNKINGS {
+        let got = drive(
+            &mut Decoder::with_config(config),
+            &stream,
+            in_chunk,
+            out_chunk,
+        )
+        .unwrap();
+        assert_eq!(got.out, b"hello");
+        assert_eq!(got.consumed, 2 * skip.len() + hello.len());
+    }
+    assert_eq!(
+        drive(&mut Decoder::with_config(config), &skip, 4096, 4096),
+        Err(Error::UnexpectedEnd)
+    );
+    // A truncated frame is still an error.
+    assert_eq!(
+        drive(
+            &mut Decoder::with_config(config),
+            &hello[..hello.len() - 1],
+            1,
+            1
+        ),
+        Err(Error::UnexpectedEnd)
+    );
+}
+
+/// `reset` returns to the start of a stream from anywhere — inside a later
+/// frame, inside a skippable frame, after the end — and keeps the
+/// configuration.
+#[test]
+fn reset_restarts_a_multi_frame_decoder() {
+    let fa = encode_at_level(b"first frame", 3);
+    let fb = encode_at_level(&gen_words(5_000), 3);
+    let skip = skippable_frame(0, &[0xAB; 50]);
+    let stream = [&fa[..], &fb[..]].concat();
+    let mut out = vec![0u8; 1 << 16];
+    for stop in [fa.len(), fa.len() + 2, fa.len() + 9, stream.len()] {
+        let mut dec = Decoder::new();
+        dec.decode(&stream[..stop], &mut out).unwrap();
+        dec.reset();
+        assert_eq!(
+            drive(&mut dec, &fa, 4096, 4096).unwrap().out,
+            b"first frame"
+        );
+    }
+    let mut dec = Decoder::new();
+    dec.decode(&skip[..20], &mut out).unwrap();
+    dec.reset();
+    assert_eq!(
+        drive(&mut dec, &stream, 1, 1).unwrap().consumed,
+        stream.len()
+    );
+    // After the end, and after an error.
+    dec.reset();
+    assert_eq!(
+        drive(&mut dec, &fa, 4096, 4096).unwrap().out,
+        b"first frame"
+    );
+    dec.reset();
+    assert!(drive(&mut dec, b"(not a frame", 4096, 4096).is_err());
+    dec.reset();
+    assert_eq!(
+        drive(&mut dec, &fa, 4096, 4096).unwrap().out,
+        b"first frame"
+    );
+
+    let mut dec = Decoder::with_config(DecoderConfig::default().with_multi_frame(false));
+    assert_eq!(
+        drive(&mut dec, &stream, 4096, 4096).unwrap().consumed,
+        fa.len()
+    );
+    dec.reset();
+    assert_eq!(
+        drive(&mut dec, &stream, 4096, 4096).unwrap().consumed,
+        fa.len()
+    );
+}
+
+/// An empty input is not a Zstandard stream: there must be at least one
+/// frame or skippable frame.
+#[test]
+fn empty_input_is_still_an_unexpected_end() {
+    assert_eq!(
+        drive(&mut Decoder::new(), b"", 4096, 4096),
+        Err(Error::UnexpectedEnd)
+    );
 }
 
 // ─── flush ──────────────────────────────────────────────────────────────

@@ -79,13 +79,32 @@
 //! [`crate::Error::ChecksumMismatch`]. Our encoder does not yet emit a content
 //! checksum.
 //!
-//! - **Skippable_Frame** magic numbers (`0x184D2A50..=0x184D2A5F`) are
-//!   detected and rejected as unsupported rather than silently skipped.
+//! # Concatenated and skippable frames
+//!
+//! A Zstandard stream is any number of frames back to back (`cat a.zst
+//! b.zst`, `pzstd` output), and the decoder decodes them as one, like
+//! `zstd -d`: the output continues seamlessly, while each frame has its own
+//! window, content size and checksum. **Skippable_Frames** (magic
+//! `0x184D2A50..=0x184D2A5F`, then a 4-byte length) are skipped wherever a
+//! frame may start; their payload is discarded as it arrives.
+//!
+//! After a frame, the next byte tells: the first byte of a frame magic
+//! (`0x28`, or `0x50..=0x5F` for a skippable one) starts another frame,
+//! which must then be valid — a wrong magic is `BadHeader`, an input that
+//! stops inside it is `UnexpectedEnd`. Any other byte ends the stream
+//! (`StreamEnd`), leaving the trailing bytes unconsumed, as the gzip decoder
+//! does (`zstd -d` rejects such input instead). Since only the next byte
+//! tells, `decode` cannot report `StreamEnd` right at the end of the input;
+//! `finish` does.
+//!
+//! [`DecoderConfig::with_multi_frame(false)`](DecoderConfig::with_multi_frame)
+//! stops after the first frame instead — for a container that embeds one
+//! frame followed by other data: `decode` reports `StreamEnd` right after
+//! the frame's last byte and consumes nothing past it.
+//!
+//! # Not supported
 //!
 //! - **Dictionary_ID != 0** frames are unsupported (no dictionary registry).
-//!
-//! - **Concatenated frames** are not supported — the decoder stops after the
-//!   last block of the first frame.
 //!
 //! Both halves are pure streaming: caller owns the input/output buffers and
 //! the codec preserves state across `encode`/`decode` calls.
@@ -199,12 +218,12 @@ impl Algorithm for Zstd {
     type Encoder = Encoder;
     type Decoder = Decoder;
     type EncoderConfig = EncoderConfig;
-    type DecoderConfig = ();
+    type DecoderConfig = DecoderConfig;
 
     fn encoder_with(c: Self::EncoderConfig) -> Encoder {
         Encoder::with_config(c)
     }
-    fn decoder_with(_: ()) -> Decoder {
-        Decoder::new()
+    fn decoder_with(c: DecoderConfig) -> Decoder {
+        Decoder::with_config(c)
     }
 }
