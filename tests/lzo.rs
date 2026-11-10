@@ -405,6 +405,148 @@ fn lorem_16kib_ratio_reasonable() {
     assert_eq!(decoded, data);
 }
 
+// ─── missing terminator ────────────────────────────────────────────────
+//
+// The framing is `block* terminator`. A stream cut exactly at a block
+// boundary has no terminator and must not be reported as complete.
+
+/// Feed everything, then `finish` until it ends or errors.
+fn try_decode(dec: &mut Decoder, encoded: &[u8]) -> Result<Vec<u8>, compcol::Error> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut consumed = 0;
+    loop {
+        let (p, status) = dec.decode(&encoded[consumed..], &mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        consumed += p.consumed;
+        match status {
+            Status::OutputFull => continue,
+            Status::InputEmpty | Status::StreamEnd => break,
+        }
+    }
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            return Ok(out);
+        }
+        assert!(p.written > 0, "decoder finish stalled");
+    }
+}
+
+/// Offsets just past each block of a framed stream, excluding the
+/// terminator.
+fn block_ends(encoded: &[u8]) -> Vec<usize> {
+    let mut ends = Vec::new();
+    let mut pos = 0;
+    loop {
+        let len = u32::from_le_bytes(encoded[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if len == 0 {
+            assert_eq!(pos, encoded.len(), "terminator must be last");
+            return ends;
+        }
+        pos += len;
+        ends.push(pos);
+    }
+}
+
+#[test]
+fn truncation_at_block_boundary_is_an_error() {
+    let data = vec![b'x'; 200_000];
+    let enc = compcol::vec::compress_to_vec::<Lzo>(&data).unwrap();
+    let ends = block_ends(&enc);
+    assert!(ends.len() >= 4, "expected several blocks");
+
+    // The whole stream, terminator included, decodes.
+    assert_eq!(
+        try_decode(&mut Decoder::new(), &enc).as_deref(),
+        Ok(&data[..])
+    );
+
+    // Cut after each block (dropping at least the terminator): not a
+    // complete stream.
+    for &end in &ends {
+        let r = compcol::vec::decompress_to_vec_capped::<Lzo>(&enc[..end], 1 << 30);
+        assert_eq!(
+            r.map(|v| v.len()),
+            Err(compcol::Error::UnexpectedEnd),
+            "cut at {end}"
+        );
+        let r = try_decode(&mut Decoder::new(), &enc[..end]);
+        assert_eq!(
+            r.map(|v| v.len()),
+            Err(compcol::Error::UnexpectedEnd),
+            "cut at {end}"
+        );
+    }
+}
+
+#[test]
+fn encoder_always_writes_the_terminator() {
+    // Empty input: just the terminator.
+    let enc = compcol::vec::compress_to_vec::<Lzo>(&[]).unwrap();
+    assert_eq!(enc, [0, 0, 0, 0]);
+    assert_eq!(
+        try_decode(&mut Decoder::new(), &enc).as_deref(),
+        Ok(&[][..])
+    );
+
+    // Exact multiples of the block size, a flush in the middle, and odd
+    // chunkings: every stream ends with the zero-length terminator.
+    for len in [1usize, 48 * 1024, 2 * 48 * 1024, 100_000] {
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        for in_chunk in [len, 4096, 48 * 1024] {
+            let enc = encode_chunked(&data, in_chunk, 1000);
+            block_ends(&enc); // asserts the terminator is present and last
+            assert_eq!(
+                try_decode(&mut Decoder::new(), &enc).as_deref(),
+                Ok(&data[..])
+            );
+        }
+    }
+    let mut e = Encoder::new();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut enc = Vec::new();
+    let (p, _) = e.encode(b"flushed in the middle", &mut buf).unwrap();
+    enc.extend_from_slice(&buf[..p.written]);
+    let (p, _) = e.flush(&mut buf, compcol::Flush::Sync).unwrap();
+    enc.extend_from_slice(&buf[..p.written]);
+    loop {
+        let (p, status) = e.finish(&mut buf).unwrap();
+        enc.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            break;
+        }
+    }
+    block_ends(&enc);
+    assert_eq!(
+        try_decode(&mut Decoder::new(), &enc).as_deref(),
+        Ok(&b"flushed in the middle"[..])
+    );
+}
+
+#[test]
+fn finish_with_no_input_at_all_is_still_an_empty_stream() {
+    // Nothing fed: the long-standing convention is an empty result.
+    let mut dec = Decoder::new();
+    assert_eq!(try_decode(&mut dec, &[]).as_deref(), Ok(&[][..]));
+
+    // After a reset the "nothing fed yet" state is restored.
+    let data = vec![b'y'; 1000];
+    let enc = compcol::vec::compress_to_vec::<Lzo>(&data).unwrap();
+    let end = block_ends(&enc)[0];
+    let mut dec = Decoder::new();
+    assert_eq!(
+        try_decode(&mut dec, &enc[..end]).map(|v| v.len()),
+        Err(compcol::Error::UnexpectedEnd)
+    );
+    dec.reset();
+    assert_eq!(try_decode(&mut dec, &[]).as_deref(), Ok(&[][..]));
+    dec.reset();
+    assert_eq!(try_decode(&mut dec, &enc).as_deref(), Ok(&data[..]));
+}
+
 #[cfg(feature = "factory")]
 mod factory {
     use compcol::Status;
