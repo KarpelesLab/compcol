@@ -136,9 +136,13 @@ impl Decoder {
     }
 
     /// Align the bit reader to a byte boundary and return any whole bytes
-    /// still sitting in its accumulator. Container wrappers call this when
-    /// the deflate64 payload ends so they can recover pre-buffered trailer
-    /// bytes.
+    /// still sitting in its accumulator.
+    ///
+    /// Once the stream has ended this returns nothing: the decoder already
+    /// leaves every byte after the final block unconsumed, so whatever
+    /// follows the deflate64 payload can be read straight from the input,
+    /// at the sum of the `consumed` counts. Kept for callers written when
+    /// the decoder read ahead.
     pub fn drain_trailing_bytes(&mut self) -> alloc::vec::Vec<u8> {
         self.bit_reader.align_to_byte();
         let mut out = alloc::vec::Vec::new();
@@ -233,6 +237,32 @@ impl Decoder {
             self.state = DecState::BlockHeader;
         }
     }
+
+    /// Hand back the whole bytes still in the bit reader when the decoder
+    /// returns for any reason other than waiting on input: the stream
+    /// ended or the output is full. This keeps `consumed` exact at the end
+    /// of the stream.
+    ///
+    /// The bytes held are always the last ones fed in this call: a call
+    /// starts either with fewer than 8 bits (handed back last time) or with
+    /// bits that all belong to the pending field, which was short of them,
+    /// so those are used up before anything else.
+    fn unfeed(&mut self, consumed: &mut usize) {
+        let blocked_on_output = matches!(
+            self.state,
+            DecState::Done
+                | DecState::Stored { .. }
+                | DecState::HuffmanBlock {
+                    phase: HuffmanPhase::EmittingMatch { .. },
+                    ..
+                }
+        );
+        if blocked_on_output {
+            let n = self.bit_reader.unfeed_whole_bytes() as usize;
+            debug_assert!(n <= *consumed);
+            *consumed -= n.min(*consumed);
+        }
+    }
 }
 
 impl Default for Decoder {
@@ -250,13 +280,15 @@ impl RawDecoder for Decoder {
         let mut written = 0usize;
 
         loop {
-            let initial_consumed = consumed;
-            let initial_written = written;
-            self.refill(input, &mut consumed);
-
+            // Past the final block nothing more is read: what follows the
+            // stream is not this decoder's.
             if matches!(self.state, DecState::Done) {
                 break;
             }
+
+            let initial_consumed = consumed;
+            let initial_written = written;
+            self.refill(input, &mut consumed);
 
             let made_progress = self.step(input, &mut consumed, output, &mut written)?;
 
@@ -264,6 +296,7 @@ impl RawDecoder for Decoder {
                 break;
             }
         }
+        self.unfeed(&mut consumed);
 
         Ok(RawProgress {
             // See the matching note in `deflate`: reporting `false` after the

@@ -659,3 +659,65 @@ fn finish_drains_pending_output_into_a_small_buffer() {
     }
     assert_eq!(out, plain);
 }
+
+/// The decoder consumes exactly the stream and not a byte of what follows
+/// it, however the input is chunked: a container reader finds what comes
+/// next at the sum of `consumed`. (It used to pull up to 8 bytes past the
+/// final block into its bit reader and report them consumed.)
+#[test]
+fn consumption_stops_at_the_end_of_the_stream() {
+    // A small xorshift, for inputs of every shape and for the chunk sizes.
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+
+    for round in 0..24 {
+        let len = (next() % 6000) as usize;
+        let plain: Vec<u8> = match round % 3 {
+            // Incompressible: stored blocks.
+            0 => (0..len).map(|_| next() as u8).collect(),
+            // Text-like: matches and literals.
+            1 => (0..len)
+                .map(|_| b"abcdefgh "[(next() % 9) as usize])
+                .collect(),
+            _ => b"hello hello hello world ".repeat(len / 24),
+        };
+        let stream = encode_all(&plain);
+        let mut input = stream.clone();
+        input.extend_from_slice(&[0x55; 16]);
+
+        // Chunk sizes: a byte at a time, everything at once, random.
+        for mode in 0..3 {
+            let mut dec = Decoder::new();
+            let mut out = Vec::new();
+            let mut buf = vec![0u8; 1 + (next() % 300) as usize];
+            let mut consumed = 0;
+            loop {
+                let chunk = match mode {
+                    0 => 1,
+                    1 => input.len(),
+                    _ => 1 + (next() % 40) as usize,
+                };
+                let end = (consumed + chunk).min(input.len());
+                let (p, status) = dec.decode(&input[consumed..end], &mut buf).unwrap();
+                out.extend_from_slice(&buf[..p.written]);
+                consumed += p.consumed;
+                if status == Status::StreamEnd {
+                    break;
+                }
+                assert!(
+                    p.consumed > 0 || p.written > 0 || end < input.len(),
+                    "no end of stream"
+                );
+            }
+            assert_eq!(out, plain, "round {round} mode {mode}");
+            assert_eq!(consumed, stream.len(), "round {round} mode {mode}");
+            assert!(dec.is_complete());
+            assert!(dec.drain_trailing_bytes().is_empty());
+        }
+    }
+}
