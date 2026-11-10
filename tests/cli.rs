@@ -751,3 +751,123 @@ fn force_refuses_output_hard_linked_to_the_input() {
     );
     assert_eq!(file_contents(&input), b"precious\n");
 }
+
+// ─── --max-output ───────────────────────────────────────────────────────
+
+/// A small compressed stream that expands to `len` zero bytes.
+fn bomb(codec: &str, len: usize) -> Vec<u8> {
+    let (encoded, err, code) = run_with_stdin(&["-t", codec], &vec![0u8; len]);
+    assert_eq!(code, 0, "{codec}: {}", String::from_utf8_lossy(&err));
+    encoded
+}
+
+#[test]
+fn max_output_aborts_a_decompression_bomb() {
+    // Without --max-output the CLI had no way to bound what a tiny hostile
+    // stream expands to; the library's LimitedDecoder was unreachable.
+    const LEN: usize = 4 * 1024 * 1024;
+    let mut codecs = vec!["gzip"];
+    if cfg!(feature = "zstd") {
+        codecs.push("zstd");
+    }
+    if cfg!(feature = "xz") {
+        codecs.push("xz");
+    }
+    if cfg!(feature = "bzip2") {
+        codecs.push("bzip2");
+    }
+    for codec in codecs {
+        let encoded = bomb(codec, LEN);
+        for limit in ["1048576", "1M", "1024k", "64K", "0"] {
+            let (out, err, code) =
+                run_with_stdin(&["-d", "-t", codec, "--max-output", limit], &encoded);
+            let err = String::from_utf8_lossy(&err);
+            assert_eq!(code, 1, "{codec} limit {limit}: {err}");
+            assert!(err.contains("--max-output"), "{codec} limit {limit}: {err}");
+            assert!(
+                out.len() <= 1024 * 1024,
+                "{codec} limit {limit}: {} bytes got out",
+                out.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn max_output_allows_output_up_to_the_limit() {
+    const LEN: usize = 300 * 1024;
+    let encoded = bomb("gzip", LEN);
+    // Exactly the limit, the `=` spelling, and each suffix.
+    for limit in [
+        "--max-output=307200",
+        "--max-output=300K",
+        "--max-output=300KiB",
+        "--max-output=1M",
+    ] {
+        let (out, err, code) = run_with_stdin(&["-d", "-t", "gzip", limit], &encoded);
+        assert_eq!(code, 0, "{limit}: {}", String::from_utf8_lossy(&err));
+        assert_eq!(out.len(), LEN, "{limit}");
+    }
+    let (out, err, code) = run_with_stdin(&["-d", "--max-output", "1G"], &encoded);
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+    assert_eq!(out.len(), LEN);
+    // One byte short is over the limit.
+    let (_out, _err, code) = run_with_stdin(&["-d", "--max-output=307199"], &encoded);
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn max_output_failure_removes_output_and_keeps_input() {
+    let s = Scratch::new("max_output_file");
+    let input = s.file("bomb.gz");
+    let encoded = bomb("gzip", 1024 * 1024);
+    fs::write(&input, &encoded).unwrap();
+
+    let (_out, err, code) = run(&["-d", "--max-output", "64K", input.to_str().unwrap()]);
+    let err = String::from_utf8_lossy(&err);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("--max-output"), "{err}");
+    assert!(err.contains("65536"), "limit not named in: {err}");
+    assert!(!s.file("bomb").exists(), "partial output left behind");
+    assert_eq!(file_contents(&input), encoded, "input must be kept");
+}
+
+#[test]
+fn max_output_is_rejected_when_compressing() {
+    let (_out, err, code) = run_with_stdin(&["-t", "gzip", "--max-output", "1M"], b"data");
+    assert_eq!(code, 2);
+    assert!(
+        String::from_utf8_lossy(&err).contains("--max-output"),
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+}
+
+#[test]
+fn max_output_rejects_malformed_values() {
+    for bad in [
+        "",
+        "abc",
+        "-1",
+        "+1",
+        "1X",
+        "K",
+        "1.5M",
+        "1 M",
+        "1KB",
+        "99999999999999999999",
+        "17179869184G",
+    ] {
+        let arg = format!("--max-output={bad}");
+        let (_out, err, code) = run_with_stdin(&["-d", "-t", "gzip", &arg], b"");
+        assert_eq!(code, 2, "'{bad}' was accepted");
+        assert!(
+            String::from_utf8_lossy(&err).contains("--max-output"),
+            "'{bad}': {}",
+            String::from_utf8_lossy(&err)
+        );
+    }
+    let (_out, err, code) = run_with_stdin(&["-d", "--max-output"], b"");
+    assert_eq!(code, 2);
+    assert!(String::from_utf8_lossy(&err).contains("requires an argument"));
+}

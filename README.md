@@ -470,6 +470,14 @@ Compression tuning:
                               brotli quality:    0..=11, default 6
                             Out-of-range values are clamped per algorithm.
 
+Decompression safety:
+        --max-output SIZE   Fail (and remove the partial output) rather than
+                            write more than SIZE decompressed bytes — the
+                            defence against decompression bombs. SIZE is a
+                            byte count, optionally with a K, M, G or T
+                            suffix (powers of 1024: 64M, 2G). Default: no
+                            limit. Only valid with -d.
+
 Misc:
     -k, --keep              Keep input file even in in-place mode
     -f, --force             Overwrite an existing output file
@@ -495,6 +503,9 @@ compcol -t gzip -d README.md.gz      # → README.md, removes README.md.gz
 
 # Decompress with format auto-detection (no -t needed)
 cat README.md.gz | compcol -d > README.md
+
+# Decompress untrusted input: refuse to write more than 1 GiB
+compcol -d --max-output 1G upload.zst
 
 # Force overwrite of an existing output file
 compcol -t gzip -f README.md

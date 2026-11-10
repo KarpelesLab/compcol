@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use compcol::factory;
+use compcol::limit::LimitedDecoder;
 use compcol::{Decoder, Encoder};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -46,6 +47,14 @@ Compression tuning:
                               brotli quality:    0..=11, default 6
                             Out-of-range values are clamped per algorithm.
 
+Decompression safety:
+        --max-output SIZE   Fail (and remove the partial output) rather than
+                            write more than SIZE decompressed bytes — the
+                            defence against decompression bombs. SIZE is a
+                            byte count, optionally with a K, M, G or T
+                            suffix (powers of 1024: 64M, 2G). Default: no
+                            limit. Only valid with -d.
+
 Misc:
     -k, --keep              Keep input file even in in-place mode
     -f, --force             Overwrite an existing output file
@@ -78,6 +87,9 @@ struct Args {
     /// When `Some`, compression level passed to the encoder via
     /// `factory::encoder_by_name_with_level`. Ignored on decompress.
     level: Option<u8>,
+    /// When `Some`, the most decompressed bytes `-d` may produce before the
+    /// run is aborted (see [`LimitedDecoder`]).
+    max_output: Option<u64>,
     input: Option<PathBuf>,
 }
 
@@ -87,6 +99,7 @@ enum ParseError {
     UnknownFlag(String),
     ExtraPositional(String),
     BadLevel(String),
+    BadSize(String),
 }
 
 impl core::fmt::Display for ParseError {
@@ -96,6 +109,10 @@ impl core::fmt::Display for ParseError {
             Self::UnknownFlag(s) => write!(f, "unknown option: {s}"),
             Self::ExtraPositional(s) => write!(f, "unexpected extra argument: {s}"),
             Self::BadLevel(s) => write!(f, "--level expects an integer in 0..=255, got '{s}'"),
+            Self::BadSize(s) => write!(
+                f,
+                "--max-output expects a byte count with an optional K/M/G/T suffix, got '{s}'"
+            ),
         }
     }
 }
@@ -143,6 +160,19 @@ where
                     .into_owned();
                 args.level = Some(v.parse().map_err(|_| ParseError::BadLevel(v))?);
             }
+            "--max-output" => {
+                let v = iter
+                    .next()
+                    .ok_or(ParseError::MissingValue("--max-output"))?
+                    .to_string_lossy()
+                    .into_owned();
+                args.max_output = Some(parse_size(&v).ok_or(ParseError::BadSize(v))?);
+            }
+            s if s.starts_with("--max-output=") => {
+                let v = &s["--max-output=".len()..];
+                args.max_output =
+                    Some(parse_size(v).ok_or_else(|| ParseError::BadSize(v.to_string()))?);
+            }
             s if s.starts_with("--type=") => {
                 args.algorithm = Some(s["--type=".len()..].to_string());
             }
@@ -170,6 +200,24 @@ where
         }
     }
     Ok(args)
+}
+
+/// Parse a byte count: a decimal integer, optionally followed by a binary
+/// multiplier — `K`, `M`, `G` or `T` (case-insensitive, optionally spelled
+/// `KiB` etc.), each a power of 1024. `None` if malformed or beyond `u64`.
+fn parse_size(s: &str) -> Option<u64> {
+    let digits = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (number, suffix) = s.split_at(digits);
+    let number: u64 = number.parse().ok()?;
+    let shift = match suffix.to_ascii_lowercase().as_str() {
+        "" => 0,
+        "k" | "kib" => 10,
+        "m" | "mib" => 20,
+        "g" | "gib" => 30,
+        "t" | "tib" => 40,
+        _ => return None,
+    };
+    number.checked_mul(1u64 << shift)
 }
 
 fn set_positional(args: &mut Args, raw: OsString) -> Result<(), ParseError> {
@@ -303,8 +351,17 @@ fn stream_decode(
     Ok(())
 }
 
+/// Wrap a codec error, keeping the typed value so `run` can tell which one
+/// it was (the `Display` output is the codec error's own).
 fn codec_err(e: compcol::Error) -> io::Error {
-    io::Error::other(format!("{e}"))
+    io::Error::other(e)
+}
+
+/// Whether `e` is the codec error `kind`, as wrapped by [`codec_err`].
+fn is_codec_err(e: &io::Error, kind: compcol::Error) -> bool {
+    e.get_ref()
+        .and_then(|inner| inner.downcast_ref::<compcol::Error>())
+        == Some(&kind)
 }
 
 /// Read up to `n` bytes from `reader`, returning what was available (possibly
@@ -569,6 +626,11 @@ fn run(args: &Args) -> Result<(), RunError> {
             "--level is only meaningful on compression (no -d)".into(),
         ));
     }
+    if !args.decompress && args.max_output.is_some() {
+        return Err(RunError::Usage(
+            "--max-output is only meaningful on decompression (-d)".into(),
+        ));
+    }
 
     // For in-place mode (input file + no -c/-o), we also remove the input on
     // success unless -k. Capture that decision up front.
@@ -624,7 +686,14 @@ fn run(args: &Args) -> Result<(), RunError> {
     // existing one.
     let unknown = || RunError::Usage(format!("unknown algorithm: '{algo}' (use --list)"));
     let codec = if args.decompress {
-        Codec::Decoder(factory::decoder_by_name(&algo).ok_or_else(unknown)?)
+        let dec = factory::decoder_by_name(&algo).ok_or_else(unknown)?;
+        // --max-output: bound the decoded size. The wrapper also hands the
+        // budget to the decoder itself, so codecs that build output
+        // internally refuse early instead of allocating it first.
+        Codec::Decoder(match args.max_output {
+            Some(limit) => Box::new(LimitedDecoder::new(dec, limit)),
+            None => dec,
+        })
     } else {
         Codec::Encoder(
             match args.level {
@@ -711,6 +780,15 @@ fn run(args: &Args) -> Result<(), RunError> {
         // Best-effort: remove the partial output, leave the input intact.
         if let Some(p) = output_path {
             let _ = std::fs::remove_file(&p);
+        }
+        // Name the flag and the limit rather than the library's generic
+        // "configured limit" wording.
+        if let Some(limit) = args.max_output
+            && is_codec_err(&e, compcol::Error::OutputLimitExceeded)
+        {
+            return Err(RunError::Io(io::Error::other(format!(
+                "decompressed output exceeds the --max-output limit of {limit} bytes"
+            ))));
         }
         return Err(RunError::Io(e));
     }
