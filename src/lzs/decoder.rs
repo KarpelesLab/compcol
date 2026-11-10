@@ -29,6 +29,24 @@ struct PendingMatch {
     remaining: u32,
 }
 
+/// A match whose length code entered the open-ended `1111` chain but has
+/// not yet seen its closing nibble. The nibbles read so far are committed
+/// (never re-read), so the running total lives here across calls.
+#[derive(Debug, Clone, Copy)]
+struct PendingLength {
+    distance: u32,
+    /// Length accumulated so far (the initial 8 plus 15 per `1111`).
+    acc: u32,
+}
+
+/// Outcome of reading the fixed-size head of a length code.
+enum LengthHead {
+    /// A complete short code: the length is known.
+    Complete(u32),
+    /// `1111`: the open-ended nibble chain follows.
+    Extended,
+}
+
 /// Streaming decoder for LZS (with our 8-byte length-prefix framing).
 pub struct Decoder {
     header_buf: [u8; 8],
@@ -43,6 +61,8 @@ pub struct Decoder {
 
     pending_literal: Option<u8>,
     pending_match: Option<PendingMatch>,
+    /// Set while the length-extension chain of a match is being read.
+    pending_length: Option<PendingLength>,
 
     /// Whether we've seen the end-of-stream marker yet.
     saw_eos: bool,
@@ -67,6 +87,7 @@ impl Decoder {
             produced: 0,
             pending_literal: None,
             pending_match: None,
+            pending_length: None,
             saw_eos: false,
             poisoned: false,
         }
@@ -87,79 +108,89 @@ impl Decoder {
         self.produced += 1;
     }
 
-    /// Try to read one variable-length length code starting from the
-    /// current bit position. Returns `None` if more bits are needed.
-    ///
-    /// On success returns the decoded length value (≥ 2).
-    fn try_read_length(&mut self) -> Result<Option<u32>, Error> {
-        // First 2 bits.
-        let snap = self.bits.snapshot();
-        let b0 = match self.bits.read_bits(2) {
-            Some(v) => v,
-            None => {
-                self.bits.restore(snap);
-                return Ok(None);
-            }
-        };
-        match b0 {
-            0b00 => Ok(Some(2)),
-            0b01 => Ok(Some(3)),
-            0b10 => Ok(Some(4)),
-            0b11 => {
-                // Need 2 more bits.
-                let b1 = match self.bits.read_bits(2) {
-                    Some(v) => v,
-                    None => {
-                        self.bits.restore(snap);
-                        return Ok(None);
-                    }
-                };
-                match b1 {
-                    0b00 => Ok(Some(5)),
-                    0b01 => Ok(Some(6)),
-                    0b10 => Ok(Some(7)),
-                    0b11 => {
-                        // Chain: read nibbles until one is != 1111. Each
-                        // 1111 adds 15. A single match can legitimately be as
-                        // long as the whole declared output (highly repetitive
-                        // input compresses to one long back-reference), so bound
-                        // the accumulator by the declared total length rather
-                        // than a fixed constant — otherwise valid streams whose
-                        // longest match exceeds ~16 MiB are wrongly rejected.
-                        let cap = match self.header {
-                            HeaderPhase::Active { target } => target.min(u32::MAX as u64) as u32,
-                            _ => SANITY_MATCH_LEN,
-                        };
-                        let mut acc: u32 = 8;
-                        loop {
-                            let nib = match self.bits.read_bits(4) {
-                                Some(v) => v,
-                                None => {
-                                    self.bits.restore(snap);
-                                    return Ok(None);
-                                }
-                            };
-                            if nib != 0b1111 {
-                                acc = match acc.checked_add(nib) {
-                                    Some(v) => v,
-                                    None => return Err(Error::Corrupt),
-                                };
-                                return Ok(Some(acc));
-                            }
-                            acc = match acc.checked_add(15) {
-                                Some(v) => v,
-                                None => return Err(Error::Corrupt),
-                            };
-                            if acc > cap {
-                                return Err(Error::Corrupt);
-                            }
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            _ => unreachable!(),
+    /// Read the fixed-size head (2 or 4 bits) of a length code. Returns
+    /// `None` if more bits are needed; the caller rolls the bit cursor
+    /// back to the token start in that case (the head is at most 4 bits,
+    /// so the rewind is bounded).
+    fn try_read_length_head(&mut self) -> Option<LengthHead> {
+        let b0 = self.bits.read_bits(2)?;
+        if b0 != 0b11 {
+            // `00` → 2, `01` → 3, `10` → 4.
+            return Some(LengthHead::Complete(b0 + 2));
         }
+        let b1 = self.bits.read_bits(2)?;
+        if b1 != 0b11 {
+            // `1100` → 5, `1101` → 6, `1110` → 7.
+            return Some(LengthHead::Complete(b1 + 5));
+        }
+        Some(LengthHead::Extended)
+    }
+
+    /// Continue the `1111` nibble chain of `self.pending_length`. Each
+    /// `1111` adds 15; the first other nibble adds its value and ends the
+    /// code. Returns the match `(distance, length)`, or `None` if more
+    /// bits are needed — in which case every nibble read so far stays
+    /// consumed and the running total is kept in `self.pending_length`,
+    /// so no input bit is read twice however the token is split across
+    /// calls.
+    ///
+    /// A single match can legitimately be as long as the whole declared
+    /// output (highly repetitive input compresses to one long
+    /// back-reference), so the accumulator is bounded by the declared
+    /// total length rather than a fixed constant — otherwise valid streams
+    /// whose longest match exceeds ~16 MiB are wrongly rejected.
+    fn try_read_length_chain(&mut self) -> Result<Option<(u32, u32)>, Error> {
+        let Some(mut pl) = self.pending_length else {
+            return Err(Error::Corrupt);
+        };
+        let cap = match self.header {
+            HeaderPhase::Active { target } => target.min(u32::MAX as u64) as u32,
+            _ => SANITY_MATCH_LEN,
+        };
+        loop {
+            let Some(nib) = self.bits.read_bits(4) else {
+                self.pending_length = Some(pl);
+                // Everything before the cursor is committed: let the
+                // reader drop it instead of pinning the whole token.
+                self.bits.compact();
+                return Ok(None);
+            };
+            if nib != 0b1111 {
+                self.pending_length = None;
+                return match pl.acc.checked_add(nib) {
+                    Some(len) => Ok(Some((pl.distance, len))),
+                    None => Err(Error::Corrupt),
+                };
+            }
+            pl.acc = match pl.acc.checked_add(15) {
+                Some(v) => v,
+                None => return Err(Error::Corrupt),
+            };
+            if pl.acc > cap {
+                return Err(Error::Corrupt);
+            }
+        }
+    }
+
+    /// Validate a fully-parsed match token and queue it as the pending
+    /// match; the main loop copies it out, enforcing the declared length
+    /// as it goes.
+    fn start_match(&mut self, offset: u32, length: u32) -> Result<(), Error> {
+        if length < 2 {
+            return Err(Error::Corrupt);
+        }
+        if (offset as u64) > self.produced {
+            return Err(Error::InvalidDistance);
+        }
+        if offset as usize > MAX_DISTANCE {
+            return Err(Error::InvalidDistance);
+        }
+        self.bits.compact();
+        self.pending_match = Some(PendingMatch {
+            distance: offset,
+            remaining: length,
+        });
+        Ok(())
     }
 
     /// Main decode loop. Drains as much as possible into `output`.
@@ -229,8 +260,27 @@ impl Decoder {
                 return Ok(());
             }
 
-            // 3. Read next token. Snapshot so we can roll back on
-            // partial reads.
+            // 3. A match whose length chain was cut short by the end of
+            // the previous input: resume it where it stopped.
+            if self.pending_length.is_some() {
+                match self.try_read_length_chain()? {
+                    Some((offset, length)) => {
+                        self.start_match(offset, length)?;
+                        continue;
+                    }
+                    None => {
+                        if at_eof {
+                            return Err(Error::UnexpectedEnd);
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+
+            // 4. Read next token. Snapshot so we can roll back on
+            // partial reads. Only the fixed-size part of a token (at most
+            // 17 bits: flag, offset prefix, offset, length head) is ever
+            // rolled back; the open-ended length chain is resumable.
             let snap = self.bits.snapshot();
             let lead = match self.bits.read_bits(1) {
                 Some(v) => v,
@@ -313,9 +363,20 @@ impl Decoder {
                 return Err(Error::InvalidDistance);
             }
 
-            // Length code.
-            let length = match self.try_read_length()? {
-                Some(v) => v,
+            // Length code. A complete match is queued as the pending
+            // match and copied out by step 2 on the next iteration.
+            match self.try_read_length_head() {
+                Some(LengthHead::Complete(length)) => {
+                    self.start_match(offset, length)?;
+                }
+                Some(LengthHead::Extended) => {
+                    // Commit the token head and switch to the resumable
+                    // chain; step 3 reads it on the next iteration.
+                    self.pending_length = Some(PendingLength {
+                        distance: offset,
+                        acc: 8,
+                    });
+                }
                 None => {
                     if at_eof {
                         return Err(Error::UnexpectedEnd);
@@ -323,43 +384,6 @@ impl Decoder {
                     self.bits.restore(snap);
                     return Ok(());
                 }
-            };
-
-            if length < 2 {
-                return Err(Error::Corrupt);
-            }
-            if (offset as u64) > self.produced {
-                return Err(Error::InvalidDistance);
-            }
-            if offset as usize > MAX_DISTANCE {
-                return Err(Error::InvalidDistance);
-            }
-
-            self.bits.compact();
-            let mut pm = PendingMatch {
-                distance: offset,
-                remaining: length,
-            };
-            while pm.remaining > 0 && *written < output.len() {
-                // A match must not push `produced` past the declared
-                // `target`: doing so would deliver more bytes than the
-                // framing header promised. Detect it here rather than
-                // deferring to the EOS cross-check.
-                if self.produced >= target {
-                    return Err(Error::TrailerMismatch);
-                }
-                if (pm.distance as usize) > self.history.len() {
-                    return Err(Error::InvalidDistance);
-                }
-                let src = self.history.len() - pm.distance as usize;
-                let byte = self.history[src];
-                self.emit_byte(byte, output, written);
-                pm.remaining -= 1;
-            }
-            self.trim_history();
-            if pm.remaining > 0 {
-                self.pending_match = Some(pm);
-                return Ok(());
             }
         }
     }
@@ -471,7 +495,123 @@ impl RawDecoder for Decoder {
         self.produced = 0;
         self.pending_literal = None;
         self.pending_match = None;
+        self.pending_length = None;
         self.saw_eos = false;
         self.poisoned = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lzs::bits::BitWriter;
+    use alloc::vec;
+
+    /// `'A'`, then one match at distance 1 whose length code is `1111`
+    /// followed by `k` more `1111` nibbles and a closing `0000`, then the
+    /// end-of-stream marker. Decodes to `9 + 15 * k` bytes of `'A'`.
+    fn long_token_stream(k: usize) -> (Vec<u8>, u64) {
+        let total = 9 + 15 * k as u64;
+        let mut w = BitWriter::new();
+        w.write_bits(1, 0);
+        w.write_bits(8, b'A' as u32);
+        w.write_bits(2, 0b11);
+        w.write_bits(7, 1);
+        w.write_bits(4, 0b1111);
+        for _ in 0..k {
+            w.write_bits(4, 0b1111);
+        }
+        w.write_bits(4, 0);
+        w.write_bits(9, 0b1_1000_0000);
+        w.pad_with_ones_to_byte();
+        let mut stream = total.to_le_bytes().to_vec();
+        stream.extend_from_slice(&w.into_bytes());
+        (stream, total)
+    }
+
+    /// Decode `stream` feeding `chunk` bytes per call. Returns the number
+    /// of decoded bytes (asserting they are all `'A'`), the number of
+    /// `raw_decode` calls, the peak number of bytes held by the bit
+    /// reader, and the decoder for inspection.
+    fn decode_all_a(stream: &[u8], chunk: usize) -> (u64, u64, usize, Decoder) {
+        let mut dec = Decoder::new();
+        let mut out = vec![0u8; 64 * 1024];
+        let mut total = 0u64;
+        let mut calls = 0u64;
+        let mut peak = 0usize;
+        let mut done = false;
+        for piece in stream.chunks(chunk) {
+            let mut input = piece;
+            loop {
+                let p = dec.raw_decode(input, &mut out).unwrap();
+                calls += 1;
+                peak = peak.max(dec.bits.buffered_bytes());
+                assert_eq!(p.consumed, input.len());
+                input = &[];
+                assert!(out[..p.written].iter().all(|&b| b == b'A'));
+                total += p.written as u64;
+                done = p.done;
+                if p.written < out.len() {
+                    break;
+                }
+            }
+        }
+        while !done {
+            let p = dec.raw_finish(&mut out).unwrap();
+            assert!(out[..p.written].iter().all(|&b| b == b'A'));
+            total += p.written as u64;
+            done = p.done;
+        }
+        (total, calls, peak, dec)
+    }
+
+    /// A long extended-length token split across many input chunks must
+    /// not be re-parsed from its start on every call: each payload bit is
+    /// read once, plus at most a short token prefix re-read per call.
+    #[test]
+    fn long_length_token_reads_each_bit_once() {
+        let k = 200_000;
+        let (stream, total) = long_token_stream(k);
+        let (got, calls, _, dec) = decode_all_a(&stream, 512);
+        assert_eq!(got, total);
+        let payload_bits = (stream.len() as u64 - 8) * 8;
+        let bound = payload_bits + 32 * calls;
+        assert!(
+            dec.bits.bits_read <= bound,
+            "read {} bits for a {}-bit payload in {} calls",
+            dec.bits.bits_read,
+            payload_bits,
+            calls
+        );
+    }
+
+    /// The same token decodes correctly when the input arrives one byte
+    /// at a time, and the reader does not keep the whole token buffered.
+    #[test]
+    fn long_length_token_one_byte_at_a_time() {
+        let (stream, total) = long_token_stream(20_000);
+        let (got, _, peak, _) = decode_all_a(&stream, 1);
+        assert_eq!(got, total);
+        assert!(peak <= 2 * 4096, "bit reader pinned {peak} bytes");
+    }
+
+    /// Reset in the middle of a length extension discards the partial
+    /// token.
+    #[test]
+    fn reset_clears_partial_length() {
+        let (stream, total) = long_token_stream(1_000);
+        let mut dec = Decoder::new();
+        let mut out = vec![0u8; 64 * 1024];
+        let p = dec.raw_decode(&stream[..200], &mut out).unwrap();
+        assert!(!p.done);
+        assert!(dec.pending_length.is_some());
+        dec.raw_reset();
+        assert!(dec.pending_length.is_none());
+        let mut got = 0u64;
+        let p = dec.raw_decode(&stream, &mut out).unwrap();
+        got += p.written as u64;
+        assert!(p.done);
+        assert_eq!(got, total);
+        assert!(out[..p.written].iter().all(|&b| b == b'A'));
     }
 }

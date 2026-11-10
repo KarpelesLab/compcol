@@ -20,14 +20,15 @@ pub(crate) struct BitReader {
     buf: Vec<u8>,
     /// Bit cursor: bit 0 of byte 0 is the MSB of `buf[0]`.
     bit_pos: usize,
+    /// Test-only instrumentation: total bits handed out by `read_bits`
+    /// (including bits re-read after a `restore`).
+    #[cfg(test)]
+    pub(crate) bits_read: u64,
 }
 
 impl BitReader {
     pub(crate) fn new() -> Self {
-        Self {
-            buf: Vec::new(),
-            bit_pos: 0,
-        }
+        Self::default()
     }
 
     /// Append raw bytes to the read window.
@@ -68,6 +69,10 @@ impl BitReader {
             v = (v << 1) | (((byte >> shift) & 1) as u32);
             self.bit_pos += 1;
         }
+        #[cfg(test)]
+        {
+            self.bits_read += n as u64;
+        }
         Some(v)
     }
 
@@ -80,6 +85,12 @@ impl BitReader {
             self.buf.drain(..drop);
             self.bit_pos -= drop * 8;
         }
+    }
+
+    /// Bytes currently held in the buffer (consumed or not).
+    #[cfg(test)]
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        self.buf.len()
     }
 
     /// Drop all buffered state.
