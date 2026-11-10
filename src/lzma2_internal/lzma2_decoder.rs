@@ -968,6 +968,27 @@ impl LzmaCore {
         self.win.output_pos = 0;
     }
 
+    /// Give back the sliding window's memory, if any was allocated. For a
+    /// caller that, right after a dictionary reset, goes on in contiguous
+    /// mode with a core that an earlier part of the stream used with a
+    /// window.
+    ///
+    /// Used by the [`crate::xz`] decoder; dead under an lzma2-only build.
+    #[cfg_attr(not(any(feature = "xz", test)), allow(dead_code))]
+    pub fn release_window(&mut self) {
+        if self.win.dict.capacity() != 0 {
+            self.win.dict = Vec::new();
+            self.win.dict_pos = 0;
+            self.win.dict_full = false;
+        }
+    }
+
+    /// How many bytes of sliding window are allocated right now.
+    #[cfg(test)]
+    pub(crate) fn window_allocated(&self) -> usize {
+        self.win.dict.capacity()
+    }
+
     /// Perform a "full reset" equivalent to constructing a new `LzmaCore`
     /// with the given props, but reuse the existing dictionary allocation
     /// (and the probability/literal table allocations where their sizes
@@ -1170,6 +1191,16 @@ impl LzmaCore {
         *pos = sink.pos;
         self.win.output_pos += (sink.pos - start) as u64;
         r
+    }
+
+    /// Whether [`Self::decode_contiguous`] with this `buf` and `margin`
+    /// would decode more if only it had room to write to: a cut match is
+    /// waiting, or enough compressed bytes are there for another packet.
+    ///
+    /// Used by the [`crate::xz`] decoder; dead under an lzma2-only build.
+    #[cfg_attr(not(any(feature = "xz", test)), allow(dead_code))]
+    pub fn can_continue(&self, buf: &[u8], margin: usize) -> bool {
+        self.model.pending_len != 0 || buf.len().saturating_sub(self.model.range.pos) >= margin
     }
 }
 
