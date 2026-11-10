@@ -6,7 +6,7 @@
 #![cfg(feature = "brotli")]
 
 use compcol::brotli::{Brotli, Decoder, Encoder, EncoderConfig};
-use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Status};
+use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Flush, Status};
 
 /// Parse a hex string into a byte vector.
 fn hex(s: &str) -> Vec<u8> {
@@ -826,4 +826,347 @@ fn decoder_resumes_inside_a_meta_block() {
         assert!(out[..p.written] == input[..p.written]);
         assert_eq!(dec.finish(&mut out).unwrap_err(), Error::UnexpectedEnd);
     }
+}
+
+// ─── flush ───────────────────────────────────────────────────────────────
+
+/// `encode` all of `input`, draining through a buffer of `out_chunk` bytes.
+fn flush_feed(enc: &mut Encoder, input: &[u8], out_chunk: usize, wire: &mut Vec<u8>) {
+    let mut buf = vec![0u8; out_chunk];
+    let mut pos = 0;
+    while pos < input.len() {
+        let (p, status) = enc.encode(&input[pos..], &mut buf).unwrap();
+        wire.extend_from_slice(&buf[..p.written]);
+        pos += p.consumed;
+        assert_ne!(status, Status::StreamEnd);
+        assert!(p.consumed > 0 || p.written > 0, "encode stalled");
+    }
+}
+
+/// Run `flush(mode)` to completion through a buffer of `out_chunk` bytes.
+fn flush_now(enc: &mut Encoder, mode: Flush, out_chunk: usize, wire: &mut Vec<u8>) {
+    let mut buf = vec![0u8; out_chunk];
+    loop {
+        let (p, status) = enc.flush(&mut buf, mode).unwrap();
+        assert_eq!(p.consumed, 0);
+        wire.extend_from_slice(&buf[..p.written]);
+        match status {
+            Status::InputEmpty => return,
+            Status::OutputFull => assert!(p.written > 0, "flush stalled"),
+            Status::StreamEnd => panic!("flush ended the stream"),
+        }
+    }
+}
+
+/// Run `finish` to completion through a buffer of `out_chunk` bytes.
+fn flush_finish(enc: &mut Encoder, out_chunk: usize, wire: &mut Vec<u8>) {
+    let mut buf = vec![0u8; out_chunk];
+    loop {
+        let (p, status) = enc.finish(&mut buf).unwrap();
+        wire.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            return;
+        }
+        assert!(p.written > 0, "finish stalled");
+    }
+}
+
+/// What a decoder that was handed `wire` and nothing else (no `finish`) has
+/// produced by the time it asks for more input, and whether it saw the end
+/// of the stream.
+fn decode_so_far(wire: &[u8], in_chunk: usize) -> (Vec<u8>, bool) {
+    let mut dec = Decoder::new();
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    let mut pos = 0;
+    loop {
+        let end = (pos + in_chunk).min(wire.len());
+        let (p, status) = dec.decode(&wire[pos..end], &mut buf).unwrap();
+        out.extend_from_slice(&buf[..p.written]);
+        pos += p.consumed;
+        if status == Status::StreamEnd {
+            return (out, true);
+        }
+        if pos == wire.len() && p.consumed == 0 && p.written == 0 {
+            return (out, false);
+        }
+    }
+}
+
+/// Inputs for the flush tests: text, a run, noise, prose, and a mix that
+/// spans several 64 KiB meta-blocks. (Nothing here has long runs or long
+/// repeats: the higher qualities are very slow on those when unoptimised.)
+fn flush_inputs() -> Vec<Vec<u8>> {
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut noise = |n: usize| -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 24) as u8
+            })
+            .collect()
+    };
+    let text = mixed_corpus();
+    let mut big = text.clone();
+    big.extend_from_slice(&noise(40_000));
+    big.extend(text.iter().rev());
+    let english = b"It was the best of times, it was the worst of times, it was the age of \
+        wisdom, it was the age of foolishness, it was the epoch of belief, it was the epoch \
+        of incredulity, it was the season of Light, it was the season of Darkness, it was \
+        the spring of hope, it was the winter of despair, we had everything before us, we \
+        had nothing before us, we were all going direct to Heaven, we were all going direct \
+        the other way."
+        .to_vec();
+    let text = text[..12_000].to_vec();
+    vec![text, vec![0u8; 300], noise(3_000), english, big]
+}
+
+/// Feed each input in pieces with a `flush(Sync)` after every piece: what
+/// has been written by the end of each flush decodes, without `finish`, to
+/// exactly the bytes fed so far, and the finished stream decodes whole.
+#[test]
+fn flush_sync_makes_everything_fed_so_far_decodable() {
+    for (n, input) in flush_inputs().iter().enumerate() {
+        // Every quality on the small inputs, a few on the big one.
+        let qualities: &[u8] = if input.len() > 100_000 {
+            &[0, 6]
+        } else {
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        };
+        for &quality in qualities {
+            for (piece, out_chunk) in [(1usize, 4096usize), (7, 1), (1000, 3), (70_000, 4096)] {
+                // Tiny pieces only on a prefix: every flush is a meta-block.
+                let input = match piece {
+                    1 => &input[..input.len().min(300)],
+                    7 => &input[..input.len().min(700)],
+                    _ if quality >= 10 => &input[..input.len().min(4_000)],
+                    _ => &input[..],
+                };
+                let what = format!("input {n}, quality {quality}, pieces of {piece}");
+                let mut enc = Encoder::with_config(EncoderConfig { quality });
+                let mut wire = Vec::new();
+                let mut fed = 0;
+                // Decoding every prefix from scratch is quadratic: check a
+                // bounded number of the flush points, and always the last.
+                let pieces = input.len().div_ceil(piece);
+                let every = pieces.div_ceil(40);
+                for (i, chunk) in input.chunks(piece).enumerate() {
+                    flush_feed(&mut enc, chunk, out_chunk, &mut wire);
+                    flush_now(&mut enc, Flush::Sync, out_chunk, &mut wire);
+                    fed += chunk.len();
+                    if i % every == 0 || i + 1 == pieces {
+                        let (got, ended) = decode_so_far(&wire, 4096);
+                        assert!(!ended, "{what}: flush ended the stream");
+                        assert!(got == input[..fed], "{what}: wrong data after {fed} bytes");
+                    }
+                }
+                flush_finish(&mut enc, out_chunk, &mut wire);
+                assert!(
+                    decode_chunked(&wire, 4096, 4096).unwrap() == input,
+                    "{what}: whole stream"
+                );
+                // A decoder fed a byte at a time sees the same thing.
+                if piece == 1000 && input.len() < 10_000 {
+                    assert!(decode_chunked(&wire, 1, 1).unwrap() == input, "{what}");
+                    assert!(decode_so_far(&wire[..wire.len() - 1], 1).0 == input);
+                }
+            }
+        }
+    }
+}
+
+/// `Flush::Full` gives the same guarantee as `Flush::Sync`.
+#[test]
+fn flush_full_makes_everything_fed_so_far_decodable() {
+    let input = mixed_corpus();
+    for quality in [0u8, 6, 11] {
+        let mut enc = Encoder::with_config(EncoderConfig { quality });
+        let mut wire = Vec::new();
+        let mut fed = 0;
+        for (i, chunk) in input.chunks(1500).enumerate() {
+            flush_feed(&mut enc, chunk, 4096, &mut wire);
+            let mode = if i % 2 == 0 { Flush::Full } else { Flush::Sync };
+            flush_now(&mut enc, mode, 4096, &mut wire);
+            fed += chunk.len();
+            let (got, ended) = decode_so_far(&wire, 4096);
+            assert!(!ended);
+            assert!(got == input[..fed], "quality {quality}: after {fed} bytes");
+        }
+        flush_finish(&mut enc, 4096, &mut wire);
+        assert!(decode_chunked(&wire, 4096, 4096).unwrap() == input);
+    }
+}
+
+/// A flush as the very first call writes the stream header and an empty
+/// metadata meta-block (RFC 7932 §9.2), padded to a byte: WBITS `0`, ISLAST
+/// `0`, MNIBBLES `11`, reserved `0`, MSKIPBYTES `00`, LSB first.
+#[test]
+fn flush_as_first_call() {
+    let mut enc = Encoder::new();
+    let mut wire = Vec::new();
+    flush_now(&mut enc, Flush::Sync, 4096, &mut wire);
+    assert_eq!(wire, [0x0c]);
+    assert_eq!(decode_so_far(&wire, 4096), (Vec::new(), false));
+
+    // Finished right away: a valid empty stream.
+    let mut empty = enc.clone();
+    let mut w = wire.clone();
+    flush_finish(&mut empty, 4096, &mut w);
+    assert_eq!(w, [0x0c, 0x03]);
+    assert_eq!(decode_chunked(&w, 4096, 4096).unwrap(), b"");
+
+    // Or carried on with.
+    flush_feed(&mut enc, b"after the flush", 4096, &mut wire);
+    flush_finish(&mut enc, 4096, &mut wire);
+    assert_eq!(
+        decode_chunked(&wire, 4096, 4096).unwrap(),
+        b"after the flush"
+    );
+}
+
+/// A flush with nothing pending on a stream that is already byte-aligned
+/// owes nothing, so it writes nothing (as the reference encoder's
+/// `BROTLI_OPERATION_FLUSH` does), however often it is repeated.
+#[test]
+fn flush_with_nothing_pending_writes_nothing() {
+    let text = b"some input, some input, some input";
+    let mut enc = Encoder::new();
+    let mut wire = Vec::new();
+    flush_feed(&mut enc, text, 4096, &mut wire);
+    flush_now(&mut enc, Flush::Sync, 4096, &mut wire);
+    let len = wire.len();
+    assert!(len > 0);
+    for mode in [Flush::Sync, Flush::Full, Flush::Sync] {
+        flush_now(&mut enc, mode, 4096, &mut wire);
+        // With no room at all, too.
+        let (p, status) = enc.flush(&mut [], mode).unwrap();
+        assert_eq!((p.written, status), (0, Status::InputEmpty));
+    }
+    assert_eq!(wire.len(), len);
+    flush_feed(&mut enc, b" and more", 4096, &mut wire);
+    flush_now(&mut enc, Flush::Sync, 4096, &mut wire);
+    assert!(wire.len() > len);
+    let all = [&text[..], b" and more"].concat();
+    assert_eq!(decode_so_far(&wire, 4096).0, all);
+    flush_finish(&mut enc, 4096, &mut wire);
+    assert_eq!(decode_chunked(&wire, 4096, 4096).unwrap(), all);
+}
+
+/// With a one-byte output buffer a flush reports `OutputFull` until its
+/// last byte is out, then `InputEmpty`.
+#[test]
+fn flush_through_one_byte_buffer() {
+    let input = mixed_corpus();
+    let mut enc = Encoder::new();
+    let mut wire = Vec::new();
+    flush_feed(&mut enc, &input, 4096, &mut wire);
+    let before = wire.len();
+    let mut byte = [0u8; 1];
+    let mut calls = 0;
+    loop {
+        let (p, status) = enc.flush(&mut byte, Flush::Sync).unwrap();
+        wire.extend_from_slice(&byte[..p.written]);
+        calls += 1;
+        if status == Status::InputEmpty {
+            break;
+        }
+        assert_eq!((p.written, status), (1, Status::OutputFull));
+    }
+    let flushed = wire.len() - before;
+    assert!(flushed > 100);
+    // One call per byte; the call that hands over the last byte may be the
+    // one that reports completion, or the one after it.
+    assert!(calls == flushed || calls == flushed + 1);
+    assert!(decode_so_far(&wire, 4096).0 == input);
+}
+
+/// A flush cut short by `OutputFull` and followed by `encode` instead of
+/// the rest of the flush: the next completed flush covers everything fed.
+#[test]
+fn flush_interrupted_by_encode() {
+    let input = &mixed_corpus()[..16_000];
+    let (a, rest) = input.split_at(2000);
+    let (b, c) = rest.split_at(3000);
+    for quality in [0u8, 6, 11] {
+        for with_input in [true, false] {
+            let mut enc = Encoder::with_config(EncoderConfig { quality });
+            let mut wire = Vec::new();
+            flush_feed(&mut enc, a, 4096, &mut wire);
+            let mut small = [0u8; 5];
+            let (p, status) = enc.flush(&mut small, Flush::Sync).unwrap();
+            wire.extend_from_slice(&small[..p.written]);
+            assert_eq!(status, Status::OutputFull);
+
+            let mut fed = a.len();
+            if with_input {
+                // One byte of room per call: the rest of the cut-short
+                // flush trickles out, then the input is taken.
+                loop {
+                    let (p, _) = enc.encode(b, &mut small[..1]).unwrap();
+                    wire.extend_from_slice(&small[..p.written]);
+                    if p.consumed > 0 {
+                        assert_eq!(p.consumed, b.len());
+                        break;
+                    }
+                    assert_eq!(p.written, 1, "encode stalled");
+                }
+                fed += b.len();
+            } else {
+                let (p, _) = enc.encode(&[], &mut small[..1]).unwrap();
+                wire.extend_from_slice(&small[..p.written]);
+            }
+            flush_now(&mut enc, Flush::Sync, 7, &mut wire);
+            let (got, ended) = decode_so_far(&wire, 4096);
+            assert!(!ended);
+            assert!(got == input[..fed], "quality {quality}, {with_input}");
+
+            if !with_input {
+                flush_feed(&mut enc, b, 4096, &mut wire);
+            }
+            flush_feed(&mut enc, c, 4096, &mut wire);
+            flush_finish(&mut enc, 4096, &mut wire);
+            assert!(decode_chunked(&wire, 4096, 4096).unwrap() == input);
+        }
+    }
+}
+
+/// `finish` right after a flush ends the stream with the empty last
+/// meta-block; flushing a finished stream is an error.
+#[test]
+fn flush_then_finish() {
+    let input = mixed_corpus();
+    let mut enc = Encoder::new();
+    let mut wire = Vec::new();
+    flush_feed(&mut enc, &input, 4096, &mut wire);
+    flush_now(&mut enc, Flush::Sync, 4096, &mut wire);
+    let len = wire.len();
+    flush_finish(&mut enc, 4096, &mut wire);
+    assert_eq!(wire[len..], [0x03]);
+    assert!(decode_chunked(&wire, 4096, 4096).unwrap() == input);
+    assert!(enc.flush(&mut [0u8; 16], Flush::Sync).is_err());
+
+    // Reset: a fresh stream, flushable again.
+    enc.reset();
+    let mut wire = Vec::new();
+    flush_feed(&mut enc, b"again", 4096, &mut wire);
+    flush_now(&mut enc, Flush::Sync, 4096, &mut wire);
+    assert_eq!(decode_so_far(&wire, 4096).0, b"again");
+}
+
+/// A stream that is never flushed does not depend on how it was fed, and
+/// the empty stream is still the single byte it always was.
+#[test]
+fn unflushed_stream_is_unchanged() {
+    assert_eq!(encode_at_quality(b"", 6), [0x06]);
+    let input = mixed_corpus();
+    let whole = encode_at_quality(&input, 6);
+    let mut enc = Encoder::new();
+    let mut wire = Vec::new();
+    for chunk in input.chunks(777) {
+        flush_feed(&mut enc, chunk, 4096, &mut wire);
+    }
+    flush_finish(&mut enc, 4096, &mut wire);
+    assert_eq!(wire, whole);
 }

@@ -452,6 +452,11 @@ fn deflate_flush_with_no_pending_input() {
 
 // ─── a flush interrupted by `encode` ─────────────────────────────────────
 
+/// A deflate stream that ends on the empty stored block of a sync flush.
+fn ends_with_deflate_marker(wire: &[u8]) -> bool {
+    wire.ends_with(&[0x00, 0x00, 0xff, 0xff])
+}
+
 /// What `encoded`, a stream cut at a sync point, decodes to.
 fn decode_prefix<D: compcol::Decoder>(mut dec: D, encoded: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -480,7 +485,9 @@ fn decode_prefix<D: compcol::Decoder>(mut dec: D, encoded: &[u8]) -> Vec<u8> {
 /// with a byte of room each, until one takes enough input to compress a
 /// block, which is then left waiting in the encoder; 2, an `encode` with
 /// room but no input.
-fn interrupted_flush<E, D>(new_enc: fn() -> E, new_dec: fn() -> D)
+///
+/// `synced` is the format's test for a stream that ends on a sync point.
+fn interrupted_flush<E, D>(new_enc: fn() -> E, new_dec: fn() -> D, synced: fn(&[u8]) -> bool)
 where
     E: compcol::Encoder,
     D: compcol::Decoder,
@@ -500,10 +507,7 @@ where
         let mut wire = Vec::new();
         let mut buf = vec![0u8; 70_000];
         let check = |wire: &[u8], upto: usize, what: &str| {
-            assert!(
-                wire.ends_with(&[0x00, 0x00, 0xff, 0xff]),
-                "how {how}: no sync marker after {what}"
-            );
+            assert!(synced(wire), "how {how}: no sync marker after {what}");
             assert!(
                 decode_prefix(new_dec(), wire) == data[..upto],
                 "how {how}: wrong data after {what}"
@@ -555,19 +559,27 @@ where
 
 #[test]
 fn deflate_flush_interrupted_by_encode() {
-    interrupted_flush(Encoder::new, Decoder::new);
+    interrupted_flush(Encoder::new, Decoder::new, ends_with_deflate_marker);
 }
 
 #[cfg(feature = "zlib")]
 #[test]
 fn zlib_flush_interrupted_by_encode() {
-    interrupted_flush(compcol::zlib::Encoder::new, compcol::zlib::Decoder::new);
+    interrupted_flush(
+        compcol::zlib::Encoder::new,
+        compcol::zlib::Decoder::new,
+        ends_with_deflate_marker,
+    );
 }
 
 #[cfg(feature = "gzip")]
 #[test]
 fn gzip_flush_interrupted_by_encode() {
-    interrupted_flush(compcol::gzip::Encoder::new, compcol::gzip::Decoder::new);
+    interrupted_flush(
+        compcol::gzip::Encoder::new,
+        compcol::gzip::Decoder::new,
+        ends_with_deflate_marker,
+    );
 }
 
 #[cfg(feature = "deflate64")]
@@ -576,5 +588,99 @@ fn deflate64_flush_interrupted_by_encode() {
     interrupted_flush(
         compcol::deflate64::Encoder::new,
         compcol::deflate64::Decoder::new,
+        ends_with_deflate_marker,
     );
+}
+
+// ─── brotli ──────────────────────────────────────────────────────────────
+
+/// Brotli's sync point is an empty metadata meta-block padded to a byte
+/// (RFC 7932 §9.2). It starts wherever the data before it stopped, so it is
+/// no fixed byte string: what can be said of the last byte is that its
+/// padding is zero. The decoding half of the contract is what counts.
+#[cfg(feature = "brotli")]
+fn ends_with_brotli_marker(wire: &[u8]) -> bool {
+    wire.last().is_some_and(|b| b & 0x80 == 0)
+}
+
+#[cfg(feature = "brotli")]
+#[test]
+fn brotli_flush_interrupted_by_encode() {
+    interrupted_flush(
+        compcol::brotli::Encoder::new,
+        compcol::brotli::Decoder::new,
+        ends_with_brotli_marker,
+    );
+}
+
+/// The deflate chunk test, for brotli: three chunks with a flush after
+/// each (the middle one `Full`), each prefix decodable on its own.
+#[cfg(feature = "brotli")]
+#[test]
+fn brotli_three_chunks_with_flushes() {
+    let chunks: [Vec<u8>; 3] = [
+        "AAAA".repeat(64).into_bytes(),
+        "BBBB".repeat(64).into_bytes(),
+        b"the quick brown fox jumps over the lazy dog. ".repeat(6),
+    ];
+    let mut enc = compcol::brotli::Encoder::new();
+    let mut wire = Vec::new();
+    let mut expect = Vec::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        drive_encode(&mut enc, chunk, &mut wire);
+        let mode = if i == 1 { Flush::Full } else { Flush::Sync };
+        drive_flush(&mut enc, mode, &mut wire);
+        expect.extend_from_slice(chunk);
+        assert!(ends_with_brotli_marker(&wire));
+        assert_eq!(
+            decode_prefix(compcol::brotli::Decoder::new(), &wire),
+            expect,
+            "after chunk {i}"
+        );
+    }
+    drive_finish(&mut enc, &mut wire);
+    let mut dec = compcol::brotli::Decoder::new();
+    let mut out = vec![0u8; expect.len() + 16];
+    let (p, status) = dec.decode(&wire, &mut out).unwrap();
+    assert_eq!(status, Status::StreamEnd);
+    assert_eq!(p.consumed, wire.len());
+    assert_eq!(out[..p.written], expect[..]);
+}
+
+/// A flush before any input still writes something (the stream header and
+/// the marker), and the stream stays usable.
+#[cfg(feature = "brotli")]
+#[test]
+fn brotli_flush_with_no_pending_input() {
+    let mut enc = compcol::brotli::Encoder::new();
+    let mut wire = Vec::new();
+    drive_flush(&mut enc, Flush::Sync, &mut wire);
+    assert!(!wire.is_empty(), "flush should emit the sync marker");
+    drive_encode(&mut enc, b"after", &mut wire);
+    drive_finish(&mut enc, &mut wire);
+    assert_eq!(
+        decode_prefix(compcol::brotli::Decoder::new(), &wire),
+        b"after"
+    );
+}
+
+/// A one-byte output buffer: the flush goes out a byte at a time.
+#[cfg(feature = "brotli")]
+#[test]
+fn brotli_flush_handles_tiny_output_buffer() {
+    let data = b"hello, hello, hello, hello, world".repeat(20);
+    let mut enc = compcol::brotli::Encoder::new();
+    let mut wire = Vec::new();
+    drive_encode(&mut enc, &data, &mut wire);
+    let mut byte = [0u8; 1];
+    loop {
+        let (p, status) = enc.flush(&mut byte, Flush::Sync).unwrap();
+        wire.extend_from_slice(&byte[..p.written]);
+        match status {
+            Status::InputEmpty => break,
+            Status::OutputFull => assert_eq!(p.written, 1),
+            Status::StreamEnd => panic!("flush returned StreamEnd"),
+        }
+    }
+    assert_eq!(decode_prefix(compcol::brotli::Decoder::new(), &wire), data);
 }
