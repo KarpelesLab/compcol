@@ -58,6 +58,28 @@
 //! minimum-correctness encoder, suitable for compatibility but not
 //! for size. Block- and content-checksums are disabled.
 //!
+//! ## Memory
+//!
+//! The decoder works a frame block at a time: a compressed block is
+//! gathered, decoded whole into an internal buffer, then handed out. The
+//! frame header's BD code sets the largest block, from 128 KiB (code 1) to
+//! 256 MiB (code 7), and a block of
+//! long matches reaches that size from almost no input, so by default **a
+//! frame of about 140 bytes can make the decoder build a 256 MiB block**.
+//! A block-dependent frame (`-BD`) additionally keeps the last 16 MiB of
+//! output as history (up to 32 MiB between trims).
+//!
+//! Two controls bound this for untrusted input:
+//!
+//! - [`DecoderConfig::with_max_block_size`] refuses, at header time and
+//!   with [`Error::Unsupported`], any frame whose BD code names a larger
+//!   block. The default is [`MAX_BLOCK_SIZE`] (256 MiB): every frame is
+//!   accepted, as before.
+//! - An output limit ([`LimitedDecoder`](crate::limit::LimitedDecoder),
+//!   or [`set_output_limit`](crate::Decoder::set_output_limit)) caps each
+//!   block's decode at what the caller will still take, failing with
+//!   [`Error::OutputLimitExceeded`] before the excess is built.
+//!
 //! ## Why "store-only" encoder
 //!
 //! Producing the compressed sequence stream involves a non-trivial
@@ -90,8 +112,52 @@ pub const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
 /// Decoder ceiling on a single block's raw size (`max_block` × growth
 /// allowance). Lizard caps blocks at 256 MiB (BD=7); we accept that
 /// upper bound but refuse anything larger to defend against malformed
-/// length prefixes.
-const MAX_BLOCK_SIZE: usize = 256 * 1024 * 1024;
+/// length prefixes. Also the default
+/// [`DecoderConfig::max_block_size`].
+pub const MAX_BLOCK_SIZE: usize = 256 * 1024 * 1024;
+
+/// Decoder options.
+///
+/// `#[non_exhaustive]`: construct via [`DecoderConfig::default`] and the
+/// `with_*` builders rather than a struct literal, so new options can be
+/// added in future without breaking downstream code.
+///
+/// ```
+/// use compcol::Algorithm;
+/// use compcol::lz5::{DecoderConfig, Lz5};
+///
+/// // Accept frames with blocks of up to 4 MiB.
+/// let config = DecoderConfig::default().with_max_block_size(4 << 20);
+/// let _decoder = Lz5::decoder_with(config);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DecoderConfig {
+    /// Largest frame block, in bytes, a frame header may declare. The BD
+    /// code names one of 128 KiB, 256 KiB, 1, 4, 16, 64 or 256 MiB; a
+    /// frame naming more than this is rejected with
+    /// [`Error::Unsupported`] when its header is read. Default
+    /// [`MAX_BLOCK_SIZE`] (256 MiB), which accepts every frame; see the
+    /// [module docs](self#memory).
+    pub max_block_size: usize,
+}
+
+impl Default for DecoderConfig {
+    fn default() -> Self {
+        Self {
+            max_block_size: MAX_BLOCK_SIZE,
+        }
+    }
+}
+
+impl DecoderConfig {
+    /// Set [`max_block_size`](Self::max_block_size), the largest frame
+    /// block in bytes a frame header may declare.
+    pub fn with_max_block_size(mut self, max_block_size: usize) -> Self {
+        self.max_block_size = max_block_size;
+        self
+    }
+}
 
 /// Zero-sized marker type implementing [`Algorithm`] for LZ5 / Lizard.
 #[derive(Debug, Clone, Copy, Default)]
@@ -102,12 +168,12 @@ impl Algorithm for Lz5 {
     type Encoder = Encoder;
     type Decoder = Decoder;
     type EncoderConfig = ();
-    type DecoderConfig = ();
+    type DecoderConfig = DecoderConfig;
     fn encoder_with(_: ()) -> Encoder {
         Encoder::new()
     }
-    fn decoder_with(_: ()) -> Decoder {
-        Decoder::new()
+    fn decoder_with(config: DecoderConfig) -> Decoder {
+        Decoder::with_config(config)
     }
 }
 
@@ -447,11 +513,26 @@ pub struct Decoder {
     /// Caller's output limit (`u64::MAX` = none). Configuration: kept
     /// across `reset`.
     limit: u64,
+    /// Largest block a frame header may declare
+    /// ([`DecoderConfig::max_block_size`]). Configuration: kept across
+    /// `reset`.
+    max_block_size: usize,
 }
 
 impl Decoder {
+    /// Decoder with the default configuration: any block size a frame
+    /// header can name (up to 256 MiB) is accepted. See
+    /// [`with_config`](Self::with_config) to cap it.
     pub fn new() -> Self {
+        Self::with_config(DecoderConfig::default())
+    }
+
+    /// Decoder with the given options, e.g.
+    /// `DecoderConfig::default().with_max_block_size(4 << 20)` to refuse
+    /// frames whose blocks may exceed 4 MiB.
+    pub fn with_config(config: DecoderConfig) -> Self {
         Self {
+            max_block_size: config.max_block_size,
             header_buf: [0; 15],
             header_idx: 0,
             header_expected: 7,
@@ -525,6 +606,11 @@ impl Decoder {
         let expected_hc = (xxh32::xxh32(descriptor, 0) >> 8) as u8;
         if self.header_buf[hc_offset] != expected_hc {
             return Err(Error::ChecksumMismatch);
+        }
+        // A well-formed header, but for blocks larger than this decoder
+        // was configured to hold: refuse before any block is gathered.
+        if max_block > self.max_block_size {
+            return Err(Error::Unsupported);
         }
         Ok(())
     }
