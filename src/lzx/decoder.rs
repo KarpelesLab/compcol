@@ -391,24 +391,10 @@ impl RawDecoder for Decoder {
         }
         let mut written = 0usize;
         if let DecState::Running(ctx) = &mut self.state {
-            drain_frame(ctx, output, &mut written);
-            if !ctx.eof_padded && ctx.bit_reader.can_pad_eof() {
-                ctx.bit_reader.pad_eof();
-                ctx.eof_padded = true;
-            }
-            let res = step(ctx);
-            // The pad is lookahead only. If any of it was consumed, the
-            // stream ended before its data did — whatever those bits then
-            // decoded to (output bytes, or some other error) is meaningless.
-            if ctx.bit_reader.eof_pad_consumed() {
-                return Err(self.poison(Error::UnexpectedEnd));
-            }
-            if let Err(e) = res {
-                return Err(self.poison(e));
-            }
-            drain_frame(ctx, output, &mut written);
-            if ctx.output_so_far == ctx.output_total && ctx.frame_emitted == ctx.frame_buf.len() {
-                self.state = DecState::Done;
+            match finish_running(ctx, output, &mut written) {
+                Ok(true) => self.state = DecState::Done,
+                Ok(false) => {}
+                Err(e) => return Err(self.poison(e)),
             }
         }
         match &self.state {
@@ -430,17 +416,13 @@ impl RawDecoder for Decoder {
                     Err(self.poison(Error::UnexpectedEnd))
                 }
             }
-            DecState::Running(_) => {
-                if written == 0 {
-                    Err(self.poison(Error::UnexpectedEnd))
-                } else {
-                    Ok(RawProgress {
-                        consumed: 0,
-                        written,
-                        done: false,
-                    })
-                }
-            }
+            // Bytes are still owed and `output` is full (or empty). That is
+            // not an error: the caller comes back with more room.
+            DecState::Running(_) => Ok(RawProgress {
+                consumed: 0,
+                written,
+                done: false,
+            }),
         }
     }
 
@@ -450,6 +432,41 @@ impl RawDecoder for Decoder {
             have: 0,
         };
         self.poisoned = false;
+    }
+}
+
+/// Run a stream to its end once the input is exhausted. `Ok(true)`: the
+/// declared total has been delivered. `Ok(false)`: decoded bytes are waiting
+/// for room in `output`. `UnexpectedEnd` only when nothing is pending and
+/// the remaining bits cannot produce any more output.
+fn finish_running(ctx: &mut RunCtx, output: &mut [u8], written: &mut usize) -> Result<bool, Error> {
+    loop {
+        drain_frame(ctx, output, written);
+        if ctx.output_so_far == ctx.output_total && ctx.frame_emitted == ctx.frame_buf.len() {
+            return Ok(true);
+        }
+        if ctx.frame_ready {
+            // `drain_frame` stopped short: `output` is full.
+            return Ok(false);
+        }
+        if !ctx.eof_padded && ctx.bit_reader.can_pad_eof() {
+            ctx.bit_reader.pad_eof();
+            ctx.eof_padded = true;
+        }
+        let res = step(ctx);
+        // The pad is lookahead only. If any of it was consumed, the stream
+        // ended before its data did — whatever those bits then decoded to
+        // (output bytes, or some other error) is meaningless.
+        if ctx.bit_reader.eof_pad_consumed() {
+            return Err(Error::UnexpectedEnd);
+        }
+        res?;
+        // `step` returns with a frame to drain or for want of input. Out of
+        // input with the pad in place is the end; without it (the reader
+        // was too full to pad) go round again, now that bits were used.
+        if !ctx.frame_ready && (ctx.eof_padded || !ctx.bit_reader.can_pad_eof()) {
+            return Err(Error::UnexpectedEnd);
+        }
     }
 }
 

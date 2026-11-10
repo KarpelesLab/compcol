@@ -339,9 +339,10 @@ impl RawDecoder for Decoder {
         }
         let mut written = 0usize;
         if let DecState::Running(ctx) = &mut self.state {
-            drain_stage(ctx, output, &mut written);
-            if ctx.output_so_far == ctx.output_total && ctx.stage_emitted == ctx.stage.len() {
-                self.state = DecState::Done;
+            match finish_running(ctx, output, &mut written) {
+                Ok(true) => self.state = DecState::Done,
+                Ok(false) => {}
+                Err(e) => return Err(self.poison(e)),
             }
         }
         match &self.state {
@@ -363,17 +364,13 @@ impl RawDecoder for Decoder {
                     Err(self.poison(Error::UnexpectedEnd))
                 }
             }
-            DecState::Running(_) => {
-                if written == 0 {
-                    Err(self.poison(Error::UnexpectedEnd))
-                } else {
-                    Ok(RawProgress {
-                        consumed: 0,
-                        written,
-                        done: false,
-                    })
-                }
-            }
+            // Bytes are still owed and `output` is full (or empty). That is
+            // not an error: the caller comes back with more room.
+            DecState::Running(_) => Ok(RawProgress {
+                consumed: 0,
+                written,
+                done: false,
+            }),
         }
     }
 
@@ -383,6 +380,29 @@ impl RawDecoder for Decoder {
             have: 0,
         };
         self.poisoned = false;
+    }
+}
+
+/// Run a stream to its end once the input is exhausted. `Ok(true)`: the
+/// declared total has been delivered. `Ok(false)`: decoded bytes are waiting
+/// for room in `output`. `UnexpectedEnd` only when nothing is pending and
+/// the remaining bits cannot produce any more output.
+fn finish_running(ctx: &mut RunCtx, output: &mut [u8], written: &mut usize) -> Result<bool, Error> {
+    loop {
+        drain_stage(ctx, output, written);
+        if ctx.output_so_far == ctx.output_total && ctx.stage_emitted == ctx.stage.len() {
+            return Ok(true);
+        }
+        if ctx.stage_emitted < ctx.stage.len() {
+            // `drain_stage` stopped short: `output` is full.
+            return Ok(false);
+        }
+        // Nothing staged. `decode` may have stopped on a full `output` with
+        // bits still buffered, so decode on before giving up.
+        step(ctx)?;
+        if ctx.stage.is_empty() {
+            return Err(Error::UnexpectedEnd);
+        }
     }
 }
 

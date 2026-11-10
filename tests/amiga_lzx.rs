@@ -743,6 +743,47 @@ fn total_reached_mid_block_ignores_what_follows() {
     assert_eq!(try_decode_all_ways(&s), Ok(vec![0u8; k as usize + 1]));
 }
 
+/// `finish` with no room for output is not an error while bytes are still
+/// owed: it used to report `UnexpectedEnd` and poison a healthy decoder.
+/// On a stream that really is truncated it must still fail, not stall.
+#[test]
+fn finish_with_empty_output_on_a_healthy_stream() {
+    let data: Vec<u8> = (0..100u32).map(|i| (i * 5 + 1) as u8).collect();
+    let enc = encode_chunked(&data, data.len(), 256);
+    for out_chunk in [1usize, 7, 4096] {
+        let mut dec = Decoder::new();
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; out_chunk];
+        let mut pos = 0;
+        while pos < enc.len() {
+            let (p, _) = dec.decode(&enc[pos..], &mut buf).unwrap();
+            pos += p.consumed;
+            got.extend_from_slice(&buf[..p.written]);
+        }
+        let mut ended = false;
+        for _ in 0..3 {
+            let (p, status) = dec.finish(&mut []).unwrap();
+            assert_eq!(p.written, 0);
+            ended = status == Status::StreamEnd;
+        }
+        while !ended {
+            let (p, status) = dec.finish(&mut buf).unwrap();
+            got.extend_from_slice(&buf[..p.written]);
+            ended = status == Status::StreamEnd;
+            assert!(ended || p.written > 0, "finish stalled");
+        }
+        assert_eq!(got, data, "out_chunk {out_chunk}");
+    }
+
+    // Truncated: whatever is still owed can be drained, then it is an error.
+    let mut dec = Decoder::new();
+    let mut buf = [0u8; 4096];
+    let cut = &enc[..enc.len() - 2];
+    let (p, _) = dec.decode(cut, &mut buf).unwrap();
+    assert_eq!(p.consumed, cut.len());
+    assert_eq!(dec.finish(&mut []).unwrap_err(), Error::UnexpectedEnd);
+}
+
 // ─── factory ─────────────────────────────────────────────────────────────
 
 #[cfg(feature = "factory")]
