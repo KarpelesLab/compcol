@@ -871,3 +871,146 @@ mod factory {
         assert_eq!(decoded, input);
     }
 }
+
+// ─── output limit ────────────────────────────────────────────────────────
+
+/// A 7-byte frame header for `flg`/`bd`. The header checksum byte is
+/// found by asking the decoder, which rejects every wrong value.
+fn frame_header(flg: u8, bd: u8) -> Vec<u8> {
+    let mut header = vec![0x06, 0x22, 0x4d, 0x18, flg, bd, 0x00];
+    for hc in 0..=255u8 {
+        header[6] = hc;
+        if Decoder::new().decode(&header, &mut [0u8; 16]).is_ok() {
+            return header;
+        }
+    }
+    panic!("no header checksum accepted");
+}
+
+/// The v0.7.8 audit's bomb: a frame whose one block is 15 maximum-length
+/// matches at offset 1, decoding to hundreds of MiB (138 bytes with a
+/// `-B7` header). A frame block is decoded whole before any of it is
+/// handed out, so only a decoder that knows the caller's limit can refuse
+/// it in time. `bd` is the frame's BD byte.
+fn bomb_frame(bd: u8) -> Vec<u8> {
+    let mut f = frame_header(0x60, bd);
+    f.extend_from_slice(&[0x7b, 0, 0, 0]);
+    // Level 10, all five streams raw; lengths/offset16/offset24 empty.
+    f.extend_from_slice(&[0x0a, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    // Tokens.
+    f.extend_from_slice(&[0x0f, 0, 0, 0xf1]);
+    f.extend_from_slice(&[0xf0; 14]);
+    // Literals: one byte, then offset 1 and a maximal length, 15 times.
+    f.extend_from_slice(&[0x5b, 0, 0, 0x41, 0x01, 0x00, 0xff, 0xff, 0xff, 0xff]);
+    for _ in 0..14 {
+        f.extend_from_slice(&[0x01, 0x00, 0xff, 0xff, 0xff, 0xff]);
+    }
+    f.extend_from_slice(&[0, 0, 0, 0]);
+    assert_eq!(f.len(), 138);
+    f
+}
+
+#[test]
+fn output_limit_refuses_a_block_bomb_before_decoding_it() {
+    let frame = bomb_frame(0x70);
+    assert_eq!(frame[6], 0x73);
+    let mut buf = vec![0u8; 4096];
+
+    let mut dec = Decoder::new();
+    dec.set_output_limit(1024);
+    assert_eq!(
+        dec.decode(&frame, &mut buf),
+        Err(Error::OutputLimitExceeded)
+    );
+
+    // The limit is configuration: it survives a reset.
+    dec.reset();
+    assert_eq!(
+        dec.decode(&frame, &mut buf),
+        Err(Error::OutputLimitExceeded)
+    );
+}
+
+#[test]
+fn limited_decoder_refuses_a_block_bomb() {
+    use compcol::limit::LimitedDecoder;
+    use compcol::vec::decompress_to_vec_capped;
+
+    let frame = bomb_frame(0x70);
+    let mut dec = LimitedDecoder::new(Decoder::new(), 1024);
+    let mut buf = vec![0u8; 4096];
+    assert_eq!(
+        dec.decode(&frame, &mut buf),
+        Err(Error::OutputLimitExceeded)
+    );
+    assert_eq!(dec.bytes_written(), 0);
+    assert_eq!(
+        decompress_to_vec_capped::<Lz5>(&frame, 1024),
+        Err(Error::OutputLimitExceeded)
+    );
+}
+
+/// The limit is a bound on the whole frame: exactly the content length
+/// decodes, one byte less does not, for compressed blocks (independent
+/// and dependent) and for stored ones.
+#[test]
+fn output_exactly_at_the_limit_decodes() {
+    use compcol::vec::decompress_to_vec_capped;
+
+    let records = records_input();
+    let stored_input: Vec<u8> = (0..300_000u32).map(|i| (i * 7 + i / 251) as u8).collect();
+    let stored = encode_all(&stored_input);
+    let cases: [(&[u8], &[u8]); 3] = [
+        (
+            include_bytes!("fixtures/lz5/records_l10_multi_subblock.liz"),
+            &records,
+        ),
+        (
+            include_bytes!("fixtures/lz5/records_l15_b1_dependent.liz"),
+            &records,
+        ),
+        (&stored, &stored_input),
+    ];
+    for (i, (encoded, want)) in cases.into_iter().enumerate() {
+        let n = want.len() as u64;
+        for (in_chunk, out_chunk) in [(encoded.len(), 1 << 16), (777, 333)] {
+            let mut dec = Decoder::new();
+            dec.set_output_limit(n);
+            let got = decode_chunked_with(&mut dec, encoded, in_chunk, out_chunk).unwrap();
+            assert!(got == want, "case {i}: mismatch at the limit");
+
+            let mut dec = Decoder::new();
+            dec.set_output_limit(n - 1);
+            assert_eq!(
+                decode_chunked_with(&mut dec, encoded, in_chunk, out_chunk),
+                Err(Error::OutputLimitExceeded),
+                "case {i}"
+            );
+        }
+        assert!(decompress_to_vec_capped::<Lz5>(encoded, n).unwrap() == want);
+        assert_eq!(
+            decompress_to_vec_capped::<Lz5>(encoded, n - 1),
+            Err(Error::OutputLimitExceeded),
+            "case {i}"
+        );
+    }
+}
+
+/// A block that outgrows the frame's own block size is still a corrupt
+/// frame, not a limit error, unless the limit is what it hit first.
+#[test]
+fn block_larger_than_the_frame_block_size_is_still_corrupt() {
+    // The bomb again, in a 128 KiB-block frame (BD code 1).
+    let frame = bomb_frame(0x10);
+    let mut buf = vec![0u8; 4096];
+    assert_eq!(Decoder::new().decode(&frame, &mut buf), Err(Error::Corrupt));
+    let mut dec = Decoder::new();
+    dec.set_output_limit(1 << 20);
+    assert_eq!(dec.decode(&frame, &mut buf), Err(Error::Corrupt));
+    let mut dec = Decoder::new();
+    dec.set_output_limit(1024);
+    assert_eq!(
+        dec.decode(&frame, &mut buf),
+        Err(Error::OutputLimitExceeded)
+    );
+}

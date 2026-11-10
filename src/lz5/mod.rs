@@ -444,6 +444,9 @@ pub struct Decoder {
     total_emitted: u64,
     phase: DecPhase,
     poisoned: bool,
+    /// Caller's output limit (`u64::MAX` = none). Configuration: kept
+    /// across `reset`.
+    limit: u64,
 }
 
 impl Decoder {
@@ -465,7 +468,14 @@ impl Decoder {
             total_emitted: 0,
             phase: DecPhase::Header,
             poisoned: false,
+            limit: u64::MAX,
         }
+    }
+
+    /// Output bytes the caller will still take, counting every block
+    /// decoded so far against its limit.
+    fn remaining_budget(&self) -> u64 {
+        self.limit.saturating_sub(self.total_emitted)
     }
 
     fn finish_header(&mut self) -> Result<(), Error> {
@@ -669,6 +679,13 @@ impl RawDecoder for Decoder {
                             self.poisoned = true;
                             return Err(Error::Corrupt);
                         }
+                        // A stored block decodes to exactly its length, so
+                        // one longer than the caller's remaining budget is
+                        // refused here rather than gathered first.
+                        if payload_len as u64 > self.remaining_budget() {
+                            self.poisoned = true;
+                            return Err(Error::OutputLimitExceeded);
+                        }
                         // `payload_len` is attacker-declared and validated only
                         // against max_block_raw, not bytes remaining, so reserve
                         // a bounded floor and let extend_from_slice grow as real
@@ -732,14 +749,26 @@ impl RawDecoder for Decoder {
                             done: false,
                         });
                     }
-                    // Block fully gathered — decompress.
-                    if let Err(e) = block::decode_compressed_block(
-                        &self.block_buf,
-                        &mut self.decoded,
-                        self.max_block_raw,
-                    ) {
+                    // Block fully gathered — decompress. The block may
+                    // grow `decoded` by at most the frame's block size,
+                    // and by no more than the caller will still take:
+                    // the decode checks the cap before every append, so
+                    // an over-long block fails before it is built.
+                    let budget = self.remaining_budget();
+                    let cap = (self.max_block_raw as u64).min(budget) as usize;
+                    if let Err(e) =
+                        block::decode_compressed_block(&self.block_buf, &mut self.decoded, cap)
+                    {
                         self.poisoned = true;
-                        return Err(e);
+                        // `OutputLimitExceeded` means the cap was hit. If
+                        // that was the frame's own block size rather than
+                        // the caller's budget, the block is malformed.
+                        return Err(match e {
+                            Error::OutputLimitExceeded if budget >= self.max_block_raw as u64 => {
+                                Error::Corrupt
+                            }
+                            e => e,
+                        });
                     }
                     // Redundant given the per-append cap inside
                     // decode_compressed_block, but kept as a cheap
@@ -855,5 +884,9 @@ impl RawDecoder for Decoder {
         self.total_emitted = 0;
         self.phase = DecPhase::Header;
         self.poisoned = false;
+    }
+
+    fn raw_set_output_limit(&mut self, max_output_bytes: u64) {
+        self.limit = max_output_bytes;
     }
 }

@@ -73,8 +73,12 @@ pub struct Lz4ModeDecoder;
 /// is checked against it *before* every append (literal run, match copy,
 /// in-block-uncompressed payload, trailing literals) so a malformed
 /// stream cannot balloon `out` to gigabytes before the size is rejected.
-/// A valid block always stays `<= cap`. On overflow we return
-/// `Error::Corrupt`, matching the caller's post-hoc size check.
+/// A valid block always stays `<= cap`. Overflow is reported as
+/// `Error::OutputLimitExceeded`, and as nothing else, so the caller can
+/// tell it from other damage: the frame decoder passes the smaller of the
+/// frame's block size and the caller's remaining output budget, and turns
+/// the error back into `Error::Corrupt` when it was the frame's own block
+/// size that was exceeded.
 pub fn decode_compressed_block(input: &[u8], out: &mut Vec<u8>, cap: usize) -> Result<(), Error> {
     if input.is_empty() {
         return Err(Error::UnexpectedEnd);
@@ -136,7 +140,7 @@ fn decode_sub_block(
             return Err(Error::UnexpectedEnd);
         }
         if length > cap - out.len() {
-            return Err(Error::Corrupt);
+            return Err(Error::OutputLimitExceeded);
         }
         out.extend_from_slice(&input[ip..ip + length]);
         return Ok(ip + length);
@@ -337,7 +341,7 @@ fn decode_lizv1_sequences(
                 return Err(Error::Corrupt);
             }
             if lit_len > cap - out.len() {
-                return Err(Error::Corrupt);
+                return Err(Error::OutputLimitExceeded);
             }
             out.extend_from_slice(&s.literals[litp..litp + lit_len]);
             litp += lit_len;
@@ -370,7 +374,7 @@ fn decode_lizv1_sequences(
     }
     let tail = &s.literals[litp..];
     if tail.len() > cap - out.len() {
-        return Err(Error::Corrupt);
+        return Err(Error::OutputLimitExceeded);
     }
     out.extend_from_slice(tail);
     Ok(())
@@ -432,7 +436,7 @@ fn decode_lz4_sequences(
                 return Err(Error::UnexpectedEnd);
             }
             if out.len() + lit_len > cap {
-                return Err(Error::Corrupt);
+                return Err(Error::OutputLimitExceeded);
             }
             out.extend_from_slice(&literals[lp..lp + lit_len]);
             lp += lit_len;
@@ -466,7 +470,7 @@ fn decode_lz4_sequences(
     if lp < literals.len() {
         let tail = literals.len() - lp;
         if out.len() + tail > cap {
-            return Err(Error::Corrupt);
+            return Err(Error::OutputLimitExceeded);
         }
         out.extend_from_slice(&literals[lp..]);
     }
@@ -515,7 +519,7 @@ fn copy_match(out: &mut Vec<u8>, offset: usize, match_len: usize, cap: usize) ->
         return Err(Error::InvalidDistance);
     }
     if out.len() + match_len > cap {
-        return Err(Error::Corrupt);
+        return Err(Error::OutputLimitExceeded);
     }
     let start = out.len() - offset;
     if offset >= match_len {
@@ -662,10 +666,13 @@ mod tests {
             run(&build(&[1, 0, 1, 0], &[], &[0x21], b"x")),
             Err(Error::Corrupt)
         );
-        // A match longer than the block may hold.
+        // A match longer than the block may hold: reported as the cap
+        // being hit, which the frame decoder turns back into `Corrupt`
+        // when the cap was the frame's block size (see tests/lz5.rs,
+        // `block_larger_than_the_frame_block_size_is_still_corrupt`).
         assert_eq!(
             run(&build(&[1, 0], &[], &[0x79], b"x\xff\xff\xff\xff")),
-            Err(Error::Corrupt)
+            Err(Error::OutputLimitExceeded)
         );
     }
 
