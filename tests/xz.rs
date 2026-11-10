@@ -1762,6 +1762,134 @@ fn finish_drains_decoded_bytes_before_reporting_truncation() {
 
 // ─── hand-built containers ──────────────────────────────────────────────
 
+fn test_varint(mut v: u64, out: &mut Vec<u8>) {
+    while v >= 0x80 {
+        out.push(v as u8 | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// A one-Block `.xz` Stream with a CRC32 Check. `bh_body` is the Block
+/// Header after its size byte (Block Flags, optional sizes, Filter Flags),
+/// `lzma2` the Block's compressed data and `plain` what it decodes to (for
+/// the Check and the Index).
+fn build_xz(bh_body: &[u8], lzma2: &[u8], plain: &[u8]) -> Vec<u8> {
+    let mut out = stream_header(0x01);
+    let mut bh = vec![0u8];
+    bh.extend_from_slice(bh_body);
+    while bh.len() % 4 != 0 {
+        bh.push(0);
+    }
+    bh[0] = ((bh.len() + 4) / 4 - 1) as u8;
+    let c = test_crc32(&bh);
+    bh.extend_from_slice(&c.to_le_bytes());
+    let unpadded = bh.len() + lzma2.len() + 4;
+    out.extend_from_slice(&bh);
+    out.extend_from_slice(lzma2);
+    out.resize(out.len() + (4 - unpadded % 4) % 4, 0);
+    out.extend_from_slice(&test_crc32(plain).to_le_bytes());
+    let mut idx = vec![0u8];
+    test_varint(1, &mut idx);
+    test_varint(unpadded as u64, &mut idx);
+    test_varint(plain.len() as u64, &mut idx);
+    while idx.len() % 4 != 0 {
+        idx.push(0);
+    }
+    let c = test_crc32(&idx);
+    idx.extend_from_slice(&c.to_le_bytes());
+    out.extend_from_slice(&idx);
+    let mut body = ((idx.len() / 4 - 1) as u32).to_le_bytes().to_vec();
+    body.extend_from_slice(&[0, 1]);
+    out.extend_from_slice(&test_crc32(&body).to_le_bytes());
+    out.extend_from_slice(&body);
+    out.extend_from_slice(b"YZ");
+    out
+}
+
+/// Check a hand-built Stream against both this decoder (at several input
+/// chunkings) and, when installed, `xz -d`: `want` is the plaintext, or
+/// `None` when both must reject it (this decoder with `Error::Corrupt`).
+fn check_hand_built(label: &str, stream: &[u8], want: Option<&[u8]>) {
+    for in_chunk in [1, 3, stream.len()] {
+        let got = decode_chunked(stream, in_chunk, 4096);
+        match want {
+            Some(plain) => assert_eq!(got.as_deref(), Ok(plain), "{label}, in_chunk {in_chunk}"),
+            None => assert_eq!(got, Err(Error::Corrupt), "{label}, in_chunk {in_chunk}"),
+        }
+    }
+    if tool_available("xz") {
+        let out = run_tool("xz", &["-d", "-c"], stream);
+        match want {
+            Some(plain) => assert!(out.status.success() && out.stdout == plain, "xz: {label}"),
+            None => assert!(!out.status.success(), "xz accepts: {label}"),
+        }
+    }
+}
+
+/// The Block Header's optional Compressed Size and Uncompressed Size were
+/// parsed and thrown away; a Block that contradicts them is corrupt.
+#[test]
+fn block_header_sizes_are_verified() {
+    // One stored chunk holding "A", then the end marker: 5 bytes of
+    // compressed data for 1 byte.
+    let lzma2 = [0x01, 0x00, 0x00, b'A', 0x00];
+    let header = |comp: Option<u64>, uncomp: Option<u64>| {
+        let flags = if comp.is_some() { 0x40 } else { 0 } | if uncomp.is_some() { 0x80 } else { 0 };
+        let mut body = vec![flags];
+        for v in [comp, uncomp].into_iter().flatten() {
+            test_varint(v, &mut body);
+        }
+        body.extend_from_slice(&[0x21, 0x01, 0x00]);
+        build_xz(&body, &lzma2, b"A")
+    };
+    check_hand_built("no sizes", &header(None, None), Some(b"A"));
+    check_hand_built("both right", &header(Some(5), Some(1)), Some(b"A"));
+    check_hand_built("compressed right", &header(Some(5), None), Some(b"A"));
+    check_hand_built("uncompressed right", &header(None, Some(1)), Some(b"A"));
+
+    check_hand_built("both wrong", &header(Some(1000), Some(2000)), None);
+    for comp in [0, 1, 3, 4, 6, 1000, (1 << 63) - 1] {
+        check_hand_built("compressed", &header(Some(comp), None), None);
+        check_hand_built("compressed", &header(Some(comp), Some(1)), None);
+    }
+    for uncomp in [0, 2, 1000, (1 << 63) - 1] {
+        check_hand_built("uncompressed", &header(None, Some(uncomp)), None);
+        check_hand_built("uncompressed", &header(Some(5), Some(uncomp)), None);
+    }
+}
+
+/// A Block running past a size its header declared fails as soon as it
+/// does, not at the end of the Block.
+#[test]
+fn block_header_sizes_fail_early() {
+    // 100 stored chunks of 1000 bytes each; no end marker, no Check.
+    let mut lzma2 = Vec::new();
+    for i in 0..100u8 {
+        lzma2.extend_from_slice(&[if i == 0 { 0x01 } else { 0x02 }, 0x03, 0xE7]);
+        lzma2.extend_from_slice(&[i; 1000]);
+    }
+    for (flags, declared) in [(0x40u8, 2500u64), (0x80, 2500)] {
+        let mut bh = vec![0u8, flags];
+        test_varint(declared, &mut bh);
+        bh.extend_from_slice(&[0x21, 0x01, 0x00]);
+        while bh.len() % 4 != 0 {
+            bh.push(0);
+        }
+        bh[0] = ((bh.len() + 4) / 4 - 1) as u8;
+        let c = test_crc32(&bh);
+        bh.extend_from_slice(&c.to_le_bytes());
+        let mut s = stream_header(0x00);
+        s.extend_from_slice(&bh);
+        let data_at = s.len();
+        s.extend_from_slice(&lzma2);
+        let (err, fed) = first_error(&s, 1);
+        assert_eq!(err, Error::Corrupt, "flags {flags:#x}");
+        // Within the chunk that crosses the declared size (the third).
+        assert!(fed <= data_at + 3 * 1003, "flags {flags:#x}: {fed}");
+    }
+}
+
 /// A 12-byte Stream Header with the given check ID.
 fn stream_header(check_id: u8) -> Vec<u8> {
     let mut s = vec![0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0x00, check_id];

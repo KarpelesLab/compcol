@@ -1295,6 +1295,11 @@ pub struct Decoder {
     block_header_size_seen: u64,
     block_compressed_seen: u64,
     block_uncompressed_seen: u64,
+    /// The Compressed Size and Uncompressed Size fields of the current
+    /// Block's header, when present: the Block's compressed data (the LZMA2
+    /// chunks and end marker) and its output must come to exactly these.
+    block_compressed_declared: Option<u64>,
+    block_uncompressed_declared: Option<u64>,
 
     /// Running Block Check over the uncompressed bytes of the block, of
     /// the kind the Stream Header's check ID selects.
@@ -1382,6 +1387,8 @@ impl Decoder {
             block_header_size_seen: 0,
             block_compressed_seen: 0,
             block_uncompressed_seen: 0,
+            block_compressed_declared: None,
+            block_uncompressed_declared: None,
             check: BlockCheck::Unverified,
             blocks: Vec::new(),
             index_buf: Vec::new(),
@@ -1471,6 +1478,16 @@ impl Decoder {
         e
     }
 
+    /// Whether the current Block is still within the sizes its header
+    /// declared (trivially so when it declared none).
+    fn block_within_declared_sizes(&self) -> bool {
+        self.block_compressed_declared
+            .is_none_or(|n| self.block_compressed_seen <= n)
+            && self
+                .block_uncompressed_declared
+                .is_none_or(|n| self.block_uncompressed_seen <= n)
+    }
+
     /// Move up to `n` bytes of `input[*consumed..]` into `index_buf`.
     /// Returns `false` when there were none to take.
     fn index_take(&mut self, input: &[u8], consumed: &mut usize, n: usize) -> bool {
@@ -1556,15 +1573,29 @@ impl Decoder {
         let mut cur = 2usize;
         let body_end = total - 4; // before CRC
 
+        // The Block is still delimited by the LZMA2 end marker; the sizes
+        // are kept to be verified against it (like liblzma, which fails
+        // such a Block with LZMA_DATA_ERROR).
+        self.block_compressed_declared = None;
+        self.block_uncompressed_declared = None;
         if has_compressed_size {
-            // Discard the value — we still bound the block by the LZMA2 end
-            // marker.
-            varint_decode(&self.scratch[..body_end], &mut cur)?
-                .ok_or_else(|| self.poison(Error::Corrupt))?;
+            let Ok(Some(size)) = varint_decode(&self.scratch[..body_end], &mut cur) else {
+                return Err(self.poison(Error::Corrupt));
+            };
+            // Zero is not a valid Compressed Size (the end marker alone is
+            // a byte), nor is one that takes the Block's Unpadded Size
+            // (header + data + Check) past what a multibyte integer holds.
+            let max = (i64::MAX as u64) - (total + self.check_size() + 3) as u64;
+            if size == 0 || size > max {
+                return Err(self.poison(Error::Corrupt));
+            }
+            self.block_compressed_declared = Some(size);
         }
         if has_uncompressed_size {
-            varint_decode(&self.scratch[..body_end], &mut cur)?
-                .ok_or_else(|| self.poison(Error::Corrupt))?;
+            let Ok(Some(size)) = varint_decode(&self.scratch[..body_end], &mut cur) else {
+                return Err(self.poison(Error::Corrupt));
+            };
+            self.block_uncompressed_declared = Some(size);
         }
         // Filter Flags: `(id varint, props size varint, props)` per filter,
         // in encode order. Only LZMA2 may (and must) be last; the others
@@ -1652,11 +1683,23 @@ impl RawDecoder for Decoder {
             // phase below runs with the chain's final bytes all handed over
             // (in particular the Block Check covers all of them).
             if !self.drain_filtered(output, &mut written) {
+                // (Also reached when the filtered output overruns the
+                // Block's declared size: the check below runs once the
+                // caller has made room.)
+                if !self.block_within_declared_sizes() {
+                    return Err(self.poison(Error::Corrupt));
+                }
                 return Ok(RawProgress {
                     consumed,
                     written,
                     done: false,
                 });
+            }
+
+            // A Block that outgrows a size declared in its header is
+            // corrupt; fail as soon as it does rather than at its end.
+            if !self.block_within_declared_sizes() {
+                return Err(self.poison(Error::Corrupt));
             }
 
             match self.phase {
@@ -1747,6 +1790,14 @@ impl RawDecoder for Decoder {
                         // End marker. Account for this byte.
                         self.block_compressed_seen += 1;
                         self.scratch.clear();
+                        // The compressed data is complete: it must be as
+                        // long as the Block Header said.
+                        if self
+                            .block_compressed_declared
+                            .is_some_and(|n| n != self.block_compressed_seen)
+                        {
+                            return Err(self.poison(Error::Corrupt));
+                        }
                         // Block Padding (0..=3 zero bytes) then Block Check.
                         let unpadded_no_pad = self.block_header_size_seen
                             + self.block_compressed_seen
@@ -1843,6 +1894,14 @@ impl RawDecoder for Decoder {
                     self.comp_uncomp_size = uncomp_size;
                     self.comp_size = comp_size;
                     self.block_compressed_seen += header_len as u64;
+                    // The chunk's payload is counted once it is complete;
+                    // do not buffer one the declared size has no room for.
+                    if self
+                        .block_compressed_declared
+                        .is_some_and(|n| n - n.min(self.block_compressed_seen) < comp_size as u64)
+                    {
+                        return Err(self.poison(Error::Corrupt));
+                    }
 
                     // Apply reset semantics. Bits 5-6 of control:
                     //   11 → dict reset + props reset + state reset (needs
@@ -2072,6 +2131,15 @@ impl RawDecoder for Decoder {
                     }
                 }
                 DecPhase::BlockPadding => {
+                    // All of the Block's output has been handed over (the
+                    // filters' tail included: it is drained at the top of
+                    // the loop), so its size is final.
+                    if self
+                        .block_uncompressed_declared
+                        .is_some_and(|n| n != self.block_uncompressed_seen)
+                    {
+                        return Err(self.poison(Error::Corrupt));
+                    }
                     if self.scratch_want == 0 {
                         // No padding to skip; proceed to check.
                         self.scratch.clear();
