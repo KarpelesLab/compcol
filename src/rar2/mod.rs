@@ -36,9 +36,11 @@
 //! // feed compressed bytes via `decode(...)`, then drain via `finish(...)`.
 //! ```
 //!
-//! `decode` buffers input but never emits output; once the caller switches
-//! to `finish` the decoder runs the actual decompression in one shot and
-//! drains the result across however many `finish` calls the caller makes.
+//! Output is streamed: `decode` and `finish` both hand decompressed bytes
+//! out as they are produced, and the decoder holds a 1 MiB window plus at
+//! most ~64 KiB of not-yet-collected output whatever size was declared.
+//! `decode` reports `StreamEnd` itself once the declared size has been
+//! produced.
 //!
 //! # Fixture famine and verification scope
 //!

@@ -6,11 +6,11 @@
 //! sequence the real RAR 2.x archiver would have written for a given block
 //! shape, then feeds it through the production decoder.
 //!
-//! The non-audio path with literals + repeat-match symbols is the primary
-//! integration target. Audio-block, short-match, and long-match coverage are
-//! handled in unit tests inside `src/rar2/` because building a valid audio
-//! block by hand is verbose enough that putting it here would obscure the
-//! integration intent.
+//! The hand-rolled block builders near the top cover literals and short
+//! matches; the `StreamBuilder` further down emits every LZ token kind next
+//! to a reference model (so expected output does not come from the decoder)
+//! and audio blocks (pinned against the decoder's earlier output, as there
+//! is no independent audio model here).
 //!
 //! Canonical v0.3 port: every call returns `(Progress, Status)` and the
 //! loop dispatches on `Status` rather than inferring from byte counts.
@@ -361,8 +361,8 @@ fn literals_only_block_roundtrip() {
     let mut dec = Decoder::with_unpack_size(count as u64);
     let (p, status) = dec.decode(&bytes, &mut []).unwrap();
     assert_eq!(p.consumed, bytes.len());
-    // `decode` only buffers; `finish` runs the actual decode. With all input
-    // consumed, the status should be InputEmpty.
+    // With no room for output `decode` only queues the input. With all of
+    // it consumed, the status should be InputEmpty.
     assert!(matches!(status, Status::InputEmpty));
 
     let mut out = vec![0u8; count];
@@ -634,6 +634,658 @@ fn huge_declared_unpack_size_does_not_preallocate() {
     dec.decode(&[0u8; 8], &mut []).unwrap();
     let mut out = [0u8; 16];
     assert!(dec.finish(&mut out).is_err());
+}
+
+// ─── streaming: synthetic stream builder with a reference model ───────────
+
+const LENGTH_BASE: [u32; 28] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128,
+    160, 192, 224,
+];
+const LENGTH_EXTRA: [u32; 28] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5,
+];
+const OFFSET_BASE: [u32; 48] = [
+    0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536,
+    2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072, 196608,
+    262144, 327680, 393216, 458752, 524288, 589824, 655360, 720896, 786432, 851968, 917504, 983040,
+];
+const OFFSET_EXTRA: [u32; 48] = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
+    13, 14, 14, 15, 15, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+];
+const SHORT_BASE: [u32; 8] = [0, 4, 8, 16, 32, 64, 128, 192];
+const SHORT_EXTRA: [u32; 8] = [2, 2, 3, 4, 5, 6, 6, 6];
+const AUDIO_TREE_SIZE: usize = 257;
+const WINDOW_SIZE: usize = 1 << 20;
+
+/// Tiny deterministic PRNG (xorshift64*), so the synthetic streams are
+/// identical on every run.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u32 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32
+    }
+    fn below(&mut self, n: u32) -> u32 {
+        self.next() % n
+    }
+}
+
+/// Index of the last table entry whose base is `<= v`.
+fn bucket(bases: &[u32], v: u32) -> usize {
+    bases.iter().rposition(|&b| b <= v).unwrap()
+}
+
+/// Flat LZ length table: every main symbol 9 bits, offsets 6, lengths 5.
+fn lz_table_a() -> Vec<u8> {
+    let mut t = vec![9u8; MAIN_TREE_SIZE];
+    t.extend(vec![6u8; OFFSET_TREE_SIZE]);
+    t.extend(vec![5u8; LENGTH_TREE_SIZE]);
+    t
+}
+
+/// Uneven LZ length table whose main codes reach 10 bits (past the
+/// decoder's 9-bit primary lookup, so the slow path is exercised too).
+fn lz_table_b() -> Vec<u8> {
+    let mut t = vec![8u8; 128];
+    t.extend(vec![10u8; MAIN_TREE_SIZE - 128]);
+    t.extend(vec![6u8; OFFSET_TREE_SIZE]);
+    t.extend(vec![4u8; 4]);
+    t.extend(vec![5u8; LENGTH_TREE_SIZE - 4]);
+    t
+}
+
+/// Builds RAR 2.x LZ streams token by token and applies the same tokens to
+/// a plain `Vec<u8>` model, so the expected output does not come from the
+/// decoder under test.
+struct StreamBuilder {
+    w: BitWriter,
+    /// Decoder-side cumulative length table (1028 entries).
+    lens: Vec<u8>,
+    main: Vec<Option<Code>>,
+    offset: Vec<Option<Code>>,
+    length: Vec<Option<Code>>,
+    audio: Vec<Vec<Option<Code>>>,
+    /// Reference output (LZ tokens only; audio samples are not modelled).
+    out: Vec<u8>,
+    old: [u32; 4],
+    old_idx: usize,
+    last_off: u32,
+    last_len: u32,
+}
+
+impl StreamBuilder {
+    fn new() -> Self {
+        Self {
+            w: BitWriter::new(),
+            lens: vec![0u8; 4 * AUDIO_TREE_SIZE],
+            main: Vec::new(),
+            offset: Vec::new(),
+            length: Vec::new(),
+            audio: Vec::new(),
+            out: Vec::new(),
+            old: [0; 4],
+            old_idx: 0,
+            last_off: 0,
+            last_len: 0,
+        }
+    }
+
+    fn put(&mut self, c: &Option<Code>) {
+        let c = c.as_ref().expect("symbol has a code");
+        self.w.write(c.bits, c.len);
+    }
+
+    /// Block header with a flat pretree: the 16 delta symbols all get 4-bit
+    /// codes (so delta `d` is written as the nibble `d`), no run symbols.
+    fn header(&mut self, channels: Option<u32>, keep: bool, new_lens: &[u8]) {
+        self.w.write(channels.is_some() as u32, 1);
+        self.w.write(keep as u32, 1);
+        if let Some(ch) = channels {
+            self.w.write(ch - 1, 2);
+        }
+        if !keep {
+            self.lens.fill(0);
+        }
+        for i in 0..PRETREE_SIZE {
+            self.w.write(if i < 16 { 4 } else { 0 }, 4);
+        }
+        for (i, &l) in new_lens.iter().enumerate() {
+            self.w.write((l.wrapping_sub(self.lens[i]) & 15) as u32, 4);
+            self.lens[i] = l;
+        }
+    }
+
+    fn lz_block(&mut self, keep: bool, table: &[u8]) {
+        assert_eq!(table.len(), NON_AUDIO_LENGTHS);
+        self.header(None, keep, table);
+        self.main = build_codes(&table[..MAIN_TREE_SIZE]);
+        self.offset = build_codes(&table[MAIN_TREE_SIZE..MAIN_TREE_SIZE + OFFSET_TREE_SIZE]);
+        self.length = build_codes(&table[MAIN_TREE_SIZE + OFFSET_TREE_SIZE..]);
+    }
+
+    fn audio_block(&mut self, channels: u32, keep: bool) {
+        let table = vec![9u8; channels as usize * AUDIO_TREE_SIZE];
+        self.header(Some(channels), keep, &table);
+        self.audio = (0..channels)
+            .map(|_| build_codes(&[9u8; AUDIO_TREE_SIZE]))
+            .collect();
+    }
+
+    fn main_sym(&mut self, sym: usize) {
+        let c = self.main[sym].clone();
+        self.put(&c);
+    }
+
+    fn audio_sym(&mut self, channel: usize, sym: usize) {
+        let c = self.audio[channel][sym].clone();
+        self.put(&c);
+    }
+
+    fn copy(&mut self, off: u32, len: u32) {
+        for _ in 0..len {
+            let b = match self.out.len().checked_sub(off as usize) {
+                Some(i) => self.out[i],
+                // Before the start of the stream the window reads as zeros.
+                None => 0,
+            };
+            self.out.push(b);
+        }
+    }
+
+    fn commit(&mut self, off: u32) {
+        self.old[self.old_idx & 3] = off;
+        self.old_idx += 1;
+        self.last_off = off;
+    }
+
+    fn literal(&mut self, b: u8) {
+        self.main_sym(b as usize);
+        self.out.push(b);
+    }
+
+    /// Main symbols 270..=297. `len` is the final match length.
+    fn long_match(&mut self, off: u32, len: u32) {
+        let adj = (off >= 0x2000) as u32 + (off >= 0x40000) as u32;
+        let base = len - 3 - adj;
+        let li = bucket(&LENGTH_BASE, base);
+        self.main_sym(270 + li);
+        self.w.write(base - LENGTH_BASE[li], LENGTH_EXTRA[li]);
+        let oi = bucket(&OFFSET_BASE, off - 1);
+        let c = self.offset[oi].clone();
+        self.put(&c);
+        self.w.write(off - 1 - OFFSET_BASE[oi], OFFSET_EXTRA[oi]);
+        self.commit(off);
+        self.last_len = len;
+        self.copy(off, len);
+    }
+
+    /// Main symbols 261..=268: length 2, offset 1..=256.
+    fn short_match(&mut self, off: u32) {
+        let si = bucket(&SHORT_BASE, off - 1);
+        self.main_sym(261 + si);
+        self.w.write(off - 1 - SHORT_BASE[si], SHORT_EXTRA[si]);
+        self.commit(off);
+        self.last_len = 2;
+        self.copy(off, 2);
+    }
+
+    /// Main symbol 256.
+    fn repeat_last(&mut self) {
+        self.main_sym(256);
+        self.commit(self.last_off);
+        self.copy(self.last_off, self.last_len);
+    }
+
+    /// Offset the `k`-th most recent match used (`k` in 1..=4).
+    fn old_offset_value(&self, k: usize) -> u32 {
+        self.old[self.old_idx.wrapping_sub(k) & 3]
+    }
+
+    /// Main symbols 257..=260. `base` is the length-tree value (0..=255).
+    fn old_offset_match(&mut self, k: usize, base: u32) {
+        let off = self.old_offset_value(k);
+        let li = bucket(&LENGTH_BASE, base);
+        self.main_sym(256 + k);
+        let c = self.length[li].clone();
+        self.put(&c);
+        self.w.write(base - LENGTH_BASE[li], LENGTH_EXTRA[li]);
+        let len =
+            base + 2 + (off >= 0x101) as u32 + (off >= 0x2000) as u32 + (off >= 0x40000) as u32;
+        self.commit(off);
+        self.last_len = len;
+        self.copy(off, len);
+    }
+
+    /// Append random LZ tokens until the model holds at least `until` bytes.
+    fn random_lz(&mut self, rng: &mut Rng, until: usize, max_off: u32) {
+        while self.out.len() < until {
+            match rng.below(16) {
+                0..=4 => self.literal(b'a' + rng.below(20) as u8),
+                5..=9 => {
+                    let off = 1 + rng.below(max_off);
+                    let adj = (off >= 0x2000) as u32 + (off >= 0x40000) as u32;
+                    self.long_match(off, 3 + adj + rng.below(256));
+                }
+                10 | 11 => self.short_match(1 + rng.below(256)),
+                12 if self.last_len > 0 => self.repeat_last(),
+                13 | 14 => {
+                    let k = 1 + rng.below(4) as usize;
+                    if self.old_offset_value(k) != 0 {
+                        self.old_offset_match(k, rng.below(256));
+                    }
+                }
+                15 if rng.below(64) == 0 => {
+                    // "Re-read trees", alternating tables, with and without
+                    // delta-coding against the previous block's lengths.
+                    self.main_sym(269);
+                    let table = if rng.below(2) == 0 {
+                        lz_table_a()
+                    } else {
+                        lz_table_b()
+                    };
+                    self.lz_block(rng.below(2) == 0, &table);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn finish(self) -> (Vec<u8>, Vec<u8>) {
+        (self.w.finish(), self.out)
+    }
+}
+
+/// ~1.3 MiB of output (past the 1 MiB window, so the ring wraps) from every
+/// LZ token kind, plus the model's expected bytes.
+fn build_big_lz_stream() -> (Vec<u8>, Vec<u8>) {
+    let mut b = StreamBuilder::new();
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    b.lz_block(false, &lz_table_a());
+    b.random_lz(&mut rng, WINDOW_SIZE + 300_000, WINDOW_SIZE as u32);
+    b.finish()
+}
+
+/// A few KiB with short offsets only: cheap enough to push through the
+/// decoder one byte at a time.
+fn build_small_lz_stream() -> (Vec<u8>, Vec<u8>) {
+    let mut b = StreamBuilder::new();
+    let mut rng = Rng(0x0123_4567_89AB_CDEF);
+    b.lz_block(false, &lz_table_b());
+    b.random_lz(&mut rng, 6000, 3000);
+    b.finish()
+}
+
+/// Audio (multimedia) block → LZ block that copies out of the audio bytes →
+/// audio block with a different channel count. Returns the stream and the
+/// number of bytes it decodes to.
+fn build_audio_stream() -> (Vec<u8>, usize) {
+    let mut b = StreamBuilder::new();
+    let mut rng = Rng(0xA5A5_5A5A_1234_5678);
+    let mut total = 0usize;
+
+    b.audio_block(2, false);
+    let mut ch = 0usize;
+    for _ in 0..3001 {
+        // Mostly small deltas, like real PCM, plus the odd jump.
+        let d = if rng.below(8) == 0 {
+            rng.below(256)
+        } else {
+            (rng.below(9) as i32 - 4) as u8 as u32
+        };
+        b.audio_sym(ch, d as usize);
+        ch = (ch + 1) % 2;
+        total += 1;
+    }
+    // Symbol 256 on the current channel: new tables follow.
+    b.audio_sym(ch, 256);
+    b.lz_block(false, &lz_table_a());
+    for _ in 0..40 {
+        let off = 1 + rng.below(3000);
+        let len = 3 + rng.below(200);
+        b.long_match(off, len);
+        b.literal(rng.below(256) as u8);
+        total += len as usize + 1;
+    }
+    b.main_sym(269);
+    b.audio_block(3, false);
+    // The decoder keeps its channel cursor across blocks (reset only when
+    // it is out of range for the new channel count); `ch` is 1 here.
+    for _ in 0..1000 {
+        b.audio_sym(ch, rng.below(256) as usize);
+        ch = (ch + 1) % 3;
+        total += 1;
+    }
+    (b.w.finish(), total)
+}
+
+/// Drive `dec` over `input` in `in_chunk`-byte pieces with an
+/// `out_chunk`-byte output buffer, through `decode` and then `finish`.
+fn drive(
+    mut dec: impl compcol::Decoder,
+    input: &[u8],
+    in_chunk: usize,
+    out_chunk: usize,
+) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; out_chunk];
+    let mut pos = 0usize;
+    while pos < input.len() {
+        let end = pos.saturating_add(in_chunk).min(input.len());
+        let (p, status) = dec.decode(&input[pos..end], &mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        pos += p.consumed;
+        if matches!(status, Status::StreamEnd) {
+            return Ok(out);
+        }
+        assert!(p.consumed > 0 || p.written > 0, "decode made no progress");
+    }
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        if matches!(status, Status::StreamEnd) {
+            return Ok(out);
+        }
+        assert!(p.written > 0, "finish made no progress");
+    }
+}
+
+fn fnv1a(data: &[u8]) -> u64 {
+    data.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+        (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// Output of [`build_audio_stream`] as decoded by the pre-streaming
+/// (decode-everything-in-`finish`) decoder: pins the audio predictor and the
+/// audio↔LZ block switches across the streaming rewrite.
+const AUDIO_STREAM_FNV1A: u64 = 0x304c_2501_dbf0_5ded;
+
+#[test]
+fn synthetic_lz_stream_matches_model() {
+    let (stream, want) = build_big_lz_stream();
+    assert!(want.len() > WINDOW_SIZE);
+    let got = drive(
+        Decoder::with_unpack_size(want.len() as u64),
+        &stream,
+        usize::MAX,
+        want.len(),
+    )
+    .unwrap();
+    assert!(got == want, "one-shot output differs from the model");
+    // Odd-sized chunks on both sides, so symbols and matches straddle calls.
+    let got = drive(
+        Decoder::with_unpack_size(want.len() as u64),
+        &stream,
+        4099,
+        7919,
+    )
+    .unwrap();
+    assert!(got == want, "chunked output differs from the model");
+}
+
+#[test]
+fn audio_and_lz_blocks_decode_to_pinned_output() {
+    let (stream, total) = build_audio_stream();
+    let got = drive(
+        Decoder::with_unpack_size(total as u64),
+        &stream,
+        usize::MAX,
+        total,
+    )
+    .unwrap();
+    assert_eq!(got.len(), total);
+    assert_eq!(fnv1a(&got), AUDIO_STREAM_FNV1A, "{:#x}", fnv1a(&got));
+}
+
+/// Chunking differential: one-shot, 1-byte input, 1-byte output and both at
+/// once must agree on every fixture.
+#[test]
+fn chunking_does_not_change_output() {
+    let (small_lz, small_want) = build_small_lz_stream();
+    let (audio, audio_len) = build_audio_stream();
+    let audio_want = drive(
+        Decoder::with_unpack_size(audio_len as u64),
+        &audio,
+        usize::MAX,
+        audio_len,
+    )
+    .unwrap();
+    let fixtures: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
+        (
+            "real hello",
+            REAL_RAR2_HELLO.to_vec(),
+            REAL_RAR2_HELLO_PLAIN.to_vec(),
+        ),
+        (
+            "real binary",
+            REAL_RAR2_BINARY_COMP.to_vec(),
+            REAL_RAR2_BINARY_PLAIN.to_vec(),
+        ),
+        (
+            "literals",
+            build_literals_only_block(b'A', 300),
+            vec![b'A'; 300],
+        ),
+        (
+            "short match",
+            build_short_match_block(b'Q', 3, &[0, 0, 0, 0, 1]),
+            b"QQQQQQ".to_vec(),
+        ),
+        ("synthetic lz", small_lz, small_want),
+        ("audio", audio, audio_want),
+    ];
+    for (name, stream, want) in &fixtures {
+        for (in_chunk, out_chunk) in [
+            (usize::MAX, want.len().max(1)),
+            (1, want.len().max(1)),
+            (usize::MAX, 1),
+            (1, 1),
+            (3, 5),
+        ] {
+            let dec = Decoder::with_unpack_size(want.len() as u64);
+            let got = drive(dec, stream, in_chunk, out_chunk)
+                .unwrap_or_else(|e| panic!("{name} in={in_chunk} out={out_chunk}: {e:?}"));
+            assert!(
+                got == *want,
+                "{name}: output differs with in={in_chunk} out={out_chunk}"
+            );
+        }
+    }
+}
+
+/// Upper bound on what the decoder may hold of its own output: the 64 KiB
+/// high-water mark plus one maximal match.
+const MAX_BUFFERED_OUTPUT: usize = 64 * 1024 + 260;
+
+/// Regression: the decoder used to buffer all input and, on the first
+/// `finish`, build the whole member in memory before handing out a byte, so
+/// a hostile declared size made it produce everything the payload could
+/// expand to no matter how little the caller took. Output must now come out
+/// of `decode` as it is produced, with only a bounded amount held back.
+#[test]
+fn output_is_streamed_and_bounded() {
+    // One input bit per output byte: 128 KiB of payload → 1 MiB of 'A's.
+    let count = 8 * 128 * 1024;
+    let stream = build_literals_only_block(b'A', count);
+    let mut dec = Decoder::with_unpack_size(1 << 40);
+    let mut buf = [0u8; 1024];
+
+    // The very first `decode` call already yields output.
+    let (p, status) = dec.decode(&stream, &mut buf).unwrap();
+    assert_eq!(p.consumed, stream.len());
+    assert_eq!(p.written, buf.len());
+    assert!(matches!(status, Status::OutputFull));
+    assert!(dec.buffered_output_len() <= MAX_BUFFERED_OUTPUT);
+
+    let mut total = p.written;
+    loop {
+        let (p, status) = dec.decode(&[], &mut buf).unwrap();
+        assert!(buf[..p.written].iter().all(|&b| b == b'A'));
+        total += p.written;
+        assert!(
+            dec.buffered_output_len() <= MAX_BUFFERED_OUTPUT,
+            "{} bytes buffered after {total} drained",
+            dec.buffered_output_len()
+        );
+        if p.written == 0 {
+            assert!(matches!(status, Status::InputEmpty));
+            break;
+        }
+    }
+    // Everything the payload encodes came out (the zero padding of the last
+    // byte reads as up to 7 more one-bit literals).
+    assert!((count..count + 8).contains(&total), "{total}");
+    assert_eq!(dec.buffered_output_len(), 0);
+    // Input the decoder has moved past is released, not kept.
+    assert!(dec.buffered_input_len() <= 4096);
+    // The declared size was a lie: the stream is truncated.
+    assert_eq!(dec.finish(&mut buf).unwrap_err(), Error::UnexpectedEnd);
+}
+
+/// The audit scenario: hostile declared size under a 1 KiB `LimitedDecoder`.
+/// The limit must trip having decoded only a bounded amount.
+#[test]
+fn output_limit_trips_without_building_the_declared_size() {
+    use compcol::limit::LimitedDecoder;
+
+    let stream = build_literals_only_block(b'A', 8 * 256 * 1024);
+    let mut dec = LimitedDecoder::new(Decoder::with_unpack_size(u64::MAX), 1024);
+    let mut buf = [0u8; 4096];
+    let (p, _) = dec.decode(&stream, &mut buf).unwrap();
+    assert_eq!(p.written, 1024);
+    assert!(dec.get_ref().buffered_output_len() <= MAX_BUFFERED_OUTPUT);
+    assert_eq!(
+        dec.decode(&[], &mut buf).unwrap_err(),
+        Error::OutputLimitExceeded
+    );
+    assert!(dec.get_ref().buffered_output_len() <= MAX_BUFFERED_OUTPUT);
+}
+
+/// `decode` with an empty output slice only queues input; `finish` with an
+/// empty slice still reports the end of an empty member and still surfaces
+/// truncation instead of asking to be called again forever.
+#[test]
+fn empty_output_slices_do_not_stall() {
+    let bytes = build_literals_only_block(b'A', 4);
+    let mut dec = Decoder::with_unpack_size(4);
+    let (p, status) = dec.decode(&bytes, &mut []).unwrap();
+    assert_eq!((p.consumed, p.written), (bytes.len(), 0));
+    assert!(matches!(status, Status::InputEmpty));
+    let (p, status) = dec.finish(&mut []).unwrap();
+    assert_eq!(p.written, 0);
+    assert!(matches!(status, Status::OutputFull));
+    let mut out = [0u8; 8];
+    let (p, status) = dec.finish(&mut out).unwrap();
+    assert_eq!(&out[..p.written], b"AAAA");
+    assert!(matches!(status, Status::StreamEnd));
+
+    let mut dec = Decoder::with_unpack_size(4);
+    dec.decode(&bytes[..10], &mut []).unwrap();
+    assert_eq!(dec.finish(&mut []).unwrap_err(), Error::UnexpectedEnd);
+}
+
+/// A member whose declared size ends in the middle of the stream (here in
+/// the middle of a match) stops exactly there, and `decode` reports the end
+/// itself without taking what follows.
+#[test]
+fn stops_exactly_at_the_declared_size() {
+    let (stream, want) = build_small_lz_stream();
+    for n in [0usize, 1, 1000, 2999, want.len() - 1] {
+        for (in_chunk, out_chunk) in [(usize::MAX, 8192), (1, 1), (5, 3)] {
+            let dec = Decoder::with_unpack_size(n as u64);
+            let got = drive(dec, &stream, in_chunk, out_chunk).unwrap();
+            assert!(got == want[..n], "n={n} in={in_chunk} out={out_chunk}");
+        }
+    }
+
+    let mut dec = Decoder::with_unpack_size(1000);
+    let mut out = vec![0u8; 4096];
+    let (p, status) = dec.decode(&stream, &mut out).unwrap();
+    assert_eq!(p.written, 1000);
+    assert!(matches!(status, Status::StreamEnd));
+    // Terminal: trailing bytes are left alone.
+    let (p, status) = dec.decode(b"next header", &mut out).unwrap();
+    assert_eq!((p.consumed, p.written), (0, 0));
+    assert!(matches!(status, Status::StreamEnd));
+    let (p, status) = dec.finish(&mut out).unwrap();
+    assert_eq!(p.written, 0);
+    assert!(matches!(status, Status::StreamEnd));
+}
+
+/// A truncated stream yields the bytes decoded before the cut and then the
+/// error, identically however the calls are chunked.
+#[test]
+fn truncation_yields_the_same_prefix_then_errors() {
+    fn run(input: &[u8], size: u64, in_chunk: usize, out_chunk: usize) -> (Vec<u8>, Error) {
+        let mut dec = Decoder::with_unpack_size(size);
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; out_chunk];
+        for chunk in input.chunks(in_chunk) {
+            let mut chunk = chunk;
+            loop {
+                let (p, _) = dec.decode(chunk, &mut buf).unwrap();
+                out.extend_from_slice(&buf[..p.written]);
+                chunk = &chunk[p.consumed..];
+                if chunk.is_empty() && p.written == 0 {
+                    break;
+                }
+            }
+        }
+        loop {
+            match dec.finish(&mut buf) {
+                Ok((p, status)) => {
+                    assert!(!matches!(status, Status::StreamEnd));
+                    assert!(p.written > 0, "finish stalled");
+                    out.extend_from_slice(&buf[..p.written]);
+                }
+                Err(e) => {
+                    // Sticky from here on.
+                    assert!(dec.finish(&mut buf).is_err());
+                    return (out, e);
+                }
+            }
+        }
+    }
+
+    let (stream, want) = build_small_lz_stream();
+    let cut = &stream[..stream.len() * 3 / 4];
+    let (prefix, err) = run(cut, want.len() as u64, usize::MAX, 8192);
+    assert_eq!(err, Error::UnexpectedEnd);
+    assert!(
+        prefix.len() > 1000 && prefix.len() < want.len(),
+        "{} of {} ({} stream bytes)",
+        prefix.len(),
+        want.len(),
+        stream.len()
+    );
+    assert!(prefix == want[..prefix.len()]);
+    for (in_chunk, out_chunk) in [(1, 1), (1, 8192), (usize::MAX, 1), (7, 11)] {
+        let (got, err) = run(cut, want.len() as u64, in_chunk, out_chunk);
+        assert_eq!(err, Error::UnexpectedEnd);
+        assert!(got == prefix, "in={in_chunk} out={out_chunk}");
+    }
+}
+
+/// `reset` mid-stream discards the window, the queued input and the pending
+/// output: the next stream decodes as on a fresh decoder.
+#[test]
+fn reset_mid_stream_starts_clean() {
+    let (stream, want) = build_small_lz_stream();
+    let mut dec = Decoder::with_unpack_size(want.len() as u64);
+    let mut buf = [0u8; 100];
+    dec.decode(&stream[..stream.len() / 2], &mut buf).unwrap();
+    assert!(dec.buffered_output_len() > 0);
+    dec.reset();
+    assert_eq!(dec.buffered_output_len(), 0);
+    assert_eq!(dec.buffered_input_len(), 0);
+    let mut out = vec![0u8; want.len()];
+    let (p, status) = dec.decode(&stream, &mut out).unwrap();
+    assert!(matches!(status, Status::StreamEnd));
+    assert!(out[..p.written] == want[..]);
 }
 
 // ─── factory (only if the feature is enabled) ─────────────────────────────
