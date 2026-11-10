@@ -408,6 +408,75 @@ fn decoder_bad_huffman_table() {
     assert!(matches!(res, Err(Error::InvalidHuffmanTree)));
 }
 
+/// `finish` on a stream that stops short must report `UnexpectedEnd`, not
+/// return `Ok` with no progress forever. The decoder used to raise the error
+/// only when its input buffer was fully consumed, so leftover bytes that
+/// cannot form a header, a table or a symbol stalled `finish` indefinitely.
+#[test]
+fn finish_errors_on_truncated_input_with_leftover_bytes() {
+    let complete = encode_all(b"the quick brown fox jumps over the lazy dog. ");
+    let cases: Vec<Vec<u8>> = vec![
+        // Header plus two bytes of a table.
+        vec![0x00, 0x00, 0x9c, 0x66, 0x23, 0x00],
+        // Partial header.
+        vec![1],
+        // Header plus most of a table.
+        complete[..200].to_vec(),
+        // Table complete, register prefill incomplete.
+        complete[..4 + 256 + 3].to_vec(),
+    ];
+    for (n, case) in cases.iter().enumerate() {
+        let mut dec = Decoder::new();
+        let mut out = [0u8; 4096];
+        dec.decode(case, &mut out).unwrap();
+        let mut result = None;
+        for _ in 0..1000 {
+            match dec.finish(&mut out) {
+                Err(e) => {
+                    result = Some(e);
+                    break;
+                }
+                Ok((_, Status::StreamEnd)) => panic!("case {n}: truncated stream accepted"),
+                Ok(_) => {}
+            }
+        }
+        assert_eq!(
+            result,
+            Some(Error::UnexpectedEnd),
+            "case {n}: finish() never reported the truncation"
+        );
+    }
+}
+
+/// `finish` with an empty output slice while decoded bytes are still pending
+/// is a "not done yet", never an error: the bytes must stay retrievable.
+#[test]
+fn finish_with_empty_output_keeps_pending_bytes() {
+    let input: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+    let encoded = encode_all(&input);
+    let mut dec = Decoder::new();
+    let mut got = Vec::new();
+    // A 16-byte output leaves almost everything pending inside the decoder.
+    let mut small = [0u8; 16];
+    let (p, _) = dec.decode(&encoded, &mut small).unwrap();
+    got.extend_from_slice(&small[..p.written]);
+    for _ in 0..3 {
+        let (p, status) = dec.finish(&mut []).unwrap();
+        assert_eq!(p.written, 0);
+        assert_ne!(status, Status::StreamEnd);
+    }
+    let mut buf = [0u8; 700];
+    loop {
+        let (p, status) = dec.finish(&mut buf).unwrap();
+        got.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            break;
+        }
+        assert_ne!(p.written, 0, "finish stalled");
+    }
+    assert_eq!(got, input);
+}
+
 // ─── ms-xca spec fixtures ──────────────────────────────────────────────
 
 /// The MS-XCA §2.1.5 worked example: `abcdefghijklmnopqrstuvwxyz`

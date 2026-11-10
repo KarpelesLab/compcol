@@ -518,8 +518,12 @@ impl RawDecoder for Decoder {
             written += p.written;
         })?;
         let done = matches!(self.phase, Phase::Done);
-        if !done && self.decoded.is_empty() && self.in_buf.len() == self.in_pos {
-            // Genuine unexpected end.
+        if !done && written == 0 && self.decoded.is_empty() && !output.is_empty() {
+            // No further input is coming, there was room to write, and yet
+            // nothing was produced and nothing is queued: the stream stops
+            // short of a header, a block table or a symbol. Leftover bytes in
+            // `in_buf` do not change that — they can never be completed — so
+            // this is a genuine unexpected end, not a "call again".
             return Err(self.poison(Error::UnexpectedEnd));
         }
         Ok(RawProgress {
