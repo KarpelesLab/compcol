@@ -431,6 +431,20 @@ fn raw_matches_framed_for_every_fixture() {
 }
 
 #[test]
+fn framed_chunkings_agree_for_every_fixture() {
+    // One-shot vs one input byte per call vs one output byte per call
+    // (and both at once): the window and input-buffer compaction must not
+    // depend on how the stream is cut up.
+    for (i, framed) in FRAMED.iter().enumerate() {
+        let expected = decode_oneshot(framed).unwrap();
+        for (ic, oc) in [(1, 8192), (framed.len(), 1), (1, 1), (3, 100_000)] {
+            let got = decode_chunked(framed, ic, oc).unwrap();
+            assert_eq!(got, expected, "fixture {i} in={ic} out={oc}");
+        }
+    }
+}
+
+#[test]
 fn raw_oneshot_matches_framed() {
     for framed in FRAMED {
         let (factor, len, payload) = split_framed(framed);

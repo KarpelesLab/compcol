@@ -711,14 +711,23 @@ impl Decoder {
     /// `keep` bytes of the current end so a future back-reference (bounded
     /// by `max_dist`) can still resolve. This is what keeps `out` bounded
     /// instead of growing to the attacker-controlled `uncomp_len`.
+    ///
+    /// This runs once per decoded token, and dropping a prefix moves the
+    /// rest of the window to the front. So the drop is deferred until the
+    /// droppable prefix is at least as long as what stays behind `keep`:
+    /// each drop then moves no more bytes than it frees (give or take the
+    /// not-yet-emitted tail, itself bounded by the buffer-ahead limit),
+    /// which makes the cost amortised O(1) per byte. Dropping whatever is
+    /// droppable every time would move the whole window per token. The
+    /// window peaks at about `2 × keep` plus the unemitted tail.
     fn slide_window(&mut self, max_dist: usize) {
         // Retain at least `max_dist` bytes of history for back references,
-        // plus a generous margin so we are not draining one byte at a time.
+        // plus a generous margin.
         let keep = max_dist.saturating_mul(4).max(max_dist + 1);
         // Highest window offset we are allowed to drop *up to* (exclusive):
         // never past the emit cursor, never within `keep` of the end.
         let drop = self.emit_offset().min(self.out.len().saturating_sub(keep));
-        if drop == 0 {
+        if drop < keep {
             return;
         }
         self.out.drain(0..drop);
@@ -738,9 +747,16 @@ impl Decoder {
 
     /// Compact `input_buf` by dropping the prefix already consumed by
     /// the bit reader.
+    ///
+    /// Called once per `decode` call. The prefix is dropped only once it
+    /// is at least as long as the live remainder, so the bytes moved are
+    /// paid for by bytes already consumed. Dropping it every call would
+    /// move the whole remainder each time — quadratic when a large input
+    /// is handed over at once and drained through a small output buffer.
+    /// `input_buf` therefore holds at most twice the unconsumed input.
     fn compact_input(&mut self) {
         let bp = self.bits.byte_pos();
-        if bp == 0 {
+        if bp == 0 || bp < self.input_buf.len() - bp {
             return;
         }
         self.input_buf.drain(0..bp);
@@ -990,12 +1006,20 @@ mod tests {
         assert_eq!(total, 66000, "decoded length mismatch");
     }
 
-    /// Build a factor-1 payload whose follower sets are all empty, so every
-    /// "next byte" is a plain 8-bit byte and the body can be written by
-    /// hand: literals, `DLE 0` for a literal 0x90, and `DLE V [ext] W`
-    /// matches. Returns the payload and the bytes it decodes to. Matches
-    /// only ever reach back into bytes this payload itself produced.
-    fn handmade_factor1_payload(total: usize) -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
+    /// Build a payload for `factor` whose follower sets are all empty, so
+    /// every "next byte" is a plain 8-bit byte and the body can be written
+    /// by hand: literals, `DLE 0` for a literal 0x90, and `DLE V [ext] W`
+    /// matches (none if `matches` is false). Returns the payload and the
+    /// bytes it decodes to. Matches only ever reach back into bytes this
+    /// payload itself produced.
+    fn handmade_payload(
+        factor: u8,
+        total: usize,
+        matches: bool,
+    ) -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
+        let len_bits = 8 - factor as usize;
+        let len_mask = (1usize << len_bits) - 1;
+        let max_dist = ((1usize << factor) - 1) * 256 + 256;
         // 256 follower sets × a 6-bit zero count = 192 zero bytes.
         let mut payload = alloc::vec![0u8; 192];
         let mut plain: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
@@ -1009,7 +1033,7 @@ mod tests {
         while plain.len() < total {
             let room = total - plain.len();
             let r = next();
-            if plain.len() < 16 || r % 3 == 0 || room < 3 {
+            if !matches || plain.len() < 16 || r % 3 == 0 || room < 3 {
                 // Literal (0x90 needs the DLE escape).
                 let b = (r >> 8) as u8;
                 payload.push(b);
@@ -1019,16 +1043,16 @@ mod tests {
                 plain.push(b);
                 continue;
             }
-            // Match: factor 1 has a 7-bit length field and 1 distance bit
-            // in V; distance = hi * 256 + W + 1 (at most 512).
-            let dist = 1 + (next() % plain.len().min(512));
-            let len = (3 + next() % 300).min(room);
-            let (len_field, ext) = if len - 3 >= 127 {
-                (127u8, Some((len - 3 - 127) as u8))
+            // Match: V holds the high distance bits above a `len_bits`-bit
+            // length field; distance = hi * 256 + W + 1.
+            let dist = 1 + (next() % plain.len().min(max_dist));
+            let len = (3 + next() % (len_mask + 200)).min(room);
+            let (len_field, ext) = if len - 3 >= len_mask {
+                (len_mask, Some((len - 3 - len_mask) as u8))
             } else {
-                ((len - 3) as u8, None)
+                (len - 3, None)
             };
-            let v = (((dist - 1) >> 8) as u8) << 7 | len_field;
+            let v = ((((dist - 1) >> 8) << len_bits) | len_field) as u8;
             if v == 0 {
                 // `DLE 0` is the literal escape, not a match; skip.
                 continue;
@@ -1077,7 +1101,7 @@ mod tests {
     fn raw_position_counters_cross_4gib() {
         const BASE: u64 = (1 << 32) - 3000;
         const N: usize = 8000;
-        let (payload, plain) = handmade_factor1_payload(N);
+        let (payload, plain) = handmade_payload(1, N, true);
 
         // Sanity: the handmade payload is what we think it is.
         let mut fresh = Decoder::raw(1, N as u64).unwrap();
@@ -1093,5 +1117,117 @@ mod tests {
                 "out_chunk={out_chunk}"
             );
         }
+    }
+
+    /// One-shot, one input byte per call, and one output byte per call
+    /// must all decode a large stream identically, for literal-only and
+    /// match-heavy payloads at the smallest and largest window.
+    #[test]
+    fn large_streams_decode_the_same_in_any_chunking() {
+        for (factor, n, matches) in [
+            (1u8, 60_000usize, true),
+            (4, 150_000, true),
+            (4, 150_000, false),
+        ] {
+            let (payload, plain) = handmade_payload(factor, n, matches);
+            let what = alloc::format!("factor={factor} matches={matches}");
+
+            let mut dec = Decoder::raw(factor, n as u64).unwrap();
+            assert!(
+                drain_raw(&mut dec, &payload, n + 16) == plain,
+                "{what} one-shot"
+            );
+
+            let mut dec = Decoder::raw(factor, n as u64).unwrap();
+            assert!(
+                drain_raw(&mut dec, &payload, 1) == plain,
+                "{what} 1-byte output"
+            );
+
+            let mut dec = Decoder::raw(factor, n as u64).unwrap();
+            let mut got = alloc::vec::Vec::new();
+            let mut buf = alloc::vec![0u8; 4096];
+            let mut done = false;
+            for b in payload.chunks(1) {
+                let mut input = b;
+                loop {
+                    let p = dec.raw_decode(input, &mut buf).unwrap();
+                    input = &input[p.consumed..];
+                    got.extend_from_slice(&buf[..p.written]);
+                    done = p.done;
+                    if done || p.written < buf.len() {
+                        break;
+                    }
+                }
+                if done {
+                    break;
+                }
+            }
+            while !done {
+                let p = dec.raw_finish(&mut buf).unwrap();
+                got.extend_from_slice(&buf[..p.written]);
+                done = p.done;
+            }
+            assert!(got == plain, "{what} 1-byte input");
+        }
+    }
+
+    /// The sliding window and the input buffer must be compacted in
+    /// amortised steps, not on every token: dropping a byte or two off the
+    /// front of a multi-kilobyte `Vec` per decoded token (or the consumed
+    /// prefix off a large input buffer per call) moves the whole buffer
+    /// each time. Count compactions and bytes moved instead of timing.
+    #[test]
+    fn window_and_input_compaction_is_amortised() {
+        const N: usize = 150_000;
+        let factor = 4u8;
+        let max_dist = ((1usize << factor) - 1) * 256 + 256;
+        let (payload, plain) = handmade_payload(factor, N, false);
+
+        // All input in the first call, then one output byte per call: the
+        // decoder advances about one token per call.
+        let mut dec = Decoder::raw(factor, N as u64).unwrap();
+        let mut got = alloc::vec::Vec::new();
+        let mut buf = [0u8; 1];
+        let mut fed = 0usize;
+        let (mut window_drops, mut input_moved) = (0usize, 0usize);
+        loop {
+            let base = dec.window_base;
+            // Input only ever enters `input_buf` here, so if the buffer is
+            // shorter afterwards than "what it held plus what we fed", its
+            // consumed prefix was dropped during this call.
+            let held = dec.input_buf.len() + (payload.len() - fed);
+            let p = dec.raw_decode(&payload[fed..], &mut buf).unwrap();
+            fed += p.consumed;
+            got.extend_from_slice(&buf[..p.written]);
+            if dec.window_base != base {
+                window_drops += 1;
+                let dropped = (dec.window_base - base) as usize;
+                assert!(dropped >= max_dist, "window dropped only {dropped} bytes");
+            }
+            if dec.input_buf.len() < held {
+                // What is left was moved to the front.
+                input_moved += dec.input_buf.len();
+            }
+            assert!(
+                dec.out.len() <= max_dist * 8 + 4096,
+                "window grew unbounded"
+            );
+            if p.done {
+                break;
+            }
+        }
+        assert!(got == plain);
+        assert!(
+            window_drops <= N / max_dist,
+            "window compacted {window_drops} times for {N} bytes"
+        );
+        // Each compaction may move at most as many bytes as were consumed
+        // since the previous one, so the total stays within the input size.
+        assert!(
+            input_moved <= payload.len(),
+            "input compaction moved {input_moved} bytes for {} bytes of input",
+            payload.len()
+        );
     }
 }
