@@ -735,7 +735,7 @@ pub struct Decoder {
     /// Parsed flag bits.
     flg: u8,
     bd: u8,
-    /// Parsed optional descriptor fields (consumed but not retained).
+    /// Byte count of the optional descriptor fields (ContentSize, DictID).
     desc_remaining: u8,
     /// Bytes of FLG+BD+ContentSize+DictID, used to recompute HC. Capped
     /// at 14 bytes (2 + 8 + 4).
@@ -758,6 +758,11 @@ pub struct Decoder {
     window: Vec<u8>,
     /// Running content checksum (if enabled).
     content_hash: XxHash32,
+    /// The descriptor's ContentSize, when FLG.C.Size is set: the exact
+    /// number of bytes the frame must decode to.
+    content_size: Option<u64>,
+    /// Bytes decoded in this frame so far, checked against `content_size`.
+    content_count: u64,
     /// `true` once a malformed input was seen; further calls error.
     poisoned: bool,
 }
@@ -786,6 +791,8 @@ impl Decoder {
             decoded_idx: 0,
             window: Vec::with_capacity(WINDOW_SIZE),
             content_hash: XxHash32::new(),
+            content_size: None,
+            content_count: 0,
             poisoned: false,
         }
     }
@@ -949,11 +956,17 @@ impl RawDecoder for Decoder {
                             done: false,
                         });
                     }
-                    // Capture these bytes for the HC computation but
-                    // otherwise ignore them — we don't honour DictID
-                    // and we don't enforce the ContentSize field.
+                    // Capture these bytes for the HC computation. The
+                    // ContentSize (always first when present) is kept
+                    // and enforced against the decoded byte count; the
+                    // DictID is ignored — we don't honour it.
                     self.descriptor
                         .extend_from_slice(&self.accum[..self.accum_len as usize]);
+                    if (self.flg & FLG_CONTENT_SIZE) != 0 {
+                        let mut size = [0u8; 8];
+                        size.copy_from_slice(&self.accum[..8]);
+                        self.content_size = Some(u64::from_le_bytes(size));
+                    }
                     self.phase = DecPhase::Hc;
                     self.accum_len = 0;
                     self.accum_need = 1;
@@ -991,7 +1004,15 @@ impl RawDecoder for Decoder {
                         self.accum[3],
                     ]);
                     if raw_word == 0 {
-                        // EndMark.
+                        // EndMark. A frame that declared its ContentSize
+                        // must have produced exactly that many bytes
+                        // (the reference's `frameSize_wrong`).
+                        if self
+                            .content_size
+                            .is_some_and(|size| size != self.content_count)
+                        {
+                            return self.poison(Error::Corrupt);
+                        }
                         if self.content_checksum {
                             self.phase = DecPhase::ContentChecksum;
                             self.accum_len = 0;
@@ -1101,6 +1122,16 @@ impl RawDecoder for Decoder {
                         ) {
                             return self.poison(e);
                         }
+                    }
+                    // Enforce the declared ContentSize as soon as the
+                    // output overruns it, before handing the block out.
+                    self.content_count =
+                        self.content_count.saturating_add(self.decoded.len() as u64);
+                    if self
+                        .content_size
+                        .is_some_and(|size| self.content_count > size)
+                    {
+                        return self.poison(Error::Corrupt);
                     }
                     if self.content_checksum {
                         self.content_hash.update(&self.decoded);
@@ -1229,6 +1260,8 @@ impl RawDecoder for Decoder {
         self.decoded_idx = 0;
         self.window.clear();
         self.content_hash = XxHash32::new();
+        self.content_size = None;
+        self.content_count = 0;
         self.poisoned = false;
     }
 }

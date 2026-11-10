@@ -397,6 +397,100 @@ fn block_checksum_detects_corruption() {
     );
 }
 
+// ─── Hand-built frames ───────────────────────────────────────────────────
+
+/// Decode `encoded` in one shot, returning the output or the first error.
+fn try_decode(encoded: &[u8]) -> Result<Vec<u8>, compcol::Error> {
+    let mut dec = Decoder::new();
+    let mut decoded = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut consumed = 0;
+    loop {
+        let (p, status) = dec.decode(&encoded[consumed..], &mut buf)?;
+        decoded.extend_from_slice(&buf[..p.written]);
+        consumed += p.consumed;
+        match status {
+            Status::StreamEnd => break,
+            Status::InputEmpty if consumed == encoded.len() => break,
+            _ => {}
+        }
+    }
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        decoded.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            return Ok(decoded);
+        }
+        assert!(p.written > 0, "decoder finish stalled");
+    }
+}
+
+/// Magic + `descriptor` (FLG, BD, optional fields) + the matching header
+/// checksum byte. The HC is found by asking the decoder, which answers
+/// `BadHeader` for every wrong value, so the tests need no xxHash of
+/// their own.
+fn frame_header(descriptor: &[u8]) -> Vec<u8> {
+    let mut header = vec![0x04, 0x22, 0x4D, 0x18];
+    header.extend_from_slice(descriptor);
+    header.push(0);
+    for hc in 0..=255u8 {
+        *header.last_mut().unwrap() = hc;
+        let mut dec = Decoder::new();
+        if dec.decode(&header, &mut [0u8; 16]).is_ok() {
+            return header;
+        }
+    }
+    panic!("no header checksum accepted for {descriptor:02X?}");
+}
+
+/// A frame declaring `content_size` whose body is the given uncompressed
+/// blocks followed by the EndMark.
+fn frame_with_content_size(content_size: u64, blocks: &[&[u8]]) -> Vec<u8> {
+    // FLG = version 01 | block independence | content size; BD = 64 KiB.
+    let mut descriptor = vec![0x68, 0x40];
+    descriptor.extend_from_slice(&content_size.to_le_bytes());
+    let mut frame = frame_header(&descriptor);
+    for block in blocks {
+        frame.extend_from_slice(&(block.len() as u32 | 0x8000_0000).to_le_bytes());
+        frame.extend_from_slice(block);
+    }
+    frame.extend_from_slice(&[0, 0, 0, 0]);
+    frame
+}
+
+#[test]
+fn content_size_matching_is_accepted() {
+    let frame = frame_with_content_size(5, &[b"hello"]);
+    assert_eq!(try_decode(&frame).unwrap(), b"hello");
+    let frame = frame_with_content_size(10, &[b"hello", b"world"]);
+    assert_eq!(try_decode(&frame).unwrap(), b"helloworld");
+    let frame = frame_with_content_size(0, &[]);
+    assert_eq!(try_decode(&frame).unwrap(), b"");
+}
+
+#[test]
+fn content_size_larger_than_content_is_rejected() {
+    // The audit's reproducer: Content_Size says 999, the frame holds 5
+    // bytes. Reference `lz4 -d` reports ERROR_frameSize_wrong.
+    let frame = [
+        0x04, 0x22, 0x4D, 0x18, 0x68, 0x40, 0xE7, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x15,
+        0x05, 0x00, 0x00, 0x80, 0x68, 0x65, 0x6C, 0x6C, 0x6F, 0x00, 0x00, 0x00, 0x00,
+    ];
+    assert_eq!(frame.to_vec(), frame_with_content_size(999, &[b"hello"]));
+    assert_eq!(try_decode(&frame), Err(compcol::Error::Corrupt));
+}
+
+#[test]
+fn content_size_smaller_than_content_is_rejected() {
+    let frame = frame_with_content_size(3, &[b"hello"]);
+    assert_eq!(try_decode(&frame), Err(compcol::Error::Corrupt));
+    // The overrun is caught at the block that crosses the declared size,
+    // before a later block is even looked at.
+    let mut frame = frame_with_content_size(7, &[b"hello", b"world"]);
+    frame.truncate(frame.len() - 4); // no EndMark needed to notice
+    assert_eq!(try_decode(&frame), Err(compcol::Error::Corrupt));
+}
+
 // ─── Linked blocks (default) ─────────────────────────────────────────────
 
 #[test]
