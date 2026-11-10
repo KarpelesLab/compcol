@@ -302,15 +302,30 @@ checksum = []
 # runtime. Pulls the tokio dependency for its AsyncRead/AsyncWrite
 # trait definitions; the rest of the crate stays dep-free.
 tokio   = ["std", "dep:tokio"]
+# CLI only: `compcol -d` decodes straight into a memory-mapped output file
+# (through `ContiguousDecoder`), so a large-dictionary stream needs no
+# window in RAM. Pulls the `memmap2` dependency, which only the `compcol`
+# binary uses; the library is unaffected and stays `forbid(unsafe_code)`.
+# Deliberately not part of `all` (CI derives its no_std build lists from
+# `all`) nor of `default`: build the binary with `--features all,mmap`.
+mmap    = ["dep:memmap2"]
 
+# `deny`, not `forbid`: the library crate root carries its own
+# `#![forbid(unsafe_code)]`, which nothing here can weaken. The `compcol`
+# binary needs exactly one `#[allow(unsafe_code)]` — the `mmap` feature's
+# call that maps the output file — and `forbid` at the package level would
+# rule that out for every target.
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [dependencies]
 # Optional, pulled in only by the `tokio` feature. We need the AsyncRead/
 # AsyncWrite traits, which live under the default-off `io-util` feature
 # in tokio's modular layout.
 tokio = { version = "1", default-features = false, optional = true }
+# Optional, pulled in only by the `mmap` feature and used only by the
+# `compcol` binary (memory-mapped output on decompression).
+memmap2 = { version = "0.9", optional = true }
 
 [dev-dependencies]
 # Test-only: the async tests need a runtime + the AsyncReadExt /
