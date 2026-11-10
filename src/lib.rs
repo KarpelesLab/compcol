@@ -121,6 +121,9 @@ pub mod xz;
 #[cfg(feature = "lzma2")]
 pub mod lzma2;
 
+#[cfg(any(feature = "zstd", feature = "lz5"))]
+mod huff0;
+
 #[cfg(feature = "zstd")]
 pub mod zstd;
 

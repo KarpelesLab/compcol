@@ -14,8 +14,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::zstd::bitreader::RevBitReader;
-use crate::zstd::fse::FseState;
+use crate::huff0::bitreader::RevBitReader;
+use crate::huff0::fse::FseState;
 
 /// Maximum number of bits used by any single Huffman code (per RFC 8478 §4.2).
 pub const HUF_MAX_BITS: u8 = 11;
@@ -258,7 +258,7 @@ fn decode_fse_weights(payload: &[u8]) -> Result<Vec<u8>, Error> {
     let max_accuracy_log = 6; // RFC §4.2.1.2 caps accuracy_log at 6 for weights
     let max_symbol: u16 = HUF_MAX_BITS as u16;
     let (table, header_bytes) =
-        crate::zstd::fse::decode_fse_table(payload, max_accuracy_log, max_symbol)?;
+        crate::huff0::fse::decode_fse_table(payload, max_accuracy_log, max_symbol)?;
     if header_bytes > payload.len() {
         return Err(Error::Corrupt);
     }
