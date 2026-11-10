@@ -48,6 +48,37 @@
 //! dictionary, which is sufficient for any stream whose dictionary code
 //! resolves to ≤ 4 MiB (the common case).
 //!
+//! ## Memory
+//!
+//! The streaming decoder's one large allocation is its window, of the
+//! configured dictionary size at most (it is grown as output is produced,
+//! so a stream costs the smaller of the dictionary size and its decoded
+//! length). [`DecoderConfig::max_dict_size`] bounds it: with a dictionary
+//! size above that limit — 128 MiB by default — `decode` and `finish` fail
+//! with [`Error::Unsupported`] from the first call, rather than decode with
+//! a smaller window and call a valid far match corrupt.
+//!
+//! ## Contiguous output
+//!
+//! [`Decoder`] implements [`ContiguousDecoder`]:
+//! when the whole decoded stream goes into one buffer, that buffer is the
+//! dictionary. Matches are copied within it, uncompressed chunks are copied
+//! into it, and **no window is allocated** whatever dictionary size is
+//! configured; what remains is the model (probability tables) and one
+//! chunk's compressed bytes (at most 64 KiB). A dictionary reset is where
+//! history starts anew: a match reaching before it — or further back than
+//! the configured dictionary size — is rejected exactly as in the streaming
+//! mode, so both modes accept the same streams and fail the others with the
+//! same error.
+//!
+//! Nor does [`DecoderConfig::max_dict_size`] apply: that limit is a memory
+//! budget for the window, and there is none here. Distances are bounded by
+//! the configured dictionary size itself, up to the format's 4 GiB − 1.
+//!
+//! Using both conventions on one stream, or passing a `filled` that is not
+//! the number of bytes the decoder has written, fails with
+//! [`Error::Unsupported`] without disturbing the decoder.
+//!
 //! ## Reuse
 //!
 //! The LZMA range coder, probability tables, and LZ window are the exact
@@ -93,13 +124,13 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::lzma2_internal::lzma2_decoder::{Lzma2Props, LzmaCore, lzma2_dict_size};
-use crate::traits::{Algorithm, Flush, RawDecoder, RawEncoder, RawProgress};
-
-/// Hard cap on the LZMA2 dictionary we will allocate, regardless of the
-/// dictionary-size code. Bounds memory against a crafted property byte;
-/// legitimate 7z LZMA2 streams essentially never exceed 64 MiB.
-const MAX_DICT: usize = 128 * 1024 * 1024;
+pub use crate::lzma2_internal::lzma2_decoder::{DEFAULT_MAX_DICT_SIZE, MAX_DICT_SIZE};
+use crate::lzma2_internal::lzma2_decoder::{
+    Lzma2Props, LzmaCore, OutputMode, effective_max_dict_size, lzma2_dict_size,
+};
+use crate::traits::{
+    Algorithm, ContiguousDecoder, Flush, Progress, RawDecoder, RawEncoder, RawProgress, Status,
+};
 
 /// Default dictionary size when no property byte is supplied (4 MiB — the
 /// LZMA2 default and the size [`crate::xz`] uses).
@@ -117,49 +148,96 @@ pub struct Lzma2;
 
 /// Decoder configuration for raw LZMA2.
 ///
-/// Both fields are optional. The dictionary-size code (the 7z coder
-/// property byte) sizes the LZ window; with no code a 4 MiB dictionary is
-/// used. `expected_len` is advisory only — the stream self-terminates on
-/// its `0x00` control byte.
-#[derive(Debug, Clone, Copy, Default)]
+/// The dictionary-size code (the 7z coder property byte) sizes the LZ
+/// window; with no code a 4 MiB dictionary is used. `expected_len` is
+/// advisory only — the stream self-terminates on its `0x00` control byte.
+///
+/// `max_dict_size` is the memory budget of the streaming calls: a
+/// dictionary size above it is refused with [`Error::Unsupported`]. It does
+/// not apply to the [`ContiguousDecoder`] calls, which allocate no window
+/// (see the [module docs](self#contiguous-output)).
+///
+/// The struct is `#[non_exhaustive]`: build it with [`DecoderConfig::new`]
+/// (or `default()`) and the `with_*` methods.
+///
+/// ```
+/// use compcol::lzma2::{Decoder, DecoderConfig};
+///
+/// // A 7z coder property declaring a 1 GiB dictionary (code 36), and the
+/// // permission to allocate that much for it.
+/// let cfg = DecoderConfig::with_dict_prop(36).with_max_dict_size(1 << 30);
+/// let _dec = Decoder::new(cfg);
+/// ```
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct DecoderConfig {
     /// The 7z LZMA2 coder property: a 1-byte dictionary-size code, decoded
     /// the same way the xz LZMA2 filter property is. `None` → 4 MiB
     /// (unless `dict_size` is set).
     pub dict_prop: Option<u8>,
     /// Explicit dictionary size in bytes, overriding `dict_prop` when set.
-    /// Clamped to `[4096, 128 MiB]` at decoder construction.
+    /// Values below 4 KiB are treated as 4 KiB and values above the
+    /// format's maximum (4 GiB − 1) as that.
     pub dict_size: Option<usize>,
     /// Advisory uncompressed length, if known. Not required for decoding.
     pub expected_len: Option<usize>,
+    /// Largest dictionary size (in bytes) the streaming calls
+    /// ([`Decoder::decode`](crate::Decoder::decode) /
+    /// [`finish`](crate::Decoder::finish)) will keep a window for.
+    /// Defaults to [`DEFAULT_MAX_DICT_SIZE`] (128 MiB). Values below 4 KiB
+    /// are treated as 4 KiB and values above [`MAX_DICT_SIZE`] as
+    /// [`MAX_DICT_SIZE`]. Not applied by the contiguous calls.
+    pub max_dict_size: u64,
 }
 
 impl DecoderConfig {
+    /// The default configuration: a 4 MiB dictionary and a
+    /// [`DEFAULT_MAX_DICT_SIZE`] limit.
+    pub const fn new() -> Self {
+        Self {
+            dict_prop: None,
+            dict_size: None,
+            expected_len: None,
+            max_dict_size: DEFAULT_MAX_DICT_SIZE,
+        }
+    }
+
     /// Configure the decoder with the 7z coder property (dictionary-size
     /// code byte).
     pub fn with_dict_prop(byte: u8) -> Self {
         Self {
             dict_prop: Some(byte),
-            dict_size: None,
-            expected_len: None,
+            ..Self::new()
         }
     }
 
     /// Configure the decoder with an explicit dictionary size in bytes
-    /// (clamped to `[4096, 128 MiB]`). Use this when the dictionary size is
-    /// known directly rather than as a code byte.
+    /// (at least 4 KiB, at most the format's 4 GiB − 1). Use this when the
+    /// dictionary size is known directly rather than as a code byte.
     pub fn with_dict_size(bytes: usize) -> Self {
         Self {
-            dict_prop: None,
             dict_size: Some(bytes),
-            expected_len: None,
+            ..Self::new()
         }
+    }
+
+    /// Allow the streaming calls a window of up to `bytes` bytes (see
+    /// [`max_dict_size`](Self::max_dict_size)).
+    pub const fn with_max_dict_size(mut self, bytes: u64) -> Self {
+        self.max_dict_size = bytes;
+        self
     }
 
     /// Add an advisory expected uncompressed length (not required to decode).
     pub fn with_len(mut self, n: usize) -> Self {
         self.expected_len = Some(n);
         self
+    }
+}
+
+impl Default for DecoderConfig {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -177,16 +255,20 @@ impl Algorithm for Lzma2 {
     }
 }
 
-/// Resolve a configured dictionary size (in bytes), clamped to a sane
-/// allocation range. An explicit `dict_size` wins; otherwise the property
-/// byte is decoded; otherwise the 4 MiB default is used.
+/// Resolve the configured dictionary size (in bytes): the stream's true
+/// one, brought into what the format can express (4 KiB..=4 GiB − 1) but
+/// not limited by any memory budget — that is `max_dict_size`'s job, and
+/// only where a window is allocated. An explicit `dict_size` wins;
+/// otherwise the property byte is decoded; otherwise the 4 MiB default is
+/// used.
 fn resolve_dict_size(cfg: &DecoderConfig) -> Result<usize, Error> {
     let raw = match (cfg.dict_size, cfg.dict_prop) {
-        (Some(n), _) => n,
-        (None, Some(b)) => lzma2_dict_size(b)? as usize,
-        (None, None) => DEFAULT_DICT,
+        (Some(n), _) => n as u64,
+        (None, Some(b)) => lzma2_dict_size(b)? as u64,
+        (None, None) => DEFAULT_DICT as u64,
     };
-    Ok(raw.clamp(4096, MAX_DICT))
+    // (`u32::MAX` fits `usize` on every supported target.)
+    Ok(raw.clamp(4096, u32::MAX as u64) as usize)
 }
 
 // ─── encoder ──────────────────────────────────────────────────────────────
@@ -609,7 +691,8 @@ enum Phase {
     CompHeader,
     /// Buffering `comp_size` compressed bytes.
     CompBuffer,
-    /// Draining the decoded chunk to the caller.
+    /// Draining the decoded chunk to the caller (contiguous mode: decoding
+    /// the buffered chunk straight into the caller's buffer).
     CompDrain,
     /// Saw the `0x00` end control; stream complete.
     Done,
@@ -619,8 +702,17 @@ enum Phase {
 ///
 /// Drive through the [`Decoder`](crate::Decoder) trait (or
 /// [`crate::io::DecoderReader`]). Self-terminates on the `0x00` control byte.
+///
+/// Also a [`ContiguousDecoder`]: see the
+/// [module docs](self#contiguous-output).
 pub struct Decoder {
+    /// The stream's dictionary size: the distance bound in both modes, and
+    /// the most the window of the streaming mode grows to.
     dict_size: usize,
+    /// `dict_size` is over the configured `max_dict_size`: the streaming
+    /// calls, which would need a window that large, return
+    /// [`Error::Unsupported`]. (Kept by `reset`: it is configuration.)
+    over_limit: bool,
     lzma_core: Option<Box<LzmaCore>>,
     phase: Phase,
     poisoned: bool,
@@ -649,6 +741,13 @@ pub struct Decoder {
 
     // Uncompressed (stored) chunk byte counter.
     chunk_remaining: usize,
+
+    /// Streaming or contiguous output, whichever the stream was started
+    /// with.
+    mode: OutputMode,
+    /// The last [`Self::run`] stopped for want of output room (rather than
+    /// of input).
+    out_blocked: bool,
 }
 
 impl Decoder {
@@ -663,6 +762,7 @@ impl Decoder {
         let _ = cfg.expected_len; // advisory only
         Self {
             dict_size,
+            over_limit: dict_size as u64 > effective_max_dict_size(cfg.max_dict_size),
             lzma_core: None,
             phase: Phase::Control,
             poisoned,
@@ -677,6 +777,8 @@ impl Decoder {
             comp_decoded: Vec::new(),
             comp_decoded_pos: 0,
             chunk_remaining: 0,
+            mode: OutputMode::default(),
+            out_blocked: false,
         }
     }
 
@@ -709,9 +811,16 @@ impl Decoder {
     /// dictionary-continuing compressed chunk (`0xC0`) can reference them.
     /// The core exists by then: the stream's first chunk resets the
     /// dictionary, which creates it.
+    ///
+    /// In contiguous mode the bytes are history where the caller has them,
+    /// in the output buffer; the core is only told how many there are.
     fn feed_uncompressed_dict(&mut self, src: &[u8]) {
         if let Some(core) = self.lzma_core.as_mut() {
-            core.append_literals(src);
+            if self.mode.is_contiguous() {
+                core.append_contiguous(src.len());
+            } else {
+                core.append_literals(src);
+            }
         }
     }
 
@@ -726,13 +835,21 @@ impl Decoder {
     }
 }
 
-impl RawDecoder for Decoder {
-    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
-        if self.poisoned {
-            return Err(Error::Corrupt);
-        }
+impl Decoder {
+    /// The chunk state machine, shared by both output conventions. Decoded
+    /// bytes are written from `output[start..]`; the returned `written` is
+    /// the *absolute* position reached in `output`.
+    ///
+    /// In streaming mode `start` is 0 and `output` is whatever buffer the
+    /// caller passed to this call. In contiguous mode `output` is the whole
+    /// decoded stream so far and `start` the caller's `filled`: compressed
+    /// chunks are then decoded straight into it and read their history
+    /// from it. Sets `out_blocked` when it returns for want of room.
+    fn run(&mut self, input: &[u8], output: &mut [u8], start: usize) -> Result<RawProgress, Error> {
+        let contiguous = self.mode.is_contiguous();
+        self.out_blocked = false;
         let mut consumed = 0usize;
-        let mut written = 0usize;
+        let mut written = start;
 
         loop {
             match self.phase {
@@ -829,6 +946,7 @@ impl RawDecoder for Decoder {
                     if self.chunk_remaining == 0 {
                         self.phase = Phase::Control;
                     } else {
+                        self.out_blocked = consumed < input.len();
                         return Ok(RawProgress {
                             consumed,
                             written,
@@ -912,13 +1030,22 @@ impl RawDecoder for Decoder {
                             done: false,
                         });
                     }
-                    // Decode the whole chunk into comp_decoded.
-                    self.comp_decoded.clear();
-                    self.comp_decoded.resize(self.comp_uncomp_size, 0u8);
                     let core = match self.lzma_core.as_mut() {
                         Some(c) => c,
                         None => return Err(self.poison(Error::Corrupt)),
                     };
+                    if contiguous {
+                        // Decoded by `CompDrain`, into the caller's buffer.
+                        if let Err(e) = core.init_range(&self.comp_buf) {
+                            return Err(self.poison(e));
+                        }
+                        self.comp_decoded_pos = 0;
+                        self.phase = Phase::CompDrain;
+                        continue;
+                    }
+                    // Decode the whole chunk into comp_decoded.
+                    self.comp_decoded.clear();
+                    self.comp_decoded.resize(self.comp_uncomp_size, 0u8);
                     if let Err(e) = core.init_range(&self.comp_buf) {
                         return Err(self.poison(e));
                     }
@@ -927,6 +1054,35 @@ impl RawDecoder for Decoder {
                     }
                     self.comp_decoded_pos = 0;
                     self.phase = Phase::CompDrain;
+                }
+                Phase::CompDrain if contiguous => {
+                    // `comp_decoded_pos` counts the chunk's bytes decoded so
+                    // far. Whatever does not fit in `output` — possibly the
+                    // rest of a match — is decoded by a later call, with a
+                    // longer buffer.
+                    let left = self.comp_uncomp_size - self.comp_decoded_pos;
+                    let before = written;
+                    let core = match self.lzma_core.as_mut() {
+                        Some(c) => c,
+                        None => return Err(self.poison(Error::Corrupt)),
+                    };
+                    let r = core.decode_contiguous(&self.comp_buf, output, &mut written, left, 0);
+                    self.comp_decoded_pos += written - before;
+                    if let Err(e) = r {
+                        return Err(self.poison(e));
+                    }
+                    if self.comp_decoded_pos < self.comp_uncomp_size {
+                        self.out_blocked = true;
+                        return Ok(RawProgress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                    if let Err(e) = core.finish_chunk(&self.comp_buf) {
+                        return Err(self.poison(e));
+                    }
+                    self.phase = Phase::Control;
                 }
                 Phase::CompDrain => {
                     let total = self.comp_decoded.len();
@@ -941,6 +1097,7 @@ impl RawDecoder for Decoder {
                     if self.comp_decoded_pos >= total {
                         self.phase = Phase::Control;
                     } else {
+                        self.out_blocked = true;
                         return Ok(RawProgress {
                             consumed,
                             written,
@@ -951,11 +1108,31 @@ impl RawDecoder for Decoder {
             }
         }
     }
+}
+
+impl RawDecoder for Decoder {
+    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
+        if self.poisoned {
+            return Err(Error::Corrupt);
+        }
+        // The window is this decoder's memory budget: refuse a stream
+        // that needs more than the caller allowed, rather than decode it
+        // with a smaller one and fail on the first match reaching further.
+        if self.over_limit {
+            return Err(Error::Unsupported);
+        }
+        self.mode.enter_streaming()?;
+        self.run(input, output, 0)
+    }
 
     fn raw_finish(&mut self, _output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
+        if self.over_limit {
+            return Err(Error::Unsupported);
+        }
+        self.mode.enter_streaming()?;
         // Self-terminating: finishing before the 0x00 control is truncation.
         if self.phase == Phase::Done {
             Ok(RawProgress {
@@ -983,6 +1160,86 @@ impl RawDecoder for Decoder {
         self.comp_decoded.clear();
         self.comp_decoded_pos = 0;
         self.chunk_remaining = 0;
+        self.mode = OutputMode::default();
+        self.out_blocked = false;
+    }
+}
+
+/// See the [module docs](self#contiguous-output).
+///
+/// [`DecoderConfig::max_dict_size`] is not applied here: no window is
+/// allocated, so there is nothing for it to bound.
+impl ContiguousDecoder for Decoder {
+    fn decode_contiguous(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        filled: usize,
+    ) -> Result<(Progress, Status), Error> {
+        if self.poisoned {
+            return Err(Error::Corrupt);
+        }
+        self.mode.enter_contiguous(output.len(), filled)?;
+        // Any error is final here: the caller cannot know how much of
+        // `output` the failed call wrote, so nothing can follow it.
+        let p = match self.run(input, output, filled) {
+            Ok(p) => p,
+            Err(e) => return Err(self.poison(e)),
+        };
+        let written = p.written - filled;
+        self.mode.advance(written);
+        let status = if p.done {
+            Status::StreamEnd
+        } else if self.out_blocked || p.consumed < input.len() {
+            Status::OutputFull
+        } else {
+            Status::InputEmpty
+        };
+        Ok((
+            Progress {
+                consumed: p.consumed,
+                written,
+            },
+            status,
+        ))
+    }
+
+    fn finish_contiguous(
+        &mut self,
+        output: &mut [u8],
+        filled: usize,
+    ) -> Result<(Progress, Status), Error> {
+        if self.poisoned {
+            return Err(Error::Corrupt);
+        }
+        self.mode.enter_contiguous(output.len(), filled)?;
+        // A buffered chunk may still have output to give.
+        let p = match self.run(&[], output, filled) {
+            Ok(p) => p,
+            Err(e) => return Err(self.poison(e)),
+        };
+        let written = p.written - filled;
+        self.mode.advance(written);
+        let status = if p.done {
+            Status::StreamEnd
+        } else if self.out_blocked || written > 0 {
+            // More is waiting for room in `output`; or this call still
+            // wrote something, which an error would throw away: the
+            // truncation is reported by the next call, the first with
+            // nothing to hand over.
+            Status::OutputFull
+        } else {
+            // Self-terminating: no `0x00` control and no input left to find
+            // it in is truncation.
+            return Err(self.poison(Error::UnexpectedEnd));
+        };
+        Ok((
+            Progress {
+                consumed: 0,
+                written,
+            },
+            status,
+        ))
     }
 }
 
@@ -1425,6 +1682,126 @@ mod tests {
             test_stats::dict_bytes() <= 1 << 16,
             "{}",
             test_stats::dict_bytes()
+        );
+    }
+
+    /// In contiguous mode the caller's buffer is the dictionary: none is
+    /// allocated, however large the one configured and however much is
+    /// decoded — through compressed chunks and stored ones.
+    #[test]
+    fn contiguous_mode_allocates_no_dictionary() {
+        use crate::lzma2_internal::lzma2_decoder::test_stats;
+        let mut data: Vec<u8> = (0u32..200_000)
+            .map(|i| (i.wrapping_mul(31) >> 3) as u8)
+            .collect();
+        let mut x = 0x1234_5678u32;
+        for b in data[90_000..160_000].iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = (x >> 24) as u8;
+        }
+        let stream = encode_all(&data, 1 << 17);
+        assert!(
+            stream.len() > 70_000,
+            "expected the noise to be stored uncompressed"
+        );
+        // 30: a 128 MiB dictionary.
+        let cfg = DecoderConfig::with_dict_prop(30);
+
+        // The streaming mode keeps a window as large as what it decoded.
+        test_stats::reset();
+        let mut dec = Decoder::new(cfg);
+        let mut out = vec![0u8; data.len() + 1];
+        let (p, status) = dec.decode(&stream, &mut out).unwrap();
+        assert_eq!(status, Status::StreamEnd);
+        assert!(out[..p.written] == data);
+        assert!(test_stats::dict_bytes() >= data.len() as u64);
+
+        test_stats::reset();
+        let mut dec = Decoder::new(cfg);
+        let mut out = vec![0u8; data.len()];
+        let (p, status) = dec.decode_contiguous(&stream, &mut out, 0).unwrap();
+        assert_eq!((p.consumed, status), (stream.len(), Status::StreamEnd));
+        assert!(out[..p.written] == data);
+        assert_eq!(test_stats::dict_bytes(), 0);
+        assert_eq!(test_stats::cores_built(), 1);
+    }
+
+    /// A dictionary size above 128 MiB used to be clamped to 128 MiB —
+    /// window and distance bound alike, so that a valid match reaching
+    /// further back was "corrupt". Now the configured size is the bound,
+    /// and the window is a budget: over `max_dict_size` the streaming calls
+    /// are `Unsupported`; with the limit raised they decode (the window
+    /// growing with the output, not the configuration); and the contiguous
+    /// calls, which have no window, decode under any limit.
+    #[test]
+    fn dictionary_size_is_a_budget_not_a_distance_clamp() {
+        use crate::lzma2_internal::lzma2_decoder::test_stats;
+        let data: Vec<u8> = (0u32..100_000)
+            .map(|i| (i.wrapping_mul(31) >> 3) as u8)
+            .collect();
+        let stream = encode_all(&data, 1 << 17);
+        let mut out = vec![0u8; data.len() + 1];
+        // 31: 192 MiB; 36: 1 GiB; 40: 4 GiB − 1.
+        let cases = [
+            (DecoderConfig::with_dict_prop(31), 192u64 << 20),
+            (DecoderConfig::with_dict_prop(36), 1 << 30),
+            (DecoderConfig::with_dict_size(1 << 30), 1 << 30),
+            (DecoderConfig::with_dict_prop(40), u32::MAX as u64),
+            (DecoderConfig::with_dict_size(usize::MAX), u32::MAX as u64),
+        ];
+        for (cfg, size) in cases {
+            // Refused from the first call on, and again after a reset.
+            let mut dec = Decoder::new(cfg);
+            assert_eq!(dec.decode(&stream, &mut out), Err(Error::Unsupported));
+            assert_eq!(dec.finish(&mut out), Err(Error::Unsupported));
+            dec.reset();
+            assert_eq!(dec.decode(&stream, &mut out), Err(Error::Unsupported));
+            let mut dec = Decoder::new(cfg.with_max_dict_size(size - 1));
+            assert_eq!(dec.decode(&stream, &mut out), Err(Error::Unsupported));
+
+            if size <= MAX_DICT_SIZE {
+                test_stats::reset();
+                let mut dec = Decoder::new(cfg.with_max_dict_size(size));
+                let (p, status) = dec.decode(&stream, &mut out).unwrap();
+                assert_eq!(status, Status::StreamEnd);
+                assert!(out[..p.written] == data);
+                // The window grew with the 100 kB decoded, no further.
+                let grown = test_stats::dict_bytes();
+                assert!(grown >= data.len() as u64 && grown <= 1 << 20, "{grown}");
+                // The distance bound is the configured size.
+                let core = dec.lzma_core.as_ref().unwrap();
+                assert_eq!(core.dict_capacity() as u64, size);
+            }
+
+            // Contiguous: no window, so no limit — and the true bound.
+            test_stats::reset();
+            let mut dec = Decoder::new(cfg);
+            let (p, status) = dec.decode_contiguous(&stream, &mut out, 0).unwrap();
+            assert_eq!(status, Status::StreamEnd);
+            assert!(out[..p.written] == data);
+            assert_eq!(test_stats::dict_bytes(), 0);
+            let core = dec.lzma_core.as_ref().unwrap();
+            assert_eq!(core.dict_capacity() as u64, size);
+        }
+
+        // Exactly the default limit is still accepted; so is a limit
+        // lowered to the dictionary's size.
+        let mut dec = Decoder::new(DecoderConfig::with_dict_prop(30));
+        let (p, _) = dec.decode(&stream, &mut out).unwrap();
+        assert!(out[..p.written] == data);
+        assert_eq!(
+            DecoderConfig::default().max_dict_size,
+            DEFAULT_MAX_DICT_SIZE
+        );
+        let cfg = DecoderConfig::with_dict_size(1 << 16).with_max_dict_size(1 << 16);
+        let (p, _) = Decoder::new(cfg).decode(&stream, &mut out).unwrap();
+        assert!(out[..p.written] == data);
+        let cfg = DecoderConfig::with_dict_size(1 << 17).with_max_dict_size(1 << 16);
+        assert_eq!(
+            Decoder::new(cfg).decode(&stream, &mut out),
+            Err(Error::Unsupported)
         );
     }
 }

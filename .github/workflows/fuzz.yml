@@ -84,6 +84,7 @@ jobs:
           - hpack_qpack
           - limited_dispatch
           - chunked_vs_oneshot
+          - contiguous_vs_windowed
     steps:
       - uses: actions/checkout@v6
       - name: Install nightly toolchain

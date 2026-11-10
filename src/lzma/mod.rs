@@ -73,6 +73,14 @@
 //! is grown as output is produced, so a stream costs at most the smaller of
 //! its declared dictionary and its decoded length.
 //!
+//! Contiguous output: when the whole result goes into one buffer, the
+//! decoder can use that buffer as its history and allocate no dictionary at
+//! all — [`Decoder`] implements [`ContiguousDecoder`]
+//! (`decode_contiguous` / `finish_contiguous`) for both framings. The same
+//! streams are accepted and rejected as with `decode` / `finish`, except
+//! that `max_dict_size` is not applied: with no dictionary there is nothing
+//! for it to bound. See the notes on that implementation.
+//!
 //! The encoder lives in the private `encoder` submodule. It accumulates input into a buffer and
 //! emits the entire compressed stream on `finish` — LZMA's range coder
 //! prevents a true byte-streaming output, and full-buffer encoding is by far
@@ -84,7 +92,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::traits::{Algorithm, RawDecoder, RawProgress};
+use crate::traits::{Algorithm, ContiguousDecoder, Progress, RawDecoder, RawProgress, Status};
 
 mod encoder;
 pub use encoder::{Encoder, EncoderConfig};
@@ -141,6 +149,11 @@ const MIN_DICT_SIZE: u64 = 4096;
 /// read: a stream costs the smaller of its declared dictionary size and the
 /// bytes it has decoded to so far, so raising the limit does not by itself
 /// make small streams expensive.
+///
+/// The limit applies to [`decode`](crate::Decoder::decode) /
+/// [`finish`](crate::Decoder::finish). Decoding through
+/// [`ContiguousDecoder`] allocates no dictionary, so the limit is not
+/// applied there.
 ///
 /// ```
 /// use compcol::lzma::{Decoder, DecoderConfig};
@@ -429,7 +442,7 @@ impl RangeDecoder {
 // approach is correct.
 
 /// `bits` is `log2(probs.len())`. Decodes `bits` bits MSB-first.
-#[inline]
+#[inline(always)]
 fn bittree_decode(
     rd: &mut RangeDecoder,
     probs: &mut [u16],
@@ -474,6 +487,49 @@ fn dist_align_reverse_decode(
     Ok(result)
 }
 
+/// The eight bits of a literal, from its 0x300-entry probability set.
+/// `match_byte` is the byte at the last match distance when the previous
+/// packet was a match ("matched literal" coding), else `None`.
+#[inline(always)]
+fn literal_bits(
+    rd: &mut RangeDecoder,
+    probs: &mut [u16],
+    match_byte: Option<u8>,
+    buf: &[u8],
+) -> Result<u8, Error> {
+    let mut symbol: u32 = 1;
+    match match_byte {
+        Some(mb) => {
+            let mut match_byte = mb as u32;
+            let mut mismatched = false;
+            while symbol < 0x100 {
+                match_byte <<= 1;
+                let match_bit = match_byte & 0x100;
+                let idx = (0x100 + match_bit + symbol) as usize;
+                let bit = rd.decode_bit(&mut probs[idx], buf)?;
+                symbol = (symbol << 1) | bit;
+                if match_bit >> 8 != bit {
+                    mismatched = true;
+                    break;
+                }
+            }
+            if mismatched {
+                while symbol < 0x100 {
+                    let bit = rd.decode_bit(&mut probs[symbol as usize], buf)?;
+                    symbol = (symbol << 1) | bit;
+                }
+            }
+        }
+        None => {
+            while symbol < 0x100 {
+                let bit = rd.decode_bit(&mut probs[symbol as usize], buf)?;
+                symbol = (symbol << 1) | bit;
+            }
+        }
+    }
+    Ok((symbol - 0x100) as u8)
+}
+
 // ─── length decoder ──────────────────────────────────────────────────────
 
 struct LengthCoder {
@@ -514,6 +570,297 @@ impl LengthCoder {
     }
 }
 
+// ─── history sinks ───────────────────────────────────────────────────────
+//
+// The LZMA logic below is written once, generic over where decoded bytes go
+// and where matches read their history from:
+//
+//   * `WindowSink` — the streaming path: a circular dictionary owned by the
+//     decoder, every byte written both to it and to the caller's output;
+//   * `ContigSink` — the contiguous path: the caller's buffer holds the whole
+//     stream from its first byte, so it is the history and nothing else is
+//     kept.
+//
+// Which distances are valid is *not* the sink's business: `LzmaCore::dict_has`
+// decides that from the stream position and the declared dictionary size
+// alone, so both paths accept and reject the same streams. The sink methods
+// taking a distance require `dict_has(distance)`.
+
+trait Sink {
+    /// Whether a decode call stops as soon as the output has no room left
+    /// (the streaming path: the caller drains and calls again), or only
+    /// once a decoded byte actually has nowhere to go (the contiguous path,
+    /// where "full" asks the caller to reallocate: a buffer of exactly the
+    /// decoded size must be enough to reach the end of the stream).
+    const STOP_WHEN_FULL: bool;
+    /// The main loop is about to start, with this (effective) dictionary
+    /// size.
+    fn begin(&mut self, dict_size: usize);
+    /// Bytes that can still be written during this call.
+    fn room(&self) -> usize;
+    /// The byte `distance + 1` positions back (0 = the last byte written).
+    fn get(&self, distance: u32) -> u8;
+    /// Append one byte. Requires `room() > 0`.
+    fn put(&mut self, b: u8);
+    /// Append `n` match bytes that do not overlap their source
+    /// (`distance + 1 >= n`). Requires `n <= room()`. Returns how many were
+    /// copied, which may be fewer than `n` (the caller's per-byte loop does
+    /// the rest).
+    fn copy_bulk(&mut self, distance: u32, n: usize) -> usize;
+    /// Same for a match that overlaps its source (`distance + 1 < n`, e.g.
+    /// an RLE-style run).
+    fn copy_overlap(&mut self, distance: u32, n: usize) -> usize;
+    /// Bytes this sink has allocated for history.
+    fn allocated(&self) -> usize;
+}
+
+/// Dictionary / sliding window of the streaming path.
+///
+/// The buffer is grown lazily, as output is produced, up to the declared
+/// window size `dict_size` (see `reserve`), so a stream that merely
+/// *declares* a large dictionary commits no memory for it. Invariants
+/// (the same as the LZMA2 core's):
+///   * `dict_pos < dict.len()` whenever a byte is about to be written
+///     (`reserve` runs before every write);
+///   * `dict_pos` reaches `dict.len()` — the wrap-around — only once
+///     `dict.len() == dict_size`, so a wrapped position implies a fully
+///     grown buffer and every wrapped read is modulo `dict_size`;
+///   * every read is guarded by `LzmaCore::dict_has`, which admits only
+///     distances below the bytes produced so far and below `dict_size`,
+///     i.e. bytes already written and still in the buffer.
+struct Window {
+    dict: Vec<u8>,
+    dict_size: usize,
+    dict_pos: usize,
+}
+
+impl Window {
+    const fn new() -> Self {
+        Self {
+            dict: Vec::new(),
+            dict_size: 1,
+            dict_pos: 0,
+        }
+    }
+
+    /// Make room for the next `n` dictionary writes. Must be called before
+    /// writing; afterwards up to `n` bytes can be put without `dict_pos`
+    /// running into the end of a not yet fully grown buffer.
+    #[inline]
+    fn reserve(&mut self, n: usize) {
+        if self.dict.len() < self.dict_size {
+            self.grow(n);
+        }
+    }
+
+    /// Slow path of [`Self::reserve`]: grow the buffer geometrically
+    /// (so the zero-fill and copying stay proportional to the bytes
+    /// produced), never past `dict_size`.
+    #[cold]
+    fn grow(&mut self, n: usize) {
+        // One spare byte keeps `dict_pos` strictly below `dict.len()` after
+        // the `n` writes, so the wrap-around test (`dict_pos >= dict.len()`)
+        // can only fire once the buffer has reached `dict_size`.
+        let need = self
+            .dict_pos
+            .saturating_add(n)
+            .saturating_add(1)
+            .min(self.dict_size);
+        let have = self.dict.len();
+        if need <= have {
+            return;
+        }
+        let new_len = need
+            .max(have.saturating_mul(2))
+            .max(DICT_GROW_MIN)
+            .min(self.dict_size);
+        self.dict.reserve_exact(new_len - have);
+        self.dict.resize(new_len, 0);
+    }
+
+    /// Index of the byte `distance + 1` positions behind `dict_pos`.
+    #[inline(always)]
+    fn src(&self, distance: u32) -> usize {
+        let dist1 = distance as usize + 1;
+        if self.dict_pos >= dist1 {
+            self.dict_pos - dist1
+        } else {
+            self.dict.len() - (dist1 - self.dict_pos)
+        }
+    }
+
+    /// Step past `n` bytes just written. Wrapping around is the rare case,
+    /// kept out of line so that the common one is a predicted branch
+    /// rather than a conditional move on the path to the next read.
+    #[inline(always)]
+    fn advance(&mut self, n: usize) {
+        self.dict_pos += n;
+        if self.dict_pos >= self.dict.len() {
+            self.wrap();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn wrap(&mut self) {
+        self.dict_pos = 0;
+    }
+}
+
+/// [`Sink`] of the streaming path: the decoder's [`Window`] (held by value
+/// for the duration of a call, so the hot loop reaches the dictionary
+/// without an extra indirection) plus the caller's output slice.
+struct WindowSink<'a> {
+    win: Window,
+    output: &'a mut [u8],
+    written: usize,
+}
+
+impl Sink for WindowSink<'_> {
+    const STOP_WHEN_FULL: bool = true;
+
+    fn begin(&mut self, dict_size: usize) {
+        self.win = Window::new();
+        self.win.dict_size = dict_size.max(1);
+    }
+
+    #[inline(always)]
+    fn room(&self) -> usize {
+        self.output.len() - self.written
+    }
+
+    #[inline(always)]
+    fn get(&self, distance: u32) -> u8 {
+        self.win.dict[self.win.src(distance)]
+    }
+
+    #[inline(always)]
+    fn put(&mut self, b: u8) {
+        let win = &mut self.win;
+        win.reserve(1);
+        win.dict[win.dict_pos] = b;
+        win.advance(1);
+        self.output[self.written] = b;
+        self.written += 1;
+    }
+
+    /// Only the part that wraps neither the source nor the destination
+    /// range around the circular dictionary is copied.
+    #[inline]
+    fn copy_bulk(&mut self, distance: u32, n: usize) -> usize {
+        let win = &mut self.win;
+        win.reserve(n);
+        let src = win.src(distance);
+        let src_room = win.dict.len() - src;
+        let dst_room = win.dict.len() - win.dict_pos;
+        let chunk = n.min(src_room).min(dst_room);
+        if chunk == 0 {
+            return 0;
+        }
+        self.output[self.written..self.written + chunk]
+            .copy_from_slice(&win.dict[src..src + chunk]);
+        win.dict.copy_within(src..src + chunk, win.dict_pos);
+        self.written += chunk;
+        win.advance(chunk);
+        chunk
+    }
+
+    /// The `distance + 1`-byte source window behind `dict_pos` is
+    /// replicated forward via doubling `copy_within` windows so each read
+    /// targets bytes written by an earlier window. Only the contiguous
+    /// portion that does not wrap the circular dictionary is handled.
+    #[inline]
+    fn copy_overlap(&mut self, distance: u32, n: usize) -> usize {
+        let win = &mut self.win;
+        let dist1 = distance as usize + 1;
+        // Source window must not wrap: it starts `dist1` bytes behind dict_pos.
+        if win.dict_pos < dist1 {
+            return 0;
+        }
+        win.reserve(n);
+        let dst = win.dict_pos;
+        let src = dst - dist1;
+        let dst_room = win.dict.len() - dst;
+        let chunk = n.min(dst_room);
+        if chunk == 0 {
+            return 0;
+        }
+        let mut filled = dist1.min(chunk);
+        win.dict.copy_within(src..src + filled, dst);
+        while filled < chunk {
+            let take = filled.min(chunk - filled);
+            win.dict.copy_within(dst..dst + take, dst + filled);
+            filled += take;
+        }
+        self.output[self.written..self.written + chunk]
+            .copy_from_slice(&win.dict[dst..dst + chunk]);
+        self.written += chunk;
+        win.advance(chunk);
+        chunk
+    }
+
+    fn allocated(&self) -> usize {
+        self.win.dict.capacity()
+    }
+}
+
+/// [`Sink`] of the contiguous path: `out` is the caller's buffer from the
+/// first byte of the stream and `pos` how much of it is decoded, so
+/// `out[..pos]` is the whole history. It is rebuilt from the caller's
+/// arguments on every call — nothing here outlives a call, so the buffer
+/// may move or grow between calls.
+struct ContigSink<'a> {
+    out: &'a mut [u8],
+    pos: usize,
+}
+
+impl Sink for ContigSink<'_> {
+    const STOP_WHEN_FULL: bool = false;
+
+    fn begin(&mut self, _dict_size: usize) {}
+
+    #[inline(always)]
+    fn room(&self) -> usize {
+        self.out.len() - self.pos
+    }
+
+    #[inline(always)]
+    fn get(&self, distance: u32) -> u8 {
+        self.out[self.pos - 1 - distance as usize]
+    }
+
+    #[inline(always)]
+    fn put(&mut self, b: u8) {
+        self.out[self.pos] = b;
+        self.pos += 1;
+    }
+
+    fn copy_bulk(&mut self, distance: u32, n: usize) -> usize {
+        let src = self.pos - 1 - distance as usize;
+        self.out.copy_within(src..src + n, self.pos);
+        self.pos += n;
+        n
+    }
+
+    fn copy_overlap(&mut self, distance: u32, n: usize) -> usize {
+        let dist1 = distance as usize + 1;
+        let dst = self.pos;
+        let mut filled = dist1.min(n);
+        self.out.copy_within(dst - dist1..dst - dist1 + filled, dst);
+        while filled < n {
+            let take = filled.min(n - filled);
+            self.out.copy_within(dst..dst + take, dst + filled);
+            filled += take;
+        }
+        self.pos += n;
+        n
+    }
+
+    fn allocated(&self) -> usize {
+        0
+    }
+}
+
 // ─── LZMA decoder core ──────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -530,24 +877,9 @@ struct LzmaCore {
     /// marker or by reaching the size.
     expected_len: Option<u64>,
 
-    // Dictionary / sliding window (decoded output buffer).
-    //
-    // The buffer is grown lazily, as output is produced, up to the declared
-    // window size `dict_size` (see `reserve_dict`), so a stream that merely
-    // *declares* a large dictionary commits no memory for it. Invariants
-    // (the same as the LZMA2 core's):
-    //   * `dict_pos < dict.len()` whenever a byte is about to be written
-    //     (`reserve_dict` runs before every write);
-    //   * `dict_pos` reaches `dict.len()` — the wrap-around — only once
-    //     `dict.len() == dict_size`, so `dict_full` implies a fully grown
-    //     buffer and every wrapped read is modulo `dict_size`;
-    //   * every read is guarded by `dict_has`, which without `dict_full`
-    //     admits only distances below `dict_pos`, i.e. bytes already
-    //     written.
-    dict: Vec<u8>,
+    /// The stream's dictionary size (at least `MIN_DICT_SIZE`): how far
+    /// back a match may reach, whichever [`Sink`] holds the history.
     dict_size: usize,
-    dict_pos: usize,
-    dict_full: bool,
     /// Total bytes already produced and successfully delivered to the caller.
     output_pos: u64,
 
@@ -592,10 +924,7 @@ impl LzmaCore {
             lit_pos_mask,
             uncompressed_size,
             expected_len: None,
-            dict: Vec::new(),
             dict_size: dict_size.max(1),
-            dict_pos: 0,
-            dict_full: false,
             output_pos: 0,
             is_match: Box::new([PROB_INIT; STATES * POS_STATES_MAX]),
             is_rep: Box::new([PROB_INIT; STATES]),
@@ -619,154 +948,14 @@ impl LzmaCore {
         }
     }
 
-    fn dict_get(&self, distance: u32) -> u8 {
-        // distance is 0-based: distance=0 -> the previous output byte.
-        let dist1 = distance as usize + 1;
-        let pos = if self.dict_pos >= dist1 {
-            self.dict_pos - dist1
-        } else {
-            self.dict.len() - (dist1 - self.dict_pos)
-        };
-        self.dict[pos]
-    }
-
-    /// Make room for the next `n` dictionary writes. Must be called before
-    /// writing; afterwards up to `n` bytes can be put without `dict_pos`
-    /// running into the end of a not yet fully grown buffer.
-    #[inline]
-    fn reserve_dict(&mut self, n: usize) {
-        if self.dict.len() < self.dict_size {
-            self.grow_dict(n);
-        }
-    }
-
-    /// Slow path of [`Self::reserve_dict`]: grow the buffer geometrically
-    /// (so the zero-fill and copying stay proportional to the bytes
-    /// produced), never past `dict_size`.
-    #[cold]
-    fn grow_dict(&mut self, n: usize) {
-        // One spare byte keeps `dict_pos` strictly below `dict.len()` after
-        // the `n` writes, so the wrap-around test (`dict_pos >= dict.len()`)
-        // can only fire once the buffer has reached `dict_size`.
-        let need = self
-            .dict_pos
-            .saturating_add(n)
-            .saturating_add(1)
-            .min(self.dict_size);
-        let have = self.dict.len();
-        if need <= have {
-            return;
-        }
-        let new_len = need
-            .max(have.saturating_mul(2))
-            .max(DICT_GROW_MIN)
-            .min(self.dict_size);
-        self.dict.reserve_exact(new_len - have);
-        self.dict.resize(new_len, 0);
-    }
-
-    fn dict_put(&mut self, b: u8) {
-        self.reserve_dict(1);
-        self.dict[self.dict_pos] = b;
-        self.dict_pos += 1;
-        if self.dict_pos >= self.dict.len() {
-            self.dict_pos = 0;
-            self.dict_full = true;
-        }
-        self.output_pos += 1;
-    }
-
-    /// Bulk-copy `n` non-overlapping match bytes (distance >= n) from the
-    /// dictionary to `output[*written..]` and back into the dict. Caller
-    /// must guarantee `dict_has(distance)` and `n` bytes of output room.
-    /// Returns the number of bytes actually copied (may be less than `n`
-    /// when the source or destination range wraps the dict — caller falls
-    /// back to the per-byte loop for the remainder).
-    fn dict_copy_match_bulk(
-        &mut self,
-        distance: u32,
-        n: usize,
-        output: &mut [u8],
-        written: &mut usize,
-    ) -> usize {
-        self.reserve_dict(n);
-        let dist1 = distance as usize + 1;
-        let src = if self.dict_pos >= dist1 {
-            self.dict_pos - dist1
-        } else {
-            self.dict.len() - (dist1 - self.dict_pos)
-        };
-        let src_room = self.dict.len() - src;
-        let dst_room = self.dict.len() - self.dict_pos;
-        let chunk = n.min(src_room).min(dst_room);
-        if chunk == 0 {
-            return 0;
-        }
-        output[*written..*written + chunk].copy_from_slice(&self.dict[src..src + chunk]);
-        self.dict.copy_within(src..src + chunk, self.dict_pos);
-        *written += chunk;
-        self.dict_pos += chunk;
-        if self.dict_pos >= self.dict.len() {
-            self.dict_pos = 0;
-            self.dict_full = true;
-        }
-        self.output_pos += chunk as u64;
-        chunk
-    }
-
-    /// Bulk-copy up to `n` *overlapping* match bytes (`distance + 1 < n`,
-    /// e.g. RLE-style runs) from the dict into both `output[*written..]` and
-    /// the dict. The `dist1`-byte source window behind `dict_pos` is
-    /// replicated forward via doubling `copy_within` windows so each read
-    /// targets bytes written by an earlier window. Only the contiguous
-    /// portion that does not wrap the circular dict is handled; the caller's
-    /// per-byte loop covers the wrap remainder. Returns bytes copied. Caller
-    /// must guarantee `dict_has(distance)` and `n` bytes of output room.
-    fn dict_copy_match_overlap(
-        &mut self,
-        distance: u32,
-        n: usize,
-        output: &mut [u8],
-        written: &mut usize,
-    ) -> usize {
-        let dist1 = distance as usize + 1;
-        // Source window must not wrap: it starts `dist1` bytes behind dict_pos.
-        if self.dict_pos < dist1 {
-            return 0;
-        }
-        self.reserve_dict(n);
-        let dst = self.dict_pos;
-        let src = dst - dist1;
-        let dst_room = self.dict.len() - dst;
-        let chunk = n.min(dst_room);
-        if chunk == 0 {
-            return 0;
-        }
-        let mut filled = dist1.min(chunk);
-        self.dict.copy_within(src..src + filled, dst);
-        while filled < chunk {
-            let take = filled.min(chunk - filled);
-            self.dict.copy_within(dst..dst + take, dst + filled);
-            filled += take;
-        }
-        output[*written..*written + chunk].copy_from_slice(&self.dict[dst..dst + chunk]);
-        *written += chunk;
-        self.dict_pos += chunk;
-        if self.dict_pos >= self.dict.len() {
-            self.dict_pos = 0;
-            self.dict_full = true;
-        }
-        self.output_pos += chunk as u64;
-        chunk
-    }
-
+    /// Whether a match may read at `distance` (0-based): the byte must
+    /// belong to this stream and lie within the dictionary. This is the one
+    /// validity rule for both sinks, so the windowed and the contiguous
+    /// decoder accept and reject exactly the same streams.
+    #[inline(always)]
     fn dict_has(&self, distance: u32) -> bool {
-        let n = if self.dict_full {
-            self.dict.len()
-        } else {
-            self.dict_pos
-        };
-        (distance as usize) < n
+        let d = distance as u64;
+        d < self.output_pos && d < self.dict_size as u64
     }
 
     fn pos_state(&self) -> u32 {
@@ -775,9 +964,10 @@ impl LzmaCore {
 
     /// Decode one literal byte. The "prev byte" is fetched from the dict at
     /// distance 0 if available; otherwise 0.
-    fn decode_literal(&mut self, buf: &[u8]) -> Result<u8, Error> {
-        let prev_byte = if self.dict_full || self.dict_pos > 0 {
-            self.dict_get(0)
+    #[inline(always)]
+    fn decode_literal<S: Sink>(&mut self, hist: &S, buf: &[u8]) -> Result<u8, Error> {
+        let prev_byte = if self.output_pos > 0 {
+            hist.get(0)
         } else {
             0u8
         };
@@ -787,7 +977,7 @@ impl LzmaCore {
             if !self.dict_has(self.rep0) {
                 return Err(Error::Corrupt);
             }
-            Some(self.dict_get(self.rep0))
+            Some(hist.get(self.rep0))
         } else {
             None
         };
@@ -796,44 +986,20 @@ impl LzmaCore {
         let prev_high = (prev_byte as u32) >> (8 - self.lc);
         let probs_idx = (lp_state + prev_high) as usize * 0x300;
         let probs = &mut self.lit[probs_idx..probs_idx + 0x300];
-        let rd = &mut self.range;
-
-        let mut symbol: u32 = 1;
-        match match_byte_init {
-            Some(mb) => {
-                let mut match_byte = mb as u32;
-                let mut mismatched = false;
-                while symbol < 0x100 {
-                    match_byte <<= 1;
-                    let match_bit = match_byte & 0x100;
-                    let idx = (0x100 + match_bit + symbol) as usize;
-                    let bit = rd.decode_bit(&mut probs[idx], buf)?;
-                    symbol = (symbol << 1) | bit;
-                    if match_bit >> 8 != bit {
-                        mismatched = true;
-                        break;
-                    }
-                }
-                if mismatched {
-                    while symbol < 0x100 {
-                        let bit = rd.decode_bit(&mut probs[symbol as usize], buf)?;
-                        symbol = (symbol << 1) | bit;
-                    }
-                }
-            }
-            None => {
-                while symbol < 0x100 {
-                    let bit = rd.decode_bit(&mut probs[symbol as usize], buf)?;
-                    symbol = (symbol << 1) | bit;
-                }
-            }
-        }
-        Ok((symbol - 0x100) as u8)
+        // The bits are decoded on a local copy of the range decoder, written
+        // back afterwards (also on error): a local's fields stay in
+        // registers across the probability updates, whatever this function
+        // ends up inlined into.
+        let mut rd = self.range.clone();
+        let r = literal_bits(&mut rd, probs, match_byte_init, buf);
+        self.range = rd;
+        r
     }
 
     /// Decode the distance value given a length. Returns full distance value
     /// (0-based; 0 = previous byte). May return `0xFFFFFFFF` for the EOS
     /// marker.
+    #[inline(always)]
     fn decode_distance(&mut self, length: u32, buf: &[u8]) -> Result<u32, Error> {
         let dist_state_idx =
             (length.min(DIST_STATES as u32 + MATCH_LEN_MIN - 1) - MATCH_LEN_MIN) as usize;
@@ -891,8 +1057,13 @@ impl LzmaCore {
     /// `finish`. In that case we attempt the packet even with less than
     /// `REQUIRED_INPUT_MAX` bytes buffered; an actual short read yields
     /// `Error::UnexpectedEnd`.
-    fn step(&mut self, buf: &[u8], at_eof: bool) -> Result<PacketOutcome, Error> {
-        let outcome = self.step_inner(buf, at_eof)?;
+    fn step<S: Sink>(
+        &mut self,
+        hist: &S,
+        buf: &[u8],
+        at_eof: bool,
+    ) -> Result<PacketOutcome, Error> {
+        let outcome = self.step_inner(hist, buf, at_eof)?;
         // The stream must end at exactly the declared size: no literal or
         // match may run past it, whether or not a marker is required. (So
         // the size caps on match copies in `drain_output` never bind.)
@@ -910,7 +1081,12 @@ impl LzmaCore {
         Ok(outcome)
     }
 
-    fn step_inner(&mut self, buf: &[u8], at_eof: bool) -> Result<PacketOutcome, Error> {
+    fn step_inner<S: Sink>(
+        &mut self,
+        hist: &S,
+        buf: &[u8],
+        at_eof: bool,
+    ) -> Result<PacketOutcome, Error> {
         if self.finished {
             return Ok(PacketOutcome::Eos);
         }
@@ -937,63 +1113,79 @@ impl LzmaCore {
 
         if bit == 0 {
             // Literal.
-            let lit = self.decode_literal(buf)?;
+            let lit = self.decode_literal(hist, buf)?;
             self.state = state_after_literal(self.state);
             Ok(PacketOutcome::Literal(lit))
         } else {
-            // Match / rep.
-            let rep_bit = self.range.decode_bit(&mut self.is_rep[self.state], buf)?;
-            if rep_bit == 1 {
-                // Some kind of rep.
-                let rep0_bit = self.range.decode_bit(&mut self.is_rep0[self.state], buf)?;
-                if rep0_bit == 0 {
-                    // SHORTREP or LONGREP[0]
-                    let rep0_long_bit = self
-                        .range
-                        .decode_bit(&mut self.is_rep0_long[is_match_idx], buf)?;
-                    if rep0_long_bit == 0 {
-                        // SHORTREP: emit 1 byte at distance rep0.
-                        if !self.dict_has(self.rep0) {
-                            return Err(Error::Corrupt);
-                        }
-                        let b = self.dict_get(self.rep0);
-                        self.state = state_after_short_rep(self.state);
-                        return Ok(PacketOutcome::Literal(b));
-                    }
-                    // LONGREP[0]: fall through with rep_idx=0
-                    return self.finish_rep_match(0, pos_state, buf);
-                }
-                // rep1/2/3
-                let r1 = self.range.decode_bit(&mut self.is_rep1[self.state], buf)?;
-                let rep_idx = if r1 == 0 {
-                    1u32
-                } else {
-                    let r2 = self.range.decode_bit(&mut self.is_rep2[self.state], buf)?;
-                    if r2 == 0 { 2 } else { 3 }
-                };
-                self.finish_rep_match(rep_idx, pos_state, buf)
-            } else {
-                // New match.
-                let len = self.len_coder.decode(&mut self.range, pos_state, buf)? + MATCH_LEN_MIN;
-                let dist = self.decode_distance(len, buf)?;
-                if dist == 0xFFFF_FFFF {
-                    // End of stream marker.
-                    self.finished = true;
-                    return Ok(PacketOutcome::Eos);
-                }
-                self.rep3 = self.rep2;
-                self.rep2 = self.rep1;
-                self.rep1 = self.rep0;
-                self.rep0 = dist;
-                self.state = state_after_match(self.state);
-                if !self.dict_has(self.rep0) {
-                    return Err(Error::Corrupt);
-                }
-                Ok(PacketOutcome::Match { length: len })
-            }
+            self.decode_match(hist, is_match_idx, pos_state, buf)
         }
     }
 
+    /// The rest of a packet that is not a literal: a match, one of the
+    /// repeated-distance forms, or the end marker. Kept out of line so that
+    /// the literal path of the main loop stays small; everything a match
+    /// needs is inlined here.
+    #[inline(never)]
+    fn decode_match<S: Sink>(
+        &mut self,
+        hist: &S,
+        is_match_idx: usize,
+        pos_state: u32,
+        buf: &[u8],
+    ) -> Result<PacketOutcome, Error> {
+        // Match / rep.
+        let rep_bit = self.range.decode_bit(&mut self.is_rep[self.state], buf)?;
+        if rep_bit == 1 {
+            // Some kind of rep.
+            let rep0_bit = self.range.decode_bit(&mut self.is_rep0[self.state], buf)?;
+            if rep0_bit == 0 {
+                // SHORTREP or LONGREP[0]
+                let rep0_long_bit = self
+                    .range
+                    .decode_bit(&mut self.is_rep0_long[is_match_idx], buf)?;
+                if rep0_long_bit == 0 {
+                    // SHORTREP: emit 1 byte at distance rep0.
+                    if !self.dict_has(self.rep0) {
+                        return Err(Error::Corrupt);
+                    }
+                    let b = hist.get(self.rep0);
+                    self.state = state_after_short_rep(self.state);
+                    return Ok(PacketOutcome::Literal(b));
+                }
+                // LONGREP[0]: fall through with rep_idx=0
+                return self.finish_rep_match(0, pos_state, buf);
+            }
+            // rep1/2/3
+            let r1 = self.range.decode_bit(&mut self.is_rep1[self.state], buf)?;
+            let rep_idx = if r1 == 0 {
+                1u32
+            } else {
+                let r2 = self.range.decode_bit(&mut self.is_rep2[self.state], buf)?;
+                if r2 == 0 { 2 } else { 3 }
+            };
+            self.finish_rep_match(rep_idx, pos_state, buf)
+        } else {
+            // New match.
+            let len = self.len_coder.decode(&mut self.range, pos_state, buf)? + MATCH_LEN_MIN;
+            let dist = self.decode_distance(len, buf)?;
+            if dist == 0xFFFF_FFFF {
+                // End of stream marker.
+                self.finished = true;
+                return Ok(PacketOutcome::Eos);
+            }
+            self.rep3 = self.rep2;
+            self.rep2 = self.rep1;
+            self.rep1 = self.rep0;
+            self.rep0 = dist;
+            self.state = state_after_match(self.state);
+            if !self.dict_has(self.rep0) {
+                return Err(Error::Corrupt);
+            }
+            Ok(PacketOutcome::Match { length: len })
+        }
+    }
+
+    #[inline(always)]
     fn finish_rep_match(
         &mut self,
         rep_idx: u32,
@@ -1098,6 +1290,27 @@ pub struct Decoder {
     /// What the dictionary had grown to when the stream ended (it is freed
     /// then); only read by [`Decoder::dict_allocated`].
     dict_at_end: usize,
+    /// Which of the two decode paths this stream is on; fixed by the first
+    /// call after a reset.
+    mode: Mode,
+    /// The dictionary of the streaming path. Never allocated on the
+    /// contiguous path.
+    window: Window,
+    /// Contiguous path: bytes written since the last reset, which is what
+    /// the caller's `filled` must be.
+    contig_filled: usize,
+}
+
+/// The decode path a stream is on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Not fed yet.
+    Unset,
+    /// [`decode`](crate::Decoder::decode) / [`finish`](crate::Decoder::finish):
+    /// history in the decoder's own window.
+    Windowed,
+    /// [`ContiguousDecoder`]: history in the caller's buffer.
+    Contiguous,
 }
 
 /// Out-of-band parameters of a ZIP method-14 entry.
@@ -1150,14 +1363,18 @@ impl Decoder {
             max_dict_size: config.effective_max_dict_size(),
             over_limit: false,
             dict_at_end: 0,
+            mode: Mode::Unset,
+            window: Window::new(),
+            contig_filled: 0,
         }
     }
 
     /// Set the largest dictionary size a stream's header may declare, as
     /// [`DecoderConfig::max_dict_size`] does; chainable after any
     /// constructor, e.g. `Decoder::zip(false, len).with_max_dict_size(n)`.
-    /// A header declaring more is rejected with [`Error::Unsupported`].
-    /// `reset` keeps the limit.
+    /// A header declaring more is rejected with [`Error::Unsupported`]
+    /// (except when decoding through [`ContiguousDecoder`], which has no
+    /// dictionary to limit). `reset` keeps the limit.
     ///
     /// Meant for a decoder that has not been fed yet: it does not
     /// reconsider a header that has already been read.
@@ -1174,12 +1391,13 @@ impl Decoder {
     }
 
     /// Bytes allocated for the dictionary of the current stream so far (it
-    /// only grows; once the stream has ended, what it had grown to). For
+    /// only grows; once the stream has ended, what it had grown to).
+    /// Always 0 for a stream decoded through [`ContiguousDecoder`]. For
     /// tests of the allocation behaviour; not part of the stable API.
     #[doc(hidden)]
     pub fn dict_allocated(&self) -> usize {
         match &self.header_state {
-            HeaderState::Active(core) => core.dict.capacity(),
+            HeaderState::Active(_) => self.window.dict.capacity(),
             HeaderState::Done => self.dict_at_end,
             _ => 0,
         }
@@ -1251,7 +1469,7 @@ impl Decoder {
     /// Parse the header and initialise the range coder from `buf` as far
     /// as the buffered bytes allow. Returns `true` once the main loop can
     /// run (or the stream is already done).
-    fn start(&mut self) -> Result<bool, Error> {
+    fn start<S: Sink>(&mut self, sink: &mut S) -> Result<bool, Error> {
         // ── header parsing ────────────────────────────────────────────
         if matches!(self.header_state, HeaderState::Empty) {
             let header_len = if self.zip.is_some() {
@@ -1311,7 +1529,9 @@ impl Decoder {
             // stream that asks for more than the caller allowed, rather
             // than decode it with a smaller window and fail on the first
             // match that reaches further back.
-            if dict_size as u64 > self.max_dict_size {
+            // (The contiguous path allocates no dictionary, so the limit
+            // has nothing to bound there and is not applied.)
+            if self.mode != Mode::Contiguous && dict_size as u64 > self.max_dict_size {
                 self.over_limit = true;
                 self.buf = Vec::new();
                 return Err(Error::Unsupported);
@@ -1343,9 +1563,11 @@ impl Decoder {
                 Some(z) if z.eos_marker => (None, z.uncompressed_len),
                 Some(z) => (z.uncompressed_len, z.uncompressed_len),
             };
-            // At most `max_dict_size` (checked when the header was parsed),
-            // which fits `usize`. Nothing is allocated for it here: the
-            // buffer grows with the output.
+            // On the streaming path at most `max_dict_size` (checked when
+            // the header was parsed), which is an allocatable size; nothing
+            // is allocated for it here, the buffer grows with the output.
+            // On the contiguous path any 32-bit value, used only to bound
+            // match distances.
             let dict_size_eff = (dict_size as u64).max(MIN_DICT_SIZE) as usize;
             let mut core = Box::new(LzmaCore::new(lc, lp, pb, dict_size_eff, unc));
             core.expected_len = expected;
@@ -1353,38 +1575,40 @@ impl Decoder {
             if !core.range.init(&self.buf)? {
                 return Ok(false);
             }
+            sink.begin(dict_size_eff);
             self.header_state = HeaderState::Active(core);
             self.compact_buf();
         }
         Ok(true)
     }
 
-    /// `raw_decode` for both framings: copies input in bounded chunks and
-    /// hands back the bytes the range decoder did not read when it stops
-    /// for a full output buffer or at the end of the stream. Once the
-    /// stream has ended nothing more is consumed.
-    fn absorb_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
+    /// The decode call of both paths and both framings: copies input in
+    /// bounded chunks and hands back the bytes the range decoder did not
+    /// read when it stops for a full output buffer or at the end of the
+    /// stream. Once the stream has ended nothing more is consumed. Returns
+    /// the input bytes consumed and whether the stream has ended; what was
+    /// written is in the sink.
+    fn absorb_decode<S: Sink>(
+        &mut self,
+        input: &[u8],
+        sink: &mut S,
+    ) -> Result<(usize, bool), Error> {
         if self.over_limit {
             return Err(Error::Unsupported);
         }
         if matches!(self.header_state, HeaderState::Done) {
-            return Ok(RawProgress {
-                consumed: 0,
-                written: 0,
-                done: true,
-            });
+            return Ok((0, true));
         }
         let mut taken = 0usize;
-        let mut written = 0usize;
         loop {
             let take = (input.len() - taken).min(ABSORB_CHUNK);
             self.buf.extend_from_slice(&input[taken..taken + take]);
             taken += take;
-            if self.start()? {
-                self.drain_output(output, &mut written, false)?;
+            if self.start(sink)? {
+                self.drain_output(sink, false)?;
             }
             let done = matches!(self.header_state, HeaderState::Done);
-            let full = written == output.len()
+            let full = (S::STOP_WHEN_FULL && sink.room() == 0)
                 || self.pending_literal.is_some()
                 || self.pending_match.is_some();
             if !done && !full && taken < input.len() {
@@ -1402,31 +1626,23 @@ impl Decoder {
             if done {
                 self.leftover -= give;
             }
-            return Ok(RawProgress {
-                consumed: taken - give,
-                written,
-                done,
-            });
+            return Ok((taken - give, done));
         }
     }
-}
 
-impl RawDecoder for Decoder {
-    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
-        self.absorb_decode(input, output)
-    }
-
-    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
+    /// The finish call of both paths. Returns whether the stream has ended;
+    /// what was written is in the sink.
+    fn finish_into<S: Sink>(&mut self, sink: &mut S) -> Result<bool, Error> {
         if self.over_limit {
             return Err(Error::Unsupported);
         }
-        let mut written = 0usize;
+        let room = sink.room();
         // Drain whatever we can with at_eof=true so the streaming gate is
         // disabled and any genuine short read errors with UnexpectedEnd.
-        self.drain_output(output, &mut written, true)?;
+        self.drain_output(sink, true)?;
 
-        let done = match &self.header_state {
-            HeaderState::Done => true,
+        match &self.header_state {
+            HeaderState::Done => Ok(true),
             HeaderState::Active(core) => {
                 let no_pending = self.pending_match.is_none() && self.pending_literal.is_none();
                 let target_met = match core.uncompressed_size {
@@ -1434,21 +1650,95 @@ impl RawDecoder for Decoder {
                     None => core.finished,
                 };
                 if target_met && no_pending {
-                    self.dict_at_end = core.dict.capacity();
+                    self.dict_at_end = sink.allocated();
                     self.header_state = HeaderState::Done;
-                    true
-                } else if no_pending && written == 0 && !output.is_empty() {
+                    Ok(true)
+                } else if no_pending && sink.room() == room && room > 0 {
                     // Genuinely stuck: the output buffer had room, no
                     // packet could be decoded, and we have no buffered
                     // bytes to flush. The stream must be truncated.
-                    return Err(Error::UnexpectedEnd);
+                    Err(Error::UnexpectedEnd)
                 } else {
-                    false
+                    Ok(false)
                 }
             }
-            _ => return Err(Error::UnexpectedEnd),
-        };
+            _ => Err(Error::UnexpectedEnd),
+        }
+    }
 
+    /// Whether the stream is on the other decode path than `mode`.
+    fn on_other_path(&self, mode: Mode) -> bool {
+        self.mode != Mode::Unset && self.mode != mode
+    }
+
+    /// Run `f` with the streaming path's sink over `output`; returns its
+    /// result and the bytes written.
+    #[inline(always)]
+    fn with_window<R>(
+        &mut self,
+        output: &mut [u8],
+        f: impl FnOnce(&mut Self, &mut WindowSink<'_>) -> Result<R, Error>,
+    ) -> Result<(R, usize), Error> {
+        if self.on_other_path(Mode::Windowed) {
+            return Err(Error::Unsupported);
+        }
+        self.mode = Mode::Windowed;
+        // The window moves into the sink for the call (a few words, no
+        // allocation) and back afterwards.
+        let mut sink = WindowSink {
+            win: core::mem::replace(&mut self.window, Window::new()),
+            output,
+            written: 0,
+        };
+        let r = f(self, &mut sink);
+        let written = sink.written;
+        // The dictionary is not needed once the stream has ended.
+        if !matches!(self.header_state, HeaderState::Done) {
+            self.window = sink.win;
+        }
+        Ok((r?, written))
+    }
+
+    /// Same for the contiguous path, after checking the caller's `filled`.
+    #[inline(always)]
+    fn with_contiguous<R>(
+        &mut self,
+        output: &mut [u8],
+        filled: usize,
+        f: impl FnOnce(&mut Self, &mut ContigSink<'_>) -> Result<R, Error>,
+    ) -> Result<(R, usize), Error> {
+        if self.on_other_path(Mode::Contiguous)
+            || filled > output.len()
+            || filled != self.contig_filled
+        {
+            return Err(Error::Unsupported);
+        }
+        self.mode = Mode::Contiguous;
+        let mut sink = ContigSink {
+            out: output,
+            pos: filled,
+        };
+        let r = f(self, &mut sink);
+        // Kept in step with the core's position even when the call fails,
+        // so a later call can never read history that is not there.
+        self.contig_filled = sink.pos;
+        Ok((r?, sink.pos - filled))
+    }
+}
+
+impl RawDecoder for Decoder {
+    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
+        let ((consumed, done), written) =
+            self.with_window(output, |d, sink| d.absorb_decode(input, sink))?;
+        Ok(RawProgress {
+            consumed,
+            written,
+            done,
+        })
+    }
+
+    fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
+        let (done, written) = self.with_window(output, |d, sink| d.finish_into(sink))?;
         Ok(RawProgress {
             consumed: 0,
             written,
@@ -1464,84 +1754,200 @@ impl RawDecoder for Decoder {
         self.leftover = 0;
         self.over_limit = false;
         self.dict_at_end = 0;
+        self.mode = Mode::Unset;
+        self.window = Window::new();
+        self.contig_filled = 0;
     }
 }
 
+/// Decoding into one buffer that holds the whole result, with no dictionary
+/// of the decoder's own: see [`ContiguousDecoder`] for the contract.
+///
+/// Both the `.lzma` and the ZIP method-14 decoders work this way, and
+/// everything about the input side is the same as for
+/// [`decode`](crate::Decoder::decode) / [`finish`](crate::Decoder::finish):
+/// what is consumed, when `StreamEnd` is reported, the end-marker and
+/// declared-size rules, and which streams are rejected with which error.
+/// A match may reach back as far as the dictionary size in the header and
+/// no further, even though the bytes before that are still in `output`.
+///
+/// What differs:
+///
+/// * **No dictionary is allocated**, whatever the header declares; the
+///   decoder keeps only its probability tables (tens of kilobytes) and a
+///   small input buffer.
+/// * **[`max_dict_size`](DecoderConfig::max_dict_size) is not applied.**
+///   The limit is a memory budget for the dictionary, and there is none
+///   here: a header declaring a 4 GiB dictionary is decoded like any
+///   other, at no extra cost. What bounds memory in this mode is the
+///   buffer the caller chooses to provide.
+/// * A stream is on one path or the other from its first call until
+///   [`reset`](crate::Decoder::reset). Calling `decode`, `finish` or
+///   [`discard_output`](crate::Decoder::discard_output) on a stream begun
+///   with these methods, or the reverse, is [`Error::Unsupported`], as is
+///   a `filled` that exceeds `output.len()` or is not the number of bytes
+///   these methods have written since the last reset. Such a call changes
+///   nothing; the stream can go on with correct calls.
+/// * [`Status::OutputFull`] is returned only when a decoded byte has
+///   nowhere to go, not as soon as `output` is full: a buffer of exactly
+///   the decoded size reaches `StreamEnd` without being grown.
+///
+/// ```
+/// use compcol::lzma::{Decoder, Encoder};
+/// use compcol::{ContiguousDecoder, Encoder as _, Status};
+///
+/// let data = b"hello hello hello hello";
+/// let mut enc = Encoder::new();
+/// let mut stream = vec![0u8; 256];
+/// let (p, _) = enc.encode(data, &mut stream).unwrap();
+/// let mut n = p.written;
+/// let (p, _) = enc.finish(&mut stream[n..]).unwrap();
+/// n += p.written;
+///
+/// let mut dec = Decoder::new();
+/// let mut out = vec![0u8; 8];
+/// let (mut filled, mut pos) = (0, 0);
+/// let mut end_of_input = false;
+/// loop {
+///     let (p, status) = if end_of_input {
+///         dec.finish_contiguous(&mut out, filled).unwrap()
+///     } else {
+///         dec.decode_contiguous(&stream[pos..n], &mut out, filled).unwrap()
+///     };
+///     pos += p.consumed;
+///     filled += p.written;
+///     match status {
+///         Status::StreamEnd => break,
+///         // The buffer may be reallocated: only its contents matter.
+///         Status::OutputFull => out.resize(out.len() * 2, 0),
+///         Status::InputEmpty => end_of_input = true,
+///     }
+/// }
+/// assert_eq!(&out[..filled], data);
+/// ```
+impl ContiguousDecoder for Decoder {
+    fn decode_contiguous(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        filled: usize,
+    ) -> Result<(Progress, Status), Error> {
+        let ((consumed, done), written) =
+            self.with_contiguous(output, filled, |d, sink| d.absorb_decode(input, sink))?;
+        // `OutputFull` only when a decoded byte is waiting for room: a
+        // buffer that is merely full may be all the stream needs.
+        let status = if done {
+            Status::StreamEnd
+        } else if self.pending_literal.is_some() || self.pending_match.is_some() {
+            Status::OutputFull
+        } else {
+            debug_assert_eq!(consumed, input.len());
+            Status::InputEmpty
+        };
+        Ok((Progress { consumed, written }, status))
+    }
+
+    fn finish_contiguous(
+        &mut self,
+        output: &mut [u8],
+        filled: usize,
+    ) -> Result<(Progress, Status), Error> {
+        let (done, written) =
+            self.with_contiguous(output, filled, |d, sink| d.finish_into(sink))?;
+        let status = if done {
+            Status::StreamEnd
+        } else {
+            Status::OutputFull
+        };
+        Ok((
+            Progress {
+                consumed: 0,
+                written,
+            },
+            status,
+        ))
+    }
+}
+
+/// Emit up to `*remaining` bytes of a match at `distance`, as far as the
+/// sink has room and the declared size allows; `*remaining` is what is
+/// still owed afterwards.
+#[inline(never)]
+fn copy_match<S: Sink>(
+    core: &mut LzmaCore,
+    sink: &mut S,
+    distance: u32,
+    remaining: &mut u32,
+) -> Result<(), Error> {
+    if !core.dict_has(distance) {
+        return Err(Error::Corrupt);
+    }
+    let cap_by_size = match core.uncompressed_size {
+        Some(t) => (t - core.output_pos) as usize,
+        None => usize::MAX,
+    };
+    let want = (*remaining as usize).min(sink.room()).min(cap_by_size);
+    if want > 0 {
+        let did = if (distance as usize + 1) >= want {
+            // Fast path: non-overlapping bulk copy.
+            sink.copy_bulk(distance, want)
+        } else {
+            // Overlapping run: replicate the source window forward.
+            sink.copy_overlap(distance, want)
+        };
+        core.output_pos += did as u64;
+        *remaining -= did as u32;
+        if matches!(core.uncompressed_size, Some(t) if core.output_pos >= t) {
+            core.finished = true;
+            *remaining = 0;
+        }
+    }
+    while *remaining > 0 && sink.room() > 0 {
+        if !core.dict_has(distance) {
+            return Err(Error::Corrupt);
+        }
+        let b = sink.get(distance);
+        sink.put(b);
+        core.output_pos += 1;
+        *remaining -= 1;
+        // Respect known uncompressed size.
+        if matches!(core.uncompressed_size, Some(t) if core.output_pos >= t) {
+            core.finished = true;
+            *remaining = 0;
+            break;
+        }
+    }
+    Ok(())
+}
+
 impl Decoder {
-    /// Drive the main decode loop, writing to `output` and recording
-    /// progress in `written`. Returns Ok when either the output is full,
-    /// the stream is done, or we genuinely need more input.
+    /// Drive the main decode loop, writing to `sink`. Returns Ok when
+    /// either the output is full, the stream is done, or we genuinely need
+    /// more input.
     ///
     /// `at_eof` enables the "no input gate" mode: packet attempts proceed
     /// even with `< REQUIRED_INPUT_MAX` bytes buffered. Used by `finish`.
-    fn drain_output(
-        &mut self,
-        output: &mut [u8],
-        written: &mut usize,
-        at_eof: bool,
-    ) -> Result<(), Error> {
+    fn drain_output<S: Sink>(&mut self, sink: &mut S, at_eof: bool) -> Result<(), Error> {
         loop {
             // 1) Drain a pending literal first. If output is full, leave it
             //    parked in `pending_literal` and bail — that's all we can do
             //    in this iteration.
             if let Some(b) = self.pending_literal.take() {
-                if *written == output.len() {
+                if sink.room() == 0 {
                     self.pending_literal = Some(b);
                     return Ok(());
                 }
                 if let HeaderState::Active(ref mut core) = self.header_state {
-                    core.dict_put(b);
+                    sink.put(b);
+                    core.output_pos += 1;
                 }
-                output[*written] = b;
-                *written += 1;
                 continue;
             }
 
             // 2) Drain pending match bytes if any.
             if let Some(mut pm) = self.pending_match.take() {
                 if let HeaderState::Active(ref mut core) = self.header_state {
-                    // Fast path: non-overlapping bulk copy.
-                    if !core.dict_has(pm.distance) {
-                        return Err(Error::Corrupt);
-                    }
-                    let cap_by_size = match core.uncompressed_size {
-                        Some(t) => (t - core.output_pos) as usize,
-                        None => usize::MAX,
-                    };
-                    let out_room = output.len() - *written;
-                    let want = (pm.remaining as usize).min(out_room).min(cap_by_size);
-                    if want > 0 && (pm.distance as usize + 1) >= want {
-                        let did = core.dict_copy_match_bulk(pm.distance, want, output, written);
-                        pm.remaining -= did as u32;
-                        if matches!(core.uncompressed_size, Some(t) if core.output_pos >= t) {
-                            core.finished = true;
-                            pm.remaining = 0;
-                        }
-                    } else if want > 0 {
-                        // Overlapping run: replicate the source window forward.
-                        let did = core.dict_copy_match_overlap(pm.distance, want, output, written);
-                        pm.remaining -= did as u32;
-                        if matches!(core.uncompressed_size, Some(t) if core.output_pos >= t) {
-                            core.finished = true;
-                            pm.remaining = 0;
-                        }
-                    }
-                    while pm.remaining > 0 && *written < output.len() {
-                        if !core.dict_has(pm.distance) {
-                            return Err(Error::Corrupt);
-                        }
-                        let b = core.dict_get(pm.distance);
-                        core.dict_put(b);
-                        output[*written] = b;
-                        *written += 1;
-                        pm.remaining -= 1;
-                        // Respect known uncompressed size.
-                        if matches!(core.uncompressed_size, Some(t) if core.output_pos >= t) {
-                            core.finished = true;
-                            pm.remaining = 0;
-                            break;
-                        }
-                    }
+                    copy_match(core, sink, pm.distance, &mut pm.remaining)?;
                     if pm.remaining > 0 {
                         // Output buffer is full, but we still owe bytes.
                         self.pending_match = Some(pm);
@@ -1554,14 +1960,6 @@ impl Decoder {
             }
 
             // 3) Try to decode the next packet.
-            let state_done = matches!(self.header_state, HeaderState::Done);
-            if state_done {
-                return Ok(());
-            }
-
-            // Working with self.buf as the input source. We must avoid
-            // double-mutable-borrow with self.header_state, so we move
-            // the core out, work, then move it back.
             let HeaderState::Active(ref mut core) = self.header_state else {
                 return Ok(());
             };
@@ -1588,7 +1986,7 @@ impl Decoder {
                     Some(false) => return Err(Error::Corrupt),
                 }
                 self.leftover = self.buf.len() - core.range.pos;
-                self.dict_at_end = core.dict.capacity();
+                self.dict_at_end = sink.allocated();
                 self.header_state = HeaderState::Done;
                 return Ok(());
             }
@@ -1602,20 +2000,19 @@ impl Decoder {
                 core.range.pos = 0;
             }
 
-            let outcome = core.step(&self.buf, at_eof)?;
+            let outcome = core.step(&*sink, &self.buf, at_eof)?;
             match outcome {
                 PacketOutcome::Literal(b) => {
                     // If output is full, park the literal in pending_literal
                     // and return. We mustn't repeat-decode the packet because
                     // the range coder already advanced past it; pending_literal
                     // exists for exactly this case.
-                    if *written == output.len() {
+                    if sink.room() == 0 {
                         self.pending_literal = Some(b);
                         return Ok(());
                     }
-                    core.dict_put(b);
-                    output[*written] = b;
-                    *written += 1;
+                    sink.put(b);
+                    core.output_pos += 1;
                     if matches!(core.uncompressed_size, Some(t) if core.output_pos >= t) {
                         core.finished = true;
                     }
@@ -1623,47 +2020,7 @@ impl Decoder {
                 PacketOutcome::Match { length } => {
                     let mut remaining = length;
                     let distance = core.rep0;
-                    if !core.dict_has(distance) {
-                        return Err(Error::Corrupt);
-                    }
-                    // Fast path: non-overlapping bulk copy.
-                    let cap_by_size = match core.uncompressed_size {
-                        Some(t) => (t - core.output_pos) as usize,
-                        None => usize::MAX,
-                    };
-                    let out_room = output.len() - *written;
-                    let want = (remaining as usize).min(out_room).min(cap_by_size);
-                    if want > 0 && (distance as usize + 1) >= want {
-                        let did = core.dict_copy_match_bulk(distance, want, output, written);
-                        remaining -= did as u32;
-                        if matches!(core.uncompressed_size, Some(t) if core.output_pos >= t) {
-                            core.finished = true;
-                            remaining = 0;
-                        }
-                    } else if want > 0 {
-                        // Overlapping run: replicate the source window forward.
-                        let did = core.dict_copy_match_overlap(distance, want, output, written);
-                        remaining -= did as u32;
-                        if matches!(core.uncompressed_size, Some(t) if core.output_pos >= t) {
-                            core.finished = true;
-                            remaining = 0;
-                        }
-                    }
-                    while remaining > 0 && *written < output.len() {
-                        if !core.dict_has(distance) {
-                            return Err(Error::Corrupt);
-                        }
-                        let b = core.dict_get(distance);
-                        core.dict_put(b);
-                        output[*written] = b;
-                        *written += 1;
-                        remaining -= 1;
-                        if matches!(core.uncompressed_size, Some(t) if core.output_pos >= t) {
-                            core.finished = true;
-                            remaining = 0;
-                            break;
-                        }
-                    }
+                    copy_match(core, sink, distance, &mut remaining)?;
                     if remaining > 0 {
                         self.pending_match = Some(PendingMatch {
                             distance,
@@ -1687,7 +2044,7 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::{Decoder as _, Encoder as _, Status};
+    use crate::traits::{Decoder as _, Encoder as _};
 
     fn lcg_bytes(n: usize) -> Vec<u8> {
         let mut x = 0x1234_5678u32;

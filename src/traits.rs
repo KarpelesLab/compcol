@@ -554,3 +554,95 @@ pub trait Algorithm {
     /// Build a decoder with the supplied configuration.
     fn decoder_with(config: Self::DecoderConfig) -> Self::Decoder;
 }
+
+/// A decoder that can use the caller's output buffer as its history.
+///
+/// An LZ77-family decoder normally keeps the last "window" of what it
+/// decoded — up to the stream's dictionary size, which for `xz`, `lzma` or
+/// long-distance `zstd` can be hundreds of megabytes — so that matches can
+/// copy from it. When the **whole** decoded stream is going into one
+/// contiguous buffer anyway (a `Vec` sized for the result, or a
+/// memory-mapped output file), that buffer already holds every byte a
+/// match can refer to, and the decoder needs no window of its own.
+///
+/// # Contract
+///
+/// Every call is given `output`, the buffer from the very first decoded
+/// byte of the stream, and `filled`, how many bytes of it previous calls
+/// have written. The decoder reads history from `output[..filled]` and
+/// writes new bytes from `output[filled..]`; `Progress::written` says how
+/// many, and the caller adds it to `filled` for the next call.
+///
+/// * `output[..filled]` must be exactly the bytes written so far,
+///   unmodified. The buffer may be a *different* slice on each call — it
+///   may have been grown, moved or re-mapped in between — as long as that
+///   prefix is the same.
+/// * [`Status::OutputFull`] means `output` has no room left: call again
+///   with a longer buffer. [`Status::InputEmpty`] and
+///   [`Status::StreamEnd`] mean what they mean for [`Decoder::decode`].
+/// * A stream is decoded either this way or through
+///   [`Decoder::decode`] / [`Decoder::finish`], never a mix of the two
+///   between [`reset`](Decoder::reset)s; mixing them is an error.
+/// * `filled` larger than `output.len()`, or different from what the
+///   decoder has itself written since the last reset, is an error.
+///
+/// What a decoder still allocates in this mode is its entropy and model
+/// state, not anything that grows with the dictionary size. A decoder
+/// whose stream needs a transformation after the LZ stage that cannot be
+/// done in place may fall back to an internal window; implementations
+/// document when.
+pub trait ContiguousDecoder: Decoder {
+    /// Feed `input`, appending decoded bytes at `output[filled..]`.
+    fn decode_contiguous(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        filled: usize,
+    ) -> Result<(Progress, Status), Error>;
+
+    /// Signal end of input. Call until it returns [`Status::StreamEnd`],
+    /// growing `output` whenever it returns [`Status::OutputFull`].
+    fn finish_contiguous(
+        &mut self,
+        output: &mut [u8],
+        filled: usize,
+    ) -> Result<(Progress, Status), Error>;
+}
+
+#[cfg(feature = "alloc")]
+impl Decoder for alloc::boxed::Box<dyn ContiguousDecoder + '_> {
+    fn decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<(Progress, Status), Error> {
+        (**self).decode(input, output)
+    }
+    fn finish(&mut self, output: &mut [u8]) -> Result<(Progress, Status), Error> {
+        (**self).finish(output)
+    }
+    fn reset(&mut self) {
+        (**self).reset()
+    }
+    fn discard_output(&mut self, input: &[u8], n: usize) -> Result<(Progress, Status), Error> {
+        (**self).discard_output(input, n)
+    }
+    fn set_output_limit(&mut self, max_output_bytes: u64) {
+        (**self).set_output_limit(max_output_bytes)
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl ContiguousDecoder for alloc::boxed::Box<dyn ContiguousDecoder + '_> {
+    fn decode_contiguous(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        filled: usize,
+    ) -> Result<(Progress, Status), Error> {
+        (**self).decode_contiguous(input, output, filled)
+    }
+    fn finish_contiguous(
+        &mut self,
+        output: &mut [u8],
+        filled: usize,
+    ) -> Result<(Progress, Status), Error> {
+        (**self).finish_contiguous(output, filled)
+    }
+}

@@ -278,6 +278,24 @@ pub fn encoder_by_name_with_level(name: &str, level: u8) -> Option<Box<dyn Encod
     }
 }
 
+/// Build a decoder for the algorithm named `name` that can decode into one
+/// contiguous output buffer without a window of its own (see
+/// [`ContiguousDecoder`](crate::ContiguousDecoder)), or `None` if the
+/// algorithm is not compiled in or has no such mode.
+pub fn contiguous_decoder_by_name(name: &str) -> Option<Box<dyn crate::ContiguousDecoder>> {
+    match name {
+        #[cfg(feature = "lzma")]
+        crate::lzma::Lzma::NAME => Some(Box::new(<crate::lzma::Lzma as Algorithm>::decoder())),
+        #[cfg(feature = "xz")]
+        crate::xz::Xz::NAME => Some(Box::new(<crate::xz::Xz as Algorithm>::decoder())),
+        #[cfg(feature = "lzma2")]
+        crate::lzma2::Lzma2::NAME => Some(Box::new(<crate::lzma2::Lzma2 as Algorithm>::decoder())),
+        #[cfg(feature = "zstd")]
+        crate::zstd::Zstd::NAME => Some(Box::new(<crate::zstd::Zstd as Algorithm>::decoder())),
+        _ => None,
+    }
+}
+
 /// Build a decoder for the algorithm named `name`, or `None` if no algorithm
 /// is compiled in under that name.
 pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {

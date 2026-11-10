@@ -14,7 +14,7 @@
 use compcol::lzma::{
     DEFAULT_MAX_DICT_SIZE, Decoder, DecoderConfig, Encoder, EncoderConfig, Lzma, MAX_DICT_SIZE,
 };
-use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Flush, Status};
+use compcol::{Algorithm, ContiguousDecoder, Decoder as _, Encoder as _, Error, Flush, Status};
 
 fn hex(s: &str) -> Vec<u8> {
     let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
@@ -1568,4 +1568,625 @@ fn four_gib_lzma2() {
         compcol::lzma2::Encoder::new(),
         compcol::lzma2::Decoder::default(),
     );
+}
+
+// ─── contiguous output (ContiguousDecoder) ───────────────────────────────
+//
+// `decode_contiguous` / `finish_contiguous` use the caller's buffer as the
+// history and allocate no dictionary. Everything else — what is consumed,
+// when the stream ends, what is rejected and how — must match the windowed
+// `decode` / `finish` path, so most tests here run both and compare.
+
+/// The windowed path, the reference: the whole of `input` in `in_chunk`
+/// pieces through a large output buffer, then `finish`. Returns the output
+/// and how many input bytes were consumed.
+fn windowed_run(
+    dec: &mut Decoder,
+    input: &[u8],
+    in_chunk: usize,
+) -> Result<(Vec<u8>, usize), Error> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut pos = 0;
+    while pos < input.len() {
+        let end = (pos + in_chunk).min(input.len());
+        let (p, status) = dec.decode(&input[pos..end], &mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        pos += p.consumed;
+        if status == Status::StreamEnd {
+            return Ok((out, pos));
+        }
+        assert!(p.consumed + p.written > 0, "windowed decode stalled");
+    }
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            return Ok((out, pos));
+        }
+        assert!(p.written > 0, "windowed finish stalled");
+    }
+}
+
+/// The contiguous path. The output buffer starts `start` bytes long; on
+/// every `OutputFull` a *new* buffer `step` bytes longer is allocated, the
+/// decoded prefix copied over and the old one scribbled on, so a decoder
+/// holding on to anything about the previous slice would be caught.
+/// `step == 0` means the buffer must already be big enough.
+fn contiguous_run(
+    dec: &mut Decoder,
+    input: &[u8],
+    in_chunk: usize,
+    start: usize,
+    step: usize,
+) -> Result<(Vec<u8>, usize), Error> {
+    fn grow(out: &mut Vec<u8>, filled: usize, step: usize) {
+        assert_eq!(filled, out.len(), "OutputFull with room left");
+        assert!(step > 0, "OutputFull with a buffer that should be enough");
+        let mut bigger = vec![0xA5u8; out.len() + step];
+        bigger[..filled].copy_from_slice(&out[..filled]);
+        out.fill(0x5A);
+        *out = bigger;
+    }
+    let mut out = vec![0xA5u8; start];
+    let mut filled = 0;
+    let mut pos = 0;
+    while pos < input.len() {
+        let end = (pos + in_chunk).min(input.len());
+        let (p, status) = dec.decode_contiguous(&input[pos..end], &mut out, filled)?;
+        assert!(p.written <= out.len() - filled);
+        pos += p.consumed;
+        filled += p.written;
+        match status {
+            Status::StreamEnd => {
+                out.truncate(filled);
+                return Ok((out, pos));
+            }
+            Status::OutputFull => grow(&mut out, filled, step),
+            Status::InputEmpty => assert_eq!(pos, end, "InputEmpty with input left"),
+        }
+    }
+    loop {
+        let (p, status) = dec.finish_contiguous(&mut out, filled)?;
+        assert_eq!(p.consumed, 0);
+        filled += p.written;
+        if status == Status::StreamEnd {
+            out.truncate(filled);
+            return Ok((out, pos));
+        }
+        grow(&mut out, filled, step);
+    }
+}
+
+/// Decode `stream` both ways with decoders from `make` and check that the
+/// contiguous path agrees with the windowed one on output, consumption and
+/// error, for the given ways of feeding input and growing the buffer.
+/// `shapes` is `(in_chunk, start, step)`. Returns the windowed result for
+/// the input in one piece.
+fn assert_paths_agree(
+    make: &dyn Fn() -> Decoder,
+    stream: &[u8],
+    shapes: &[(usize, usize, usize)],
+    ctx: &str,
+) -> Result<(Vec<u8>, usize), Error> {
+    let whole = stream.len().max(1);
+    let reference = windowed_run(&mut make(), stream, whole);
+    for &(in_chunk, start, step) in shapes {
+        let ctx = format!("{ctx}: in {in_chunk}, buffer {start}+{step}");
+        let want = if in_chunk >= whole {
+            reference.clone()
+        } else {
+            windowed_run(&mut make(), stream, in_chunk)
+        };
+        let mut dec = make();
+        let got = contiguous_run(&mut dec, stream, in_chunk, start, step);
+        assert_eq!(dec.dict_allocated(), 0, "{ctx}: dictionary allocated");
+        match (&got, &want) {
+            (Ok((g, gc)), Ok((w, wc))) => {
+                assert!(g == w, "{ctx}: output differs");
+                if in_chunk >= whole {
+                    assert_eq!(gc, wc, "{ctx}: consumed");
+                } else {
+                    // Input in small pieces: either path may have taken up
+                    // to a packet's worth of lookahead (20 bytes) past the
+                    // end of the stream in calls before the last one, and
+                    // where those calls fall depends on when the output
+                    // filled up.
+                    assert!(gc.abs_diff(*wc) <= 20, "{ctx}: consumed {gc} / {wc}");
+                }
+            }
+            (Err(g), Err(w)) => assert_eq!(g, w, "{ctx}"),
+            _ => panic!(
+                "{ctx}: contiguous {:?}, windowed {:?}",
+                got.as_ref().map(|r| r.0.len()),
+                want.as_ref().map(|r| r.0.len())
+            ),
+        }
+    }
+    reference
+}
+
+/// Feeding and buffer-growth shapes for a stream decoding to `n` bytes:
+/// whole input / 1-byte input / odd chunks, against an exact-size buffer,
+/// one that starts empty or tiny and grows a little at a time, and one
+/// that is too big.
+fn contiguous_shapes(n: usize, stream_len: usize) -> Vec<(usize, usize, usize)> {
+    let whole = stream_len.max(1);
+    let mut v = vec![
+        (whole, n, 0),
+        (whole, n + 1000, 0),
+        (whole, 0, n / 7 + 1),
+        (whole, 1, n / 3 + 13),
+        (977, n / 2, n / 5 + 1),
+    ];
+    if stream_len <= 1 << 14 {
+        v.extend([(1, n, 0), (1, 0, n / 50 + 1), (7, 3, n / 20 + 3)]);
+    }
+    if n <= 4096 {
+        v.extend([(whole, 0, 1), (1, 0, 1), (3, 1, 2)]);
+    }
+    v
+}
+
+/// Payloads from empty to tens of kilobytes, compressible and not.
+fn contiguous_payloads() -> Vec<(&'static str, Vec<u8>)> {
+    let mut long_range = flush_noise(6_000, 3);
+    long_range.extend(flush_noise(6_000, 3));
+    long_range.extend_from_slice(&lorem_corpus(1_000));
+    long_range.extend(flush_noise(2_000, 3));
+    vec![
+        ("empty", Vec::new()),
+        ("one byte", vec![b'x']),
+        ("hello", b"hello hello hello hello".to_vec()),
+        ("run", vec![b'A'; 5000]),
+        ("period 3", b"abc".repeat(700)),
+        ("lorem", lorem_corpus(20_000)),
+        ("mixed", mixed_corpus()[..16_000].to_vec()),
+        ("noise", flush_noise(8_000, 11)),
+        ("long range", long_range),
+    ]
+}
+
+/// Our encoder's output at several levels, with an end marker, with a
+/// declared size, and with both: the contiguous path gives what the
+/// windowed one gives, however the input arrives and the buffer grows.
+#[test]
+fn contiguous_matches_windowed() {
+    for (name, payload) in contiguous_payloads() {
+        // (Setting up a high-level encoder is what costs time here.)
+        let levels: &[u8] = if payload.len() > 6_000 {
+            &[1]
+        } else if name == "hello" {
+            &[0, 6, 9]
+        } else {
+            &[0, 6]
+        };
+        for &level in levels {
+            let marker = encode_at_level(&payload, level);
+            let mut both = marker.clone();
+            both[5..13].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+            let mut streams = vec![("marker", marker), ("both", both)];
+            if level == levels[0] {
+                streams.push(("known", known_size_stream(&payload)));
+            }
+            for (kind, stream) in &streams {
+                let ctx = format!("{name} level {level} {kind}");
+                // Junk after the stream must stay unconsumed either way.
+                let mut input = stream.clone();
+                input.extend_from_slice(&[0x55; 100]);
+                let shapes = contiguous_shapes(payload.len(), input.len());
+                let (out, consumed) =
+                    assert_paths_agree(&Decoder::new, &input, &shapes, &ctx).unwrap();
+                assert!(out == payload, "{ctx}");
+                assert_eq!(consumed, stream.len(), "{ctx}");
+                // And without the junk (the end then comes from `finish`
+                // when the input is fed in small pieces).
+                let shapes = &shapes[if payload.len() > 6_000 { 2 } else { 0 }..];
+                let (out, consumed) =
+                    assert_paths_agree(&Decoder::new, stream, shapes, &ctx).unwrap();
+                assert!(out == payload, "{ctx}");
+                assert_eq!(consumed, stream.len(), "{ctx}");
+            }
+        }
+    }
+}
+
+/// A few megabytes, mostly matches, with incompressible stretches: the
+/// buffer is reallocated many times while it holds megabytes of history.
+#[test]
+fn contiguous_matches_windowed_on_megabytes() {
+    let noise = flush_noise(100_000, 5);
+    let mut payload = Vec::new();
+    while payload.len() < 3_000_000 {
+        payload.extend_from_slice(&noise[payload.len() % 977..]);
+        payload.extend_from_slice(&lorem_corpus(30_000));
+    }
+    let stream = encode_at_level(&payload, 1);
+    let n = payload.len();
+    let shapes = [
+        (stream.len(), n, 0),
+        (stream.len(), 0, 65_537),
+        (4096, 1 << 20, 300_001),
+    ];
+    let (out, consumed) = assert_paths_agree(&Decoder::new, &stream, &shapes, "megabytes").unwrap();
+    assert!(out == payload);
+    assert_eq!(consumed, stream.len());
+}
+
+/// Reference streams from liblzma (via Python).
+#[test]
+fn contiguous_decodes_liblzma_fixtures() {
+    for (fix, want) in [
+        (FIX_EMPTY, Vec::new()),
+        (FIX_HELLO, b"hello world".to_vec()),
+        (FIX_REP4K, vec![b'A'; 4096]),
+    ] {
+        let stream = hex(fix);
+        let shapes = contiguous_shapes(want.len(), stream.len());
+        let (out, consumed) = assert_paths_agree(&Decoder::new, &stream, &shapes, fix).unwrap();
+        assert_eq!(out, want);
+        assert_eq!(consumed, stream.len());
+    }
+}
+
+/// An exact-size buffer is enough, with or without an end marker and
+/// however the input is cut: `OutputFull` is only reported when a decoded
+/// byte has nowhere to go.
+#[test]
+fn contiguous_exact_size_buffer_reaches_the_end() {
+    let payload = lorem_corpus(3000);
+    for stream in [encode_one_shot(&payload), known_size_stream(&payload)] {
+        for in_chunk in [stream.len(), 1, 5, 64] {
+            let mut dec = Decoder::new();
+            let mut out = vec![0u8; payload.len()];
+            let (mut filled, mut pos) = (0, 0);
+            let mut ended = false;
+            while pos < stream.len() && !ended {
+                let end = (pos + in_chunk).min(stream.len());
+                let (p, status) = dec
+                    .decode_contiguous(&stream[pos..end], &mut out, filled)
+                    .unwrap();
+                pos += p.consumed;
+                filled += p.written;
+                assert_ne!(status, Status::OutputFull, "in {in_chunk} at {pos}");
+                ended = status == Status::StreamEnd;
+            }
+            if !ended {
+                let (p, status) = dec.finish_contiguous(&mut out, filled).unwrap();
+                filled += p.written;
+                assert_eq!(status, Status::StreamEnd);
+            }
+            assert_eq!(pos, stream.len());
+            assert_eq!(filled, payload.len());
+            assert!(out == payload);
+            // After the end: nothing consumed, nothing written.
+            let (p, status) = dec
+                .decode_contiguous(&[0x55; 64], &mut out, filled)
+                .unwrap();
+            assert_eq!((p.consumed, p.written, status), (0, 0, Status::StreamEnd));
+            let (p, status) = dec.finish_contiguous(&mut out, filled).unwrap();
+            assert_eq!((p.written, status), (0, Status::StreamEnd));
+        }
+    }
+}
+
+/// A buffer that is too short stops the decoder with `OutputFull` in the
+/// middle of the stream (here mostly inside a match) and nothing is lost
+/// when the decoding goes on in a longer buffer at another address.
+#[test]
+fn contiguous_match_cut_by_the_end_of_the_buffer_resumes() {
+    let payload = b"abcdefgh".repeat(40);
+    let stream = encode_one_shot(&payload);
+    // Bytes after the stream, so that `decode` has the lookahead to reach
+    // the end by itself.
+    let mut input = stream.clone();
+    input.extend_from_slice(&[0x55; 64]);
+    for cut in 0..payload.len() {
+        let mut dec = Decoder::new();
+        let mut small = vec![0u8; cut];
+        let (p, status) = dec.decode_contiguous(&input, &mut small, 0).unwrap();
+        assert_eq!((p.written, status), (cut, Status::OutputFull), "cut {cut}");
+        assert_eq!(small[..], payload[..cut]);
+        // Asking again without room changes nothing.
+        let (p2, status) = dec
+            .decode_contiguous(&input[p.consumed..], &mut small, cut)
+            .unwrap();
+        assert_eq!((p2.written, status), (0, Status::OutputFull), "cut {cut}");
+        let (p3, status) = dec.finish_contiguous(&mut small, cut).unwrap();
+        assert_eq!((p3.written, status), (0, Status::OutputFull), "cut {cut}");
+        let pos = p.consumed + p2.consumed;
+
+        let mut big = vec![0xEEu8; payload.len() + 5];
+        big[..cut].copy_from_slice(&small);
+        drop(small);
+        let (p, status) = dec.decode_contiguous(&input[pos..], &mut big, cut).unwrap();
+        assert_eq!(status, Status::StreamEnd, "cut {cut}");
+        assert_eq!(pos + p.consumed, stream.len(), "cut {cut}");
+        assert_eq!(cut + p.written, payload.len(), "cut {cut}");
+        assert_eq!(big[..payload.len()], payload[..], "cut {cut}");
+        assert_eq!(big[payload.len()..], [0xEE; 5], "cut {cut}: overrun");
+    }
+}
+
+/// Every damaged or cut stream gets the same verdict from both paths.
+#[test]
+fn contiguous_rejects_what_windowed_rejects() {
+    let check = |stream: &[u8], n: usize, ctx: &str| {
+        let whole = stream.len().max(1);
+        let shapes = [(whole, n + 64, 0), (whole, 0, 5), (1, 0, 7), (7, 3, 64)];
+        assert_paths_agree(&Decoder::new, stream, &shapes, ctx).map(|r| r.0)
+    };
+
+    // Header and range-coder initialisation.
+    let hello = hex(FIX_HELLO);
+    let mut s = hello.clone();
+    s[0] = 0xFF;
+    assert_eq!(check(&s, 11, "props"), Err(Error::BadHeader));
+    let mut s = hello.clone();
+    s[0] = 4 * 9 + 8; // lc = 8, lp = 4: lc + lp > 4
+    assert_eq!(check(&s, 11, "lc+lp"), Err(Error::BadHeader));
+    let mut s = hello.clone();
+    s[13] = 0x01;
+    assert_eq!(check(&s, 11, "init byte"), Err(Error::Corrupt));
+
+    // Truncation at every length.
+    let payload = lorem_corpus(600);
+    for stream in [
+        hello.clone(),
+        encode_one_shot(&payload),
+        known_size_stream(&payload),
+    ] {
+        for cut in 0..stream.len() {
+            let ctx = format!("cut {cut}/{}", stream.len());
+            assert_eq!(
+                check(&stream[..cut], 600, &ctx),
+                Err(Error::UnexpectedEnd),
+                "{ctx}"
+            );
+        }
+    }
+
+    // Declared size against what the stream holds.
+    let mut s = hello.clone();
+    s[5..13].copy_from_slice(&5u64.to_le_bytes());
+    assert_eq!(check(&s, 11, "data past size"), Err(Error::Corrupt));
+    let mut s = hello.clone();
+    s[5..13].copy_from_slice(&12u64.to_le_bytes());
+    assert_eq!(check(&s, 12, "marker before size"), Err(Error::Corrupt));
+    let data = b"abcabcabcabcabcabcabcabcabcabc";
+    let good = encode_one_shot(data);
+    for (size, ok) in [
+        (30u64, true),
+        (29, false),
+        (26, false),
+        (4, false),
+        (31, false),
+    ] {
+        let mut s = good.clone();
+        s[5..13].copy_from_slice(&size.to_le_bytes());
+        let r = check(&s, 31, &format!("size {size}"));
+        if ok {
+            assert_eq!(r.unwrap(), data);
+        } else {
+            assert_eq!(r, Err(Error::Corrupt), "size {size}");
+        }
+    }
+    // A declared size the marker-less stream has no data for.
+    let mut s = known_size_stream(&payload);
+    s[5..13].copy_from_slice(&601u64.to_le_bytes());
+    assert!(check(&s, 601, "size too large").is_err());
+
+    // Every byte of a small stream changed: whatever the windowed path
+    // makes of it (an error, or some other output), so does the contiguous
+    // one. The dictionary limit is lifted so that a changed dictionary
+    // size field is not what makes the difference.
+    let unlimited = || Decoder::new().with_max_dict_size(MAX_DICT_SIZE);
+    let stream = encode_at_level(&mixed_corpus()[..1500], 6);
+    let mut errors = 0;
+    for i in 0..stream.len() {
+        for flip in [0x01u8, 0x80] {
+            let mut s = stream.clone();
+            s[i] ^= flip;
+            let shapes = [(s.len(), 0, 997), (5, 0, 4096)];
+            let r = assert_paths_agree(&unlimited, &s, &shapes, &format!("flip {i}"));
+            errors += r.is_err() as usize;
+        }
+    }
+    assert!(errors > stream.len(), "only {errors} flips were errors");
+}
+
+/// A match may not reach further back than the dictionary size in the
+/// header, even though in contiguous mode the bytes are still there: the
+/// same streams are rejected as with a real window.
+#[test]
+fn contiguous_enforces_the_declared_dictionary_size() {
+    // 12 KiB of noise twice: the second copy is matches at distance 12288.
+    let noise = flush_noise(12 * 1024, 9);
+    let mut payload = noise.clone();
+    payload.extend_from_slice(&noise);
+    let stream = encode_at_level(&payload, 6);
+    assert!(stream.len() < 14 * 1024, "second half must be matches");
+    let shapes = contiguous_shapes(payload.len(), stream.len());
+
+    // Dictionaries that cover the distance: fine in both.
+    for dict in [12 * 1024, 16 * 1024, 1 << 20] {
+        let s = with_header_dict(&stream, dict);
+        let ctx = format!("dict {dict}");
+        let (out, _) = assert_paths_agree(&Decoder::new, &s, &shapes, &ctx).unwrap();
+        assert!(out == payload, "{ctx}");
+    }
+    // Dictionaries that do not (0 means the 4 KiB minimum): corrupt in both.
+    for dict in [0, 4096, 8192, 12 * 1024 - 1] {
+        let s = with_header_dict(&stream, dict);
+        let ctx = format!("dict {dict}");
+        let r = assert_paths_agree(&Decoder::new, &s, &shapes, &ctx);
+        assert_eq!(r, Err(Error::Corrupt), "{ctx}");
+    }
+}
+
+/// A header declaring a 1 GiB (or 4 GiB − 1) dictionary costs nothing in
+/// contiguous mode — and `max_dict_size`, the dictionary's memory budget,
+/// is not applied there, since there is no dictionary.
+#[test]
+fn contiguous_allocates_no_dictionary() {
+    let payload = mixed_corpus();
+    for dict in [1u32 << 30, u32::MAX] {
+        for (plain, stream) in [
+            (b"hello world".to_vec(), hex(FIX_HELLO)),
+            (payload.clone(), encode_at_level(&payload, 1)),
+        ] {
+            let mut stream = with_header_dict(&stream, dict);
+            let stream_len = stream.len();
+            stream.extend_from_slice(&[0x55; 64]);
+            // The windowed path refuses it under the default 64 MiB limit …
+            let mut dec = Decoder::new();
+            assert_eq!(
+                windowed_run(&mut dec, &stream, stream.len()),
+                Err(Error::Unsupported)
+            );
+            // … the contiguous one decodes it, whatever the limit.
+            for limit in [0, DEFAULT_MAX_DICT_SIZE, MAX_DICT_SIZE] {
+                let ctx = format!("dict {dict} limit {limit}");
+                let mut dec = Decoder::new().with_max_dict_size(limit);
+                assert_eq!(dec.dict_allocated(), 0, "{ctx}");
+                // Header, range-coder start and the first bytes.
+                let mut out = vec![0u8; 4];
+                let (p, status) = dec.decode_contiguous(&stream, &mut out, 0).unwrap();
+                assert_eq!((p.written, status), (4, Status::OutputFull), "{ctx}");
+                assert_eq!(out[..], plain[..4], "{ctx}");
+                assert_eq!(dec.dict_allocated(), 0, "{ctx}");
+                // The whole stream, with the buffer growing.
+                dec.reset();
+                let (got, consumed) =
+                    contiguous_run(&mut dec, &stream, stream.len(), 64, 4096).unwrap();
+                assert!(got == plain, "{ctx}");
+                assert_eq!(consumed, stream_len, "{ctx}");
+                assert_eq!(dec.dict_allocated(), 0, "{ctx}");
+            }
+        }
+    }
+}
+
+/// A stream is decoded one way or the other; the other way's calls, and a
+/// `filled` that is not what the decoder wrote, are `Unsupported` and
+/// change nothing. `reset` allows either way again.
+#[test]
+fn contiguous_and_windowed_calls_do_not_mix() {
+    let payload = mixed_corpus()[..3000].to_vec();
+    let stream = encode_one_shot(&payload);
+    let half = stream.len() / 2;
+    let mut scratch = vec![0u8; 4096];
+    let mut dec = Decoder::new();
+
+    // Begun contiguous: the windowed calls are refused, and the stream
+    // carries on unharmed.
+    let mut out = vec![0u8; 100];
+    let (p, status) = dec.decode_contiguous(&stream[..half], &mut out, 0).unwrap();
+    assert_eq!((p.written, status), (100, Status::OutputFull));
+    let pos = p.consumed;
+    assert_eq!(
+        dec.decode(&stream[pos..], &mut scratch),
+        Err(Error::Unsupported)
+    );
+    assert_eq!(dec.finish(&mut scratch), Err(Error::Unsupported));
+    assert_eq!(
+        dec.discard_output(&stream[pos..], 10),
+        Err(Error::Unsupported)
+    );
+
+    // A `filled` that disagrees with what was written, or does not fit.
+    out.resize(4000, 0);
+    for bad in [0, 99, 101, 4000, 4001, usize::MAX] {
+        assert_eq!(
+            dec.decode_contiguous(&stream[pos..], &mut out, bad),
+            Err(Error::Unsupported),
+            "filled {bad}"
+        );
+        assert_eq!(
+            dec.finish_contiguous(&mut out, bad),
+            Err(Error::Unsupported),
+            "filled {bad}"
+        );
+    }
+    assert_eq!(
+        dec.decode_contiguous(&stream[pos..], &mut out[..50], 100),
+        Err(Error::Unsupported)
+    );
+    let (p, status) = dec
+        .decode_contiguous(&stream[pos..], &mut out, 100)
+        .unwrap();
+    assert_eq!(status, Status::InputEmpty);
+    assert_eq!(pos + p.consumed, stream.len());
+    let (p2, status) = dec.finish_contiguous(&mut out, 100 + p.written).unwrap();
+    assert_eq!(status, Status::StreamEnd);
+    assert_eq!(out[..100 + p.written + p2.written], payload[..]);
+    // Still a contiguous stream after its end.
+    assert_eq!(dec.decode(&[], &mut scratch), Err(Error::Unsupported));
+    assert_eq!(dec.finish(&mut scratch), Err(Error::Unsupported));
+
+    // After a reset: windowed, and now the contiguous calls are refused.
+    dec.reset();
+    let (p, status) = dec.decode(&stream[..half], &mut scratch[..100]).unwrap();
+    assert_eq!((p.written, status), (100, Status::OutputFull));
+    let pos = p.consumed;
+    for filled in [0, 100] {
+        assert_eq!(
+            dec.decode_contiguous(&stream[pos..], &mut out, filled),
+            Err(Error::Unsupported)
+        );
+        assert_eq!(
+            dec.finish_contiguous(&mut out, filled),
+            Err(Error::Unsupported)
+        );
+    }
+    let (p, status) = dec.decode(&stream[pos..], &mut scratch[100..]).unwrap();
+    assert_eq!(status, Status::InputEmpty);
+    let (p2, status) = dec.finish(&mut scratch[100 + p.written..]).unwrap();
+    assert_eq!(status, Status::StreamEnd);
+    assert_eq!(scratch[..100 + p.written + p2.written], payload[..]);
+    assert_eq!(dec.finish_contiguous(&mut out, 0), Err(Error::Unsupported));
+
+    // A refused first call does not pick a path.
+    dec.reset();
+    assert_eq!(
+        dec.decode_contiguous(&stream, &mut out, 1),
+        Err(Error::Unsupported)
+    );
+    assert_eq!(
+        decode_chunked_with(&mut dec, &stream, 100, 100).unwrap(),
+        payload
+    );
+
+    // Reset, one way then the other, on the same decoder.
+    for _ in 0..3 {
+        dec.reset();
+        let (got, consumed) = contiguous_run(&mut dec, &stream, 300, 10, 500).unwrap();
+        assert_eq!((got, consumed), (payload.clone(), stream.len()));
+        dec.reset();
+        assert_eq!(
+            decode_chunked_with(&mut dec, &stream, 300, 500).unwrap(),
+            payload
+        );
+    }
+}
+
+/// Through `Box<dyn ContiguousDecoder>`, as the factory hands it out.
+#[test]
+fn contiguous_through_the_trait_object() {
+    let payload = lorem_corpus(5000);
+    let stream = encode_one_shot(&payload);
+    let mut dec: Box<dyn ContiguousDecoder> = Box::new(Decoder::new());
+    let mut out = vec![0u8; payload.len()];
+    let (p, status) = dec.decode_contiguous(&stream, &mut out, 0).unwrap();
+    assert_eq!((p.consumed, status), (stream.len(), Status::InputEmpty));
+    let (p2, status) = dec.finish_contiguous(&mut out, p.written).unwrap();
+    assert_eq!(status, Status::StreamEnd);
+    assert_eq!(p.written + p2.written, payload.len());
+    assert!(out == payload);
+    assert_eq!(dec.decode(&[], &mut out), Err(Error::Unsupported));
+    dec.reset();
+    let (p, _) = dec.decode(&stream, &mut out).unwrap();
+    let (p2, status) = dec.finish(&mut out[p.written..]).unwrap();
+    assert_eq!(status, Status::StreamEnd);
+    assert_eq!(p.written + p2.written, payload.len());
 }

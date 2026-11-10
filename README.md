@@ -21,11 +21,13 @@ flag, and a `compcol` binary turns the library into a Unix-style filter.
 ## Design principles
 
 - **Pure Rust.** No `bindgen`, no FFI, no C dependencies. The crate has
-  **zero runtime dependencies** by default — the only entry in
-  `[dependencies]` is an optional `tokio` (trait definitions only),
-  pulled in solely by the opt-in `tokio` feature.
-- **100% safe.** `unsafe_code = "forbid"` is set crate-wide; the library
-  never opts out.
+  **zero runtime dependencies** by default — `[dependencies]` holds only
+  two optional entries: `tokio` (trait definitions only, for the opt-in
+  `tokio` feature) and `memmap2` (for the CLI's opt-in `mmap` feature).
+- **100% safe library.** The library is `#![forbid(unsafe_code)]` and
+  never opts out. The only `unsafe` in the package is one call in the
+  `compcol` binary, compiled only with the `mmap` feature, that maps the
+  output file.
 - **`no_std`.** The library is `#![no_std]`. `alloc` is used by
   everything except the bare-bones `rle` algorithm; algorithms that need
   large windows or work buffers pull in `alloc` automatically.
@@ -442,6 +444,13 @@ cargo install --path . --features all
 cargo install --path . --features "gzip,zstd,brotli,lz4,factory"
 ```
 
+Add `mmap` (it is not part of `all`) for
+[memory-mapped decompression output](#memory-mapped-output):
+
+```sh
+cargo install --path . --features all,mmap
+```
+
 ```text
 Usage: compcol -t ALGO [OPTIONS] [INPUT]
 
@@ -483,6 +492,25 @@ Decompression safety:
                             stream is an error by default (the output is
                             removed, the input kept). With this flag it is
                             ignored with a warning. Only valid with -d.
+
+Decompression output:
+        --no-mmap           Always decode through ordinary buffered writes.
+                            By default, a build with the `mmap` feature
+                            memory-maps the output of -d when it is a file
+                            that compcol itself creates and the format
+                            allows it (xz, lzma, lzma2, zstd), and decodes
+                            straight into it. The file then serves as the
+                            dictionary too, so a stream with a 1 GiB
+                            dictionary does not take 1 GiB of memory.
+                            Caveats: the result is synced to disk before
+                            compcol exits; and should the disk fill up in
+                            a way that reserving space ahead of the
+                            decoder does not catch (copy-on-write and
+                            network file systems), the process is killed
+                            (SIGBUS on unix) and leaves a partial output
+                            behind instead of failing cleanly. Pass
+                            --no-mmap if that matters. Only valid with -d;
+                            accepted and without effect in other builds.
 
 Misc:
     -k, --keep              Keep input file even in in-place mode
@@ -534,6 +562,74 @@ compcol --list
 
 Exit codes: `0` success, `1` runtime / I/O error, `2` usage / argument
 error (including `-l` combined with `-d`).
+
+### Memory-mapped output
+
+An LZ decoder has to keep the last *dictionary size* bytes it produced, to
+copy matches from. For `xz` / `lzma` with a 1 GiB dictionary, or
+`zstd --long`, that is up to a gigabyte or more of memory just to
+decompress. A binary built with the `mmap` Cargo feature avoids it: when
+`-d` writes a file, it maps that file and decodes straight into the mapping
+(through [`ContiguousDecoder`](https://docs.rs/compcol/latest/compcol/trait.ContiguousDecoder.html)),
+so the output *is* the dictionary. It lives in the page cache, which the
+kernel writes out and drops as it sees fit, and the decoder keeps only its
+entropy-coder state.
+
+```sh
+cargo install --path . --features all,mmap
+compcol -d huge.tar.xz               # mapped: no dictionary-sized window
+compcol -d --no-mmap huge.tar.xz     # the ordinary buffered writes
+```
+
+This is the default whenever all of the following hold; otherwise, and
+with `--no-mmap`, output is streamed through buffered writes exactly as in
+a build without the feature:
+
+- decompression (`-d`) with a format that has a contiguous decoder (`xz`,
+  `lzma`, `lzma2`, `zstd`);
+- the output is a regular file that `compcol` itself creates — in-place
+  mode or `-o FILE`, with or without `--force` (the temporary file is
+  mapped, then renamed as usual). Never stdout, a device, a FIFO or a file
+  that already existed;
+- on unix, nobody but the owner may write to that new file. That is always
+  so when the input is a regular file (the output is created `0600` and
+  gets the input's mode once complete); reading from stdin, it depends on
+  the umask;
+- the mapping can be set up at all. If it cannot (a file system without
+  `mmap`, no address space), the streaming path takes over silently.
+
+Everything else is the same either way: `--max-output` (the file is never
+grown past the limit, and the run fails with the same message),
+trailing-data detection and `--ignore-trailing`, cleanup of a failed run,
+permissions, `--force`. The input may be a pipe.
+
+What differs, and why `--no-mmap` exists:
+
+- **Disk full.** A write through a mapping that cannot get a disk block
+  does not return an error: the process is killed (`SIGBUS` on unix), and
+  the partial output stays behind. To turn that into the ordinary "no space
+  left on device" error, `compcol` reserves the blocks a few megabytes
+  ahead of the decoder by writing zeros to the file through a normal
+  `write` first (about 0.1 s per GiB of output). That covers the common
+  local file systems; it cannot on copy-on-write ones (btrfs, ZFS, APFS
+  clones), where rewriting a block needs new space, or over a network.
+  On Windows, growing the file allocates it.
+- **Sync.** The mapped pages are written out (`msync`) before `compcol`
+  reports success, because an I/O error on them has no other way to
+  surface. The streaming path leaves its output in the page cache, so on a
+  slow disk the mapped path can take noticeably longer to return.
+- **Address space.** The whole output is mapped at once. A 32-bit build
+  cannot decode an output of several gigabytes this way and fails with a
+  message naming `--no-mmap`.
+- **Foreign writers.** Only a file `compcol` has just created is mapped,
+  but another process of the same user that truncated or rewrote it while
+  it is being decoded would crash the decoder or corrupt its output, where
+  the streaming path would merely produce a file someone else scribbled on.
+
+The library itself is unaffected: it stays `#![forbid(unsafe_code)]` with
+no non-optional dependency. `mmap` pulls [`memmap2`](https://crates.io/crates/memmap2)
+for the binary only, whose single `unsafe` block is the call that maps the
+file.
 
 ## Cargo feature topology
 

@@ -408,3 +408,10 @@ path             = "fuzz_targets/chunked_vs_oneshot.rs"
 test             = false
 doc              = false
 bench            = false
+
+[[bin]]
+name = "contiguous_vs_windowed"
+path = "fuzz_targets/contiguous_vs_windowed.rs"
+test = false
+doc = false
+bench = false

@@ -607,3 +607,105 @@ pub fn execute_sequences(
     }
     Ok(())
 }
+
+/// Validate a decoded sequence stream without executing it, and return the
+/// number of bytes the block regenerates.
+///
+/// This is the contiguous-output counterpart of the checks
+/// [`execute_sequences`] makes while it copies: the same conditions, in the
+/// same order, are `Error::Corrupt`. It exists so that the block's size is
+/// known — and the block known to be valid — before a single byte is written
+/// to the caller's buffer, which may not have room for it yet.
+///
+/// `frame_pos` is the number of bytes the current frame has produced before
+/// this block. [`execute_sequences`] bounds an offset by `history.len()` and
+/// by the window; the history holds everything the frame produced, trimmed to
+/// no less than the window, so the two together are exactly
+/// `offset <= min(frame bytes so far, Window_Size)`, which is what is checked
+/// here without any history at hand.
+pub fn measure_sequences(
+    sequences: &[Sequence],
+    literals_len: usize,
+    frame_pos: u64,
+    max_block_output: usize,
+    max_offset: u64,
+) -> Result<usize, Error> {
+    let mut block_output = 0usize;
+    let mut lit_pos = 0usize;
+    for seq in sequences {
+        let ll = seq.literal_length as usize;
+        if lit_pos + ll > literals_len {
+            return Err(Error::Corrupt);
+        }
+        let ml = seq.match_length as usize;
+        block_output = block_output
+            .checked_add(ll)
+            .and_then(|n| n.checked_add(ml))
+            .ok_or(Error::Corrupt)?;
+        if block_output > max_block_output {
+            return Err(Error::Corrupt);
+        }
+        lit_pos += ll;
+        let offset = seq.offset as u64;
+        // Bytes of this frame in front of the match: earlier blocks, plus
+        // this block up to and including the sequence's literals.
+        let available = frame_pos.saturating_add((block_output - ml) as u64);
+        if offset == 0 || offset > available || offset > max_offset {
+            return Err(Error::Corrupt);
+        }
+    }
+    let trailing = literals_len - lit_pos;
+    let total = block_output.checked_add(trailing).ok_or(Error::Corrupt)?;
+    if total > max_block_output {
+        return Err(Error::Corrupt);
+    }
+    Ok(total)
+}
+
+/// Execute a sequence stream that [`measure_sequences`] accepted, writing at
+/// `out[pos..]` and copying matches from `out[..pos]`. Returns the position
+/// after the block, `pos` plus the size `measure_sequences` reported.
+///
+/// `out[..pos]` must hold at least the `frame_pos` bytes given to
+/// `measure_sequences` and `out[pos..]` at least the size it returned; with
+/// that, nothing here can go out of bounds.
+pub fn execute_sequences_into(
+    sequences: &[Sequence],
+    literals: &[u8],
+    out: &mut [u8],
+    mut pos: usize,
+) -> usize {
+    let mut lit_pos = 0usize;
+    for seq in sequences {
+        let ll = seq.literal_length as usize;
+        out[pos..pos + ll].copy_from_slice(&literals[lit_pos..lit_pos + ll]);
+        lit_pos += ll;
+        pos += ll;
+        let ml = seq.match_length as usize;
+        let offset = seq.offset as usize;
+        let start = pos - offset;
+        if offset >= ml {
+            // Non-overlapping: collapses to memcpy.
+            out.copy_within(start..start + ml, pos);
+            pos += ml;
+        } else if offset == 1 {
+            // Byte-splat.
+            let b = out[start];
+            out[pos..pos + ml].fill(b);
+            pos += ml;
+        } else {
+            // Self-overlapping (period `offset`): the region `start..pos`
+            // is a whole number of periods and grows with every chunk
+            // copied, so the copy takes O(log(ml / offset)) memcpys.
+            let end = pos + ml;
+            while pos < end {
+                let n = (end - pos).min(pos - start);
+                out.copy_within(start..start + n, pos);
+                pos += n;
+            }
+        }
+    }
+    let trailing = literals.len() - lit_pos;
+    out[pos..pos + trailing].copy_from_slice(&literals[lit_pos..]);
+    pos + trailing
+}

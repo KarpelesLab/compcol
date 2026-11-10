@@ -71,6 +71,25 @@
 //! [`Decoder::with_config`] to pick a tighter limit such as the RFC 8878
 //! recommended [`RECOMMENDED_WINDOW_SIZE`] (8 MiB).
 //!
+//! # Decoding into one buffer
+//!
+//! When the whole output goes into one contiguous buffer, the decoder's
+//! [`ContiguousDecoder`](crate::ContiguousDecoder) implementation uses that
+//! buffer as the window and keeps no history at all: blocks are decoded
+//! straight into it and matches are copied from within it. Memory use is
+//! then one block's worth of scratch (the compressed block, its literals and
+//! its sequence list, each bounded by the 128 KiB block size) whatever
+//! `Window_Size` the frame declares, which is why
+//! [`DecoderConfig::max_window_size`] is **not applied** in that mode — a
+//! `zstd --long=31` frame decodes without a 2 GiB allocation. Everything
+//! else is identical to the streaming path: the same frames are accepted
+//! and rejected with the same errors (a match still may not reach before
+//! its own frame's first byte or beyond its `Window_Size`). A
+//! Compressed_Block is written whole or not at all, so
+//! [`Status::OutputFull`](crate::Status::OutputFull) can come back while a
+//! little room (less than the block) is left. See the trait impl on
+//! [`Decoder`] for the details.
+//!
 //! # Content checksum
 //!
 //! Frames with `Content_Checksum_Flag` set (the `zstd` CLI writes one by

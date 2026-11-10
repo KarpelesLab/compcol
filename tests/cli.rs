@@ -1321,3 +1321,479 @@ fn auto_detect_archive_refusal_touches_no_files() {
     assert_eq!(names_in(&s.path), ["stuff.rar"]);
     assert_eq!(file_contents(&input), bytes);
 }
+
+// ─── --no-mmap / memory-mapped output ───────────────────────────────────
+
+#[test]
+fn no_mmap_is_accepted_on_decompress_in_every_build() {
+    // The flag selects between two ways of writing the same output; a build
+    // without the `mmap` feature only has the one, and takes the flag anyway
+    // so that a command line works with either binary.
+    let (gz, _err, code) = run_with_stdin(&["-t", "gzip"], b"same bytes either way\n");
+    assert_eq!(code, 0);
+    let (out, err, code) = run_with_stdin(&["-d", "--no-mmap"], &gz);
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+    assert_eq!(out, b"same bytes either way\n");
+
+    let s = Scratch::new("no_mmap");
+    let input = s.file("a.gz");
+    fs::write(&input, &gz).unwrap();
+    let (_out, err, code) = run(&["-d", "--no-mmap", input.to_str().unwrap()]);
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+    assert_eq!(file_contents(&s.file("a")), b"same bytes either way\n");
+    assert_eq!(names_in(&s.path), ["a"]);
+}
+
+#[test]
+fn no_mmap_is_rejected_when_compressing() {
+    let (_out, err, code) = run_with_stdin(&["-t", "gzip", "--no-mmap"], b"data");
+    assert_eq!(code, 2);
+    assert!(
+        String::from_utf8_lossy(&err).contains("only meaningful on decompression"),
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+}
+
+#[test]
+fn help_documents_no_mmap() {
+    let (out, _err, code) = run(&["--help"]);
+    assert_eq!(code, 0);
+    assert!(String::from_utf8_lossy(&out).contains("--no-mmap"));
+}
+
+/// With the `mmap` feature, `-d` into a file the CLI creates is decoded
+/// straight into a mapping of that file for the formats that have a
+/// `ContiguousDecoder`. Nothing about the result may depend on which of the
+/// two ways was used: every scenario here is run both ways (`--no-mmap`
+/// forces the streaming one) and has to end with the same exit status and
+/// the same files. These hold whether or not a given format takes the mapped
+/// path in this build — which `COMPCOL_DEBUG_IO` reports, see the last tests.
+#[cfg(feature = "mmap")]
+mod mmap_output {
+    use super::*;
+    use std::sync::OnceLock;
+
+    /// How the decompression is invoked.
+    #[derive(Clone, Copy, Debug)]
+    enum Mode {
+        /// `compcol -d in.EXT` → `in`, input removed.
+        InPlace,
+        /// `-o out in.EXT`.
+        Output,
+        /// `-f -o out in.EXT`, with `out` already there.
+        Force,
+        /// `-o out < in.EXT`.
+        Stdin,
+    }
+
+    const MODES: [Mode; 4] = [Mode::InPlace, Mode::Output, Mode::Force, Mode::Stdin];
+
+    /// What a run left behind.
+    #[derive(Debug, PartialEq)]
+    struct Outcome {
+        code: i32,
+        /// Every file in the scratch directory, with its contents.
+        files: Vec<(String, Vec<u8>)>,
+    }
+
+    impl Outcome {
+        fn file(&self, name: &str) -> Option<&[u8]> {
+            self.files
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, bytes)| &bytes[..])
+        }
+        fn names(&self) -> Vec<&str> {
+            self.files.iter().map(|(n, _)| n.as_str()).collect()
+        }
+    }
+
+    /// The codecs the mapped path is meant for, as compiled in:
+    /// `(name, extension)`.
+    fn codecs() -> Vec<(&'static str, &'static str)> {
+        let mut codecs = Vec::new();
+        if cfg!(feature = "xz") {
+            codecs.push(("xz", "xz"));
+        }
+        if cfg!(feature = "lzma") {
+            codecs.push(("lzma", "lzma"));
+        }
+        if cfg!(feature = "zstd") {
+            codecs.push(("zstd", "zst"));
+        }
+        codecs
+    }
+
+    fn encode(codec: &str, payload: &[u8]) -> Vec<u8> {
+        let (encoded, err, code) = run_with_stdin(&["-t", codec], payload);
+        assert_eq!(code, 0, "{codec}: {}", String::from_utf8_lossy(&err));
+        encoded
+    }
+
+    /// A payload larger than the first mapping (4 MiB for a small input), so
+    /// that the mapped path has to grow the file, and made of long-distance
+    /// repeats, so that the decoder has to reach far back into it.
+    fn large_payload() -> &'static [u8] {
+        static PAYLOAD: OnceLock<Vec<u8>> = OnceLock::new();
+        PAYLOAD.get_or_init(|| {
+            let block: Vec<u8> = (0..256 * 1024usize)
+                .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+                .collect();
+            let mut payload = Vec::with_capacity(5 * 1024 * 1024 + 512 * 1024);
+            let mut round = 0u8;
+            while payload.len() < 5 * 1024 * 1024 {
+                payload.extend_from_slice(&block);
+                // Something new between the repeats.
+                payload.extend_from_slice(&[round; 37]);
+                round = round.wrapping_add(1);
+            }
+            payload
+        })
+    }
+
+    fn small_payload() -> Vec<u8> {
+        b"A modest payload, repeated a few times over. ".repeat(300)
+    }
+
+    /// Decompress `input` (as `in.EXT`) in a fresh directory.
+    fn decode_once(
+        codec: (&str, &str),
+        input: &[u8],
+        mode: Mode,
+        extra: &[&str],
+    ) -> (Outcome, String) {
+        let s = Scratch::new("mmap");
+        let in_path = s.file(&format!("in.{}", codec.1));
+        let out_path = s.file("out");
+        fs::write(&in_path, input).unwrap();
+
+        let mut cmd = Command::new(BIN);
+        cmd.args(["-d", "-t", codec.0]).args(extra);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        match mode {
+            Mode::InPlace => {
+                cmd.arg(&in_path).stdin(Stdio::null());
+            }
+            Mode::Output => {
+                cmd.arg("-o").arg(&out_path).arg(&in_path);
+                cmd.stdin(Stdio::null());
+            }
+            Mode::Force => {
+                fs::write(&out_path, b"what was there before").unwrap();
+                cmd.arg("-f").arg("-o").arg(&out_path).arg(&in_path);
+                cmd.stdin(Stdio::null());
+            }
+            Mode::Stdin => {
+                cmd.arg("-o").arg(&out_path);
+                cmd.stdin(Stdio::from(fs::File::open(&in_path).unwrap()));
+            }
+        }
+        let done = cmd
+            .spawn()
+            .expect("spawn compcol")
+            .wait_with_output()
+            .unwrap();
+        assert!(done.stdout.is_empty(), "nothing goes to stdout");
+        let files = names_in(&s.path)
+            .into_iter()
+            .map(|name| {
+                let bytes = file_contents(&s.file(&name));
+                (name, bytes)
+            })
+            .collect();
+        (
+            Outcome {
+                code: done.status.code().unwrap_or(-1),
+                files,
+            },
+            String::from_utf8_lossy(&done.stderr).into_owned(),
+        )
+    }
+
+    /// Run the scenario with and without `--no-mmap`, require the same
+    /// outcome, and return it (with the stderr of the default run).
+    fn decode_both_ways(
+        codec: (&str, &str),
+        input: &[u8],
+        mode: Mode,
+        extra: &[&str],
+    ) -> (Outcome, String) {
+        let (default, err) = decode_once(codec, input, mode, extra);
+        let mut streamed_args = extra.to_vec();
+        streamed_args.push("--no-mmap");
+        let (streamed, streamed_err) = decode_once(codec, input, mode, &streamed_args);
+        assert!(
+            default == streamed,
+            "{} {mode:?} {extra:?}: exit {} with files {:?} by default, \
+             exit {} with files {:?} with --no-mmap\n--- default stderr:\n{err}\n\
+             --- --no-mmap stderr:\n{streamed_err}",
+            codec.0,
+            default.code,
+            default.names(),
+            streamed.code,
+            streamed.names(),
+        );
+        (default, err)
+    }
+
+    /// The name the output has in `mode`, and the files a success leaves.
+    fn expected_files(codec: (&str, &str), mode: Mode) -> (&'static str, Vec<String>) {
+        match mode {
+            Mode::InPlace => ("in", vec!["in".to_string()]),
+            _ => ("out", vec![format!("in.{}", codec.1), "out".to_string()]),
+        }
+    }
+
+    /// The files a failure leaves: the input, and whatever `--force` was
+    /// asked to replace, untouched.
+    fn assert_failed_cleanly(
+        codec: (&str, &str),
+        mode: Mode,
+        input: &[u8],
+        outcome: &Outcome,
+        what: &str,
+    ) {
+        let in_name = format!("in.{}", codec.1);
+        assert!(outcome.file(&in_name) == Some(input), "{what}: input kept");
+        match mode {
+            Mode::Force => {
+                assert_eq!(outcome.names(), [in_name.as_str(), "out"], "{what}");
+                assert_eq!(
+                    outcome.file("out"),
+                    Some(&b"what was there before"[..]),
+                    "{what}: the old destination survives"
+                );
+            }
+            _ => assert_eq!(outcome.names(), [in_name.as_str()], "{what}"),
+        }
+    }
+
+    #[test]
+    fn output_is_identical_with_and_without_mmap() {
+        let large = large_payload();
+        let small = small_payload();
+        for codec in codecs() {
+            for (payload, label) in [(large, "large"), (&small[..], "small"), (&[][..], "empty")] {
+                let encoded = encode(codec.0, payload);
+                for mode in MODES {
+                    let what = format!("{} {label} {mode:?}", codec.0);
+                    let (outcome, err) = decode_both_ways(codec, &encoded, mode, &[]);
+                    assert_eq!(outcome.code, 0, "{what}: {err}");
+                    let (out_name, names) = expected_files(codec, mode);
+                    assert_eq!(outcome.names(), names, "{what}");
+                    assert!(
+                        outcome.file(out_name) == Some(payload),
+                        "{what}: wrong output"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn concatenated_streams_decode_the_same_way() {
+        // Whatever a format makes of a second stream — more output, or
+        // trailing data — it makes of it on both paths.
+        let a = small_payload();
+        let b = b"second stream, other text\n".repeat(2000);
+        for codec in codecs() {
+            let mut joined = encode(codec.0, &a);
+            joined.extend_from_slice(&encode(codec.0, &b));
+            for mode in MODES {
+                let (outcome, err) = decode_both_ways(codec, &joined, mode, &[]);
+                if outcome.code == 0 {
+                    let (out_name, _) = expected_files(codec, mode);
+                    assert!(
+                        outcome.file(out_name) == Some(&[&a[..], &b[..]].concat()[..]),
+                        "{} {mode:?}: wrong output",
+                        codec.0
+                    );
+                } else {
+                    assert!(err.contains(TRAILING_MSG), "{} {mode:?}: {err}", codec.0);
+                    assert_failed_cleanly(codec, mode, &joined, &outcome, codec.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trailing_data_is_handled_the_same_way() {
+        let payload = small_payload();
+        for codec in codecs() {
+            let mut bytes = encode(codec.0, &payload);
+            bytes.extend_from_slice(&[0x55u8; 300 * 1024]);
+            for mode in MODES {
+                let what = format!("{} {mode:?}", codec.0);
+                let (outcome, err) = decode_both_ways(codec, &bytes, mode, &[]);
+                // Garbage after the stream is either trailing data or, to a
+                // format that expects another stream there, a corrupt one:
+                // an error in both cases, with nothing left behind.
+                assert_eq!(outcome.code, 1, "{what}: {err}");
+                assert_failed_cleanly(codec, mode, &bytes, &outcome, &what);
+
+                let (lenient, err) = decode_both_ways(codec, &bytes, mode, &["--ignore-trailing"]);
+                if lenient.code == 0 {
+                    assert!(err.contains("warning"), "{what}: {err}");
+                    let (out_name, names) = expected_files(codec, mode);
+                    assert_eq!(lenient.names(), names, "{what}");
+                    assert!(
+                        lenient.file(out_name) == Some(&payload[..]),
+                        "{what}: wrong output"
+                    );
+                } else {
+                    assert_failed_cleanly(codec, mode, &bytes, &lenient, &what);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn damaged_input_fails_the_same_way() {
+        let large = large_payload();
+        for codec in codecs() {
+            let encoded = encode(codec.0, large);
+            // Cut short, and with a byte flipped well into the stream —
+            // after output has been produced.
+            let truncated = &encoded[..encoded.len() - encoded.len() / 3];
+            let mut flipped = encoded.clone();
+            let at = flipped.len() / 2;
+            flipped[at] ^= 0x5a;
+            for (bytes, label) in [(truncated, "truncated"), (&flipped[..], "flipped")] {
+                for mode in MODES {
+                    let what = format!("{} {label} {mode:?}", codec.0);
+                    let (outcome, err) = decode_both_ways(codec, bytes, mode, &[]);
+                    assert_eq!(outcome.code, 1, "{what}: {err}");
+                    assert_failed_cleanly(codec, mode, bytes, &outcome, &what);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn max_output_is_enforced_the_same_way() {
+        let large = large_payload();
+        let exact = format!("--max-output={}", large.len());
+        let short = format!("--max-output={}", large.len() - 1);
+        for codec in codecs() {
+            let encoded = encode(codec.0, large);
+            for mode in MODES {
+                let what = format!("{} {mode:?}", codec.0);
+                // Exactly the limit is allowed …
+                let (outcome, err) = decode_both_ways(codec, &encoded, mode, &[&exact]);
+                assert_eq!(outcome.code, 0, "{what}: {err}");
+                let (out_name, names) = expected_files(codec, mode);
+                assert_eq!(outcome.names(), names, "{what}");
+                assert!(
+                    outcome.file(out_name) == Some(large),
+                    "{what}: wrong output"
+                );
+
+                // … one byte less, and far less, are not.
+                for limit in [short.as_str(), "--max-output=64K", "--max-output=0"] {
+                    let (outcome, err) = decode_both_ways(codec, &encoded, mode, &[limit]);
+                    let what = format!("{what} {limit}");
+                    assert_eq!(outcome.code, 1, "{what}: {err}");
+                    assert!(
+                        err.contains("exceeds the --max-output limit"),
+                        "{what}: {err}"
+                    );
+                    assert_failed_cleanly(codec, mode, &encoded, &outcome, &what);
+                }
+            }
+            // An empty output fits a limit of zero.
+            let empty = encode(codec.0, b"");
+            let (outcome, err) = decode_both_ways(codec, &empty, Mode::Output, &["--max-output=0"]);
+            assert_eq!(outcome.code, 0, "{}: {err}", codec.0);
+            assert_eq!(outcome.file("out"), Some(&[][..]));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permissions_are_the_same_with_and_without_mmap() {
+        let payload = small_payload();
+        for codec in codecs() {
+            let encoded = encode(codec.0, &payload);
+            for extra in [&[][..], &["--no-mmap"]] {
+                let s = Scratch::new("mmap_mode");
+                let input = s.file(&format!("in.{}", codec.1));
+                fs::write(&input, &encoded).unwrap();
+                set_mode(&input, 0o640);
+                let mut args = vec!["-d", "-k", "-t", codec.0];
+                args.extend_from_slice(extra);
+                args.push(input.to_str().unwrap());
+                let (_out, err, code) = run(&args);
+                assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+                assert_eq!(mode_of(&s.file("in")), 0o640, "{} {extra:?}", codec.0);
+                assert_eq!(file_contents(&s.file("in")), payload);
+            }
+        }
+    }
+
+    /// `COMPCOL_DEBUG_IO` makes the CLI say on stderr which way it writes.
+    fn io_path(args: &[&str], stdin: &[u8]) -> String {
+        let s = Scratch::new("mmap_debug");
+        let stdin_path = s.file("stdin");
+        fs::write(&stdin_path, stdin).unwrap();
+        let done = Command::new(BIN)
+            .args(args)
+            .env("COMPCOL_DEBUG_IO", "1")
+            .stdin(Stdio::from(fs::File::open(&stdin_path).unwrap()))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn compcol")
+            .wait_with_output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&done.stderr).into_owned();
+        assert!(done.status.success(), "{args:?}: {err}");
+        let mut lines = err.lines().filter_map(|l| l.strip_prefix("io: "));
+        let path = lines.next().unwrap_or_else(|| panic!("no io line: {err}"));
+        assert!(lines.next().is_none(), "{err}");
+        path.to_string()
+    }
+
+    #[test]
+    fn debug_io_reports_the_path_taken() {
+        let payload = small_payload();
+        for codec in codecs() {
+            let encoded = encode(codec.0, &payload);
+            let s = Scratch::new("mmap_debug_out");
+            let out = s.file("out");
+            let out = out.to_str().unwrap();
+
+            // To a file: these formats have a contiguous decoder, so the
+            // output is mapped.
+            let path = io_path(&["-d", "-t", codec.0, "-f", "-o", out], &encoded);
+            assert_eq!(path, "mmap", "{}", codec.0);
+            assert_eq!(file_contents(Path::new(out)), payload);
+
+            // Asked not to, or with nothing to map: always streamed.
+            let args = ["-d", "-t", codec.0, "-f", "--no-mmap", "-o", out];
+            assert_eq!(io_path(&args, &encoded), "stream", "{}", codec.0);
+            assert_eq!(io_path(&["-d", "-t", codec.0], &encoded), "stream");
+            assert_eq!(io_path(&["-d", "-t", codec.0, "-c"], &encoded), "stream");
+        }
+        // A format with no contiguous decoder is streamed; so is compression.
+        let (gz, _err, code) = run_with_stdin(&["-t", "gzip"], &payload);
+        assert_eq!(code, 0);
+        let s = Scratch::new("mmap_debug_gz");
+        let out = s.file("out");
+        let out = out.to_str().unwrap();
+        assert_eq!(io_path(&["-d", "-t", "gzip", "-o", out], &gz), "stream");
+        assert_eq!(
+            io_path(&["-t", "gzip", "-f", "-o", out], &payload),
+            "stream"
+        );
+    }
+
+    #[test]
+    fn debug_io_is_silent_unless_asked() {
+        let (gz, _err, code) = run_with_stdin(&["-t", "gzip"], b"quiet");
+        assert_eq!(code, 0);
+        let (_out, err, code) = run_with_stdin(&["-d"], &gz);
+        assert_eq!(code, 0);
+        assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+    }
+}

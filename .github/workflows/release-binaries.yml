@@ -88,7 +88,7 @@ jobs:
         run: |
           # `all`, not `--all-features`: the latter would turn on `embed`
           # and ship the small deflate codecs instead of the standard ones.
-          cargo build --release --bin compcol --features all --target ${{ matrix.target }}
+          cargo build --release --bin compcol --features all,mmap --target ${{ matrix.target }}
 
       - name: Stage archive contents
         shell: bash
@@ -150,7 +150,7 @@ jobs:
       - name: Build both Apple slices
         run: |
           for t in x86_64-apple-darwin aarch64-apple-darwin; do
-            cargo build --release --bin compcol --features all --target "$t"
+            cargo build --release --bin compcol --features all,mmap --target "$t"
           done
 
       - name: Lipo into universal artifact

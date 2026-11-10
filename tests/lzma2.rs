@@ -12,7 +12,7 @@
 
 use compcol::lzma2::{DecoderConfig, Lzma2};
 #[allow(unused_imports)]
-use compcol::{Algorithm, Decoder, Encoder, Error, Flush, Status};
+use compcol::{Algorithm, ContiguousDecoder, Decoder, Encoder, Error, Flush, Status};
 
 /// Frame `data` as a single uncompressed dict-reset chunk (control 0x01)
 /// followed by the 0x00 end marker. Uncompressed chunks carry the bytes
@@ -29,7 +29,20 @@ fn uncompressed_stream(data: &[u8]) -> Vec<u8> {
     s
 }
 
+/// Decode `stream` with the streaming calls — and check that the
+/// contiguous ones agree (see `assert_contiguous_agrees`), so that every
+/// test going through here covers both modes.
 fn decode_all(stream: &[u8], cfg: DecoderConfig, out_cap: usize) -> Result<Vec<u8>, Error> {
+    let result = decode_all_streaming(stream, cfg, out_cap);
+    assert_contiguous_agrees(stream, cfg, &result);
+    result
+}
+
+fn decode_all_streaming(
+    stream: &[u8],
+    cfg: DecoderConfig,
+    out_cap: usize,
+) -> Result<Vec<u8>, Error> {
     let mut dec = Lzma2::decoder_with(cfg);
     let mut out = vec![0u8; out_cap + 16];
     let mut consumed = 0;
@@ -301,7 +314,7 @@ fn xz_cross_validates_framing() {
     xz.extend_from_slice(&[0x59, 0x5A]);
 
     // Decode the whole thing through the public xz decoder.
-    let mut dec = Xz::decoder_with(());
+    let mut dec = Xz::decoder();
     let mut out = vec![0u8; data.len() + 64];
     let mut consumed = 0;
     let mut written = 0;
@@ -859,4 +872,321 @@ fn lazily_grown_dictionary_wraps_at_its_size() {
     s.push(0x00);
     let got = decode_all(&s, DecoderConfig::with_dict_size(4096), want.len()).unwrap();
     assert!(got == want);
+}
+
+// ─── contiguous output ──────────────────────────────────────────────────
+
+/// Decode `stream` through the [`ContiguousDecoder`] calls the way a caller
+/// growing its buffer would: input in `in_chunk`-byte pieces, an output
+/// buffer of `start` bytes which, whenever the decoder asks for room, is
+/// replaced by a *new* allocation holding the same decoded prefix — `step`
+/// bytes longer, plus 1/`ratio` of its length when `ratio` is not 0 (so
+/// that a large output does not take a quadratic number of copies). The
+/// old buffer is scribbled over first and the new tail is junk: the decoder
+/// may rely on neither. `finish_contiguous` is called once the input is
+/// used up.
+///
+/// Returns what was decoded, the input consumed (or the error), and how
+/// often the buffer had to grow.
+fn drive_contiguous<D: ContiguousDecoder>(
+    dec: &mut D,
+    stream: &[u8],
+    in_chunk: usize,
+    start: usize,
+    (step, ratio): (usize, usize),
+) -> (Vec<u8>, Result<usize, Error>, usize) {
+    let mut out = vec![0xA5u8; start];
+    let (mut filled, mut pos, mut grows) = (0usize, 0usize, 0usize);
+    let result = loop {
+        let end = pos.saturating_add(in_chunk).min(stream.len());
+        let feeding = pos < stream.len();
+        let r = if feeding {
+            dec.decode_contiguous(&stream[pos..end], &mut out, filled)
+        } else {
+            dec.finish_contiguous(&mut out, filled)
+        };
+        let (p, status) = match r {
+            Ok(v) => v,
+            Err(e) => break Err(e),
+        };
+        pos += p.consumed;
+        filled += p.written;
+        assert!(pos <= end && filled <= out.len());
+        match status {
+            Status::StreamEnd => break Ok(pos),
+            Status::OutputFull if filled == out.len() => {
+                let extra = step + out.len().checked_div(ratio).unwrap_or(0);
+                let junk = if grows % 2 == 0 { 0x5A } else { 0xC3 };
+                let mut longer = vec![junk; out.len() + extra];
+                longer[..filled].copy_from_slice(&out[..filled]);
+                out.fill(0xEE);
+                out = longer;
+                grows += 1;
+            }
+            Status::OutputFull => assert!(
+                p.written > 0 || p.consumed > 0,
+                "OutputFull with room left and nothing done"
+            ),
+            Status::InputEmpty => assert!(feeding && pos == end, "InputEmpty with input left"),
+        }
+    };
+    out.truncate(filled);
+    (out, result, grows)
+}
+
+/// What the streaming calls made of `stream` — its output, or the error —
+/// is what every way of driving the contiguous calls must give: from an
+/// empty buffer grown in small steps, a byte of input at a time, and with
+/// a buffer of exactly the decoded size (which then never has to grow).
+fn assert_contiguous_agrees(stream: &[u8], cfg: DecoderConfig, want: &Result<Vec<u8>, Error>) {
+    let len = want.as_ref().map_or(0, |v| v.len());
+    let fine = if len <= 2048 { (1, 0) } else { (1, 16) };
+    for (in_chunk, start, grow) in [
+        (usize::MAX, 0, fine),
+        (1, 1, (3, 8)),
+        (usize::MAX, len, fine),
+        (5, len, (64, 4)),
+    ] {
+        let mut dec = Lzma2::decoder_with(cfg);
+        let (out, r, grows) = drive_contiguous(&mut dec, stream, in_chunk, start, grow);
+        let got = r.map(|_| out);
+        assert!(
+            got == *want,
+            "contiguous (in {in_chunk}, start {start}, grow {grow:?}): {:?}, streaming: {:?}",
+            got.as_ref().map(|v| v.len()),
+            want.as_ref().map(|v| v.len()),
+        );
+        if want.is_ok() && start == len {
+            assert_eq!(grows, 0, "a buffer of the exact size had to grow");
+        }
+    }
+}
+
+/// Encoder output — plain, and with Sync and Full flushes — decodes the
+/// same in both modes (`decode_all` compares them), and so does every
+/// flushed prefix, which never reaches the end marker.
+#[test]
+fn contiguous_matches_streaming_on_encoder_output() {
+    let mut data = flush_text(70_000);
+    data.extend_from_slice(&flush_noise(9_000, 5));
+    data.extend_from_slice(&vec![b'z'; 30_000]);
+    data.extend_from_slice(&flush_words(40_000, 11));
+    for out_chunk in [1 << 16, 13] {
+        let wire = encode_all(&data, out_chunk);
+        let got = decode_all(&wire, DecoderConfig::default(), data.len()).unwrap();
+        assert!(got == data);
+    }
+    for mode in [Flush::Sync, Flush::Full] {
+        let mut enc = Lzma2::encoder_with(());
+        let mut wire = Vec::new();
+        let mut given = Vec::new();
+        let segments = [
+            b"x".to_vec(),
+            flush_words(100, 1),
+            flush_words(5_000, 2),
+            flush_noise(3_000, 3),
+            flush_words(60_000, 4),
+            b"tail".to_vec(),
+            flush_words(20_000, 5),
+        ];
+        for seg in segments {
+            flush_test_encode(&mut enc, &seg, 4096, &mut wire);
+            given.extend_from_slice(&seg);
+            flush_test_flush(&mut enc, mode, 4096, &mut wire);
+            // The unterminated prefix: everything given so far comes out,
+            // and the decoder waits for more.
+            let mut dec = Lzma2::decoder_with(DecoderConfig::default());
+            let mut out = vec![0u8; given.len()];
+            let (p, status) = dec.decode_contiguous(&wire, &mut out, 0).unwrap();
+            assert_eq!((p.consumed, status), (wire.len(), Status::InputEmpty));
+            assert!(out[..p.written] == given, "{mode:?} prefix");
+            assert_eq!(
+                dec.finish_contiguous(&mut out, p.written),
+                Err(Error::UnexpectedEnd)
+            );
+        }
+        flush_test_finish(&mut enc, 4096, &mut wire);
+        let got = decode_all(&wire, DecoderConfig::default(), given.len()).unwrap();
+        assert!(got == given, "{mode:?}");
+    }
+}
+
+/// The contiguous buffer holds everything decoded since the start of the
+/// stream, but the history a match may use is still what the dictionary
+/// would hold: nothing from before a dictionary reset. The hand-built
+/// streams of `match_cannot_reach_bytes_from_before_a_dictionary_reset`,
+/// with the output cut at every possible length.
+#[test]
+fn contiguous_match_cannot_reach_before_a_dictionary_reset() {
+    let first: &[u8] = b"0123456789abcdef";
+    let second: &[u8] = b"ABCDEFGH";
+    let tail = compressed_chunk(0xC0, 2, &match_len2_dist9_payload());
+    let decode = |chunks: &[&[u8]], start: usize| {
+        let s = [&chunks.concat()[..], &[0x00]].concat();
+        let mut dec = Lzma2::decoder_with(DecoderConfig::default());
+        let (out, r, _) = drive_contiguous(&mut dec, &s, usize::MAX, start, (1, 0));
+        r.map(|_| out)
+    };
+    for start in 0..=32 {
+        // Within one dictionary the match reaches whatever is 9 back, in
+        // the same chunk's bytes or an earlier chunk's.
+        let got = decode(&[&stored_chunk(0x01, first), &tail], start);
+        assert_eq!(got.as_deref(), Ok(&b"0123456789abcdef78"[..]));
+        let got = decode(
+            &[
+                &stored_chunk(0x01, first),
+                &stored_chunk(0x02, second),
+                &tail,
+            ],
+            start,
+        );
+        assert_eq!(got.as_deref(), Ok(&b"0123456789abcdefABCDEFGHfA"[..]));
+
+        // After a reset only `second`'s 8 bytes are history, although the
+        // 16 before them are right there in the buffer.
+        let got = decode(
+            &[
+                &stored_chunk(0x01, first),
+                &stored_chunk(0x01, second),
+                &tail,
+            ],
+            start,
+        );
+        assert_eq!(got, Err(Error::Corrupt), "start {start}");
+        // A full-reset compressed chunk has no history at all.
+        let full_reset = compressed_chunk(0xE0, 2, &match_len2_dist9_payload());
+        let got = decode(&[&stored_chunk(0x01, first), &full_reset], start);
+        assert_eq!(got, Err(Error::Corrupt), "start {start}");
+    }
+}
+
+/// A match further back than the configured dictionary size is corrupt in
+/// both modes, even though the contiguous buffer still has the bytes.
+#[test]
+fn contiguous_distances_are_bounded_by_the_dictionary_size() {
+    // 6000 bytes with no long repeats (but compressible: 4 bits each),
+    // then the first 300 again: a match 6000 back.
+    let mut s = 0x1234_5678u32;
+    let mut data: Vec<u8> = (0..6000)
+        .map(|_| {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            b'a' + (s >> 28) as u8
+        })
+        .collect();
+    data.extend_from_within(..300);
+    let wire = encode_all(&data, 1 << 16);
+    assert!(wire.len() < 4000, "the repeat was not found");
+
+    let roomy = DecoderConfig::with_dict_size(8192);
+    assert!(decode_all(&wire, roomy, data.len()).unwrap() == data);
+    // (`decode_all` checks that the contiguous calls fail alike.)
+    let tight = DecoderConfig::with_dict_size(4096);
+    assert_eq!(decode_all(&wire, tight, data.len()), Err(Error::Corrupt));
+    let mut dec = Lzma2::decoder_with(tight);
+    let mut out = vec![0u8; data.len()];
+    assert_eq!(
+        dec.decode_contiguous(&wire, &mut out, 0),
+        Err(Error::Corrupt)
+    );
+}
+
+/// A stream is decoded with the streaming calls or the contiguous ones,
+/// not both; `filled` must be what the decoder has written. Either mistake
+/// is refused without harming the decoder, and `reset` allows either mode
+/// again.
+#[test]
+fn contiguous_and_streaming_calls_do_not_mix() {
+    let mut data = flush_noise(70_000, 9);
+    data.extend_from_slice(&flush_text(80_000));
+    let wire = encode_all(&data, 1 << 16);
+    let (head, rest) = wire.split_at(wire.len() / 2);
+    let mut out = vec![0u8; data.len()];
+    let mut scratch = vec![0u8; data.len()];
+
+    // Contiguous first: the streaming calls are refused, and decoding goes
+    // on undisturbed afterwards.
+    let mut dec = Lzma2::decoder_with(DecoderConfig::default());
+    let (p, status) = dec.decode_contiguous(head, &mut out, 0).unwrap();
+    assert_eq!((p.consumed, status), (head.len(), Status::InputEmpty));
+    let mut filled = p.written;
+    assert!(filled > 0);
+    assert_eq!(dec.decode(rest, &mut scratch), Err(Error::Unsupported));
+    assert_eq!(dec.finish(&mut scratch), Err(Error::Unsupported));
+    assert_eq!(
+        dec.discard_output(rest, 10).map(|_| ()),
+        Err(Error::Unsupported)
+    );
+    // A wrong `filled`: too small, too large, beyond the buffer.
+    for bad in [0, filled - 1, filled + 1, out.len() + 1] {
+        if bad != filled {
+            assert_eq!(
+                dec.decode_contiguous(rest, &mut out, bad),
+                Err(Error::Unsupported),
+                "filled {bad} instead of {filled}"
+            );
+            assert_eq!(
+                dec.finish_contiguous(&mut out, bad),
+                Err(Error::Unsupported)
+            );
+        }
+    }
+    let (p, status) = dec.decode_contiguous(rest, &mut out, filled).unwrap();
+    filled += p.written;
+    assert_eq!(status, Status::StreamEnd);
+    assert_eq!(
+        dec.finish_contiguous(&mut out, filled),
+        Ok((Default::default(), Status::StreamEnd))
+    );
+    assert!(out[..filled] == data);
+
+    // Streaming first: the contiguous calls are refused.
+    dec.reset();
+    let (p, _) = dec.decode(head, &mut scratch).unwrap();
+    let n = p.written;
+    assert_eq!(
+        dec.decode_contiguous(rest, &mut out, 0),
+        Err(Error::Unsupported)
+    );
+    assert_eq!(dec.finish_contiguous(&mut out, 0), Err(Error::Unsupported));
+    let (p, status) = dec.decode(rest, &mut scratch[n..]).unwrap();
+    assert_eq!(status, Status::StreamEnd);
+    assert!(scratch[..n + p.written] == data);
+
+    // After a reset, contiguous again — from `filled` 0.
+    dec.reset();
+    assert_eq!(
+        dec.decode_contiguous(&wire, &mut out, filled),
+        Err(Error::Unsupported)
+    );
+    out.fill(0);
+    let (p, status) = dec.decode_contiguous(&wire, &mut out, 0).unwrap();
+    assert_eq!(status, Status::StreamEnd);
+    assert!(out[..p.written] == data);
+}
+
+/// Truncated at any point, a stream gives the same bytes and the same
+/// error in both modes.
+#[test]
+fn contiguous_truncation_matches_streaming() {
+    let mut data = flush_text(2500);
+    data.extend_from_slice(&flush_noise(700, 3));
+    data.extend_from_slice(&flush_text(900));
+    let wire = encode_all(&data, 1 << 16);
+    for cut in 0..wire.len() {
+        let cut = &wire[..cut];
+        // Streaming: all of it, then `finish`.
+        let mut dec = Lzma2::decoder_with(DecoderConfig::default());
+        let mut want = vec![0u8; data.len() + 1];
+        let (p, status) = dec.decode(cut, &mut want).unwrap();
+        assert_eq!(status, Status::InputEmpty);
+        want.truncate(p.written);
+        assert_eq!(dec.finish(&mut []), Err(Error::UnexpectedEnd));
+
+        for (in_chunk, start, grow) in [(usize::MAX, 0, (7, 0)), (3, data.len(), (1, 0))] {
+            let mut dec = Lzma2::decoder_with(DecoderConfig::default());
+            let (out, r, _) = drive_contiguous(&mut dec, cut, in_chunk, start, grow);
+            assert_eq!(r, Err(Error::UnexpectedEnd), "cut at {}", cut.len());
+            assert!(out == want, "cut at {}", cut.len());
+        }
+    }
 }

@@ -36,8 +36,7 @@ decoders are written to that bar:
   | `ppmd`, `ppmd-zip` | a model arena sized by the stream header, up to 256 MiB | `DecoderConfig::max_memory` / `ZipDecoder::with_max_memory` |
   | `rar3` | a PPMd model arena sized by the stream, up to 256 MiB; the whole compressed member | bound the input size |
   | `lz5` | 16 MiB of history in a block-dependent frame; one compressed block | `DecoderConfig::max_block_size` |
-  | `lzma`, `zstd` | a dictionary / window as large as the stream declares (`lzma`: grown as output is produced) | `DecoderConfig::max_dict_size` (default 64 MiB), `DecoderConfig::max_window_size` |
-  | `xz`, `lzma2` | a dictionary as large as the stream declares, up to 128 MiB, grown as output is produced | bound the output |
+  | `lzma`, `xz`, `lzma2`, `zstd` | a dictionary / window as large as the stream declares (`lzma`, `xz`, `lzma2`: grown as output is produced) | `DecoderConfig::max_dict_size` (default 64 MiB for `lzma`, 128 MiB for `xz` and `lzma2`), `DecoderConfig::max_window_size` for `zstd` |
   | `snappy`, `huffman`, `bwt`, `range`, `rar2`, `arsenic`, `sit13` | the whole compressed input, until `finish` | bound the input size |
   | `bwt` | about 5× one block while inverting it | bound the input size |
 
