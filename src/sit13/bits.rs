@@ -7,9 +7,10 @@
 //! opposite order from method 5 ("LZAH"), and getting it wrong is the single
 //! most common interop pitfall between the two methods.
 //!
-//! The reader buffers the whole compressed payload (the consumer
+//! The reader borrows the whole compressed payload (the consumer
 //! [`super::decoder`] accumulates input across streaming calls, then decodes
-//! in one pass) and tracks a bit cursor. Every read is bounds-checked and
+//! it a stretch at a time, re-creating the reader at the saved bit position)
+//! and tracks a bit cursor. Every read is bounds-checked and
 //! returns [`Error::UnexpectedEnd`] on underrun; no `unsafe`, no panic
 //! reachable from any input.
 
@@ -25,6 +26,18 @@ pub(crate) struct BitReader<'a> {
 impl<'a> BitReader<'a> {
     pub(crate) fn new(data: &'a [u8]) -> Self {
         Self { data, bit_pos: 0 }
+    }
+
+    /// Reader over `data` resuming at absolute bit position `bit_pos`, as
+    /// returned by [`bit_pos`](Self::bit_pos) on an earlier reader over the
+    /// same bytes.
+    pub(crate) fn at(data: &'a [u8], bit_pos: usize) -> Self {
+        Self { data, bit_pos }
+    }
+
+    /// Absolute bit position of the next bit to consume.
+    pub(crate) fn bit_pos(&self) -> usize {
+        self.bit_pos
     }
 
     /// Total number of bits remaining (not yet consumed).
@@ -106,6 +119,18 @@ mod tests {
         let data = [0xFFu8];
         let mut r = BitReader::new(&data);
         assert!(matches!(r.read_bits(16), Err(Error::UnexpectedEnd)));
+    }
+
+    #[test]
+    fn resumes_at_a_saved_position() {
+        let data = [0xABu8, 0xCD];
+        let mut r = BitReader::new(&data);
+        assert_eq!(r.read_bits(4).unwrap(), 0xB);
+        let pos = r.bit_pos();
+        assert_eq!(pos, 4);
+        let mut r = BitReader::at(&data, pos);
+        assert_eq!(r.read_bits(8).unwrap(), 0xDA);
+        assert_eq!(r.bit_pos(), 12);
     }
 
     #[test]

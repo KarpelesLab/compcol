@@ -1,13 +1,16 @@
 //! Bounds-checked LZSS output buffer for StuffIt method 13.
 //!
-//! Method 13 is LZSS over a 64 KiB sliding window. Because the decoder
-//! buffers the whole compressed payload and decodes in one pass (the
-//! uncompressed size is known out of band — see [`super::decoder`]), the
-//! "window" is simply the growing output vector: a back-reference of
-//! distance `D` copies from `out.len() - D`. The 64 KiB window bound is
-//! enforced by rejecting distances larger than the window, and the
-//! "reaches before stream start" condition is rejected by requiring
-//! `D <= out.len()`.
+//! Method 13 is LZSS over a 64 KiB sliding window. The "window" is simply
+//! the end of the output vector: a back-reference of distance `D` copies
+//! from `out.len() - D`. The 64 KiB window bound is enforced by rejecting
+//! distances larger than the window, and the "reaches before stream start"
+//! condition is rejected by requiring `D <= out.len()`.
+//!
+//! `out` need not be the whole output. [`super::decoder`] hands decoded
+//! bytes on and drops them from the front, but always leaves at least a
+//! full window behind once that much has been produced, so `out.len()` is
+//! below the window size only while the whole output so far is still in it
+//! and the second check means what it says.
 //!
 //! The match copy is performed **one byte at a time** so overlapping
 //! (run-length) copies extend correctly when `D < L`. Every back-reference is

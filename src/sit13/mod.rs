@@ -46,6 +46,17 @@
 //! stops decoding at exactly `n` bytes and bounds output. See
 //! [`DecoderConfig`].
 //!
+//! ## Memory
+//!
+//! The decoder holds the compressed payload until `finish` says it is
+//! complete, then decodes it as output is asked for. The decoded fork is
+//! never held whole: beyond the payload, the decoder keeps the 64 KiB match
+//! window and a short read-ahead (about 230 KiB at most), however far the
+//! stream expands. A stream with no supplied length may decode to at most
+//! 256 MiB ([`Error::Corrupt`] beyond that); a caller's output limit
+//! ([`LimitedDecoder`](crate::limit::LimitedDecoder)) is enforced as the
+//! tokens are decoded, with [`Error::OutputLimitExceeded`].
+//!
 //! ## Encoder
 //!
 //! [`Error::Unsupported`]: no StuffIt encoder exists, so there is nothing to
