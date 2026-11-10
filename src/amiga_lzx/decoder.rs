@@ -88,6 +88,12 @@ struct RunCtx {
     stage: Vec<u8>,
     /// Cursor into `stage` for bytes already forwarded to the caller.
     stage_emitted: usize,
+    /// `finish` has appended one zero word past the end of the input. A
+    /// Huffman decode looks ahead by the tree's longest code, which can run
+    /// past the last real bit; the CAB decoder and libmspack pad the input
+    /// the same way. The pad may only be looked at: consuming any of it is
+    /// `UnexpectedEnd`.
+    eof_padded: bool,
 }
 
 enum BlockState {
@@ -261,6 +267,7 @@ impl RawDecoder for Decoder {
                         aligned_tree: None,
                         stage: Vec::with_capacity(STAGE_BYTES),
                         stage_emitted: 0,
+                        eof_padded: false,
                     };
                     // Trivially-empty streams (total == 0) skip straight to
                     // Done without parsing a single block.
@@ -339,9 +346,10 @@ impl RawDecoder for Decoder {
         }
         let mut written = 0usize;
         if let DecState::Running(ctx) = &mut self.state {
-            drain_stage(ctx, output, &mut written);
-            if ctx.output_so_far == ctx.output_total && ctx.stage_emitted == ctx.stage.len() {
-                self.state = DecState::Done;
+            match finish_running(ctx, output, &mut written) {
+                Ok(true) => self.state = DecState::Done,
+                Ok(false) => {}
+                Err(e) => return Err(self.poison(e)),
             }
         }
         match &self.state {
@@ -363,17 +371,13 @@ impl RawDecoder for Decoder {
                     Err(self.poison(Error::UnexpectedEnd))
                 }
             }
-            DecState::Running(_) => {
-                if written == 0 {
-                    Err(self.poison(Error::UnexpectedEnd))
-                } else {
-                    Ok(RawProgress {
-                        consumed: 0,
-                        written,
-                        done: false,
-                    })
-                }
-            }
+            // Bytes are still owed and `output` is full (or empty). That is
+            // not an error: the caller comes back with more room.
+            DecState::Running(_) => Ok(RawProgress {
+                consumed: 0,
+                written,
+                done: false,
+            }),
         }
     }
 
@@ -383,6 +387,44 @@ impl RawDecoder for Decoder {
             have: 0,
         };
         self.poisoned = false;
+    }
+}
+
+/// Run a stream to its end once the input is exhausted. `Ok(true)`: the
+/// declared total has been delivered. `Ok(false)`: decoded bytes are waiting
+/// for room in `output`. `UnexpectedEnd` only when nothing is pending and
+/// the remaining bits cannot produce any more output.
+fn finish_running(ctx: &mut RunCtx, output: &mut [u8], written: &mut usize) -> Result<bool, Error> {
+    loop {
+        drain_stage(ctx, output, written);
+        if ctx.output_so_far == ctx.output_total && ctx.stage_emitted == ctx.stage.len() {
+            return Ok(true);
+        }
+        if ctx.stage_emitted < ctx.stage.len() {
+            // `drain_stage` stopped short: `output` is full.
+            return Ok(false);
+        }
+        // Nothing staged. `decode` may have stopped on a full `output` with
+        // bits still buffered, and the last Huffman codes need the pad for
+        // their lookahead, so decode on before giving up.
+        if !ctx.eof_padded && ctx.bit_reader.can_pad_eof() {
+            ctx.bit_reader.pad_eof();
+            ctx.eof_padded = true;
+        }
+        let res = step(ctx);
+        // The pad is lookahead only. If any of it was consumed, the stream
+        // ended before its data did — whatever those bits then decoded to
+        // (output bytes, or some other error) is meaningless.
+        if ctx.bit_reader.eof_pad_consumed() {
+            return Err(Error::UnexpectedEnd);
+        }
+        res?;
+        // `step` returns with bytes staged or for want of input. Out of
+        // input with the pad in place is the end; without it (the reader
+        // was too full to pad) go round again, now that bits were used.
+        if ctx.stage.is_empty() && (ctx.eof_padded || !ctx.bit_reader.can_pad_eof()) {
+            return Err(Error::UnexpectedEnd);
+        }
     }
 }
 
@@ -422,15 +464,21 @@ fn emit_window(ctx: &mut RunCtx, b: u8) {
     ctx.stage.push(b);
 }
 
+/// Decoding must pause: a chunk is staged for the caller to drain, or the
+/// stream's declared total has been reached. The total ends the stream even
+/// inside a block whose BLOCK_SIZE runs past it — reading on would make the
+/// result depend on how much input happens to be buffered.
+fn stage_complete(ctx: &RunCtx) -> bool {
+    ctx.stage.len() >= STAGE_BYTES || ctx.output_so_far + ctx.stage.len() as u64 >= ctx.output_total
+}
+
 /// Run one or more state-machine substeps. Returns Ok when progress is
 /// blocked on more input or the staging buffer is full (callers re-enter).
 fn step(ctx: &mut RunCtx) -> Result<(), Error> {
     loop {
-        // Yield once we've staged a chunk so the caller can drain.
-        if ctx.stage.len() >= STAGE_BYTES {
-            return Ok(());
-        }
-        if ctx.output_so_far + ctx.stage.len() as u64 >= ctx.output_total {
+        // Yield once we've staged a chunk so the caller can drain, or once
+        // the stream is complete.
+        if stage_complete(ctx) {
             return Ok(());
         }
 
@@ -546,6 +594,15 @@ fn step(ctx: &mut RunCtx) -> Result<(), Error> {
                 // An odd-sized block's pad byte is the high half of its last
                 // word, dropped by the `remaining == 0` break below.
                 while remaining > 0 && ctx.bit_reader.bits_available() >= 16 {
+                    // The block's last byte may be the last byte of the
+                    // stream, its pad byte left off.
+                    if remaining == 1
+                        && let Some(b) = ctx.bit_reader.take_eof_half_byte()
+                    {
+                        emit_window(ctx, b);
+                        remaining = 0;
+                        break;
+                    }
                     let word = ctx.bit_reader.peek(16);
                     ctx.bit_reader.drop_bits(16);
                     let lo = (word & 0xFF) as u8;
@@ -669,7 +726,7 @@ fn step_huff(ctx: &mut RunCtx) -> Result<bool, Error> {
                                 ctx.block = BlockState::AwaitBlockHeader;
                                 return Ok(true);
                             }
-                            if ctx.stage.len() >= STAGE_BYTES {
+                            if stage_complete(ctx) {
                                 yield_progress!(HuffPhase::NextMain);
                             }
                             ph = HuffPhase::NextMain;
@@ -807,6 +864,12 @@ fn step_huff(ctx: &mut RunCtx) -> Result<bool, Error> {
                         ctx.block = BlockState::AwaitBlockHeader;
                         return Ok(true);
                     }
+                }
+                // The copy needs no input and always runs to its end
+                // (bytes past the declared total are dropped on drain),
+                // but nothing after the total may be read.
+                if stage_complete(ctx) {
+                    yield_progress!(HuffPhase::NextMain);
                 }
                 ph = HuffPhase::NextMain;
             }

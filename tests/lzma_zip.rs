@@ -370,6 +370,30 @@ fn truncation_is_an_error() {
     }
 }
 
+/// Size-only mode: a match that runs past the declared size is corrupt. It
+/// used to be cut at the size and reported as a complete stream, while a
+/// literal past the size was already an error.
+#[test]
+fn match_past_declared_size_is_corrupt() {
+    // 30 bytes that end inside a match.
+    let data = b"abcabcabcabcabcabcabcabcabcabc";
+    for eos in [false, true] {
+        let enc = encode(data, 6, eos);
+        let mut dec = Decoder::zip(false, Some(30));
+        assert_eq!(run(&mut dec, &enc, 1 << 20, 1 << 16).unwrap().0, data);
+        for len in [29u64, 26, 4] {
+            for (ic, oc) in [(1 << 20, 1 << 16), (1, 1), (7, 3)] {
+                let mut dec = Decoder::zip(false, Some(len));
+                assert_eq!(
+                    run(&mut dec, &enc, ic, oc),
+                    Err(Error::Corrupt),
+                    "eos {eos} len {len} chunks {ic}/{oc}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn reset_keeps_zip_mode() {
     let data = sample(3000);

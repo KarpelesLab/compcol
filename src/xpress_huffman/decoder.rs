@@ -1,10 +1,13 @@
 //! XPress Huffman streaming decoder.
 //!
-//! Strategy mirrors [`crate::lzx::decoder`]: buffer compressed bytes
-//! into a `Vec<u8>` and parse speculatively. The MS-XCA bit stream is
-//! variable-rate and intermixes raw escape bytes with bit-packed
-//! Huffman codes, so we keep the entire current block in memory and
-//! drive a register-based decoder against it.
+//! Compressed bytes are appended to an internal `Vec<u8>` and consumed by
+//! a register-based bit reader. The MS-XCA bit stream is variable-rate
+//! and intermixes raw escape bytes with bit-packed Huffman codes, but a
+//! single symbol never needs more than [`MAX_SYMBOL_INPUT_BYTES`] further
+//! input bytes. Decoding is therefore resumable per symbol: before a
+//! symbol is consumed the decoder checks that everything it needs is
+//! buffered, and otherwise stops there — with all earlier symbols already
+//! committed — until more input arrives.
 //!
 //! Multi-block streams are handled inline: when 65,536 output bytes
 //! have been produced for the current block we hand the next 256
@@ -18,7 +21,7 @@ use alloc::vec::Vec;
 use crate::error::Error;
 use crate::traits::{RawDecoder, RawProgress};
 
-use super::huffman::{DecodeTable, NUM_SYMBOLS, build_decode_table, unpack_lengths};
+use super::huffman::{DecodeTable, build_decode_table, unpack_lengths};
 
 const BLOCK_OUTPUT_BYTES: usize = 65536;
 /// Maximum back-reference distance. XPRESS-Huffman distances are bounded
@@ -32,6 +35,13 @@ const TABLE_BYTES: usize = 256;
 /// Each block reserves at least the table plus the initial 4 bytes for the
 /// 32-bit register prefill.
 const MIN_BLOCK_BYTES: usize = TABLE_BYTES + 4;
+/// Upper bound on the input bytes one symbol can pull in beyond what is
+/// already in the bit register: a refill word after the Huffman code (2),
+/// the length-escape byte (1) and its 16-bit extension (2), and a refill
+/// word after the distance bits (2). The code itself (≤ 15 bits) and the
+/// distance bits (≤ 15) always come out of the register, which holds at
+/// least 16 valid bits before each of them.
+const MAX_SYMBOL_INPUT_BYTES: usize = 7;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Phase {
@@ -44,6 +54,17 @@ enum Phase {
     /// transition to `Done`.
     DrainTail,
     Done,
+}
+
+/// Why [`Decoder::decode_loop`] returned without an error.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Stop {
+    /// The buffered input cannot complete the next block header or symbol.
+    NeedInput,
+    /// The undrained backlog reached the cap; drain and call again.
+    Backlog,
+    /// All `total_output` bytes have been produced.
+    Finished,
 }
 
 pub struct Decoder {
@@ -69,15 +90,24 @@ pub struct Decoder {
 
     // Per-block state, valid only while Phase::Decoding.
     table: Option<Box<DecodeTable>>,
-    lengths: [u8; NUM_SYMBOLS],
     next_bits: u32,
     extra_bit_count: i32,
     block_end_emitted: u64,
-    /// Set in `raw_finish` to let the bit-stream refill treat missing
-    /// trailing bytes as zero (the encoder emits trailing zero words for
-    /// the spec's eager-refill behaviour, but in case it falls short the
-    /// finishing path still drains correctly).
+    /// Set in `raw_finish`: no further input will arrive, so a refill that
+    /// finds the input exhausted may be satisfied by the single virtual
+    /// lookahead word described on `virtual_word`.
     finishing: bool,
+    /// Whether the one permitted virtual zero word has been shifted into the
+    /// register. MS-XCA refills eagerly after every symbol, so a decoder
+    /// legitimately reads up to 16 bits past the last symbol's bits and a
+    /// complete stream may end without that final lookahead word. Exactly
+    /// one such word is tolerated, and only as lookahead: it enters below
+    /// the register's remaining real bits, so decoding can only touch it by
+    /// driving `extra_bit_count` negative again — which demands a second
+    /// refill, and that one is refused with `UnexpectedEnd`. Hence no
+    /// fabricated bit is ever consumed as data. Once set, the input is
+    /// treated as exhausted for raw byte/word reads too.
+    virtual_word: bool,
 }
 
 impl Decoder {
@@ -93,11 +123,11 @@ impl Decoder {
             total_output: 0,
             output_emitted: 0,
             table: None,
-            lengths: [0u8; NUM_SYMBOLS],
             next_bits: 0,
             extra_bit_count: 0,
             block_end_emitted: 0,
             finishing: false,
+            virtual_word: false,
         }
     }
 
@@ -143,8 +173,8 @@ impl Decoder {
 
     /// Try to start (or restart) a block by parsing the 256-byte length
     /// table and the initial two 16-bit words. Returns `Ok(true)` if the
-    /// block was successfully primed, `Ok(false)` if more input is needed,
-    /// or `Err` on a malformed table.
+    /// block was successfully primed, `Ok(false)` if more input is needed
+    /// (nothing is consumed in that case), or `Err` on a malformed table.
     fn try_start_block(&mut self) -> Result<bool, Error> {
         let available = self.in_buf.len() - self.in_pos;
         if available < MIN_BLOCK_BYTES {
@@ -157,8 +187,8 @@ impl Decoder {
         let mut packed = [0u8; TABLE_BYTES];
         packed.copy_from_slice(&self.in_buf[self.in_pos..self.in_pos + TABLE_BYTES]);
         self.in_pos += TABLE_BYTES;
-        self.lengths = unpack_lengths(&packed);
-        self.table = Some(build_decode_table(&self.lengths)?);
+        let lengths = unpack_lengths(&packed);
+        self.table = Some(build_decode_table(&lengths)?);
 
         // Prefill the 32-bit register with two 16-bit LE words.
         let lo_a = self.in_buf[self.in_pos] as u32;
@@ -177,7 +207,7 @@ impl Decoder {
     /// Read a 16-bit LE word at the current in_pos. Returns `None` if
     /// the input is too short — caller treats this as truncated input.
     fn read_word(&mut self) -> Option<u16> {
-        if self.in_pos + 2 > self.in_buf.len() {
+        if self.virtual_word || self.in_pos + 2 > self.in_buf.len() {
             return None;
         }
         let lo = self.in_buf[self.in_pos] as u16;
@@ -187,7 +217,7 @@ impl Decoder {
     }
 
     fn read_byte(&mut self) -> Option<u8> {
-        if self.in_pos >= self.in_buf.len() {
+        if self.virtual_word || self.in_pos >= self.in_buf.len() {
             return None;
         }
         let b = self.in_buf[self.in_pos];
@@ -195,15 +225,74 @@ impl Decoder {
         Some(b)
     }
 
+    /// Top the register back up after bits were dropped: when
+    /// `extra_bit_count` went negative, shift in the next 16-bit word.
+    ///
+    /// If the input is exhausted and the stream is finishing, the first
+    /// such refill is satisfied with a virtual zero word (pure lookahead,
+    /// see `virtual_word`); any later one means real data bits are missing
+    /// and yields `UnexpectedEnd`.
+    fn refill(&mut self) -> Result<(), Error> {
+        if self.extra_bit_count < 0 {
+            let w: u32 = match self.read_word() {
+                Some(w) => w as u32,
+                None if self.finishing && !self.virtual_word => {
+                    self.virtual_word = true;
+                    0
+                }
+                None => return Err(Error::UnexpectedEnd),
+            };
+            self.next_bits |= w << (-self.extra_bit_count);
+            self.extra_bit_count += 16;
+        }
+        Ok(())
+    }
+
+    /// Whether the buffered input holds every byte that decoding `symbol`
+    /// (whose code is `len` bits and sits at the top of the register) will
+    /// read: the refill word after the code, the length-escape byte(s), and
+    /// the refill word after the distance bits. This mirrors the reads in
+    /// [`Self::decode_loop`] exactly, so when it returns `true` none of them
+    /// can fail and the symbol can be consumed without any way back.
+    fn symbol_input_buffered(&self, symbol: u16, len: u32) -> bool {
+        let avail = self.in_buf.len() - self.in_pos;
+        if avail >= MAX_SYMBOL_INPUT_BYTES {
+            return true;
+        }
+        let mut need = 0usize;
+        let mut bits = self.extra_bit_count - len as i32;
+        if bits < 0 {
+            need += 2;
+            bits += 16;
+        }
+        if symbol >= 256 {
+            let match_sym = symbol as usize - 256;
+            if match_sym & 15 == 15 {
+                // The escape byte sits right after the refill word (if any);
+                // its value decides whether a 16-bit extension follows.
+                match self.in_buf.get(self.in_pos + need) {
+                    None => return false,
+                    Some(&255) => need += 3,
+                    Some(_) => need += 1,
+                }
+            }
+            if bits - ((match_sym >> 4) as i32) < 0 {
+                need += 2;
+            }
+        }
+        avail >= need
+    }
+
     /// Decode as many symbols as the buffered input allows, appending to
-    /// `self.decoded`. Stops at end-of-block (transitions to a new block
-    /// or to `DrainTail`), at exhausted input (returns `Ok(())`), or on
-    /// malformed input.
-    fn decode_loop(&mut self, cap: usize) -> Result<(), Error> {
+    /// `self.decoded`. Every symbol is consumed whole or not at all, so
+    /// whatever this returns — including [`Stop::NeedInput`] — the decoder
+    /// state is consistent and a later call resumes exactly where this one
+    /// stopped.
+    fn decode_loop(&mut self, cap: usize) -> Result<Stop, Error> {
         loop {
             if self.output_emitted == self.total_output {
                 self.phase = Phase::DrainTail;
-                return Ok(());
+                return Ok(Stop::Finished);
             }
             // Output back-pressure: `decode_loop` would otherwise keep
             // decoding across every buffered block (the block-boundary
@@ -215,98 +304,77 @@ impl Decoder {
             // `raw_decode` can drain into `output` and resume on the next
             // call. State lives on `self`, so resuming is seamless.
             if self.decoded.len() - self.decoded_idx >= cap {
-                return Ok(());
+                return Ok(Stop::Backlog);
             }
             if self.output_emitted >= self.block_end_emitted {
                 // Block boundary: try to start the next block. If input
                 // isn't sufficient yet, exit and wait for more.
                 self.table = None;
                 if !self.try_start_block()? {
-                    return Ok(());
+                    return Ok(Stop::NeedInput);
                 }
                 continue;
             }
 
-            // Need 15 bits available in NextBits to peek a symbol.
-            // The register always carries `extra_bit_count + 16` valid
-            // bits in its top portion; we have a symbol's worth when
-            // that count is at least 15 plus whatever we've already
-            // dropped beyond. The pseudocode just peeks blindly because
-            // refills are triggered by ExtraBitCount going below zero
-            // AFTER a drop. We follow the same shape — but we need to
-            // guarantee the next refill is buffered (2 bytes per word)
-            // so we don't panic on partial input.
+            // Peek the next symbol. The register always holds at least 16
+            // valid bits here (`extra_bit_count >= 0` after every refill),
+            // so the ≤ 15-bit code at its top is fully determined.
+            //
             // Invariant: a block is always primed before the symbol loop is
             // entered. Treat a missing table as corrupt input rather than
             // panicking, so the no-panic-on-untrusted-input guarantee holds
             // structurally even if that invariant is ever weakened.
             let table = match self.table.as_ref() {
                 Some(t) => t,
-                None => return Err(self.poison(Error::Corrupt)),
+                None => return Err(Error::Corrupt),
             };
             let idx = (self.next_bits >> (32 - 15)) as usize;
             let (symbol, len) = table[idx];
             let len = len as u32;
+
+            // Commit point. While more input may still arrive, only consume
+            // a symbol whose every read is already buffered; otherwise stop
+            // *before* it, keeping all earlier symbols. When finishing there
+            // is nothing to wait for: go ahead, and a read that falls off
+            // the end of the input is a genuine `UnexpectedEnd`.
+            if !self.finishing && !self.symbol_input_buffered(symbol, len) {
+                return Ok(Stop::NeedInput);
+            }
+
             // Drop the code bits.
             self.next_bits = self.next_bits.wrapping_shl(len);
             self.extra_bit_count -= len as i32;
-            if self.extra_bit_count < 0 {
-                let w: u32 = match self.read_word() {
-                    Some(w) => w as u32,
-                    None if self.finishing || self.output_emitted == self.total_output => {
-                        // No more input; zero-fill the refill so the
-                        // top-of-loop end-of-output check can fire.
-                        0
-                    }
-                    None => return Err(Error::UnexpectedEnd),
-                };
-                self.next_bits |= w << (-self.extra_bit_count);
-                self.extra_bit_count += 16;
-            }
+            self.refill()?;
 
             if (symbol as usize) < 256 {
-                if self.output_emitted >= self.total_output {
-                    // Garbage symbol past expected end — ignore.
-                    continue;
-                }
                 self.emit_byte(symbol as u8);
                 continue;
             }
 
-            // Match symbol.
+            // Match symbol. Symbol 256 doubles as the end-of-stream marker,
+            // but only once the expected output length has been reached —
+            // and the check at the top of the loop stops decoding at that
+            // point, so here (output still pending) it is always a real
+            // match of length 3, distance 1.
             let match_sym = symbol as usize - 256;
             let length_class = (match_sym & 15) as u32;
             let dist_hi = (match_sym >> 4) as u32;
 
-            let length_short_or_escape = length_class;
-            let mut match_length: u32 = length_short_or_escape;
-            if length_short_or_escape == 15 {
+            let mut match_length: u32 = length_class;
+            if length_class == 15 {
                 let byte = self.read_byte().ok_or(Error::UnexpectedEnd)?;
                 let mut len_extra = byte as u32;
                 if len_extra == 255 {
                     let word = self.read_word().ok_or(Error::UnexpectedEnd)?;
                     let word = word as u32;
                     if word < 15 {
-                        return Err(self.poison(Error::Corrupt));
+                        return Err(Error::Corrupt);
                     }
                     len_extra = word - 15;
                 }
                 match_length = len_extra + 15;
             }
             match_length += 3;
-
-            if symbol == 256 && self.output_emitted == self.total_output {
-                // EOF sentinel. Per MS-XCA the decoder accepts this only
-                // when the entire input buffer has been read AND the
-                // expected output length is met. Our framing carries the
-                // expected length explicitly, so we treat EOF as a
-                // padding marker that just consumes one symbol. Real
-                // termination is driven by `output_emitted == total_output`.
-                continue;
-            }
-            // Sym=256 with output still pending is a real match of
-            // (length=3, distance=1). Falls through to distance-extra
-            // decoding below.
 
             // Distance extras.
             let dist_low: u32 = if dist_hi == 0 {
@@ -315,11 +383,7 @@ impl Decoder {
                 let v = self.next_bits >> (32 - dist_hi);
                 self.next_bits = self.next_bits.wrapping_shl(dist_hi);
                 self.extra_bit_count -= dist_hi as i32;
-                if self.extra_bit_count < 0 {
-                    let w = self.read_word().ok_or(Error::UnexpectedEnd)? as u32;
-                    self.next_bits |= w << (-self.extra_bit_count);
-                    self.extra_bit_count += 16;
-                }
+                self.refill()?;
                 v
             };
             let match_offset = dist_low + (1u32 << dist_hi);
@@ -329,7 +393,7 @@ impl Decoder {
             // rejects distances that reach before the start of the stream
             // and prevents an underflow when `decoded` has been drained.
             if (match_offset as usize) > self.out_history.len() {
-                return Err(self.poison(Error::InvalidDistance));
+                return Err(Error::InvalidDistance);
             }
 
             // Byte-by-byte copy: match length may exceed match offset
@@ -395,80 +459,40 @@ impl RawDecoder for Decoder {
                     if self.total_output == 0 {
                         self.phase = Phase::Done;
                     } else {
-                        // Prime the first block.
-                        if !self.try_start_block()? {
-                            self.phase = Phase::Decoding;
-                            // re-enter loop, will re-attempt or break
-                            // depending on state.
-                            // Actually try_start_block returns false only
-                            // when input insufficient; we should break.
-                            break;
-                        }
+                        // The first block is primed by `Phase::Decoding`.
                         self.phase = Phase::Decoding;
                     }
                 }
                 Phase::Decoding => {
-                    if self.table.is_none() && !self.try_start_block()? {
-                        break;
+                    if self.table.is_none() {
+                        match self.try_start_block() {
+                            Ok(true) => {}
+                            Ok(false) => break,
+                            Err(e) => return Err(self.poison(e)),
+                        }
                     }
-                    // Snapshot for rewind in case decode_loop hits EOF mid-symbol.
-                    // Also snapshot phase/table so a block transition mid-
-                    // decode_loop can be rolled back if the new block's
-                    // bit stream is truncated.
-                    let snap_in_pos = self.in_pos;
-                    let snap_next_bits = self.next_bits;
-                    let snap_extra = self.extra_bit_count;
-                    let snap_decoded_len = self.decoded.len();
-                    let snap_output_emitted = self.output_emitted;
-                    let snap_block_end = self.block_end_emitted;
-                    let snap_phase = self.phase;
-                    let snap_table = self.table.clone();
-                    let snap_lengths = self.lengths;
-                    // The retained history is mutated in place (appended to
-                    // and trimmed), so unlike `decoded` it cannot be undone
-                    // with a `truncate`. Snapshot it so an `UnexpectedEnd`
-                    // rollback restores it exactly. It is bounded by
-                    // `MAX_DISTANCE`, and this clone happens at most once per
-                    // `raw_decode` call, not per symbol.
-                    let snap_out_history = self.out_history.clone();
                     // Bound the backlog `decode_loop` may build up to what the
                     // caller can drain this round, plus one block of slack (a
                     // single match copy can emit up to a block before the cap
                     // is re-checked).
                     let cap = (output.len() - written).saturating_add(BLOCK_OUTPUT_BYTES);
-                    match self.decode_loop(cap) {
-                        Ok(()) => {}
-                        Err(Error::UnexpectedEnd) => {
-                            // Roll back: not a real error, just need more
-                            // input.
-                            self.in_pos = snap_in_pos;
-                            self.next_bits = snap_next_bits;
-                            self.extra_bit_count = snap_extra;
-                            self.decoded.truncate(snap_decoded_len);
-                            self.output_emitted = snap_output_emitted;
-                            self.block_end_emitted = snap_block_end;
-                            self.phase = snap_phase;
-                            self.table = snap_table;
-                            self.lengths = snap_lengths;
-                            self.out_history = snap_out_history;
-                            break;
-                        }
+                    // Decoding commits symbol by symbol, so there is nothing
+                    // to roll back: an error here is final.
+                    let stop = match self.decode_loop(cap) {
+                        Ok(stop) => stop,
                         Err(e) => return Err(self.poison(e)),
-                    }
+                    };
 
                     // Drain newly decoded bytes.
                     written += self.drain_decoded_into(&mut output[written..]);
                     if written == output.len() && self.phase != Phase::Done {
                         break;
                     }
-                    if self.phase == Phase::Decoding {
-                        // decode_loop exited because of input exhaustion or
-                        // block transition (handled inside) — re-loop
-                        // unless decoded is empty and we made no progress.
-                        if snap_in_pos == self.in_pos && snap_decoded_len == self.decoded.len() {
-                            break;
-                        }
+                    if stop == Stop::NeedInput {
+                        break;
                     }
+                    // `Backlog` with room left in `output` (the backlog was
+                    // just drained) or `Finished`: go around again.
                 }
                 Phase::DrainTail => {
                     written += self.drain_decoded_into(&mut output[written..]);
@@ -518,8 +542,12 @@ impl RawDecoder for Decoder {
             written += p.written;
         })?;
         let done = matches!(self.phase, Phase::Done);
-        if !done && self.decoded.is_empty() && self.in_buf.len() == self.in_pos {
-            // Genuine unexpected end.
+        if !done && written == 0 && self.decoded.is_empty() && !output.is_empty() {
+            // No further input is coming, there was room to write, and yet
+            // nothing was produced and nothing is queued: the stream stops
+            // short of a header, a block table or a symbol. Leftover bytes in
+            // `in_buf` do not change that — they can never be completed — so
+            // this is a genuine unexpected end, not a "call again".
             return Err(self.poison(Error::UnexpectedEnd));
         }
         Ok(RawProgress {
@@ -540,10 +568,10 @@ impl RawDecoder for Decoder {
         self.total_output = 0;
         self.output_emitted = 0;
         self.table = None;
-        self.lengths = [0u8; NUM_SYMBOLS];
         self.next_bits = 0;
         self.extra_bit_count = 0;
         self.block_end_emitted = 0;
         self.finishing = false;
+        self.virtual_word = false;
     }
 }

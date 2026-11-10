@@ -234,6 +234,17 @@ fn auto_detect_unknown_format_is_usage_error() {
 }
 
 #[test]
+fn auto_detect_failure_names_the_real_flag() {
+    // The hint must name a flag that exists: the option is `--type` / `-t`
+    // (there is no `--algo`).
+    let (_out, err, code) = run_with_stdin(&["-d"], b"this is not a compressed stream at all");
+    assert_eq!(code, 2);
+    let s = String::from_utf8_lossy(&err);
+    assert!(s.contains("--type"), "stderr: {s}");
+    assert!(!s.contains("--algo"), "stderr: {s}");
+}
+
+#[test]
 fn pipe_round_trip_zlib() {
     let input = b"compress me through zlib".to_vec();
     let (encoded, _err, code) = run_with_stdin(&["-t", "zlib"], &input);
@@ -528,4 +539,215 @@ fn level_ignored_on_algorithms_without_a_level_knob() {
     let (back, _err, code) = run_with_stdin(&["-t", "rle", "-d", "-c"], &out);
     assert_eq!(code, 0);
     assert_eq!(back, b"aaaa");
+}
+
+// ─── output-file safety ─────────────────────────────────────────────────
+
+#[test]
+fn unknown_algorithm_does_not_truncate_force_target() {
+    // The algorithm must be validated before the output is opened: with -f
+    // an unknown -t used to truncate the existing target and then bail out.
+    for mode in [&[][..], &["-d"][..]] {
+        let s = Scratch::new("unknown_algo_force");
+        let input = s.file("in.txt");
+        let keep = s.file("keep.txt");
+        fs::write(&input, b"input data").unwrap();
+        fs::write(&keep, b"precious user data").unwrap();
+
+        let mut args = vec!["-t", "nosuch", "-f", "-o", keep.to_str().unwrap()];
+        args.extend_from_slice(mode);
+        args.push(input.to_str().unwrap());
+        let (_out, err, code) = run(&args);
+        assert_eq!(code, 2, "stderr: {}", String::from_utf8_lossy(&err));
+        assert!(
+            String::from_utf8_lossy(&err).contains("unknown algorithm"),
+            "{}",
+            String::from_utf8_lossy(&err)
+        );
+        assert_eq!(file_contents(&keep), b"precious user data");
+        assert_eq!(file_contents(&input), b"input data");
+    }
+}
+
+#[test]
+fn unknown_algorithm_does_not_create_output() {
+    for mode in [&[][..], &["-d"][..]] {
+        let s = Scratch::new("unknown_algo_new");
+        let input = s.file("in.txt");
+        let out = s.file("new.out");
+        fs::write(&input, b"input data").unwrap();
+
+        let mut args = vec!["-t", "nosuch", "-o", out.to_str().unwrap()];
+        args.extend_from_slice(mode);
+        args.push(input.to_str().unwrap());
+        let (_out, err, code) = run(&args);
+        assert_eq!(code, 2, "stderr: {}", String::from_utf8_lossy(&err));
+        assert!(!out.exists(), "an empty output file was left behind");
+        assert!(input.exists());
+    }
+}
+
+#[test]
+fn force_refuses_output_that_is_the_input() {
+    // `-f -o X X` used to truncate X before reading it, "successfully"
+    // replacing the input with a compressed empty stream.
+    let s = Scratch::new("same_file");
+    let same = s.file("same.txt");
+    fs::write(&same, b"precious\n").unwrap();
+    // Same file through a different spelling of the path.
+    let respelled = s.path.join(".").join("same.txt");
+
+    for out in [&same, &respelled] {
+        let (_out, err, code) = run(&[
+            "-t",
+            "gzip",
+            "-f",
+            "-o",
+            out.to_str().unwrap(),
+            same.to_str().unwrap(),
+        ]);
+        assert_ne!(code, 0, "must refuse to overwrite the input with itself");
+        assert!(
+            String::from_utf8_lossy(&err).contains("same file"),
+            "{}",
+            String::from_utf8_lossy(&err)
+        );
+        assert_eq!(file_contents(&same), b"precious\n");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn in_place_decompress_keeps_non_utf8_name_bytes() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    // Stripping the extension went through a lossy UTF-8 conversion, so
+    // `f\xFF.gz` decompressed to `f` + U+FFFD (and distinct inputs could
+    // collide on that one mangled name) before the input was removed.
+    let (gz, _err, code) = run_with_stdin(&["-t", "gzip"], b"non-utf8 name payload");
+    assert_eq!(code, 0);
+
+    let s = Scratch::new("non_utf8");
+    let input = s.path.join(OsString::from_vec(b"f\xff.gz".to_vec()));
+    let expected = s.path.join(OsString::from_vec(b"f\xff".to_vec()));
+    if fs::write(&input, &gz).is_err() {
+        // Some filesystems (APFS, for one) reject names that aren't UTF-8.
+        println!("skipping: filesystem rejects non-UTF-8 file names");
+        return;
+    }
+
+    let out = Command::new(BIN)
+        .arg("-d")
+        .arg(&input)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn compcol");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!input.exists(), "input should have been removed");
+    assert!(
+        !s.file("f\u{FFFD}").exists(),
+        "output name was mangled to U+FFFD"
+    );
+    assert_eq!(file_contents(&expected), b"non-utf8 name payload");
+}
+
+/// Permission bits of `p`.
+#[cfg(unix)]
+fn mode_of(p: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(p).expect("stat").permissions().mode() & 0o777
+}
+
+#[cfg(unix)]
+fn set_mode(p: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(p, fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+#[cfg(unix)]
+#[test]
+fn output_inherits_input_permissions() {
+    // The output used to be created with the default mode (0666 & !umask),
+    // so compressing a 0600 file produced a world-readable copy of it — and
+    // in-place mode then removed the protected original.
+    for mode in [0o600, 0o640] {
+        let s = Scratch::new("perms");
+        let secret = s.file("secret");
+        fs::write(&secret, b"s3cret\n").unwrap();
+        set_mode(&secret, mode);
+
+        // In-place compress.
+        let (_out, err, code) = run(&["-t", "gzip", secret.to_str().unwrap()]);
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+        let gz = s.file("secret.gz");
+        assert_eq!(mode_of(&gz), mode, "compressed output mode");
+
+        // In-place decompress.
+        let (_out, err, code) = run(&["-d", gz.to_str().unwrap()]);
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+        assert_eq!(mode_of(&secret), mode, "decompressed output mode");
+        assert_eq!(file_contents(&secret), b"s3cret\n");
+
+        // Explicit -o, onto an existing more permissive file with --force.
+        let other = s.file("other.gz");
+        fs::write(&other, b"old").unwrap();
+        set_mode(&other, 0o666);
+        let (_out, err, code) = run(&[
+            "-t",
+            "gzip",
+            "-f",
+            "-o",
+            other.to_str().unwrap(),
+            secret.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+        assert_eq!(mode_of(&other), mode, "--force output mode");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn output_from_stdin_keeps_default_permissions() {
+    // With no input file there is no mode to copy: the output gets whatever
+    // a plainly created file gets under the current umask.
+    let s = Scratch::new("perms_stdin");
+    let reference = s.file("reference");
+    fs::write(&reference, b"x").unwrap();
+    let out = s.file("out.gz");
+
+    let (_out, err, code) = run_with_stdin(&["-t", "gzip", "-o", out.to_str().unwrap()], b"data");
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+    assert_eq!(mode_of(&out), mode_of(&reference));
+}
+
+#[cfg(unix)]
+#[test]
+fn force_refuses_output_hard_linked_to_the_input() {
+    // Two names, one inode: path comparison can't see it, dev/ino can.
+    let s = Scratch::new("same_inode");
+    let input = s.file("data.txt");
+    let link = s.file("alias.txt");
+    fs::write(&input, b"precious\n").unwrap();
+    fs::hard_link(&input, &link).unwrap();
+
+    let (_out, err, code) = run(&[
+        "-t",
+        "gzip",
+        "-f",
+        "-o",
+        link.to_str().unwrap(),
+        input.to_str().unwrap(),
+    ]);
+    assert_ne!(code, 0, "must refuse to overwrite the input with itself");
+    assert!(
+        String::from_utf8_lossy(&err).contains("same file"),
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+    assert_eq!(file_contents(&input), b"precious\n");
 }

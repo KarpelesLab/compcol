@@ -826,10 +826,13 @@ pub struct Encoder {
     state: EncState,
     /// True once we've emitted a BFINAL=1 block; finish() will not produce more.
     final_emitted: bool,
-    /// True while `raw_flush` is mid-emission of a sync marker — distinguishes
-    /// "out_buffer holds the marker from a prior partial flush" (drain only)
-    /// from "out_buffer is empty at entry" (emit marker, then drain).
-    /// Cleared once the marker has been fully forwarded to the caller.
+    /// True from the moment `raw_flush` writes its marker to `out_buffer`
+    /// until a flush call reports it complete — distinguishes "the marker
+    /// of a prior partial flush is still owed, or just went out" (drain
+    /// only) from "nothing flushed yet" (emit a block and a marker, then
+    /// drain). Also cleared when `raw_encode` accepts input in between: the
+    /// earlier marker no longer covers everything, so the next flush starts
+    /// afresh.
     mid_flush: bool,
     /// Match-finder tuning derived from [`EncoderConfig::level`]. Persisted
     /// across `reset` since configuration is meant to survive resets.
@@ -1535,6 +1538,13 @@ impl RawEncoder for Encoder {
                 self.window
                     .extend_from_slice(&input[consumed..consumed + to_copy]);
                 consumed += to_copy;
+                if to_copy > 0 {
+                    // New input after a flush that was cut short (its
+                    // marker is out by now, or this state would not be
+                    // `Accepting`): the next flush is a new one, and owes
+                    // a block for this input and a marker of its own.
+                    self.mid_flush = false;
+                }
 
                 let lookahead = self.window.len() - self.cursor;
                 if lookahead >= self.block_size {
@@ -1694,7 +1704,17 @@ impl Encoder {
             // for this flush call. Encode any pending lookahead into a
             // non-final block, then emit the empty stored-block sync
             // marker into out_buffer.
-            debug_assert!(!self.mid_flush);
+            if self.mid_flush {
+                // The marker of a flush that was cut short went out through
+                // `encode` calls, which took no input since: nothing is
+                // owed, that flush is complete.
+                self.mid_flush = false;
+                return Ok(RawProgress {
+                    consumed: 0,
+                    written,
+                    done: true,
+                });
+            }
             let remaining = self.window.len() - self.cursor;
             if remaining > 0 {
                 // Compress everything we have. Use a non-final block so

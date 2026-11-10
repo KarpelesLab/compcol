@@ -13,6 +13,9 @@ on:
       - '.github/workflows/fuzz.yml'
   workflow_dispatch: {}
 
+permissions:
+  contents: read
+
 jobs:
   fuzz:
     name: ${{ matrix.target }}
@@ -49,6 +52,7 @@ jobs:
           - decoder_lzss
           - decoder_lzham
           - decoder_lha
+          - decoder_h2_huffman
           - decoder_bcj
           - decoder_delta
           - decoder_arc_crunch

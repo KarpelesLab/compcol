@@ -9,9 +9,16 @@
 //! never re-parsed. (The reference bzip2 source suspends its state
 //! machine at any bit for the same effect.)
 //!
-//! Once a block's end-of-block symbol is seen we invert MTF, BWT,
-//! the optional randomisation and RLE-1, check the block CRC, and hold
-//! the raw bytes in `decoded` to drain into the caller's output buffer.
+//! Once a block's end-of-block symbol is seen we invert MTF, BWT and
+//! the optional randomisation, and keep the result (at most the block
+//! size, 900 kB). The last step, the inverse of RLE-1, is run straight
+//! into the caller's output buffer as it drains, as libbzip2 does: a
+//! block of maximal runs expands 51-fold, and materialising that would
+//! hold tens of megabytes whatever output limit the caller applies. The
+//! block CRC is therefore computed over the bytes as they are handed
+//! out and checked once the block is exhausted, so a corrupt block's
+//! bytes are emitted before the mismatch is reported (again as
+//! libbzip2).
 //!
 //! What is accepted follows libbzip2 (`decompress.c`), not a stricter
 //! reading of the format: code tables need not be complete prefix codes
@@ -33,7 +40,6 @@ use super::bwt::bwt_inverse;
 use super::crc::Crc32;
 use super::huffman::{DecodeTable, MAX_CODE_LEN};
 use super::mtf::mtf_inverse_reduced;
-use super::rle::rle1_inverse;
 
 const BLOCK_MAGIC: u64 = 0x3141_5926_5359;
 const STREAM_END_MAGIC: u64 = 0x1772_4538_5090;
@@ -42,6 +48,34 @@ const STREAM_END_MAGIC: u64 = 0x1772_4538_5090;
 /// 900 000 symbols plus EOB, in groups of 50); libbzip2 reads and drops
 /// them, since some encoders round the count up.
 const MAX_SELECTORS: usize = 18002;
+
+/// How much of the caller's input is copied into `in_buf` at a time, and
+/// how far the parser may get into `in_buf` before the bytes behind it
+/// are dropped. Input is only taken when the parser has run dry, so a
+/// call copies at most one window more than it consumes.
+const INPUT_WINDOW: usize = 64 * 1024;
+
+/// Upper bound, in bits, on a block header (everything between the block
+/// magic and the first Huffman symbol); a longer one is `Error::Corrupt`.
+///
+/// The format itself sets no limit: each code length is reached from the
+/// previous one by `+1`/`-1` steps, and nothing stops a stream stepping
+/// up and down forever (libbzip2 keeps reading too), which would have us
+/// buffer input without end while waiting for the header to finish. But
+/// everything else in a header is bounded, and an encoder that steps
+/// straight from one length to the next needs little:
+///
+/// * CRC, randomised bit, origin, symbol map, table and selector counts:
+///   `32 + 1 + 24 + 16 + 16 * 16 + 3 + 15` = 347 bits;
+/// * selectors: at most 32 767 (a 15-bit count) of at most 6 bits;
+/// * code lengths: at most 6 tables of 258 symbols, each 5 bits to start
+///   and, per symbol, at most 19 steps of 2 bits (lengths stay within
+///   1..=20) and a stop bit.
+///
+/// That is 347 + 196 602 + 60 402 bits, under 32 KiB. 256 KiB leaves any
+/// plausible encoder a wide margin and still keeps the decoder's input
+/// buffer small.
+const MAX_BLOCK_HEADER_BITS: usize = 8 * 256 * 1024;
 
 /// bzip2 decoder configuration.
 ///
@@ -121,7 +155,7 @@ enum Phase {
     /// Block header parsed; decoding its Huffman symbols, state in
     /// `block`.
     Symbols,
-    /// A block is decoded and waiting in `decoded` to be drained.
+    /// A block is decoded and waiting in `out` to be drained.
     DrainDecoded,
     /// End-of-stream magic seen; reading combined CRC.
     StreamCrc,
@@ -131,8 +165,7 @@ enum Phase {
     /// else is trailing garbage, ignored as the reference tool does).
     /// Only reached with [`DecoderConfig::multi_stream`].
     BetweenStreams,
-    /// Stream successfully terminated; drain any remaining decoded
-    /// bytes and return `done=true`.
+    /// Stream successfully terminated; return `done=true`.
     Done,
 }
 
@@ -160,6 +193,73 @@ struct BlockDecode {
     zero_weight: u32,
 }
 
+/// A decoded block, as it came out of the inverse BWT (and
+/// de-randomisation): still RLE-1 coded, and expanded on the way out.
+struct BlockOut {
+    data: Vec<u8>,
+    /// Next byte of `data` to read.
+    pos: usize,
+    /// The byte of the current run.
+    last: u8,
+    /// Length so far of the current run of equal bytes in `data`, 0..=4.
+    /// After four, the next byte of `data` is a repeat count.
+    run: u8,
+    /// Copies of `last` still owed from a repeat count.
+    repeat: u8,
+    /// CRC of the bytes handed out so far.
+    crc: Crc32,
+    stored_crc: u32,
+}
+
+impl BlockOut {
+    /// Expand into `output[*written..]`, advancing `written`. Returns
+    /// `true` once the whole block has been handed out.
+    fn expand(&mut self, output: &mut [u8], written: &mut usize) -> bool {
+        let start = *written;
+        let mut w = start;
+        loop {
+            if self.repeat > 0 {
+                let n = (self.repeat as usize).min(output.len() - w);
+                if n == 0 {
+                    break;
+                }
+                output[w..w + n].fill(self.last);
+                self.repeat -= n as u8;
+                w += n;
+                continue;
+            }
+            let Some(&b) = self.data.get(self.pos) else {
+                break;
+            };
+            if self.run == 4 {
+                // The count after four equal bytes. (A block may end
+                // right after the four, with no count: libbzip2 takes
+                // that too.) Taken even when the output is full, so a
+                // block is never left pending with nothing to emit.
+                self.pos += 1;
+                self.repeat = b;
+                self.run = 0;
+                continue;
+            }
+            if w == output.len() {
+                break;
+            }
+            self.pos += 1;
+            if self.run > 0 && b == self.last {
+                self.run += 1;
+            } else {
+                self.last = b;
+                self.run = 1;
+            }
+            output[w] = b;
+            w += 1;
+        }
+        self.crc.update(&output[start..w]);
+        *written = w;
+        self.pos == self.data.len() && self.repeat == 0
+    }
+}
+
 pub struct Decoder {
     config: DecoderConfig,
 
@@ -170,9 +270,9 @@ pub struct Decoder {
     /// Everything before `bit_pos / 8` is no longer needed.
     bit_pos: usize,
 
-    /// Decoded raw bytes waiting to be delivered to the caller.
-    decoded: Vec<u8>,
-    decoded_idx: usize,
+    /// The decoded block being delivered to the caller, in
+    /// `Phase::DrainDecoded`.
+    out: Option<BlockOut>,
 
     /// The block being decoded, in `Phase::Symbols`.
     block: Option<Box<BlockDecode>>,
@@ -199,6 +299,10 @@ pub struct Decoder {
     /// requiring 1/8 more input per retry bounds the total work at a
     /// constant multiple of the header size.
     retry_at: usize,
+
+    /// Total bytes ever copied into `in_buf`, for the tests.
+    #[cfg(test)]
+    copied_in: usize,
 }
 
 impl Decoder {
@@ -211,8 +315,7 @@ impl Decoder {
             config,
             in_buf: Vec::new(),
             bit_pos: 0,
-            decoded: Vec::new(),
-            decoded_idx: 0,
+            out: None,
             block: None,
             combined_crc: 0,
             level: 0,
@@ -220,7 +323,15 @@ impl Decoder {
             poisoned: false,
             finishing: false,
             retry_at: 0,
+            #[cfg(test)]
+            copied_in: 0,
         }
+    }
+
+    /// Decoded bytes held for the caller, for the tests.
+    #[cfg(test)]
+    fn buffered_out(&self) -> usize {
+        self.out.as_ref().map_or(0, |o| o.data.len())
     }
 
     fn poison(&mut self, e: Error) -> Error {
@@ -229,7 +340,7 @@ impl Decoder {
     }
 
     /// Try to make progress: parse whatever the buffered input
-    /// supports, populating `self.decoded`. Returns `Ok(true)` if we
+    /// supports, populating `self.out`. Returns `Ok(true)` if we
     /// made any state-machine progress, `Ok(false)` if we genuinely
     /// need more input or the decoded bytes must be drained first.
     fn step(&mut self) -> Result<bool, Error> {
@@ -443,6 +554,11 @@ impl Decoder {
                     if !(1..=(MAX_CODE_LEN as i32)).contains(&cur) {
                         return Err(Error::Corrupt);
                     }
+                    // The one loop in a header that the format does
+                    // not bound.
+                    if br.position() - pos > MAX_BLOCK_HEADER_BITS {
+                        return Err(Error::Corrupt);
+                    }
                 }
                 *symbol_len = cur as u8;
             }
@@ -468,7 +584,7 @@ impl Decoder {
 
     /// Decode as many of the current block's symbols as the buffered
     /// input holds. On the end-of-block symbol, reconstruct the block
-    /// into `decoded`.
+    /// (up to the inverse BWT) into `out`.
     fn decode_symbols(&mut self) -> Result<bool, Error> {
         let mut blk = self.block.take().expect("Symbols phase without a block");
         let start = self.bit_pos;
@@ -547,7 +663,8 @@ impl Decoder {
         }
 
         // mtf_indices is the L-column-after-MTF stream; invert MTF, then
-        // invert BWT, then the randomisation, then RLE-1.
+        // invert BWT, then the randomisation. RLE-1 is undone as the
+        // block drains, and the block CRC checked at its end.
         let l_column = mtf_inverse_reduced(&blk.mtf_indices, &blk.alphabet);
         drop(blk.mtf_indices);
         if blk.origin as usize >= l_column.len() {
@@ -557,44 +674,59 @@ impl Decoder {
         if blk.randomised {
             derandomise(&mut bwt);
         }
-        let raw = rle1_inverse(&bwt);
-
-        // Validate the per-block CRC.
-        let mut crc = Crc32::new();
-        crc.update(&raw);
-        if crc.value() != blk.stored_crc {
-            return Err(Error::ChecksumMismatch);
-        }
-
-        // Update combined CRC: rotate-left then XOR.
-        self.combined_crc = self.combined_crc.rotate_left(1) ^ blk.stored_crc;
-
-        // Stash the decoded bytes for the caller.
-        self.decoded.extend_from_slice(&raw);
+        self.out = Some(BlockOut {
+            data: bwt,
+            pos: 0,
+            last: 0,
+            run: 0,
+            repeat: 0,
+            crc: Crc32::new(),
+            stored_crc: blk.stored_crc,
+        });
         self.phase = Phase::DrainDecoded;
         Ok(true)
     }
 
-    fn drain(&mut self, output: &mut [u8], written: &mut usize) {
-        let avail = self.decoded.len() - self.decoded_idx;
-        let space = output.len() - *written;
-        let n = avail.min(space);
-        if n > 0 {
-            output[*written..*written + n]
-                .copy_from_slice(&self.decoded[self.decoded_idx..self.decoded_idx + n]);
-            self.decoded_idx += n;
-            *written += n;
-        }
-        if self.decoded_idx == self.decoded.len() {
-            self.decoded.clear();
-            self.decoded_idx = 0;
-            if matches!(self.phase, Phase::DrainDecoded) {
-                // After fully draining a decoded block, return to the
-                // BlockOrEnd state so the next iteration parses either
-                // another block or the end-of-stream magic.
-                self.phase = Phase::BlockOrEnd;
+    /// Drain and parse until the output is full, the stream is over, or
+    /// the buffered input runs out. Returns whether it stopped for want
+    /// of input.
+    fn run(&mut self, output: &mut [u8], written: &mut usize) -> Result<bool, Error> {
+        loop {
+            // Hand out the decoded block, as far as the output allows.
+            self.drain(output, written)?;
+            if matches!(self.phase, Phase::Done) {
+                return Ok(false);
+            }
+            if *written == output.len() && !output.is_empty() {
+                // Output full: let the caller drain.
+                return Ok(false);
+            }
+            if !self.step()? {
+                // In `DrainDecoded`, decoded bytes are waiting but the
+                // output is empty-sized.
+                return Ok(self.phase != Phase::DrainDecoded);
             }
         }
+    }
+
+    /// Expand the pending block into the output. Once all of it is out,
+    /// check its CRC and move on to whatever follows the block.
+    fn drain(&mut self, output: &mut [u8], written: &mut usize) -> Result<(), Error> {
+        let Some(out) = self.out.as_mut() else {
+            return Ok(());
+        };
+        if !out.expand(output, written) {
+            return Ok(());
+        }
+        let (computed, stored) = (out.crc.value(), out.stored_crc);
+        self.out = None;
+        if computed != stored {
+            return Err(self.poison(Error::ChecksumMismatch));
+        }
+        // Update combined CRC: rotate-left then XOR.
+        self.combined_crc = self.combined_crc.rotate_left(1) ^ stored;
+        self.phase = Phase::BlockOrEnd;
+        Ok(())
     }
 }
 
@@ -628,40 +760,39 @@ impl RawDecoder for Decoder {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
-        // Take the whole input; whatever the parser does not reach is
-        // handed back below.
-        self.in_buf.extend_from_slice(input);
         let mut written = 0usize;
-        let mut starved = false;
+        // How much of `input` has been copied into `in_buf`.
+        let mut taken = 0usize;
 
-        loop {
-            // Drain anything already decoded.
-            self.drain(output, &mut written);
-            if matches!(self.phase, Phase::Done) && self.decoded_idx == self.decoded.len() {
-                break;
+        // Parse what is buffered, and take input only once the parser
+        // has run dry, a window at a time. A caller may pass everything
+        // it has left on every call; copying all of that in just to hand
+        // most of it back would cost (calls x remaining input).
+        let starved = loop {
+            if !self.run(output, &mut written)? {
+                break false;
             }
-            if written == output.len() && !output.is_empty() {
-                // Output full: let the caller drain.
-                break;
+            if taken == input.len() {
+                break true;
             }
-            if !self.step()? {
-                if self.phase != Phase::DrainDecoded {
-                    starved = true;
-                    break;
-                }
-                // Decoded bytes are waiting but the output is empty-sized.
-                break;
+            // Drop the prefix the parser is done with. What stays is at
+            // most a partial block header, so `in_buf` stays bounded by
+            // `MAX_BLOCK_HEADER_BITS` and a few windows however much
+            // input goes by (and its length in bits fits a 32-bit usize).
+            let off = self.bit_pos / 8;
+            if off >= INPUT_WINDOW {
+                self.in_buf.drain(..off);
+                self.bit_pos -= off * 8;
+                self.retry_at = self.retry_at.saturating_sub(off);
             }
-        }
-
-        // Drop the prefix the parser is done with, once it is big
-        // enough to be worth the move.
-        let off = self.bit_pos / 8;
-        if off > 1 << 20 {
-            self.in_buf.drain(..off);
-            self.bit_pos -= off * 8;
-            self.retry_at = self.retry_at.saturating_sub(off);
-        }
+            let n = (input.len() - taken).min(INPUT_WINDOW);
+            self.in_buf.extend_from_slice(&input[taken..taken + n]);
+            taken += n;
+            #[cfg(test)]
+            {
+                self.copied_in += n;
+            }
+        };
 
         // Unless the parser is waiting for more input (in which case it
         // needs everything buffered), the bytes past its position are
@@ -671,7 +802,7 @@ impl RawDecoder for Decoder {
         // again; bytes from earlier calls were already reported
         // consumed. Without `multi_stream`, the end of the stream is
         // thus exact.
-        let mut consumed = input.len();
+        let mut consumed = taken;
         if !starved {
             let frontier = self.bit_pos.div_ceil(8);
             let give_back = (self.in_buf.len() - frontier).min(consumed);
@@ -682,7 +813,7 @@ impl RawDecoder for Decoder {
         Ok(RawProgress {
             consumed,
             written,
-            done: matches!(self.phase, Phase::Done) && self.decoded_idx == self.decoded.len(),
+            done: matches!(self.phase, Phase::Done),
         })
     }
 
@@ -695,9 +826,9 @@ impl RawDecoder for Decoder {
         if p.done {
             Ok(p)
         } else if output.is_empty() || p.written > 0 {
-            // A whole decoded block can be larger than the caller's
-            // buffer: the input may be fully absorbed while decoded bytes
-            // are still pending. `finish` must stay drainable — report
+            // A decoded block can be larger than the caller's buffer: the
+            // input may be fully absorbed while decoded bytes are still
+            // pending. `finish` must stay drainable — report
             // "not done" so the caller drains and calls again. Only a call
             // with nothing left to hand over reports a truncated stream;
             // failing earlier dropped the bytes written this call.
@@ -716,8 +847,7 @@ impl RawDecoder for Decoder {
     fn raw_reset(&mut self) {
         self.in_buf.clear();
         self.bit_pos = 0;
-        self.decoded.clear();
-        self.decoded_idx = 0;
+        self.out = None;
         self.block = None;
         self.combined_crc = 0;
         self.level = 0;
@@ -725,5 +855,220 @@ impl RawDecoder for Decoder {
         self.poisoned = false;
         self.finishing = false;
         self.retry_at = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bzip2::{Encoder, EncoderConfig};
+    use crate::traits::RawEncoder;
+
+    /// Deterministic incompressible bytes.
+    fn noise(n: usize) -> Vec<u8> {
+        let mut x: u32 = 0x9E37_79B9;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn encode(plain: &[u8], level: u8) -> Vec<u8> {
+        let mut enc = Encoder::with_config(EncoderConfig { level });
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 1 << 16];
+        let mut pos = 0;
+        while pos < plain.len() {
+            let p = enc.raw_encode(&plain[pos..], &mut buf).unwrap();
+            out.extend_from_slice(&buf[..p.written]);
+            pos += p.consumed;
+        }
+        loop {
+            let p = enc.raw_finish(&mut buf).unwrap();
+            out.extend_from_slice(&buf[..p.written]);
+            if p.done {
+                break;
+            }
+        }
+        out
+    }
+
+    /// A caller that passes everything it has left on each call (as
+    /// `vec::decompress_to_vec` does) must not make the decoder copy the
+    /// whole remainder every time: the bytes taken into `in_buf` stay
+    /// proportional to the stream, whatever follows it.
+    #[test]
+    fn whole_remaining_input_per_call_is_not_recopied() {
+        let plain = noise(300_000);
+        let stream = encode(&plain, 1); // several 100 kB blocks
+        let mut input = stream.clone();
+        input.resize(stream.len() + (4 << 20), 0xA5); // trailing junk
+
+        let mut dec = Decoder::new();
+        let mut buf = [0u8; 1024];
+        let mut got = Vec::new();
+        let mut pos = 0;
+        loop {
+            let p = dec.raw_decode(&input[pos..], &mut buf).unwrap();
+            got.extend_from_slice(&buf[..p.written]);
+            pos += p.consumed;
+            assert!(dec.in_buf.len() <= 1 << 20, "in_buf {}", dec.in_buf.len());
+            if p.done {
+                break;
+            }
+            assert!(p.consumed > 0 || p.written > 0, "stalled at {pos}");
+        }
+        assert!(got == plain);
+        assert_eq!(pos, stream.len());
+        assert!(
+            dec.copied_in <= 3 * stream.len(),
+            "copied {} bytes for a {}-byte stream",
+            dec.copied_in,
+            stream.len()
+        );
+    }
+
+    /// `(b"a" * 259 + b"b" * 259) * 88803` through `bzip2 -9`: every
+    /// run is the longest RLE-1 can code (four bytes and a count of
+    /// 255), so 146 bytes decode to 46 MB.
+    const MAX_RUNS_9: [u8; 146] = [
+        0x42, 0x5a, 0x68, 0x39, 0x31, 0x41, 0x59, 0x26, 0x53, 0x59, 0x05, 0x0a, 0x41, 0xfd, 0x02,
+        0x0f, 0x55, 0x41, 0x00, 0xc0, 0x00, 0x30, 0x00, 0x00, 0x08, 0x20, 0x00, 0x90, 0x19, 0xa6,
+        0x82, 0x6a, 0xa6, 0xd4, 0xe1, 0x50, 0x12, 0xea, 0x15, 0x01, 0x2d, 0x52, 0x80, 0x96, 0x15,
+        0x01, 0x2e, 0xa8, 0x90, 0x55, 0x59, 0x24, 0x82, 0xaa, 0xc2, 0xa0, 0x25, 0x85, 0x40, 0x4b,
+        0x92, 0x48, 0x2a, 0xad, 0x52, 0x80, 0x97, 0x85, 0x40, 0x4b, 0xe6, 0x28, 0x2b, 0x24, 0xca,
+        0x6b, 0x27, 0xcd, 0xb1, 0x69, 0xa0, 0x40, 0x2a, 0x78, 0x20, 0x18, 0x00, 0x06, 0x00, 0x00,
+        0x01, 0x04, 0x00, 0x12, 0x20, 0xa5, 0x00, 0x52, 0xa6, 0xd4, 0xe2, 0xa1, 0x49, 0x38, 0x2a,
+        0x14, 0x93, 0x52, 0x85, 0x24, 0xc5, 0x42, 0x92, 0x74, 0x24, 0x80, 0x31, 0x24, 0x80, 0x31,
+        0x50, 0xa4, 0x98, 0xa8, 0x52, 0x4e, 0x24, 0x90, 0x07, 0x52, 0x85, 0x24, 0xc2, 0xa1, 0x49,
+        0x3c, 0x5d, 0xc9, 0x14, 0xe1, 0x42, 0x40, 0xd1, 0xe4, 0x22, 0xdc,
+    ];
+
+    /// A block of maximal runs expands 51-fold. The decoder must not
+    /// hold the expansion: what it keeps per block is bounded by the
+    /// block size, and the rest goes straight to the caller, whose
+    /// output limit (here 1 KiB a call) is thus honoured.
+    #[test]
+    fn run_expansion_is_not_materialised() {
+        const TOTAL: usize = 518 * 88803;
+        let mut dec = Decoder::new();
+        let mut buf = [0u8; 1024];
+        let mut input = &MAX_RUNS_9[..];
+        let mut total = 0usize;
+        let mut max_held = 0usize;
+        loop {
+            let p = if input.is_empty() {
+                dec.raw_finish(&mut buf).unwrap()
+            } else {
+                dec.raw_decode(input, &mut buf).unwrap()
+            };
+            input = &input[p.consumed..];
+            max_held = max_held.max(dec.buffered_out());
+            // The output is runs of 259: a, b, a, b, ...
+            let mut chunk = &buf[..p.written];
+            while !chunk.is_empty() {
+                let in_run = total % 259;
+                let n = (259 - in_run).min(chunk.len());
+                let want = if (total / 259).is_multiple_of(2) {
+                    b'a'
+                } else {
+                    b'b'
+                };
+                assert!(chunk[..n] == [want; 259][..n], "at {total}");
+                total += n;
+                chunk = &chunk[n..];
+            }
+            if p.done {
+                break;
+            }
+            assert!(
+                p.consumed > 0 || p.written > 0 || input.is_empty(),
+                "stalled at {total}"
+            );
+        }
+        assert_eq!(total, TOTAL);
+        assert!(input.is_empty());
+        // A level-9 block is at most 900 000 bytes before expansion.
+        assert!(max_held <= 900_000, "held {max_held} decoded bytes");
+    }
+
+    fn expand_all(data: &[u8], out_chunk: usize) -> (Vec<u8>, u32) {
+        let mut blk = BlockOut {
+            data: data.to_vec(),
+            pos: 0,
+            last: 0,
+            run: 0,
+            repeat: 0,
+            crc: Crc32::new(),
+            stored_crc: 0,
+        };
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; out_chunk];
+        loop {
+            let mut w = 0;
+            let done = blk.expand(&mut buf, &mut w);
+            got.extend_from_slice(&buf[..w]);
+            if done {
+                break;
+            }
+            assert_eq!(w, out_chunk, "stopped short of a full buffer");
+        }
+        // Done stays done, and writes nothing more.
+        let mut w = 0;
+        assert!(blk.expand(&mut buf, &mut w));
+        assert_eq!(w, 0);
+        (got, blk.crc.value())
+    }
+
+    /// The incremental RLE-1 expansion agrees with the one-shot
+    /// reference for any split of the output.
+    #[test]
+    fn incremental_rle1_matches_one_shot() {
+        use crate::bzip2::rle::rle1_inverse;
+
+        let mut cases: Vec<Vec<u8>> = vec![
+            b"a".to_vec(),
+            b"abc".to_vec(),
+            b"aaab".to_vec(),
+            // Four equal bytes at the very end, with no count.
+            b"aaaa".to_vec(),
+            b"xaaaa".to_vec(),
+            vec![b'a', b'a', b'a', b'a', 0],
+            vec![b'a', b'a', b'a', b'a', 0, b'a'],
+            vec![b'a', b'a', b'a', b'a', 255],
+            // A count equal to the run's byte, then the same byte again:
+            // the run starts afresh after a count.
+            vec![4, 4, 4, 4, 4, 4, 4, 4, 4, 1, 4],
+            vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            vec![b'a', b'a', b'a', b'a', 3, b'a', b'a', b'a', b'a', 251, b'b'],
+            [b'a', b'a', b'a', b'a', 255].repeat(50),
+        ];
+        // Small alphabets make runs, counts and their collisions common.
+        let mut x: u32 = 12345;
+        for len in [1usize, 2, 5, 17, 100, 1000] {
+            for alphabet in [1u32, 2, 3, 6] {
+                let v: Vec<u8> = (0..len)
+                    .map(|_| {
+                        x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                        ((x >> 16) % alphabet) as u8
+                    })
+                    .collect();
+                cases.push(v);
+            }
+        }
+        for data in &cases {
+            let want = rle1_inverse(data);
+            let mut crc = Crc32::new();
+            crc.update(&want);
+            for out_chunk in [1usize, 2, 3, 4, 5, 7, 254, 255, 256, 259, 4096] {
+                let (got, got_crc) = expand_all(data, out_chunk);
+                assert!(got == want, "{data:?} by {out_chunk}");
+                assert_eq!(got_crc, crc.value(), "{data:?} by {out_chunk}");
+            }
+        }
     }
 }

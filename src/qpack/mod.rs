@@ -599,6 +599,12 @@ impl QpackDecoder {
     /// Literal Name, and Duplicate. Returns [`Error::Corrupt`] on a malformed
     /// instruction, a bad table reference, an over-limit capacity, or an insert
     /// that cannot fit; [`Error::UnexpectedEnd`] on truncation.
+    ///
+    /// `data` must end on an instruction boundary: this method does not
+    /// buffer a partial instruction. On any error — including
+    /// [`Error::UnexpectedEnd`] for a truncated tail — the complete
+    /// instructions that preceded it have already been applied to the
+    /// dynamic table, so callers must not feed those bytes again.
     pub fn feed_encoder_stream(&mut self, data: &[u8]) -> Result<(), Error> {
         let mut pos = 0;
         while pos < data.len() {

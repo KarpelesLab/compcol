@@ -306,3 +306,257 @@ fn declared_length_beyond_payload_is_rejected() {
     s.extend_from_slice(&[0x01, 0xF0, 236, 0x00]);
     assert_eq!(decode(&s).unwrap(), vec![0u8; 8]);
 }
+
+// ─── exact stream length: no trailing bytes, zero padding ─────────────────
+
+/// Number of payload bits the encoder writes for `input`.
+fn payload_bits(input: &[u8]) -> usize {
+    let mut counts = [0u64; 256];
+    for &b in input {
+        counts[b as usize] += 1;
+    }
+    let lengths = length_limited_lengths(&scale_freqs(&counts), MAX_CODE_LEN);
+    input.iter().map(|&b| lengths[b as usize] as usize).sum()
+}
+
+#[test]
+fn trailing_bytes_are_corrupt() {
+    for input in [
+        &b"hello hello hello"[..],
+        b"abracadabra",
+        b"ab",
+        b"xxxxxxxxxxxxxxxx",
+        b"x",
+        b"",
+    ] {
+        let enc = encode(input);
+        assert_eq!(decode(&enc).unwrap(), input);
+        for trailer in [&b"GARBAGE-TRAILER"[..], &[0x00], &[0xFF], &[0x00; 9]] {
+            let mut s = enc.clone();
+            s.extend_from_slice(trailer);
+            assert_eq!(
+                decode(&s).unwrap_err(),
+                Error::Corrupt,
+                "input {input:?} + trailer {trailer:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nonzero_padding_bits_are_corrupt() {
+    let mut checked = 0;
+    for input in [
+        &b"hello hello hello"[..],
+        b"abracadabra",
+        b"ab",
+        b"abc",
+        b"the quick brown fox jumps over the lazy dog",
+        b"mississippi",
+    ] {
+        let enc = encode(input);
+        let pad = (8 - payload_bits(input) % 8) % 8;
+        // The encoder pads with zero bits…
+        let last = *enc.last().unwrap();
+        assert_eq!(last & ((1u16 << pad) - 1) as u8, 0, "{input:?}");
+        // …and the decoder insists on it: setting any padding bit is corrupt.
+        for bit in 0..pad {
+            let mut s = enc.clone();
+            *s.last_mut().unwrap() |= 1 << bit;
+            assert_eq!(
+                decode(&s).unwrap_err(),
+                Error::Corrupt,
+                "{input:?} bit {bit}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no input with padding bits was exercised");
+}
+
+#[test]
+fn single_symbol_payload_is_validated() {
+    // 16 × 'x': varint 16, table (101 absent, 'x' = 1 bit, 154 absent), then
+    // 16 payload bits, all zero (the lone symbol's code is `0`).
+    let good = [0x10u8, 0xF0, 0x65, 0x01, 0xF0, 0x74, 0x00, 0x00];
+    assert_eq!(encode(&[b'x'; 16]), good);
+    assert_eq!(decode(&good).unwrap(), [b'x'; 16]);
+
+    // Payload bits that are not the symbol's code.
+    for (i, b) in [(6, 0xFF), (7, 0xFF), (6, 0x80), (7, 0x01)] {
+        let mut s = good;
+        s[i] = b;
+        assert_eq!(decode(&s).unwrap_err(), Error::Corrupt, "byte {i}={b:#x}");
+    }
+    // Both payload bytes overwritten.
+    let mut s = good;
+    s[6] = 0xFF;
+    s[7] = 0xFF;
+    assert_eq!(decode(&s).unwrap_err(), Error::Corrupt);
+
+    // More payload than the declared length needs.
+    let mut s = good.to_vec();
+    s.push(0x00);
+    assert_eq!(decode(&s).unwrap_err(), Error::Corrupt);
+    // Less is truncation.
+    assert_eq!(
+        decode(&good[..good.len() - 1]).unwrap_err(),
+        Error::UnexpectedEnd
+    );
+
+    // 9 symbols need 2 bytes; the 7 padding bits must be zero too.
+    let mut s = good;
+    s[0] = 9;
+    assert_eq!(decode(&s).unwrap(), [b'x'; 9]);
+    s[7] = 0x01;
+    assert_eq!(decode(&s).unwrap_err(), Error::Corrupt);
+    // …and 8 symbols need exactly one byte, not two.
+    let mut s = good;
+    s[0] = 8;
+    assert_eq!(decode(&s).unwrap_err(), Error::Corrupt);
+    assert_eq!(decode(&s[..7]).unwrap(), [b'x'; 8]);
+}
+
+/// Every stream the encoder produces must satisfy the strict length/padding
+/// rules, across lengths that hit every padding width.
+#[test]
+fn encoder_output_always_satisfies_strict_decoder() {
+    let mut seed = 0x1234_5678_9abc_def1u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for len in 0..200usize {
+        // Single symbol, two symbols, skewed text-like, and wide alphabets.
+        let single = vec![b'q'; len];
+        let two: Vec<u8> = (0..len).map(|_| (next() % 2) as u8).collect();
+        let skew: Vec<u8> = (0..len)
+            .map(|_| b"aaaaaaaabbbbccd e"[(next() % 17) as usize])
+            .collect();
+        let wide: Vec<u8> = (0..len).map(|_| (next() >> 8) as u8).collect();
+        for input in [single, two, skew, wide] {
+            roundtrip(&input);
+        }
+    }
+}
+
+// ─── declared output length vs. the address space ─────────────────────────
+//
+// On a 32-bit target a large (but possible) input can declare more than
+// `isize::MAX` output bytes, which used to truncate in an `as usize` cast or
+// panic in `Vec::with_capacity`. That cannot be reproduced with a real
+// stream on a 64-bit host, so the conversion is tested directly.
+
+#[test]
+fn declared_length_must_fit_an_allocation() {
+    assert_eq!(checked_output_len(0), Ok(0));
+    assert_eq!(checked_output_len(1), Ok(1));
+    let max = isize::MAX as u64;
+    assert_eq!(checked_output_len(max), Ok(isize::MAX as usize));
+    for declared in [max + 1, usize::MAX as u64, u64::MAX] {
+        assert_eq!(
+            checked_output_len(declared),
+            Err(Error::Unsupported),
+            "{declared}"
+        );
+    }
+    // Lengths that fit `u64` but not a 32-bit `usize` must not truncate.
+    #[cfg(target_pointer_width = "32")]
+    for declared in [1u64 << 31, 1u64 << 32, (1u64 << 32) + 5] {
+        assert_eq!(checked_output_len(declared), Err(Error::Unsupported));
+    }
+}
+
+/// Output larger than the up-front reservation is grown into as it is
+/// decoded, for both the general and the single-symbol path.
+#[test]
+fn output_beyond_initial_reservation_round_trips() {
+    let n = MAX_PREALLOC * 2 + 123;
+    let text: Vec<u8> = (0..n).map(|i| b"abcdefgh"[(i * 7 + i / 5) % 8]).collect();
+    let enc = encode_stream(&text);
+    assert_eq!(decode_stream(&enc).unwrap(), text);
+
+    let run = vec![b'z'; n];
+    let enc = encode_stream(&run);
+    assert_eq!(enc.len(), 3 + 5 + n.div_ceil(8));
+    assert_eq!(decode_stream(&enc).unwrap(), run);
+}
+
+// ─── frequency scaling (inputs with ≥ 2^32 occurrences of a byte) ─────────
+//
+// The encoder used to count in `u32`, so a byte occurring 2^32 times wrapped
+// its counter (to 0: the symbol lost its code and the output was silently
+// corrupt). Exercising that for real needs a multi-GiB input, so the scaling
+// step is tested directly.
+
+#[test]
+fn scale_freqs_is_identity_when_counts_fit() {
+    let mut counts = [0u64; 256];
+    counts[0] = 1;
+    counts[7] = 12_345;
+    counts[200] = u32::MAX as u64;
+    let scaled = scale_freqs(&counts);
+    for (i, &c) in counts.iter().enumerate() {
+        assert_eq!(scaled[i] as u64, c, "symbol {i}");
+    }
+    assert_eq!(scale_freqs(&[0u64; 256]), [0u32; 256]);
+}
+
+#[test]
+fn scale_freqs_keeps_every_present_symbol() {
+    // Counts at and around the old wrap points, next to rare symbols.
+    for big in [
+        1u64 << 32,
+        (1u64 << 32) + 1,
+        (1u64 << 33) - 1,
+        1u64 << 40,
+        u64::MAX,
+    ] {
+        let mut counts = [0u64; 256];
+        counts[b'a' as usize] = big;
+        counts[b'b' as usize] = 1;
+        counts[b'c' as usize] = 2;
+        counts[b'd' as usize] = big / 2;
+        counts[b'e' as usize] = big - 1;
+        let scaled = scale_freqs(&counts);
+
+        for (i, &c) in counts.iter().enumerate() {
+            // Present stays present, absent stays absent.
+            assert_eq!(scaled[i] != 0, c != 0, "big={big} symbol {i}");
+        }
+        // The largest count uses the top of the u32 range, and order is kept.
+        assert!(scaled[b'a' as usize] >= 1 << 31, "big={big}");
+        for i in 0..256 {
+            for j in 0..256 {
+                if counts[i] <= counts[j] {
+                    assert!(scaled[i] <= scaled[j], "big={big} {i} vs {j}");
+                }
+            }
+        }
+
+        // The code built from the scaled weights covers every present symbol
+        // and is a valid (complete) code the decoder accepts.
+        let lengths = length_limited_lengths(&scaled, MAX_CODE_LEN);
+        for (i, &c) in counts.iter().enumerate() {
+            assert_eq!(lengths[i] != 0, c != 0, "big={big} symbol {i}");
+        }
+        assert!(CanonicalTable::from_lengths(&lengths).is_ok());
+    }
+}
+
+#[test]
+fn scale_freqs_all_symbols_huge() {
+    // 256 symbols each with a count far beyond u32: still a complete code.
+    let mut counts = [0u64; 256];
+    for (i, c) in counts.iter_mut().enumerate() {
+        *c = (1u64 << 50) + ((i as u64) << 40);
+    }
+    counts[255] = 1;
+    let scaled = scale_freqs(&counts);
+    assert!(scaled.iter().all(|&f| f != 0));
+    let lengths = length_limited_lengths(&scaled, MAX_CODE_LEN);
+    assert!(lengths.iter().all(|&l| (1..=MAX_CODE_LEN).contains(&l)));
+    assert!(CanonicalTable::from_lengths(&lengths).is_ok());
+}

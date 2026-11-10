@@ -94,6 +94,86 @@ fn round_trip(input: &[u8]) {
     assert_eq!(decoded, input, "round-trip data mismatch");
 }
 
+/// Input whose byte frequencies follow the Fibonacci sequence over `n`
+/// symbols — the worst case for Huffman depth (an unlimited tree is about
+/// `n` levels deep). No byte repeats back to back, so the RLE stage leaves
+/// the frequencies alone.
+fn fib_input(n: usize) -> Vec<u8> {
+    let mut w = vec![1u64; n];
+    w[1] = 2;
+    for i in 2..n {
+        w[i] = w[i - 1] + w[i - 2];
+    }
+    let total: u64 = w.iter().sum();
+    let (mut out, mut prev) = (Vec::new(), None);
+    for _ in 0..total {
+        let mut best: Option<usize> = None;
+        for i in 0..n {
+            if w[i] > 0 && Some(i) != prev && best.is_none_or(|b| w[i] > w[b]) {
+                best = Some(i);
+            }
+        }
+        let b = best.or(prev).unwrap();
+        w[b] -= 1;
+        out.push(b as u8);
+        prev = Some(b);
+    }
+    out
+}
+
+/// Depth of the deepest leaf in an encoded stream's node table.
+fn max_code_len(encoded: &[u8]) -> usize {
+    let n = u16::from_le_bytes([encoded[0], encoded[1]]) as usize;
+    let child = |node: usize, right: usize| {
+        let at = 2 + 4 * node + 2 * right;
+        i16::from_le_bytes([encoded[at], encoded[at + 1]])
+    };
+    let mut deepest = 0;
+    let mut stack = vec![(0usize, 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        assert!(node < n && depth < n, "malformed node table");
+        for right in 0..2 {
+            let c = child(node, right);
+            if c < 0 {
+                deepest = deepest.max(depth + 1);
+            } else {
+                stack.push((c as usize, depth + 1));
+            }
+        }
+    }
+    deepest
+}
+
+/// Skewed frequencies used to produce Huffman codes of unbounded length;
+/// past 25 bits the encoder's bit accumulator truncated them and the
+/// stream no longer decoded to the input. Codes are now limited to 16
+/// bits, as in the original SQ.
+#[test]
+fn skewed_frequencies_are_length_limited() {
+    for n in [16, 20, 23] {
+        let input = fib_input(n);
+        let encoded = encode_chunked(&input, input.len(), 1 << 16);
+        let depth = max_code_len(&encoded);
+        assert!(depth <= 16, "n = {n}: {depth}-bit code");
+        let decoded = decode_chunked(&encoded, 4096, 1 << 16);
+        assert!(decoded == input, "n = {n}: round-trip mismatch");
+    }
+}
+
+/// The multi-megabyte inputs that hit the truncation: `n = 28` failed to
+/// decode (`UnexpectedEnd`), `n = 30` decoded to the wrong bytes.
+#[test]
+#[ignore = "multi-megabyte input, slow in debug builds"]
+fn skewed_frequencies_round_trip_large() {
+    for n in [28, 30] {
+        let input = fib_input(n);
+        let encoded = encode_chunked(&input, input.len(), 1 << 16);
+        assert!(max_code_len(&encoded) <= 16);
+        let decoded = decode_chunked(&encoded, 1 << 16, 1 << 16);
+        assert!(decoded == input, "n = {n}: round-trip mismatch");
+    }
+}
+
 #[test]
 fn name_is_squeeze() {
     assert_eq!(<ArcSqueeze as Algorithm>::NAME, "squeeze");

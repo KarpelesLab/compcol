@@ -376,6 +376,93 @@ fn bad_header_checksum_rejected() {
     assert_eq!(err, Error::ChecksumMismatch);
 }
 
+// ─── content checksum ──────────────────────────────────────────────────
+
+/// Header of a frame with the content-checksum flag set (FLG = 0x64,
+/// BD = 0x10). The header checksum byte is found by asking the decoder,
+/// which rejects every wrong value.
+fn checksummed_frame_header() -> Vec<u8> {
+    let mut header = vec![0x06, 0x22, 0x4d, 0x18, 0x64, 0x10, 0x00];
+    for hc in 0..=255u8 {
+        header[6] = hc;
+        let mut dec = Decoder::new();
+        if dec.decode(&header, &mut [0u8; 16]).is_ok() {
+            return header;
+        }
+    }
+    panic!("no header checksum accepted");
+}
+
+/// `header ‖ one uncompressed block per chunk ‖ EndMark ‖ checksum`.
+fn checksummed_frame(blocks: &[&[u8]], checksum: u32) -> Vec<u8> {
+    let mut frame = checksummed_frame_header();
+    for block in blocks {
+        frame.extend_from_slice(&(block.len() as u32 | 0x8000_0000).to_le_bytes());
+        frame.extend_from_slice(block);
+    }
+    frame.extend_from_slice(&[0, 0, 0, 0]);
+    frame.extend_from_slice(&checksum.to_le_bytes());
+    frame
+}
+
+/// XXH32("hello", seed 0) — the frame format's content checksum.
+const XXH32_HELLO: u32 = 0xFB00_77F9;
+/// XXH32("hello world", seed 0).
+const XXH32_HELLO_WORLD: u32 = 0xCEBB_6622;
+
+#[test]
+fn content_checksum_verified() {
+    let frame = checksummed_frame(&[b"hello"], XXH32_HELLO);
+    assert_eq!(decode_chunked(&frame, 1024, 1024).unwrap(), b"hello");
+    // The checksum covers the whole content across blocks, and survives
+    // the trailer being split across `decode` calls.
+    let frame = checksummed_frame(&[b"hello", b" ", b"world"], XXH32_HELLO_WORLD);
+    assert_eq!(decode_chunked(&frame, 1024, 1024).unwrap(), b"hello world");
+    assert_eq!(decode_chunked(&frame, 1, 1).unwrap(), b"hello world");
+}
+
+#[test]
+fn content_checksum_mismatch_rejected() {
+    // FLG promises a content checksum; the trailer carries a wrong one.
+    // This used to decode to "hello" without complaint.
+    let frame = checksummed_frame(&[b"hello"], 0xEFBE_ADDE);
+    assert_eq!(
+        decode_chunked(&frame, 1024, 1024).unwrap_err(),
+        Error::ChecksumMismatch
+    );
+    assert_eq!(
+        decode_chunked(&frame, 1, 1).unwrap_err(),
+        Error::ChecksumMismatch
+    );
+    // Right checksum, corrupted payload.
+    let mut frame = checksummed_frame(&[b"hello"], XXH32_HELLO);
+    let payload_at = frame.len() - 4 - 4 - 5;
+    frame[payload_at] ^= 0x20;
+    assert_eq!(
+        decode_chunked(&frame, 1024, 1024).unwrap_err(),
+        Error::ChecksumMismatch
+    );
+    // A checksum for different content of the same frame shape.
+    let frame = checksummed_frame(&[b"hello", b" ", b"world"], XXH32_HELLO);
+    assert_eq!(
+        decode_chunked(&frame, 1024, 1024).unwrap_err(),
+        Error::ChecksumMismatch
+    );
+}
+
+#[test]
+fn content_checksum_trailer_truncated_rejected() {
+    let frame = checksummed_frame(&[b"hello"], XXH32_HELLO);
+    for cut in 1..=4 {
+        let truncated = &frame[..frame.len() - cut];
+        assert_eq!(
+            decode_chunked(truncated, 1024, 1024).unwrap_err(),
+            Error::UnexpectedEnd,
+            "cut {cut}"
+        );
+    }
+}
+
 #[test]
 fn invalid_clevel_rejected() {
     // Frame OK; first block claims compressionLevel = 5 (< MIN).

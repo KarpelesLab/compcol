@@ -864,20 +864,20 @@ impl LzmaEncCore {
 
     /// Emit a literal packet for the byte at absolute position `pos`, reading
     /// from the sliding window `win` (whose first byte is absolute `base`).
-    fn emit_literal(&mut self, win: &[u8], base: usize, pos: usize) {
+    fn emit_literal(&mut self, win: &[u8], base: u64, pos: u64) {
         let pos_state = self.pos_state();
         let idx = self.state * POS_STATES_MAX + pos_state as usize;
         rc_encode_bit(&mut self.rc, &mut self.is_match[idx], 0);
 
-        let i = pos - base;
-        let prev_byte = if pos > 0 { win[i - 1] } else { 0 };
+        let i = (pos - base) as usize;
+        let prev_byte = if i > 0 { win[i - 1] } else { 0 };
         let match_byte = if self.state < LIT_STATES {
             None
         } else {
             // The byte at distance rep0; always retained in the sliding window
             // (distance ≤ dict_size ≤ retained history).
             let d = self.rep0 as usize + 1;
-            if d <= pos {
+            if d <= i {
                 Some(win[i - d])
             } else {
                 // Shouldn't happen at a literal-after-match state, but be
@@ -1045,6 +1045,11 @@ fn get_dist_slot(distance: u32) -> u32 {
 /// `dict_size`) is still intact. Byte reads go through the sliding window `win`
 /// whose first byte is absolute `base` (absolute `p` reads `win[p - base]`).
 /// This keeps peak memory `O(dict_size)` regardless of input length.
+///
+/// Absolute offsets are `u64` so they keep counting past 4 GiB on 32-bit
+/// targets; only window indices (`p - base`) are `usize`. Nothing reaches
+/// behind `base`: it is either the start of the stream or more than a
+/// dictionary's worth of history behind the parse position.
 struct HashChain {
     head: Box<[u32; HASH_SIZE]>,
     prev: Vec<u32>,
@@ -1070,13 +1075,13 @@ impl HashChain {
 
     /// Splice absolute position `pos` into the hash chain. No-op if fewer than
     /// three bytes follow in the window.
-    fn insert(&mut self, win: &[u8], base: usize, pos: usize) {
-        let i = pos - base;
+    fn insert(&mut self, win: &[u8], base: u64, pos: u64) {
+        let i = (pos - base) as usize;
         if i + 3 > win.len() {
             return;
         }
         let h = hash3(win[i], win[i + 1], win[i + 2]) as usize;
-        self.prev[pos & self.prev_mask] = self.head[h];
+        self.prev[pos as usize & self.prev_mask] = self.head[h];
         self.head[h] = pos as u32;
     }
 
@@ -1086,19 +1091,19 @@ impl HashChain {
     fn find_longest(
         &self,
         win: &[u8],
-        base: usize,
-        pos: usize,
+        base: u64,
+        pos: u64,
         dict_size: u32,
         max_chain: usize,
         nice_match: u32,
     ) -> Option<(u32, u32)> {
-        let pi = pos - base;
+        let pi = (pos - base) as usize;
         if pi + 3 > win.len() {
             return None;
         }
         let h = hash3(win[pi], win[pi + 1], win[pi + 2]) as usize;
         let max_len = MAX_MATCH_LEN.min((win.len() - pi) as u32);
-        let max_dist = (dict_size as usize).min(pos);
+        let max_dist = (dict_size as usize).min(pi);
         let mut best_len: u32 = 0;
         let mut best_dist: u32 = 0;
         let mut cur = self.head[h];
@@ -1108,23 +1113,23 @@ impl HashChain {
             // distance modulo 2^32 so matching keeps working past 4 GiB of
             // input (`max_dist < 2^32`, so in-range distances are exact).
             let dist = (pos as u32).wrapping_sub(cur) as usize;
-            let cur_pos = pos.wrapping_sub(dist);
+            let cur_pos = pos.wrapping_sub(dist as u64);
             if dist == 0 || dist > i32::MAX as usize {
                 // Not behind `pos`.
-                cur = self.prev[cur_pos & self.prev_mask];
+                cur = self.prev[cur_pos as usize & self.prev_mask];
                 steps += 1;
                 continue;
             }
             if dist > max_dist {
                 break;
             }
-            let ci = cur_pos - base;
+            let ci = (cur_pos - base) as usize;
             // Cheap rejection by the (best_len)-th byte.
             if best_len > 2
                 && (best_len as usize) < (win.len() - pi)
                 && win[ci + best_len as usize] != win[pi + best_len as usize]
             {
-                cur = self.prev[cur_pos & self.prev_mask];
+                cur = self.prev[cur_pos as usize & self.prev_mask];
                 steps += 1;
                 continue;
             }
@@ -1140,7 +1145,7 @@ impl HashChain {
                     break;
                 }
             }
-            cur = self.prev[cur_pos & self.prev_mask];
+            cur = self.prev[cur_pos as usize & self.prev_mask];
             steps += 1;
         }
         if best_len >= MATCH_LEN_MIN {
@@ -1158,21 +1163,21 @@ impl HashChain {
     fn find_matches(
         &self,
         win: &[u8],
-        base: usize,
-        pos: usize,
+        base: u64,
+        pos: u64,
         dict_size: u32,
         max_chain: usize,
         nice_match: u32,
         out: &mut Vec<(u32, u32)>,
     ) -> u32 {
         out.clear();
-        let pi = pos - base;
+        let pi = (pos - base) as usize;
         if pi + 3 > win.len() {
             return 0;
         }
         let h = hash3(win[pi], win[pi + 1], win[pi + 2]) as usize;
         let max_len = MAX_MATCH_LEN.min((win.len() - pi) as u32);
-        let max_dist = (dict_size as usize).min(pos);
+        let max_dist = (dict_size as usize).min(pi);
         let mut best_len: u32 = MATCH_LEN_MIN - 1;
         let mut cur = self.head[h];
         let mut steps = 0usize;
@@ -1181,22 +1186,22 @@ impl HashChain {
             // distance modulo 2^32 so matching keeps working past 4 GiB of
             // input (`max_dist < 2^32`, so in-range distances are exact).
             let dist = (pos as u32).wrapping_sub(cur) as usize;
-            let cur_pos = pos.wrapping_sub(dist);
+            let cur_pos = pos.wrapping_sub(dist as u64);
             if dist == 0 || dist > i32::MAX as usize {
                 // Not behind `pos`.
-                cur = self.prev[cur_pos & self.prev_mask];
+                cur = self.prev[cur_pos as usize & self.prev_mask];
                 steps += 1;
                 continue;
             }
             if dist > max_dist {
                 break;
             }
-            let ci = cur_pos - base;
+            let ci = (cur_pos - base) as usize;
             if best_len >= MATCH_LEN_MIN
                 && (best_len as usize) < (win.len() - pi)
                 && win[ci + best_len as usize] != win[pi + best_len as usize]
             {
-                cur = self.prev[cur_pos & self.prev_mask];
+                cur = self.prev[cur_pos as usize & self.prev_mask];
                 steps += 1;
                 continue;
             }
@@ -1213,7 +1218,7 @@ impl HashChain {
                     break;
                 }
             }
-            cur = self.prev[cur_pos & self.prev_mask];
+            cur = self.prev[cur_pos as usize & self.prev_mask];
             steps += 1;
         }
         if best_len >= MATCH_LEN_MIN {
@@ -1229,12 +1234,12 @@ impl HashChain {
 /// Length of a repeat match at absolute `pos` against 0-based LZ distance
 /// `dist`, reading from the sliding window `win` (first byte = absolute `base`).
 /// Capped at `MAX_MATCH_LEN`.
-fn rep_match_len(win: &[u8], base: usize, pos: usize, dist: u32) -> u32 {
+fn rep_match_len(win: &[u8], base: u64, pos: u64, dist: u32) -> u32 {
     let d = dist as usize + 1;
-    if d > pos {
+    let pi = (pos - base) as usize;
+    if d > pi {
         return 0;
     }
-    let pi = pos - base;
     let max_len = MAX_MATCH_LEN.min((win.len() - pi) as u32) as usize;
     let mut len = 0usize;
     while len < max_len && win[pi - d + len] == win[pi + len] {
@@ -1338,21 +1343,21 @@ fn literal_price_at(
     prices: &[u32; PRICE_TABLE_SIZE],
     snap: &PriceSnapshot,
     win: &[u8],
-    base: usize,
-    pos: usize,
+    base: u64,
+    pos: u64,
     out_pos: u64,
     state: usize,
     rep0: u32,
 ) -> u32 {
     let pos_state = (out_pos as u32) & core.pos_mask;
     let im_idx = state * POS_STATES_MAX + pos_state as usize;
-    let i = pos - base;
-    let prev_byte = if pos > 0 { win[i - 1] } else { 0 };
+    let i = (pos - base) as usize;
+    let prev_byte = if i > 0 { win[i - 1] } else { 0 };
     let match_byte = if state < LIT_STATES {
         None
     } else {
         let d = rep0 as usize + 1;
-        if d <= pos { Some(win[i - d]) } else { None }
+        if d <= i { Some(win[i - d]) } else { None }
     };
     snap.is_match[im_idx][0] + core.literal_price(prices, out_pos, win[i], prev_byte, match_byte)
 }
@@ -1398,11 +1403,11 @@ struct LzmaStreamEncoder {
     prob_prices: [u32; PRICE_TABLE_SIZE],
     /// Retained window bytes; `win[0]` is absolute offset `win_base`.
     win: Vec<u8>,
-    win_base: usize,
+    win_base: u64,
     /// Absolute offset of the next byte to encode.
-    pos: usize,
+    pos: u64,
     /// Absolute count of bytes appended so far.
-    appended: usize,
+    appended: u64,
     /// Set once the header has been emitted (prepended to the first push).
     header_done: bool,
     /// Set once the EOS marker + flush have been emitted.
@@ -1457,12 +1462,12 @@ impl LzmaStreamEncoder {
     /// first commit, then range-coded body bytes).
     fn push(&mut self, data: &[u8]) -> Vec<u8> {
         self.win.extend_from_slice(data);
-        self.appended += data.len();
+        self.appended += data.len() as u64;
         // While still small and uncommitted, only buffer — `finish` will run the
         // greedy-vs-optimal guard. Commit (and start streaming) once the total
         // crosses GUARD_LIMIT.
         if !self.committed {
-            if self.appended <= GUARD_LIMIT {
+            if self.appended <= GUARD_LIMIT as u64 {
                 return Vec::new();
             }
             self.committed = true;
@@ -1470,7 +1475,7 @@ impl LzmaStreamEncoder {
         let margin = lookahead_margin(self.params);
         // Only encode up to `appended - margin` so the parser keeps full
         // forward context; the tail is encoded at `finish`.
-        let encode_to = self.appended.saturating_sub(margin);
+        let encode_to = self.appended.saturating_sub(margin as u64);
         if encode_to > self.pos {
             self.encode_range(encode_to);
             self.trim_window();
@@ -1537,7 +1542,7 @@ impl LzmaStreamEncoder {
                 input,
                 0,
                 0,
-                input.len(),
+                input.len() as u64,
                 dict_size,
                 params,
                 &prices,
@@ -1558,7 +1563,7 @@ impl LzmaStreamEncoder {
                 input,
                 0,
                 0,
-                input.len(),
+                input.len() as u64,
                 dict_size,
                 params,
             );
@@ -1583,7 +1588,7 @@ impl LzmaStreamEncoder {
 
     /// Encode absolute positions `[self.pos, end)` into the continuous range
     /// coder, advancing `self.pos`.
-    fn encode_range(&mut self, end: usize) {
+    fn encode_range(&mut self, end: u64) {
         let base = self.win_base;
         let start = self.pos;
         if self.params.opt_window == 0 {
@@ -1618,11 +1623,11 @@ impl LzmaStreamEncoder {
     /// Only shifts once the droppable prefix exceeds a whole `dict_size +
     /// WINDOW_SLOP`, amortising the `drain` memmove to `O(1)` per input byte.
     fn trim_window(&mut self) {
-        let keep_from = self
-            .pos
-            .saturating_sub(self.dict_size as usize + WINDOW_SLOP);
-        let droppable = keep_from.saturating_sub(self.win_base);
-        if droppable >= self.dict_size as usize + WINDOW_SLOP {
+        let history = self.dict_size as usize + WINDOW_SLOP;
+        let keep_from = self.pos.saturating_sub(history as u64);
+        // Always a window offset (`keep_from <= pos`), so it fits `usize`.
+        let droppable = keep_from.saturating_sub(self.win_base) as usize;
+        if droppable >= history {
             self.win.drain(..droppable);
             self.win_base = keep_from;
         }
@@ -1650,16 +1655,16 @@ fn encode_greedy(
     core: &mut LzmaEncCore,
     hc: &mut HashChain,
     win: &[u8],
-    base: usize,
-    pos_start: usize,
-    pos_end: usize,
+    base: u64,
+    pos_start: u64,
+    pos_end: u64,
     dict_size: u32,
     params: LevelParams,
 ) {
-    let win_end = base + win.len();
+    let win_end = base + win.len() as u64;
     let mut pos = pos_start;
     while pos < pos_end {
-        let cap = (pos_end - pos) as u32;
+        let cap = (pos_end - pos).min(u32::MAX as u64) as u32;
         let rep_lens = [
             rep_match_len(win, base, pos, core.rep0).min(cap),
             rep_match_len(win, base, pos, core.rep1).min(cap),
@@ -1697,22 +1702,22 @@ fn encode_greedy(
         if emit_new {
             let (len, dist) = new_match.unwrap();
             for j in 1..(len as usize) {
-                let p = pos + j;
+                let p = pos + j as u64;
                 if p + 3 <= win_end {
                     hc.insert(win, base, p);
                 }
             }
             core.emit_match(dist, len);
-            pos += len as usize;
+            pos += len as u64;
         } else if emit_rep_long {
             for j in 1..(best_rep_len as usize) {
-                let p = pos + j;
+                let p = pos + j as u64;
                 if p + 3 <= win_end {
                     hc.insert(win, base, p);
                 }
             }
             core.emit_long_rep(best_rep_idx, best_rep_len);
-            pos += best_rep_len as usize;
+            pos += best_rep_len as u64;
         } else if emit_short_rep {
             core.emit_short_rep();
             pos += 1;
@@ -1730,9 +1735,9 @@ fn encode_optimal(
     core: &mut LzmaEncCore,
     hc: &mut HashChain,
     win: &[u8],
-    base: usize,
-    pos_start: usize,
-    pos_end: usize,
+    base: u64,
+    pos_start: u64,
+    pos_end: u64,
     dict_size: u32,
     params: LevelParams,
     prob_prices: &[u32; PRICE_TABLE_SIZE],
@@ -1759,7 +1764,7 @@ fn encode_optimal(
         );
         debug_assert!(parsed > 0);
         replay(core, hc, win, base, pos, &opt.decisions);
-        pos += parsed;
+        pos += parsed as u64;
     }
 }
 
@@ -1770,9 +1775,9 @@ fn parse_window(
     core: &LzmaEncCore,
     hc: &HashChain,
     win: &[u8],
-    base: usize,
-    start: usize,
-    pos_end: usize,
+    base: u64,
+    start: u64,
+    pos_end: u64,
     dict_size: u32,
     params: LevelParams,
     window: usize,
@@ -1782,7 +1787,7 @@ fn parse_window(
 ) -> usize {
     // `avail` is bounded by the encode boundary `pos_end`, not the end of the
     // window, so the DP never produces a decision that carries past `pos_end`.
-    let avail = pos_end - start;
+    let avail = usize::try_from(pos_end - start).unwrap_or(usize::MAX);
     let limit = window.min(avail);
 
     opt.opt[0] = OptNode {
@@ -1822,7 +1827,7 @@ fn parse_window(
             cur += 1;
             continue;
         }
-        let pos = start + cur;
+        let pos = start + cur as u64;
         let out_pos = core.output_pos + cur as u64;
         let state = node.state;
         let reps = node.reps;
@@ -2008,11 +2013,11 @@ fn replay(
     core: &mut LzmaEncCore,
     hc: &mut HashChain,
     win: &[u8],
-    base: usize,
-    start: usize,
+    base: u64,
+    start: u64,
     decisions: &[Decision],
 ) {
-    let win_end = base + win.len();
+    let win_end = base + win.len() as u64;
     let mut pos = start;
     for &d in decisions {
         match d {
@@ -2028,23 +2033,23 @@ fn replay(
             }
             Decision::Match(dist, len) => {
                 for j in 0..(len as usize) {
-                    let p = pos + j;
+                    let p = pos + j as u64;
                     if p + 3 <= win_end {
                         hc.insert(win, base, p);
                     }
                 }
                 core.emit_match(dist, len);
-                pos += len as usize;
+                pos += len as u64;
             }
             Decision::Rep(idx, len) => {
                 for j in 0..(len as usize) {
-                    let p = pos + j;
+                    let p = pos + j as u64;
                     if p + 3 <= win_end {
                         hc.insert(win, base, p);
                     }
                 }
                 core.emit_long_rep(idx, len);
-                pos += len as usize;
+                pos += len as u64;
             }
         }
     }
@@ -2314,10 +2319,9 @@ mod tests {
     /// The hash chain stores positions as `u32`; past 4 GiB of input the
     /// truncated links used to look ~4 GiB away, so every probe broke out
     /// as "beyond the dictionary" and the encoder stopped finding matches.
-    #[cfg(target_pointer_width = "64")]
     #[test]
     fn match_finder_works_past_4gib() {
-        let base = (1usize << 32) - 100;
+        let base = (1u64 << 32) - 100;
         let mut win = Vec::new();
         while win.len() < 400 {
             win.extend_from_slice(b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN");
@@ -2334,5 +2338,70 @@ mod tests {
         assert_eq!(dist, 49);
         let mut out = Vec::new();
         assert!(hc.find_matches(&win, base, probe, 1 << 20, 64, 273, &mut out) >= 50);
+    }
+
+    /// Text with long-range repeats, broken up by runs of noise.
+    fn mixed_data(n: usize) -> Vec<u8> {
+        let mut s = 0x9E37_79B9u32;
+        let mut d = Vec::with_capacity(n);
+        while d.len() < n {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            if (s >> 28) < 3 {
+                for _ in 0..200 {
+                    s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    d.push((s >> 24) as u8);
+                }
+            } else {
+                let line = alloc::format!("record {:05} value={} ok\n", (s >> 12) % 3000, s >> 27);
+                d.extend_from_slice(line.as_bytes());
+            }
+        }
+        d.truncate(n);
+        d
+    }
+
+    /// Encode `data` with the absolute input counters starting at `start`,
+    /// as if that many bytes had already gone through (the window starts
+    /// empty there, so nothing earlier is referenced), and decode it back.
+    fn round_trip_from(start: u64, level: u8, data: &[u8]) {
+        use crate::traits::{Decoder as _, Status};
+
+        let mut enc = LzmaStreamEncoder::new(LevelParams::from_level(level), Framing::Alone);
+        enc.win_base = start;
+        enc.pos = start;
+        enc.appended = start;
+        let mut stream = Vec::new();
+        for piece in data.chunks(50_000) {
+            stream.extend(enc.push(piece));
+        }
+        stream.extend(enc.finish());
+        assert_eq!(enc.appended, start + data.len() as u64);
+        assert_eq!(enc.pos, start + data.len() as u64);
+
+        let mut dec = super::super::Decoder::new();
+        let mut out = vec![0u8; data.len() + 16];
+        let (p1, _) = dec.decode(&stream, &mut out).unwrap();
+        assert_eq!(p1.consumed, stream.len());
+        let (p2, status) = dec.finish(&mut out[p1.written..]).unwrap();
+        assert_eq!(status, Status::StreamEnd);
+        assert_eq!(p1.written + p2.written, data.len(), "decoded length");
+        assert!(out[..data.len()] == *data, "decoded bytes differ");
+    }
+
+    /// The absolute stream offsets must not wrap at 4 GiB on 32-bit targets:
+    /// they were `usize`, so past 2^32 bytes of input the `.lzma` encoder
+    /// lost track of what it had buffered and silently dropped data.
+    #[test]
+    fn stream_encoder_crosses_4gib() {
+        let data = mixed_data(300_000);
+        let start = (1u64 << 32) - 100_000;
+        // Level 0: greedy parse, 64 KiB dictionary, so the window is trimmed
+        // several times on both sides of the boundary.
+        round_trip_from(start, 0, &data);
+        // Level 3: optimal parse.
+        round_trip_from(start, 3, &data);
+        // And well clear of the boundary on both sides.
+        round_trip_from(0, 0, &data);
+        round_trip_from(5 << 32, 0, &data);
     }
 }

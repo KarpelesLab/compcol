@@ -752,6 +752,303 @@ fn cab_match_ending_on_frame_boundary() {
     assert_eq!(decode_all_ways(&w.framed(16, want.len())), want);
 }
 
+// ─── audit regressions: end of input, declared total, finish ────────────
+
+/// Like `decode_chunked`, but returns the decoder's error instead of
+/// panicking on it.
+fn try_decode(stream: &[u8], in_chunk: usize, out_chunk: usize) -> Result<Vec<u8>, Error> {
+    let mut dec = Decoder::new();
+    let mut decoded = Vec::new();
+    let mut buf = vec![0u8; out_chunk.max(1)];
+    for chunk in stream.chunks(in_chunk.max(1)) {
+        let mut consumed = 0;
+        while consumed < chunk.len() {
+            let (p, status) = dec.decode(&chunk[consumed..], &mut buf)?;
+            decoded.extend_from_slice(&buf[..p.written]);
+            consumed += p.consumed;
+            match status {
+                Status::StreamEnd => return Ok(decoded),
+                Status::InputEmpty => break,
+                Status::OutputFull => {}
+            }
+        }
+    }
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        decoded.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            return Ok(decoded);
+        }
+        assert_ne!(p.written, 0, "finish stalled after {} bytes", decoded.len());
+    }
+}
+
+/// Every chunking must agree on the result, error or not.
+fn try_decode_all_ways(stream: &[u8]) -> Result<Vec<u8>, Error> {
+    let whole = try_decode(stream, stream.len(), 1 << 20);
+    for (i, o) in [(1, 1), (1, 4096), (3, 7), (4096, 1)] {
+        let got = try_decode(stream, i, o);
+        match (&whole, &got) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "chunking {i}/{o}"),
+            (Err(_), Err(_)) => {}
+            _ => panic!("chunking {i}/{o}: {got:?} vs one-shot {whole:?}"),
+        }
+    }
+    whole
+}
+
+/// No proper prefix of `stream` may decode successfully to anything but
+/// `want` (a prefix that only loses tolerated trailing padding may still
+/// decode in full). Returns how many prefixes decoded.
+fn check_prefixes(stream: &[u8], want: &[u8]) -> usize {
+    let mut ok = 0;
+    // From 1: zero bytes of input is, by design, the empty stream.
+    for cut in 1..stream.len() {
+        if let Ok(got) = try_decode_all_ways(&stream[..cut]) {
+            assert_eq!(got, want, "prefix of {cut}/{} bytes", stream.len());
+            ok += 1;
+        }
+    }
+    ok
+}
+
+/// `finish` pads the input with one zero word for Huffman lookahead. A
+/// stream missing its last word used to have that padding decoded as data:
+/// two zero bytes in an uncompressed block, up to 16 bits of symbols in a
+/// Huffman block.
+#[test]
+fn stream_missing_last_word_is_rejected() {
+    let data = b"hello world, this is the LZX tail!";
+    let enc = encode_chunked(data, data.len(), 256);
+    assert_eq!(try_decode_all_ways(&enc).unwrap(), data);
+    assert_eq!(
+        try_decode_all_ways(&enc[..enc.len() - 2]),
+        Err(Error::UnexpectedEnd)
+    );
+    assert_eq!(check_prefixes(&enc, data), 0);
+
+    // Verbatim block of 8-bit literals; the last word holds real symbols.
+    let data: Vec<u8> = (0..23u32).map(|i| (i * 37 + 1) as u8).collect();
+    let mut w = BitW::new();
+    w.put(1, 0);
+    put_verbatim_literals(&mut w, 16, &data, false);
+    let tail_bits = if w.n == 0 { 16 } else { w.n };
+    if w.n != 0 {
+        w.put(16 - w.n, 0);
+    }
+    let s = w.framed(16, data.len());
+    assert_eq!(try_decode_all_ways(&s).unwrap(), data);
+    assert_eq!(
+        try_decode_all_ways(&s[..s.len() - 2]),
+        Err(Error::UnexpectedEnd)
+    );
+    assert_eq!(check_prefixes(&s, &data), 0, "tail bits {tail_bits}");
+
+    // Zero literals coded as a 1-bit zero code look exactly like the pad.
+    let mut lens = [0u8; 256];
+    lens[0] = 1;
+    lens[1] = 1;
+    for n in [16usize, 17, 31, 40] {
+        let mut w = BitW::new();
+        w.put(1, 0);
+        put_verbatim_with_lens(&mut w, 16, &lens, &vec![0u8; n]);
+        if w.n != 0 {
+            w.put(16 - w.n, 0);
+        }
+        let s = w.framed(16, n);
+        assert_eq!(try_decode_all_ways(&s).unwrap(), vec![0u8; n]);
+        assert_eq!(
+            try_decode_all_ways(&s[..s.len() - 2]),
+            Err(Error::UnexpectedEnd),
+            "n={n}"
+        );
+    }
+}
+
+/// An odd-sized final uncompressed block does not need its pad byte: there
+/// is nothing after it to align (libmspack only skips the pad when another
+/// block follows). Dropping that byte must keep decoding; dropping a data
+/// byte must not.
+#[test]
+fn odd_final_uncompressed_block_without_pad_byte() {
+    let data: Vec<u8> = (0..41u32).map(|i| (i * 11 + 3) as u8).collect();
+    let mut w = BitW::new();
+    w.put(1, 0);
+    put_uncompressed_block(&mut w, &data);
+    let s = w.framed(16, data.len());
+    assert_eq!(try_decode_all_ways(&s).unwrap(), data);
+    assert_eq!(try_decode_all_ways(&s[..s.len() - 1]).unwrap(), data);
+    assert_eq!(
+        try_decode_all_ways(&s[..s.len() - 2]),
+        Err(Error::UnexpectedEnd)
+    );
+    assert_eq!(check_prefixes(&s, &data), 1);
+}
+
+/// Pretree with all 20 lengths = 5 (so code == symbol), then one 5-bit
+/// delta per code length (first block: the previous lengths are all 0).
+fn put_lens_fixed5(w: &mut BitW, lens: &[u8]) {
+    for _ in 0..20 {
+        w.put(4, 5);
+    }
+    for &l in lens {
+        w.put(5, (17 - u32::from(l)) % 17);
+    }
+}
+
+/// Header of a verbatim block (window 15) whose main tree is: literal 0 =
+/// "0" and `sym10` = "10"; "11" is not a code. No length tree.
+fn put_overshoot_header(w: &mut BitW, block_size: u32, sym10: usize) {
+    w.put(1, 0);
+    w.put(3, 1);
+    w.put(24, block_size);
+    let mut main = vec![0u8; 256 + 30 * 8];
+    main[0] = 1;
+    main[sym10] = 2;
+    put_lens_fixed5(w, &main[..256]);
+    put_lens_fixed5(w, &main[256..]);
+    put_lens_fixed5(w, &[0u8; 249]);
+}
+
+/// The declared total ends the stream, even inside a block whose
+/// BLOCK_SIZE runs past it. The symbol loop used to keep decoding as long
+/// as bits were buffered, so garbage after the last byte was an error when
+/// it arrived in the same `decode` call and ignored when it did not.
+#[test]
+fn total_reached_mid_block_ignores_what_follows() {
+    // How many bits are left in the current word after the header.
+    let mut probe = BitW::new();
+    put_overshoot_header(&mut probe, 5, 1);
+    let fill = 16 - probe.n;
+    // `k` zero literals then a lone "1": a word boundary, and a decoder that
+    // reads on is one bit short of a symbol.
+    let k = if fill > 1 { fill - 1 } else { 16 };
+    let mut w = BitW::new();
+    put_overshoot_header(&mut w, k + 5, 1);
+    for _ in 0..k {
+        w.put(1, 0);
+    }
+    w.put(1, 1);
+    assert_eq!(w.n, 0);
+    w.raw(&[0xFF; 8]); // "11" is not a code
+    let s = w.framed(15, k as usize);
+    assert_eq!(try_decode_all_ways(&s), Ok(vec![0u8; k as usize]));
+}
+
+/// Same, with the total falling inside a match: the match's surplus byte
+/// is dropped and nothing after it is read.
+#[test]
+fn total_reached_mid_match_ignores_what_follows() {
+    // Symbol 256: match, position slot 0 (R0 = 1), length 2.
+    let mut probe = BitW::new();
+    put_overshoot_header(&mut probe, 5, 256);
+    let fill = 16 - probe.n;
+    let k = if fill > 3 { fill - 3 } else { fill + 13 };
+    let mut w = BitW::new();
+    put_overshoot_header(&mut w, k + 7, 256);
+    for _ in 0..k {
+        w.put(1, 0);
+    }
+    w.put(2, 0b10); // 2 bytes at distance 1; the second is past the total
+    w.put(1, 1);
+    assert_eq!(w.n, 0);
+    w.raw(&[0xFF; 8]);
+    let s = w.framed(15, k as usize + 1);
+    assert_eq!(try_decode_all_ways(&s), Ok(vec![0u8; k as usize + 1]));
+}
+
+/// Every chunking of input and output gives the same result, and no proper
+/// prefix of a small stream decodes to anything but the full output.
+#[test]
+fn chunking_and_truncation_differential() {
+    let mut cases: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for n in [0usize, 1, 2, 3, 100, 101, 4096, 40_001, 70_000] {
+        let data = lorem(n);
+        let enc = encode_chunked(&data, data.len().max(1), 4096);
+        cases.push((enc, data));
+    }
+    // Verbatim blocks, alone and followed by an (odd) uncompressed block;
+    // the larger ones cross a 32 KiB frame boundary.
+    let mut lens = [0u8; 256];
+    for (k, l) in lens.iter_mut().enumerate().take(16) {
+        *l = k as u8 + 1;
+    }
+    lens[16] = 16;
+    for n in [5usize, 64, 333, 33_000] {
+        let data: Vec<u8> = (0..n).map(|i| (i % 5) as u8).collect();
+        let tail: Vec<u8> = (0..37u32).map(|i| (i * 3) as u8).collect();
+        for with_tail in [false, true] {
+            let mut w = BitW::new();
+            w.put(1, 0);
+            if n > 32_768 {
+                put_verbatim_literals(&mut w, 16, &data, true);
+            } else {
+                put_verbatim_with_lens(&mut w, 16, &lens, &data);
+            }
+            let mut want = data.clone();
+            if with_tail {
+                put_uncompressed_block(&mut w, &tail);
+                want.extend_from_slice(&tail);
+            } else if w.n != 0 {
+                w.put(16 - w.n, 0);
+            }
+            cases.push((w.framed(16, want.len()), want));
+        }
+    }
+    for (stream, want) in &cases {
+        assert_eq!(
+            try_decode_all_ways(stream).as_deref(),
+            Ok(&want[..]),
+            "{} bytes",
+            want.len()
+        );
+        if stream.len() <= 400 {
+            check_prefixes(stream, want);
+        }
+    }
+}
+
+/// `finish` with no room for output is not an error while bytes are still
+/// owed: it used to report `UnexpectedEnd` and poison a healthy decoder.
+/// On a stream that really is truncated it must still fail, not stall.
+#[test]
+fn finish_with_empty_output_on_a_healthy_stream() {
+    let data: Vec<u8> = (0..100u32).map(|i| (i * 5 + 1) as u8).collect();
+    let enc = encode_chunked(&data, data.len(), 256);
+    for out_chunk in [1usize, 7, 4096] {
+        let mut dec = Decoder::new();
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; out_chunk];
+        let mut pos = 0;
+        while pos < enc.len() {
+            let (p, _) = dec.decode(&enc[pos..], &mut buf).unwrap();
+            pos += p.consumed;
+            got.extend_from_slice(&buf[..p.written]);
+        }
+        let mut ended = false;
+        for _ in 0..3 {
+            let (p, status) = dec.finish(&mut []).unwrap();
+            assert_eq!(p.written, 0);
+            ended = status == Status::StreamEnd;
+        }
+        while !ended {
+            let (p, status) = dec.finish(&mut buf).unwrap();
+            got.extend_from_slice(&buf[..p.written]);
+            ended = status == Status::StreamEnd;
+            assert!(ended || p.written > 0, "finish stalled");
+        }
+        assert_eq!(got, data, "out_chunk {out_chunk}");
+    }
+
+    // Truncated: whatever is still owed can be drained, then it is an error.
+    let mut dec = Decoder::new();
+    let mut buf = [0u8; 4096];
+    let cut = &enc[..enc.len() - 2];
+    let (p, _) = dec.decode(cut, &mut buf).unwrap();
+    assert_eq!(p.consumed, cut.len());
+    assert_eq!(dec.finish(&mut []).unwrap_err(), Error::UnexpectedEnd);
+}
+
 // ─── factory ─────────────────────────────────────────────────────────────
 
 #[cfg(feature = "factory")]

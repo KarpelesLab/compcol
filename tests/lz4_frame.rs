@@ -397,6 +397,193 @@ fn block_checksum_detects_corruption() {
     );
 }
 
+// ─── Hand-built frames ───────────────────────────────────────────────────
+
+/// Decode `encoded` in one shot, returning the output or the first error.
+fn try_decode(encoded: &[u8]) -> Result<Vec<u8>, compcol::Error> {
+    let mut dec = Decoder::new();
+    let mut decoded = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut consumed = 0;
+    loop {
+        let (p, status) = dec.decode(&encoded[consumed..], &mut buf)?;
+        decoded.extend_from_slice(&buf[..p.written]);
+        consumed += p.consumed;
+        match status {
+            Status::StreamEnd => break,
+            Status::InputEmpty if consumed == encoded.len() => break,
+            _ => {}
+        }
+    }
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        decoded.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            return Ok(decoded);
+        }
+        assert!(p.written > 0, "decoder finish stalled");
+    }
+}
+
+/// Magic + `descriptor` (FLG, BD, optional fields) + the matching header
+/// checksum byte. The HC is found by asking the decoder, which answers
+/// `BadHeader` for every wrong value, so the tests need no xxHash of
+/// their own.
+fn frame_header(descriptor: &[u8]) -> Vec<u8> {
+    let mut header = vec![0x04, 0x22, 0x4D, 0x18];
+    header.extend_from_slice(descriptor);
+    header.push(0);
+    for hc in 0..=255u8 {
+        *header.last_mut().unwrap() = hc;
+        let mut dec = Decoder::new();
+        if dec.decode(&header, &mut [0u8; 16]).is_ok() {
+            return header;
+        }
+    }
+    panic!("no header checksum accepted for {descriptor:02X?}");
+}
+
+/// A frame declaring `content_size` whose body is the given uncompressed
+/// blocks followed by the EndMark.
+fn frame_with_content_size(content_size: u64, blocks: &[&[u8]]) -> Vec<u8> {
+    // FLG = version 01 | block independence | content size; BD = 64 KiB.
+    let mut descriptor = vec![0x68, 0x40];
+    descriptor.extend_from_slice(&content_size.to_le_bytes());
+    let mut frame = frame_header(&descriptor);
+    for block in blocks {
+        frame.extend_from_slice(&(block.len() as u32 | 0x8000_0000).to_le_bytes());
+        frame.extend_from_slice(block);
+    }
+    frame.extend_from_slice(&[0, 0, 0, 0]);
+    frame
+}
+
+#[test]
+fn content_size_matching_is_accepted() {
+    let frame = frame_with_content_size(5, &[b"hello"]);
+    assert_eq!(try_decode(&frame).unwrap(), b"hello");
+    let frame = frame_with_content_size(10, &[b"hello", b"world"]);
+    assert_eq!(try_decode(&frame).unwrap(), b"helloworld");
+    let frame = frame_with_content_size(0, &[]);
+    assert_eq!(try_decode(&frame).unwrap(), b"");
+}
+
+#[test]
+fn content_size_larger_than_content_is_rejected() {
+    // The audit's reproducer: Content_Size says 999, the frame holds 5
+    // bytes. Reference `lz4 -d` reports ERROR_frameSize_wrong.
+    let frame = [
+        0x04, 0x22, 0x4D, 0x18, 0x68, 0x40, 0xE7, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x15,
+        0x05, 0x00, 0x00, 0x80, 0x68, 0x65, 0x6C, 0x6C, 0x6F, 0x00, 0x00, 0x00, 0x00,
+    ];
+    assert_eq!(frame.to_vec(), frame_with_content_size(999, &[b"hello"]));
+    assert_eq!(try_decode(&frame), Err(compcol::Error::Corrupt));
+}
+
+#[test]
+fn content_size_smaller_than_content_is_rejected() {
+    let frame = frame_with_content_size(3, &[b"hello"]);
+    assert_eq!(try_decode(&frame), Err(compcol::Error::Corrupt));
+    // The overrun is caught at the block that crosses the declared size,
+    // before a later block is even looked at.
+    let mut frame = frame_with_content_size(7, &[b"hello", b"world"]);
+    frame.truncate(frame.len() - 4); // no EndMark needed to notice
+    assert_eq!(try_decode(&frame), Err(compcol::Error::Corrupt));
+}
+
+/// Append an uncompressed block to a hand-built frame.
+fn push_raw_block(frame: &mut Vec<u8>, data: &[u8]) {
+    frame.extend_from_slice(&(data.len() as u32 | 0x8000_0000).to_le_bytes());
+    frame.extend_from_slice(data);
+}
+
+/// Append a compressed block holding one 4-byte match at `offset` followed
+/// by the single literal `tail`.
+fn push_match_block(frame: &mut Vec<u8>, offset: u16, tail: u8) {
+    let [lo, hi] = offset.to_le_bytes();
+    frame.extend_from_slice(&5u32.to_le_bytes());
+    frame.extend_from_slice(&[0x00, lo, hi, 0x10, tail]);
+}
+
+#[test]
+fn linked_frame_of_tiny_blocks() {
+    // A linked-mode frame (FLG = 0x40) made of one 64 KiB block followed by
+    // a long run of 1-byte blocks. The decoder used to slide its 64 KiB
+    // history window with a full memmove for every one of them (~30x
+    // slower than the same frame in independent mode); the window is now
+    // trimmed in amortised O(1) per byte. No timing assertion here — this
+    // pins the output of that path.
+    const TINY: usize = 100_000;
+    let mut expected: Vec<u8> = (0..64 * 1024u32)
+        .map(|i| (i * 7 + (i >> 8)) as u8)
+        .collect();
+    let mut frame = frame_header(&[0x40, 0x40]);
+    push_raw_block(&mut frame, &expected);
+    for i in 0..TINY {
+        let b = (i % 251) as u8;
+        frame.extend_from_slice(&[0x01, 0x00, 0x00, 0x80, b]);
+        expected.push(b);
+    }
+    frame.extend_from_slice(&[0, 0, 0, 0]);
+    assert_eq!(try_decode(&frame).unwrap(), expected);
+}
+
+#[test]
+fn linked_matches_reach_exactly_64k_back_across_window_trims() {
+    // Interleave uncompressed blocks of awkward sizes with compressed
+    // blocks whose only match reaches a chosen distance back into earlier
+    // blocks — up to 65535, the farthest an LZ4 offset can express. The
+    // history kept for linked blocks must serve every one of them no
+    // matter where its internal trim points fall.
+    let mut frame = frame_header(&[0x40, 0x40]);
+    let mut expected: Vec<u8> = Vec::new();
+    let mut state = 0x2545_F491u32;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    let first: Vec<u8> = (0..64 * 1024).map(|_| next() as u8).collect();
+    push_raw_block(&mut frame, &first);
+    expected.extend_from_slice(&first);
+    let offsets = [65535u16, 4, 65534, 4096, 65535, 32768, 1000];
+    for round in 0..600 {
+        let len = 1 + (next() as usize % 997);
+        let raw: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+        push_raw_block(&mut frame, &raw);
+        expected.extend_from_slice(&raw);
+
+        let offset = offsets[round % offsets.len()];
+        let tail = next() as u8;
+        push_match_block(&mut frame, offset, tail);
+        let start = expected.len() - offset as usize;
+        expected.extend_from_within(start..start + 4);
+        expected.push(tail);
+    }
+    frame.extend_from_slice(&[0, 0, 0, 0]);
+    assert!(expected.len() > 5 * 64 * 1024);
+    assert_eq!(try_decode(&frame).unwrap(), expected);
+}
+
+#[test]
+fn linked_match_beyond_history_is_rejected() {
+    // Only 10 bytes of history exist; an offset of 11 points before the
+    // start of the frame.
+    let mut frame = frame_header(&[0x40, 0x40]);
+    push_raw_block(&mut frame, b"0123456789");
+    push_match_block(&mut frame, 11, b'!');
+    frame.extend_from_slice(&[0, 0, 0, 0]);
+    assert_eq!(try_decode(&frame), Err(compcol::Error::InvalidDistance));
+
+    // Offset 10 is the oldest byte and is fine.
+    let mut frame = frame_header(&[0x40, 0x40]);
+    push_raw_block(&mut frame, b"0123456789");
+    push_match_block(&mut frame, 10, b'!');
+    frame.extend_from_slice(&[0, 0, 0, 0]);
+    assert_eq!(try_decode(&frame).unwrap(), b"01234567890123!");
+}
+
 // ─── Linked blocks (default) ─────────────────────────────────────────────
 
 #[test]

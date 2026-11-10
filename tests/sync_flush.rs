@@ -449,3 +449,132 @@ fn deflate_flush_with_no_pending_input() {
     let decoded = decode_all(&wire).expect("decode empty-flush wire");
     assert_eq!(decoded, b"after");
 }
+
+// ─── a flush interrupted by `encode` ─────────────────────────────────────
+
+/// What `encoded`, a stream cut at a sync point, decodes to.
+fn decode_prefix<D: compcol::Decoder>(mut dec: D, encoded: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    let mut consumed = 0;
+    loop {
+        let (p, status) = dec.decode(&encoded[consumed..], &mut buf).unwrap();
+        out.extend_from_slice(&buf[..p.written]);
+        consumed += p.consumed;
+        let stalled = p.consumed == 0 && p.written == 0;
+        if status == Status::StreamEnd || (consumed == encoded.len() && stalled) {
+            return out;
+        }
+        assert!(!stalled, "decoder stalled with input left");
+    }
+}
+
+/// A `flush` that returns `OutputFull`, followed by `encode` rather than by
+/// the rest of the flush: the next completed `flush` must still cover all
+/// the input accepted so far, and end on a sync marker. (The encoder used to
+/// take that next flush for the end of the interrupted one: it wrote neither
+/// the pending data nor a marker, or tripped a debug assertion.)
+///
+/// `how` is what comes between the two flushes: 0, an `encode` with room,
+/// which drains the old marker and takes a little input; 1, `encode` calls
+/// with a byte of room each, until one takes enough input to compress a
+/// block, which is then left waiting in the encoder; 2, an `encode` with
+/// room but no input.
+fn interrupted_flush<E, D>(new_enc: fn() -> E, new_dec: fn() -> D)
+where
+    E: compcol::Encoder,
+    D: compcol::Decoder,
+{
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let data: Vec<u8> = (0..40_000)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            b"abcdefghijklmnop"[(seed % 16) as usize]
+        })
+        .collect();
+
+    for how in 0..3 {
+        let mut enc = new_enc();
+        let mut wire = Vec::new();
+        let mut buf = vec![0u8; 70_000];
+        let check = |wire: &[u8], upto: usize, what: &str| {
+            assert!(
+                wire.ends_with(&[0x00, 0x00, 0xff, 0xff]),
+                "how {how}: no sync marker after {what}"
+            );
+            assert!(
+                decode_prefix(new_dec(), wire) == data[..upto],
+                "how {how}: wrong data after {what}"
+            );
+        };
+
+        let (p, _) = enc.encode(&data[..1000], &mut buf).unwrap();
+        assert_eq!(p.consumed, 1000);
+        wire.extend_from_slice(&buf[..p.written]);
+        let (p, status) = enc.flush(&mut buf[..1], Flush::Sync).unwrap();
+        wire.extend_from_slice(&buf[..p.written]);
+        assert_eq!(status, Status::OutputFull);
+
+        let mut pos = 1000;
+        match how {
+            0 => {
+                let (p, _) = enc.encode(&data[pos..2000], &mut buf[..4096]).unwrap();
+                wire.extend_from_slice(&buf[..p.written]);
+                pos += p.consumed;
+                assert_eq!(pos, 2000);
+            }
+            1 => loop {
+                let (p, _) = enc.encode(&data[pos..21_000], &mut buf[..1]).unwrap();
+                wire.extend_from_slice(&buf[..p.written]);
+                pos += p.consumed;
+                if p.consumed > 0 {
+                    break;
+                }
+                assert!(p.written > 0, "encode stalled");
+            },
+            _ => {
+                let (p, _) = enc.encode(&[], &mut buf).unwrap();
+                wire.extend_from_slice(&buf[..p.written]);
+            }
+        }
+
+        drive_flush(&mut enc, Flush::Sync, &mut wire);
+        check(&wire, pos, "the flush that follows");
+
+        // And the stream goes on as usual.
+        drive_encode(&mut enc, &data[pos..30_000], &mut wire);
+        drive_flush(&mut enc, Flush::Sync, &mut wire);
+        check(&wire, 30_000, "a later flush");
+        drive_encode(&mut enc, &data[30_000..], &mut wire);
+        drive_finish(&mut enc, &mut wire);
+        assert!(decode_prefix(new_dec(), &wire) == data, "how {how}: whole");
+    }
+}
+
+#[test]
+fn deflate_flush_interrupted_by_encode() {
+    interrupted_flush(Encoder::new, Decoder::new);
+}
+
+#[cfg(feature = "zlib")]
+#[test]
+fn zlib_flush_interrupted_by_encode() {
+    interrupted_flush(compcol::zlib::Encoder::new, compcol::zlib::Decoder::new);
+}
+
+#[cfg(feature = "gzip")]
+#[test]
+fn gzip_flush_interrupted_by_encode() {
+    interrupted_flush(compcol::gzip::Encoder::new, compcol::gzip::Decoder::new);
+}
+
+#[cfg(feature = "deflate64")]
+#[test]
+fn deflate64_flush_interrupted_by_encode() {
+    interrupted_flush(
+        compcol::deflate64::Encoder::new,
+        compcol::deflate64::Decoder::new,
+    );
+}

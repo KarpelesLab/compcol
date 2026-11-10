@@ -63,6 +63,10 @@ pub(crate) struct Inflate<'a, I, O, C> {
     pub(crate) check: C,
     pub(crate) bit_buf: u32,
     pub(crate) bit_cnt: u32,
+    /// Where the output was when the deflate stream started: the history a
+    /// back-reference may reach into starts there, not with whatever an
+    /// earlier stream or gzip member left in the same output.
+    pub(crate) floor: u64,
     /// The first failure of the input. From then on it reads as zeros, which
     /// spares an error path at every read; see `bits`.
     pub(crate) status: Result<(), Error>,
@@ -175,6 +179,7 @@ pub(crate) fn build_codes(
 impl<'a, I: Input, O: Output, C: Checksum> Inflate<'a, I, O, C> {
     pub(crate) fn new(input: &'a mut I, out: &'a mut O, check: C) -> Self {
         Inflate {
+            floor: out.written(),
             input,
             out,
             check,
@@ -417,6 +422,9 @@ impl<'a, I: Input, O: Output, C: Checksum> Inflate<'a, I, O, C> {
         };
 
         self.status?;
+        if dist as u64 > self.out.written() - self.floor {
+            return Err(Error::InvalidDistance);
+        }
         self.out.copy(dist as usize, len as usize, &mut self.check)
     }
 

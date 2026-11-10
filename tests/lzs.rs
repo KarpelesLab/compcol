@@ -558,6 +558,111 @@ fn length_mismatch_rejected() {
     );
 }
 
+// ─── resumable length chain ────────────────────────────────────────────
+
+/// `'A'`, then one match at distance 1 whose length code is `1111`
+/// followed by `k` more `1111` nibbles and a closing `0000`, then EOS.
+/// `declared` is the framing length; the stream really decodes to
+/// `9 + 15 * k` bytes.
+fn long_token_stream(k: usize, declared: u64) -> Vec<u8> {
+    let mut bits: Vec<u8> = vec![0];
+    for shift in (0..8).rev() {
+        bits.push((b'A' >> shift) & 1);
+    }
+    bits.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 0, 1]);
+    for _ in 0..=k {
+        bits.extend_from_slice(&[1, 1, 1, 1]);
+    }
+    bits.extend_from_slice(&[0, 0, 0, 0]);
+    bits.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 0, 0]);
+    let mut framed = declared.to_le_bytes().to_vec();
+    framed.extend_from_slice(&pack_msb(&bits));
+    framed
+}
+
+/// A match-length chain spanning many input chunks is parsed
+/// incrementally (it used to be re-parsed from the token start on every
+/// call) and decodes identically however the input is split.
+#[test]
+fn long_length_chain_decodes_in_any_chunking() {
+    let k = 20_000;
+    let total = 9 + 15 * k;
+    let framed = long_token_stream(k, total as u64);
+    let expected = vec![b'A'; total];
+    for (in_chunk, out_chunk) in [(framed.len(), 4096), (512, 4096), (1, 4096), (3, 1000)] {
+        let decoded = decode_chunked(&framed, in_chunk, out_chunk).unwrap();
+        assert!(decoded == expected, "in_chunk {in_chunk}");
+    }
+}
+
+/// Input ending inside the length chain is a truncation, whatever the
+/// chunking.
+#[test]
+fn truncated_length_chain_rejected() {
+    let k = 2_000;
+    let framed = long_token_stream(k, 9 + 15 * k as u64);
+    for cut in [11, 12, 500, framed.len() - 3] {
+        for in_chunk in [1, 7, 4096] {
+            let err = decode_chunked(&framed[..cut], in_chunk, 4096).unwrap_err();
+            assert_eq!(err, Error::UnexpectedEnd, "cut {cut} in_chunk {in_chunk}");
+        }
+    }
+}
+
+/// A chain that runs past the declared length is rejected as soon as it
+/// does, also when it arrives a byte at a time.
+#[test]
+fn length_chain_exceeding_declared_length_rejected() {
+    let framed = long_token_stream(2_000, 100);
+    for in_chunk in [1, 5, 4096] {
+        let err = decode_chunked(&framed, in_chunk, 4096).unwrap_err();
+        assert_eq!(err, Error::Corrupt, "in_chunk {in_chunk}");
+    }
+}
+
+/// Chunked decoding agrees with one-shot decoding on encoder output.
+#[test]
+fn chunked_decode_matches_one_shot() {
+    let mut inputs: Vec<Vec<u8>> = vec![
+        vec![b'a'; 100_000],
+        b"the quick brown fox jumps over the lazy dog "
+            .iter()
+            .copied()
+            .cycle()
+            .take(20_000)
+            .collect(),
+    ];
+    let mut s = 0x9E37_79B9u32;
+    inputs.push(
+        (0..8_192)
+            .map(|_| {
+                s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (s >> 16) as u8
+            })
+            .collect(),
+    );
+    // Runs of assorted lengths: every length-code shape.
+    let mut runs = Vec::new();
+    for len in 1..200usize {
+        runs.extend(core::iter::repeat_n((len % 251) as u8, len));
+    }
+    inputs.push(runs);
+
+    for input in &inputs {
+        let encoded = encode_all(input);
+        let one_shot = decode_chunked(&encoded, encoded.len(), 1 << 20).unwrap();
+        assert!(&one_shot == input);
+        for (in_chunk, out_chunk) in [(1, 4096), (2, 3), (7, 64), (512, 4096), (4096, 1)] {
+            let decoded = decode_chunked(&encoded, in_chunk, out_chunk).unwrap();
+            assert!(
+                decoded == one_shot,
+                "len {} in_chunk {in_chunk} out_chunk {out_chunk}",
+                input.len()
+            );
+        }
+    }
+}
+
 // ─── Algorithm-trait entry points ──────────────────────────────────────
 
 #[test]

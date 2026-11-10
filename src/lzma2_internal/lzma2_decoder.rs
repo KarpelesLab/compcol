@@ -24,6 +24,47 @@ use alloc::vec::Vec;
 
 use crate::error::Error;
 
+// ─── test instrumentation ────────────────────────────────────────────────
+//
+// Allocation counters for the regression tests guarding against a crafted
+// stream making the decoder rebuild or re-zero its dictionary over and over.
+// Per thread, so concurrently running tests do not disturb each other.
+
+#[cfg(test)]
+pub(crate) mod test_stats {
+    extern crate std;
+
+    use core::cell::Cell;
+
+    std::thread_local! {
+        /// `LzmaCore`s constructed on this thread.
+        static CORES_BUILT: Cell<u64> = const { Cell::new(0) };
+        /// Dictionary bytes allocated (and zero-filled) on this thread.
+        static DICT_BYTES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn reset() {
+        CORES_BUILT.with(|c| c.set(0));
+        DICT_BYTES.with(|c| c.set(0));
+    }
+
+    pub(crate) fn cores_built() -> u64 {
+        CORES_BUILT.with(|c| c.get())
+    }
+
+    pub(crate) fn dict_bytes() -> u64 {
+        DICT_BYTES.with(|c| c.get())
+    }
+
+    pub(super) fn add_core() {
+        CORES_BUILT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(super) fn add_dict_bytes(n: usize) {
+        DICT_BYTES.with(|c| c.set(c.get() + n as u64));
+    }
+}
+
 // ─── LZMA constants (copied from src/lzma/mod.rs) ────────────────────────
 
 const STATES: usize = 12;
@@ -54,6 +95,9 @@ const RC_BIT_MODEL_TOTAL: u32 = 1 << RC_BIT_MODEL_TOTAL_BITS;
 const RC_MOVE_BITS: u32 = 5;
 const RC_TOP_VALUE: u32 = 0x0100_0000;
 const PROB_INIT: u16 = (RC_BIT_MODEL_TOTAL / 2) as u16;
+
+/// Smallest step the lazily grown dictionary buffer is extended by.
+const DICT_GROW_MIN: usize = 4096;
 
 // ─── state transition helpers (copied from src/lzma/mod.rs) ──────────────
 
@@ -341,7 +385,23 @@ pub struct LzmaCore {
 
     // Dictionary / sliding window. Decoded bytes are written here in
     // wrap-around order so that we can satisfy match-back-references.
+    //
+    // The buffer is grown with the bytes actually produced, up to the
+    // declared window size `dict_size` (see `reserve_dict`), so a stream
+    // that merely *declares* a large dictionary commits no memory for it.
+    // Invariants the indexing below relies on:
+    //   * `dict_pos < dict.len()` whenever a byte is about to be written
+    //     (`reserve_dict` runs before every batch of writes);
+    //   * `dict_pos` reaches `dict.len()` — the wrap-around — only once
+    //     `dict.len() == dict_size`, so `dict_full` implies a fully grown
+    //     buffer and every wrapped read is modulo `dict_size`;
+    //   * only bytes written since the last dictionary reset are ever read:
+    //     each read is guarded by `dict_has`, which without `dict_full`
+    //     admits only distances below `dict_pos`. Bytes left over from
+    //     before a reset (the buffer is neither cleared nor shrunk) are
+    //     therefore unreachable.
     dict: Vec<u8>,
+    dict_size: usize,
     dict_pos: usize,
     dict_full: bool,
     output_pos: u64,
@@ -375,11 +435,14 @@ impl LzmaCore {
         let lit_size = (0x300_usize) << (props.lc + props.lp);
         let pos_mask = (1u32 << props.pb).wrapping_sub(1);
         let lit_pos_mask = (1u32 << props.lp).wrapping_sub(1);
+        #[cfg(test)]
+        test_stats::add_core();
         Self {
             lc: props.lc,
             pos_mask,
             lit_pos_mask,
-            dict: vec![0u8; dict_size.max(1)],
+            dict: Vec::new(),
+            dict_size: dict_size.max(1),
             dict_pos: 0,
             dict_full: false,
             output_pos: 0,
@@ -417,11 +480,58 @@ impl LzmaCore {
         }
     }
 
-    /// True iff the current dictionary buffer has the requested size, so
-    /// the caller can reuse this core for a full-reset chunk instead of
-    /// allocating a fresh `LzmaCore`.
+    /// The window size this core was built for (not how much of it is
+    /// allocated so far), so the caller can reuse this core for a
+    /// dictionary-reset chunk instead of allocating a fresh `LzmaCore`.
     pub fn dict_capacity(&self) -> usize {
-        self.dict.len()
+        self.dict_size
+    }
+
+    /// Forget the dictionary contents (an LZMA2 dictionary reset) without
+    /// touching the allocation, the properties or the probability state.
+    /// Nothing written before the reset can be read afterwards: see the
+    /// invariants on the `dict` field.
+    pub fn reset_dict(&mut self) {
+        self.dict_pos = 0;
+        self.dict_full = false;
+        self.output_pos = 0;
+    }
+
+    /// Make room for the next `n` dictionary writes. Must be called before
+    /// writing; afterwards up to `n` bytes can be put without `dict_pos`
+    /// running into the end of a not yet fully grown buffer.
+    #[inline]
+    fn reserve_dict(&mut self, n: usize) {
+        if self.dict.len() < self.dict_size {
+            self.grow_dict(n);
+        }
+    }
+
+    /// Slow path of [`Self::reserve_dict`]: grow the buffer geometrically
+    /// (so the zero-fill and copying stay proportional to the bytes
+    /// produced), never past `dict_size`.
+    #[cold]
+    fn grow_dict(&mut self, n: usize) {
+        // One spare byte keeps `dict_pos` strictly below `dict.len()` after
+        // the `n` writes, so the wrap-around test (`dict_pos >= dict.len()`)
+        // can only fire once the buffer has reached `dict_size`.
+        let need = self
+            .dict_pos
+            .saturating_add(n)
+            .saturating_add(1)
+            .min(self.dict_size);
+        let have = self.dict.len();
+        if need <= have {
+            return;
+        }
+        let new_len = need
+            .max(have.saturating_mul(2))
+            .max(DICT_GROW_MIN)
+            .min(self.dict_size);
+        #[cfg(test)]
+        test_stats::add_dict_bytes(new_len - have);
+        self.dict.reserve_exact(new_len - have);
+        self.dict.resize(new_len, 0);
     }
 
     /// Perform a "full reset" equivalent to constructing a new `LzmaCore`
@@ -432,9 +542,7 @@ impl LzmaCore {
     /// re-bind the range coder to the next chunk's payload.
     pub fn reset_full(&mut self, props: Lzma2Props) {
         self.replace_props(props);
-        self.dict_pos = 0;
-        self.dict_full = false;
-        self.output_pos = 0;
+        self.reset_dict();
         self.reset_state();
     }
 
@@ -491,10 +599,8 @@ impl LzmaCore {
     /// Feed already-known literal bytes (e.g. from an LZMA2 *uncompressed*
     /// chunk) into the LZ window so a later compressed chunk that does not
     /// reset the dictionary can back-reference them. Does not emit output.
-    ///
-    /// Used by the raw [`crate::lzma2`] decoder; dead under an xz-only build.
-    #[cfg_attr(not(any(feature = "lzma2", test)), allow(dead_code))]
     pub fn append_literals(&mut self, bytes: &[u8]) {
+        self.reserve_dict(bytes.len());
         for &b in bytes {
             self.dict_put(b);
         }
@@ -825,13 +931,41 @@ impl LzmaCore {
     /// were already consumed by `init_range`) into `out`. The output buffer
     /// must be sized to hold the chunk's `uncomp_size` bytes.
     ///
-    /// On success the range coder must be in a "clean" terminal state
-    /// (range >= TOP and code == 0); we *don't* enforce that here because
-    /// the chunk's `comp_size` already bounds how many bytes we read, and
-    /// any trailing slack just stays in `buf`.
+    /// `buf` must be the chunk's whole compressed payload: on success the
+    /// range coder has been checked to end exactly there (see
+    /// [`Self::finish_chunk`]).
+    ///
+    /// Used by the raw [`crate::lzma2`] decoder; dead under an xz-only build.
+    #[cfg_attr(not(any(feature = "lzma2", test)), allow(dead_code))]
     pub fn decode_chunk(&mut self, buf: &[u8], out: &mut [u8]) -> Result<(), Error> {
         let mut written = 0usize;
-        self.decode_partial(buf, out, &mut written, 0)
+        self.decode_partial(buf, out, &mut written, 0)?;
+        self.finish_chunk(buf)
+    }
+
+    /// Check that the range coder ended exactly at the end of the chunk's
+    /// compressed payload `buf`, to be called once all of the chunk's
+    /// output has been decoded. Returns `Error::Corrupt` otherwise.
+    ///
+    /// This is liblzma's rule for an LZMA2 chunk: after the last symbol the
+    /// decoder normalises once more (the encoder already shifted out the
+    /// byte for it), and then `code` must be zero (`rc_is_finished`) and
+    /// the chunk's Compressed Size used up to the byte. A range encoder
+    /// flushing its 5 final bytes always ends this way; anything else is
+    /// either damage or bytes smuggled in behind the LZMA data.
+    pub fn finish_chunk(&mut self, buf: &[u8]) -> Result<(), Error> {
+        if self.range.range < RC_TOP_VALUE {
+            let Some(&b) = buf.get(self.range.pos) else {
+                return Err(Error::Corrupt);
+            };
+            self.range.range <<= 8;
+            self.range.code = (self.range.code << 8) | b as u32;
+            self.range.pos += 1;
+        }
+        if self.range.code != 0 || self.range.pos != buf.len() {
+            return Err(Error::Corrupt);
+        }
+        Ok(())
     }
 
     /// Continue decoding a chunk whose compressed bytes may not all be in
@@ -853,6 +987,8 @@ impl LzmaCore {
         margin: usize,
     ) -> Result<(), Error> {
         let target = out.len();
+        // Everything this call can write to the dictionary.
+        self.reserve_dict(target - *written);
         while *written < target && buf.len().saturating_sub(self.range.pos) >= margin {
             match self.step(buf)? {
                 PacketOutcome::Literal(b) => {

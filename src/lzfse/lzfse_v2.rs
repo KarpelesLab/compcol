@@ -436,7 +436,11 @@ pub(crate) fn decode_block(
         if lit_pos + l > n_literals {
             return Err(Error::Corrupt);
         }
-        if out.len() + l > start_len + n_raw {
+        // Compare against the room left in the block rather than adding to
+        // `start_len + n_raw`, which overflows `usize` on 32-bit targets when
+        // a hostile `n_raw_bytes` is near `u32::MAX` and history is present.
+        // `out.len() - start_len <= n_raw` holds throughout the loop.
+        if l > n_raw - (out.len() - start_len) {
             return Err(Error::Corrupt);
         }
         out.extend_from_slice(&literals[lit_pos..lit_pos + l]);
@@ -451,7 +455,7 @@ pub(crate) fn decode_block(
         if d > out.len() {
             return Err(Error::Corrupt);
         }
-        if out.len() + m > start_len + n_raw {
+        if m > n_raw - (out.len() - start_len) {
             return Err(Error::Corrupt);
         }
         // Vectorized match copy. The two guards above already bound-check the

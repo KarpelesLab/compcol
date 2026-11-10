@@ -50,8 +50,19 @@ const EOS_SYMBOL: u32 = 0x140;
 /// `expected_len` is the out-of-band uncompressed length; when `Some(n)`,
 /// decoding stops at exactly `n` bytes (and `n` bounds output). When `None`,
 /// decoding runs until the `0x140` end-of-stream symbol, bounded by
-/// [`DEFAULT_OUTPUT_CAP`].
+/// [`DEFAULT_OUTPUT_CAP`]: a stream that would produce more is rejected with
+/// [`Error::Corrupt`].
 pub(crate) fn decode_payload(input: &[u8], expected_len: Option<usize>) -> Result<Vec<u8>, Error> {
+    decode_payload_capped(input, expected_len, DEFAULT_OUTPUT_CAP)
+}
+
+/// [`decode_payload`] with the open-ended output cap as a parameter
+/// (`open_cap` only applies when `expected_len` is `None`).
+fn decode_payload_capped(
+    input: &[u8],
+    expected_len: Option<usize>,
+    open_cap: usize,
+) -> Result<Vec<u8>, Error> {
     if let Some(0) = expected_len {
         return Ok(Vec::new());
     }
@@ -61,7 +72,7 @@ pub(crate) fn decode_payload(input: &[u8], expected_len: Option<usize>) -> Resul
         return Err(Error::UnexpectedEnd);
     }
 
-    let cap = expected_len.unwrap_or(DEFAULT_OUTPUT_CAP);
+    let cap = expected_len.unwrap_or(open_cap);
     let mut out: Vec<u8> = Vec::new();
     if let Some(n) = expected_len {
         // Pre-reserve modestly; do not trust a huge n to pre-allocate.
@@ -113,11 +124,15 @@ pub(crate) fn decode_payload(input: &[u8], expected_len: Option<usize>) -> Resul
     // match).
     let mut use_a = true;
     loop {
-        if out.len() >= cap {
+        if expected_len.is_some() && out.len() >= cap {
             // Reached the requested length. A well-formed stream emits the
             // EOS symbol here, but the header length is the authority.
             break;
         }
+        // With no expected length the cap is only a bomb guard, not a place
+        // to stop: decoding carries on so that the end-of-stream symbol is
+        // still accepted at exactly `cap` bytes, while any further output
+        // is rejected below instead of returning a truncated prefix.
         let litlen = if use_a {
             code_a.decode(&mut reader)?
         } else {
@@ -125,6 +140,11 @@ pub(crate) fn decode_payload(input: &[u8], expected_len: Option<usize>) -> Resul
         };
 
         if litlen <= 0xFF {
+            if out.len() >= cap {
+                // Open-ended cap reached (see above); same error as a match
+                // that would cross it.
+                return Err(Error::Corrupt);
+            }
             window::emit_literal(&mut out, litlen as u8);
             use_a = true;
             continue;
@@ -369,5 +389,107 @@ impl RawDecoder for Decoder {
         self.out_cursor = 0;
         self.state = State::Buffering;
         self.poisoned = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal method-13 writer for the predefined code set 1: literals and
+    /// the end-of-stream symbol only, so every symbol uses code A.
+    struct Writer {
+        bytes: Vec<u8>,
+        bits: usize,
+        codes: Vec<(u32, u32)>,
+    }
+
+    impl Writer {
+        fn new() -> Self {
+            // MSB-canonical codes for the length list, as `from_lengths`
+            // assigns them.
+            let lengths = tables::PREDEFINED_FIRST[0];
+            let mut order: Vec<usize> = (0..lengths.len()).filter(|&s| lengths[s] != 0).collect();
+            order.sort_by_key(|&s| (lengths[s], s));
+            let mut codes = alloc::vec![(0u32, 0u32); lengths.len()];
+            let (mut code, mut prev) = (0u64, lengths[order[0]] as u32);
+            for s in order {
+                let l = lengths[s] as u32;
+                code <<= l - prev;
+                prev = l;
+                codes[s] = (code as u32, l);
+                code += 1;
+            }
+            let mut w = Self {
+                bytes: Vec::new(),
+                bits: 0,
+                codes,
+            };
+            // Control byte: high nibble 1 = predefined set 1.
+            for i in 0..8 {
+                w.bit((0x10u32 >> i) & 1);
+            }
+            w
+        }
+
+        fn bit(&mut self, b: u32) {
+            if self.bits.is_multiple_of(8) {
+                self.bytes.push(0);
+            }
+            *self.bytes.last_mut().unwrap() |= (b as u8) << (self.bits % 8);
+            self.bits += 1;
+        }
+
+        /// Emit a literal/length symbol: MSB-canonical code, first bit first.
+        fn symbol(&mut self, sym: u32) {
+            let (code, len) = self.codes[sym as usize];
+            for i in (0..len).rev() {
+                self.bit((code >> i) & 1);
+            }
+        }
+
+        fn literals(mut self, data: &[u8]) -> Self {
+            for &b in data {
+                self.symbol(b as u32);
+            }
+            self
+        }
+
+        fn finish(mut self, eos: bool) -> Vec<u8> {
+            if eos {
+                self.symbol(EOS_SYMBOL);
+            }
+            self.bytes
+        }
+    }
+
+    #[test]
+    fn writer_round_trips() {
+        let stream = Writer::new().literals(b"stuffit!").finish(true);
+        assert_eq!(decode_payload(&stream, None).unwrap(), b"stuffit!");
+        assert_eq!(decode_payload(&stream, Some(8)).unwrap(), b"stuffit!");
+    }
+
+    #[test]
+    fn open_ended_output_exactly_at_cap_is_accepted() {
+        let stream = Writer::new().literals(b"stuffit!").finish(true);
+        assert_eq!(
+            decode_payload_capped(&stream, None, 8).unwrap(),
+            b"stuffit!"
+        );
+    }
+
+    /// With no out-of-band length, a stream that keeps producing output at
+    /// the internal cap must fail rather than return a silently truncated
+    /// prefix as if it were the whole member.
+    #[test]
+    fn open_ended_literal_past_cap_is_an_error() {
+        let stream = Writer::new().literals(b"stuffit!!").finish(true);
+        assert_eq!(decode_payload_capped(&stream, None, 8), Err(Error::Corrupt));
+        // A known length is still the authority on where to stop.
+        assert_eq!(
+            decode_payload_capped(&stream, Some(8), 8).unwrap(),
+            b"stuffit!"
+        );
     }
 }

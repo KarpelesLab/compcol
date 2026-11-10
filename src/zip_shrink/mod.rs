@@ -277,13 +277,55 @@ impl Decoder {
     /// Compact the input buffer once we have consumed a healthy prefix —
     /// avoids unbounded growth when the caller streams many small chunks
     /// through a long payload.
+    ///
+    /// The consumed prefix is dropped only once it is at least as long as
+    /// the live remainder, so the bytes moved are paid for by the bytes
+    /// already consumed. Dropping it at a fixed threshold instead would
+    /// move the whole remainder each time, which is quadratic when one
+    /// large input is decoded through a small output buffer.
     fn compact_in_buf(&mut self) {
-        if self.in_pos >= 4096 && self.in_pos == self.in_buf.len() {
+        if self.in_pos == self.in_buf.len() {
             self.in_buf.clear();
             self.in_pos = 0;
-        } else if self.in_pos >= 64 * 1024 {
+        } else if self.in_pos >= 64 * 1024 && self.in_pos >= self.in_buf.len() - self.in_pos {
             self.in_buf.drain(0..self.in_pos);
             self.in_pos = 0;
+        }
+    }
+
+    /// Decode buffered input and hand the result to `output` until
+    /// `output` is full, the declared length has been delivered, or the
+    /// buffered input holds no further complete code. Returns the number
+    /// of bytes written.
+    ///
+    /// [`pump`](Self::pump) decodes in bursts of about 16 KiB, so a single
+    /// pump-then-drain is not enough: it has to be repeated for as long as
+    /// it makes progress. On return with `written < output.len()` and
+    /// `!self.completed`, `emit_buf` is empty and the input is exhausted.
+    fn pump_into(&mut self, output: &mut [u8]) -> Result<usize, Error> {
+        let mut written = 0usize;
+        loop {
+            // Run the LZW state machine (a no-op once completed, or while
+            // a full burst is still waiting to be drained).
+            self.pump()?;
+
+            // Drain to the caller, capped at target_len.
+            let cap = (output.len() - written).min(self.remaining());
+            let n = if cap > 0 && self.emit_head < self.emit_buf.len() {
+                self.drain_emit(&mut output[written..written + cap])
+            } else {
+                0
+            };
+            written += n;
+            self.out_pos += n as u64;
+            if self.out_pos >= self.target_len {
+                self.completed = true;
+            }
+            // `n == 0` with room left in `output` means pump produced
+            // nothing: it ran out of input.
+            if self.completed || written == output.len() || n == 0 {
+                return Ok(written);
+            }
         }
     }
 
@@ -521,7 +563,6 @@ impl Decoder {
 impl RawDecoder for Decoder {
     fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         let mut consumed = 0usize;
-        let mut written = 0usize;
 
         // ── parse the 4-byte LE length header ──
         while self.header_pos < 4 && consumed < input.len() {
@@ -533,7 +574,7 @@ impl RawDecoder for Decoder {
         if self.header_pos < 4 {
             return Ok(RawProgress {
                 consumed,
-                written,
+                written: 0,
                 done: false,
             });
         }
@@ -546,19 +587,11 @@ impl RawDecoder for Decoder {
         self.in_buf.extend_from_slice(&input[consumed..]);
         consumed = input.len();
 
-        // Run the LZW state machine.
-        self.pump()?;
-
-        // Drain to the caller, capped at target_len.
-        let cap = output.len().min(self.remaining());
-        if cap > 0 && self.emit_head < self.emit_buf.len() {
-            let n = self.drain_emit(&mut output[..cap]);
-            written += n;
-            self.out_pos += n as u64;
-            if self.out_pos >= self.target_len {
-                self.completed = true;
-            }
-        }
+        // Run the LZW state machine until `output` is full or the
+        // buffered input is used up. Stopping after one burst would leave
+        // input we have already reported as consumed undecoded, with
+        // nothing telling the caller to call again.
+        let written = self.pump_into(output)?;
 
         self.compact_in_buf();
 
@@ -570,7 +603,6 @@ impl RawDecoder for Decoder {
     }
 
     fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
-        let mut written = 0usize;
         if self.header_pos < 4 {
             if self.header_pos == 0 && self.in_buf.is_empty() && self.emit_buf.is_empty() {
                 // No data at all → empty stream is permissible only after
@@ -581,22 +613,13 @@ impl RawDecoder for Decoder {
             return Err(Error::UnexpectedEnd);
         }
 
-        // Best-effort pump: there may be a pending code whose width was
-        // bumped just before EOF, and we may still be able to drain
-        // emit_buf into the caller.
-        if !self.completed {
-            self.pump()?;
-        }
+        // Decode whatever input is still buffered: `raw_decode` stops as
+        // soon as the caller's output is full, so any amount of it can be
+        // left.
+        let written = self.pump_into(output)?;
+        self.compact_in_buf();
 
-        let cap = output.len().min(self.remaining());
-        if cap > 0 && self.emit_head < self.emit_buf.len() {
-            let n = self.drain_emit(&mut output[..cap]);
-            written += n;
-            self.out_pos += n as u64;
-        }
-
-        if self.out_pos >= self.target_len {
-            self.completed = true;
+        if self.completed {
             return Ok(RawProgress {
                 consumed: 0,
                 written,
@@ -604,8 +627,11 @@ impl RawDecoder for Decoder {
             });
         }
 
-        // More output owed than we have buffered, and the input is gone.
-        if self.emit_head >= self.emit_buf.len() {
+        // More output is owed. If `output` filled up, the caller drains it
+        // and calls again. Otherwise nothing is buffered and the input ran
+        // out (less than one code is left) short of the declared length.
+        let drained = self.emit_head >= self.emit_buf.len();
+        if written < output.len() || (output.is_empty() && drained) {
             return Err(Error::UnexpectedEnd);
         }
         Ok(RawProgress {

@@ -53,11 +53,14 @@ pub(crate) fn decode_int(buf: &[u8], pos: usize, n: u32) -> Result<(usize, usize
     loop {
         let b = *buf.get(p).ok_or(Error::UnexpectedEnd)? as usize;
         p += 1;
-        if shift >= usize::BITS {
+        // Checking the shift count alone is not enough (`checked_shl` only
+        // rejects a count >= the type width): the group's own high bits must
+        // not be shifted out either, or the value would silently wrap.
+        let group = b & 0x7f;
+        if shift >= usize::BITS || group > (usize::MAX >> shift) {
             return Err(Error::Corrupt);
         }
-        let add = (b & 0x7f).checked_shl(shift).ok_or(Error::Corrupt)?;
-        value = value.checked_add(add).ok_or(Error::Corrupt)?;
+        value = value.checked_add(group << shift).ok_or(Error::Corrupt)?;
         if b & 0x80 == 0 {
             break;
         }

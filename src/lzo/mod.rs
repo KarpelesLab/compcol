@@ -19,7 +19,9 @@
 //! length-prefixed compressed block. `finish` flushes any trailing partial
 //! block and then writes the zero-length terminator. The decoder reads a
 //! length, accumulates that many bytes, decompresses them, and emits the
-//! result; it stops at the first zero-length terminator.
+//! result; it stops at the first zero-length terminator. A stream that ends
+//! without the terminator is truncated ([`Error::UnexpectedEnd`] from
+//! `finish`), even if it ends exactly at a block boundary.
 //!
 //! This is intentionally not the `lzop`/`.lzo` container format (which has a
 //! magic header, file metadata, and per-block uncompressed-size + adler32
@@ -266,6 +268,10 @@ pub struct Decoder {
     decoded: Vec<u8>,
     decoded_idx: usize,
     phase: DecPhase,
+    /// At least one block header has been read. From then on the stream
+    /// must end with the terminator; only a decoder that was never fed
+    /// anything may finish without one.
+    saw_block: bool,
     poisoned: bool,
 }
 
@@ -279,6 +285,7 @@ impl Decoder {
             decoded: Vec::new(),
             decoded_idx: 0,
             phase: DecPhase::Length,
+            saw_block: false,
             poisoned: false,
         }
     }
@@ -345,6 +352,7 @@ impl RawDecoder for Decoder {
                     // compress_bound(BLOCK_SIZE); double the cap for
                     // headroom against foreign-encoder streams that
                     // packed less efficiently.
+                    self.saw_block = true;
                     let max_block = block::compress_bound(BLOCK_SIZE)
                         .saturating_add(4)
                         .saturating_mul(2);
@@ -432,7 +440,11 @@ impl RawDecoder for Decoder {
                 written,
                 done: true,
             }),
-            DecPhase::Length if self.length_idx == 0 => Ok(RawProgress {
+            // Nothing was ever fed: treated as an empty stream. Once a
+            // block has been seen, stopping between blocks means the
+            // terminator is missing, i.e. the stream was cut at a block
+            // boundary, which is as truncated as a cut inside a block.
+            DecPhase::Length if self.length_idx == 0 && !self.saw_block => Ok(RawProgress {
                 consumed: 0,
                 written,
                 done: true,
@@ -450,6 +462,7 @@ impl RawDecoder for Decoder {
         self.decoded.clear();
         self.decoded_idx = 0;
         self.phase = DecPhase::Length;
+        self.saw_block = false;
         self.poisoned = false;
     }
 }

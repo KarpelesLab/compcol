@@ -293,6 +293,107 @@ fn absurd_length_header_errors() {
     assert_eq!(decode(&bytes).unwrap_err(), Error::Corrupt);
 }
 
+/// The declared length must not size an allocation. The decoder used to
+/// `reserve` it before decoding a single byte: up to 256x the payload (256
+/// MiB for 1 MiB of input), and on 32-bit targets a declared length of 2^31
+/// made `Vec::reserve` panic with `capacity overflow`.
+///
+/// 8 MiB of zeros is the smallest payload that lets 2^31 through the
+/// plausibility check. Asking for a few bytes must hand back exactly those
+/// bytes, at once, with the rest still pending.
+#[test]
+fn declared_length_is_not_preallocated() {
+    let mut input = (1u64 << 31).to_le_bytes().to_vec();
+    input.resize(8 + (8 << 20), 0);
+
+    let mut dec = RangeCoder::decoder();
+    let mut buf = [0u8; 4096];
+    let mut consumed = 0;
+    while consumed < input.len() {
+        let (p, _) = dec.decode(&input[consumed..], &mut buf).unwrap();
+        assert_eq!(p.written, 0);
+        consumed += p.consumed;
+    }
+    for _ in 0..4 {
+        let (p, status) = dec.finish(&mut buf).unwrap();
+        assert_eq!(p.written, buf.len());
+        assert_eq!(status, Status::OutputFull);
+        // An all-zero payload decodes to zeros.
+        assert!(buf.iter().all(|&b| b == 0));
+        buf.fill(0xFF);
+    }
+}
+
+/// The 256x plausibility bound itself must not overflow or wrap: the largest
+/// length it lets through and the first one it rejects, for a small payload.
+#[test]
+fn plausibility_bound_is_exact() {
+    let payload = 64usize;
+    let limit = payload as u64 * 256 + 1024;
+    for (len, ok) in [(limit, true), (limit + 1, false), (u64::MAX - 1, false)] {
+        let mut input = len.to_le_bytes().to_vec();
+        input.resize(8 + payload, 0);
+        let mut dec = RangeCoder::decoder();
+        let mut buf = [0u8; 16];
+        dec.decode(&input, &mut buf).unwrap();
+        let r = dec.finish(&mut buf);
+        if ok {
+            assert_eq!(r.unwrap().0.written, buf.len(), "len {len}");
+        } else {
+            assert_eq!(r.unwrap_err(), Error::Corrupt, "len {len}");
+        }
+    }
+}
+
+/// Output is produced incrementally, whatever the size of the caller's
+/// buffer, and a truncated stream still ends in an error (after the bytes
+/// that could be decoded).
+#[test]
+fn finish_streams_into_any_buffer_size() {
+    let data: Vec<u8> = (0..20_000u32)
+        .map(|i| (i % 7 * 31 + i / 500) as u8)
+        .collect();
+    let enc = encode(&data);
+    for chunk in [1usize, 3, 1000, 20_000, 65_536] {
+        let mut dec = RangeCoder::decoder();
+        let mut buf = vec![0u8; chunk];
+        dec.decode(&enc, &mut buf).unwrap();
+        let mut out = Vec::new();
+        loop {
+            let (p, status) = dec.finish(&mut buf).unwrap();
+            out.extend_from_slice(&buf[..p.written]);
+            if matches!(status, Status::StreamEnd) {
+                break;
+            }
+            assert!(p.written > 0, "stalled (chunk {chunk})");
+        }
+        assert_eq!(out, data, "chunk {chunk}");
+        // Finished: further calls are no-ops.
+        let (p, status) = dec.finish(&mut buf).unwrap();
+        assert_eq!((p.written, status), (0, Status::StreamEnd));
+    }
+
+    // Truncated: some output, then an error that sticks.
+    let cut = &enc[..enc.len() / 2];
+    let mut dec = RangeCoder::decoder();
+    let mut buf = [0u8; 512];
+    dec.decode(cut, &mut buf).unwrap();
+    let mut got = 0usize;
+    let err = loop {
+        match dec.finish(&mut buf) {
+            Ok((p, status)) => {
+                assert!(data[got..].starts_with(&buf[..p.written]));
+                got += p.written;
+                assert!(!matches!(status, Status::StreamEnd));
+            }
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(err, Error::UnexpectedEnd);
+    assert!(got > 0 && got < data.len());
+    assert_eq!(dec.finish(&mut buf).unwrap_err(), Error::UnexpectedEnd);
+}
+
 #[test]
 fn zero_length_with_payload_is_corrupt() {
     let mut bytes = 0u64.to_le_bytes().to_vec();

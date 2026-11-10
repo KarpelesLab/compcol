@@ -34,6 +34,9 @@ pub const RECOMMENDED_WINDOW_SIZE: u64 = 8 * 1024 * 1024;
 /// `Window_Size` the format allows (1 KiB). Lower values are clamped up.
 const MIN_WINDOW_SIZE: u64 = 1024;
 
+/// Format-wide ceiling on `Block_Maximum_Size` (RFC 8878 §3.1.1.2.4): 128 KiB.
+const MAX_BLOCK_SIZE: u64 = 128 * 1024;
+
 /// Decoder tunables.
 ///
 /// The decoder keeps at most `Window_Size` bytes of decoded history (plus a
@@ -119,10 +122,12 @@ pub struct Decoder {
     window_size: u64,
     /// Configured upper bound on `window_size`.
     max_window_size: u64,
-    /// Frame_Content_Size, if known (Single_Segment frames always report it).
-    /// Currently unused — we don't validate against actual decoded length.
-    #[allow(dead_code)]
+    /// Frame_Content_Size, if the header carries it (Single_Segment frames
+    /// always do). The decoded length is validated against it block by block
+    /// (see [`Self::account_block`]).
     frame_content_size: Option<u64>,
+    /// Decompressed bytes of every block admitted so far in this frame.
+    decoded_size: u64,
 
     /// `Last_Block` bit of the block currently being decoded.
     last_block: bool,
@@ -181,6 +186,7 @@ impl Decoder {
             window_size: 0,
             max_window_size: config.max_window_size.max(MIN_WINDOW_SIZE),
             frame_content_size: None,
+            decoded_size: 0,
             last_block: false,
             raw_remaining: 0,
             rle_byte: 0,
@@ -336,13 +342,20 @@ impl Decoder {
         let block_size = (bh >> 3) & 0x1F_FFFF;
         self.last_block = last;
 
+        // RFC 8878 §3.1.1.2.4: for every block type `Block_Size` is bounded
+        // by Block_Maximum_Size. For Raw and Compressed blocks that is the
+        // size on the wire; for an RLE_Block it is the regenerated size (the
+        // block itself is one byte). The regenerated size of a
+        // Compressed_Block is bounded separately, in
+        // `decode_compressed_block`.
+        if block_size as u64 > self.block_max_size() {
+            return Err(self.poison(Error::Corrupt));
+        }
+
         match block_type {
             0 => {
                 // Raw_Block: `block_size` literal bytes follow.
-                // Spec caps Block_Size at min(Window_Size, 128 KiB).
-                if block_size as u64 > 128 * 1024 {
-                    return Err(self.poison(Error::Corrupt));
-                }
+                self.account_block(block_size as u64)?;
                 self.raw_remaining = block_size;
                 Ok(DecPhase::RawBlock)
             }
@@ -354,14 +367,12 @@ impl Decoder {
                     // Be defensive: treat as corrupt.
                     return Err(self.poison(Error::Corrupt));
                 }
+                self.account_block(block_size as u64)?;
                 self.rle_remaining = block_size;
                 Ok(DecPhase::RleByte)
             }
             2 => {
                 // Compressed_Block: buffer `block_size` bytes, then decode.
-                if block_size as u64 > 128 * 1024 {
-                    return Err(self.poison(Error::Corrupt));
-                }
                 if block_size < 2 {
                     // Compressed blocks need at least a literals section
                     // header (1 byte) and a sequences-count byte. Anything
@@ -379,6 +390,37 @@ impl Decoder {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// `Block_Maximum_Size` of the current frame (RFC 8878 §3.1.1.2.4):
+    /// `min(Window_Size, 128 KiB)`. In a Single_Segment frame `Window_Size`
+    /// is the Frame_Content_Size, so a frame declaring fewer than 128 KiB of
+    /// content has a correspondingly smaller block limit (down to 0 for an
+    /// empty frame, which can then only hold empty Raw_Blocks). This matches
+    /// the reference decoder's `blockSizeMax = MIN(windowSize,
+    /// ZSTD_BLOCKSIZE_MAX)`.
+    ///
+    /// Every frame sets `window_size` before its first block header: from the
+    /// Window_Descriptor, or from the Frame_Content_Size that a
+    /// Single_Segment frame always carries.
+    fn block_max_size(&self) -> u64 {
+        core::cmp::min(self.window_size, MAX_BLOCK_SIZE)
+    }
+
+    /// Account for a block that regenerates `regen` bytes and validate the
+    /// running total against `Frame_Content_Size` when the header declared
+    /// one: the content may never exceed it, and must equal it exactly once
+    /// the last block is in. Called before any byte of the block is emitted,
+    /// so a frame that lies about its size yields no output past the lie.
+    /// `self.last_block` must already describe the block being accounted.
+    fn account_block(&mut self, regen: u64) -> Result<(), Error> {
+        self.decoded_size = self.decoded_size.saturating_add(regen);
+        if let Some(fcs) = self.frame_content_size
+            && (self.decoded_size > fcs || (self.last_block && self.decoded_size != fcs))
+        {
+            return Err(self.poison(Error::Corrupt));
+        }
+        Ok(())
     }
 }
 
@@ -723,6 +765,7 @@ impl Decoder {
     /// later blocks can reference them.
     fn decode_compressed_block(&mut self) -> Result<(), Error> {
         let block = core::mem::take(&mut self.comp_buf);
+        let history_before = self.history.len();
         // 1. Literals section.
         let lit = decode_literals(&block, &mut self.lit_state)?;
         let after_lit = lit.consumed;
@@ -738,14 +781,8 @@ impl Decoder {
         // Block_Maximum_Size = min(Window_Size, 128 KiB). Enforce that bound on
         // the bytes this block appends so a malicious block (e.g. RLE_Mode FSE
         // tables emitting huge match-lengths from cheap sequences) can't expand
-        // `history` to multiple GiB before any output is drained. When no
-        // Window_Descriptor was present (window_size == 0) fall back to the
-        // 128 KiB block cap.
-        let block_max = if self.window_size == 0 {
-            128 * 1024
-        } else {
-            core::cmp::min(self.window_size, 128 * 1024)
-        } as usize;
+        // `history` to multiple GiB before any output is drained.
+        let block_max = self.block_max_size() as usize;
         // RFC 8878 §3.1.1.4: offsets must stay within Window_Size. We only
         // retain that much history (see `trim_history`), so enforce it
         // uniformly rather than depending on when the history was last
@@ -758,6 +795,8 @@ impl Decoder {
             block_max,
             max_offset,
         )?;
+        // Frame_Content_Size check, before any of this block is emitted.
+        self.account_block((self.history.len() - history_before) as u64)?;
         // Return ownership of comp_buf for reuse.
         self.comp_buf = block;
         self.comp_buf.clear();

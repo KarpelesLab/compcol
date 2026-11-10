@@ -879,3 +879,23 @@ fn single_member_stops_after_first_trailer() {
     let (p, status) = dec.decode(&stream, &mut buf).unwrap();
     assert_eq!((status, p.consumed), (Status::StreamEnd, first.len()));
 }
+
+/// A back-reference cannot reach into the previous gzip member: each member
+/// is a deflate stream of its own, with its own history. (The `embed`
+/// decoder used to take the first member's data for the second one's.)
+#[test]
+fn member_cannot_reference_the_previous_one() {
+    // Member 1 stores "abcdefgh"; member 2 is a fixed block with a match of
+    // length 8 at distance 8, and the trailer of "abcdefgh".
+    let stream = hex(concat!(
+        "1f8b08000000000000ff010800f7ff6162636465666768502aefae08000000",
+        "1f8b08000000000000ff83d100502aefae08000000",
+    ));
+    for (in_chunk, out_chunk) in [(stream.len(), 64), (1, 1), (7, 3)] {
+        assert_eq!(
+            decode_chunked(&stream, in_chunk, out_chunk),
+            Err(Error::InvalidDistance),
+            "chunks of {in_chunk} in, {out_chunk} out"
+        );
+    }
+}

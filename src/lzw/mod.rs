@@ -514,6 +514,9 @@ pub struct Decoder {
     finchar: u8,
     /// Codes read at the current width since the last alignment (0..7).
     codes_in_group: u8,
+    /// A CLEAR code has been read, but the padding after it has not been
+    /// fully skipped and the dictionary not yet reset.
+    clear_pending: bool,
     /// Decoded characters waiting to be flushed into the caller's output,
     /// in forward order. `emit_head` is the read cursor.
     emit_buf: Vec<u8>,
@@ -538,6 +541,7 @@ impl Decoder {
             prev_code: u32::MAX,
             finchar: 0,
             codes_in_group: 0,
+            clear_pending: false,
             emit_buf: Vec::new(),
             emit_head: 0,
             completed: false,
@@ -696,6 +700,24 @@ impl RawDecoder for Decoder {
                 });
             }
 
+            // A CLEAR has been read but its padding (the rest of the
+            // 8-code group) not yet fully skipped. `codes_in_group` tracks
+            // how many padding codes are left; `clear_pending` records that
+            // they are padding and that the reset is still owed. Without
+            // it, a call that ran out of input mid-padding would resume by
+            // decoding the remaining padding codes as data.
+            if self.clear_pending {
+                if !self.skip_to_group_boundary(input, &mut in_cursor) {
+                    return Ok(RawProgress {
+                        consumed: in_cursor,
+                        written,
+                        done: false,
+                    });
+                }
+                self.reset_dict();
+                self.clear_pending = false;
+            }
+
             // Width-bump / alignment check.
             let bump_threshold = if self.nbits < self.maxbits {
                 (1u32 << self.nbits) - 1
@@ -724,19 +746,12 @@ impl RawDecoder for Decoder {
                 }
             };
 
-            // Handle CLEAR.
+            // Handle CLEAR: align to the group boundary at the *current*
+            // width, then reset. The skip can run out of input, so it is
+            // done at the top of the loop under `clear_pending`, which
+            // survives across calls.
             if self.block_mode && code == CLEAR {
-                // Align to group boundary at the *current* width, then reset.
-                if !self.skip_to_group_boundary(input, &mut in_cursor) {
-                    // We've already partially consumed bits for this CLEAR;
-                    // the codes_in_group counter remembers how far we got.
-                    return Ok(RawProgress {
-                        consumed: in_cursor,
-                        written,
-                        done: false,
-                    });
-                }
-                self.reset_dict();
+                self.clear_pending = true;
                 continue;
             }
 
@@ -825,6 +840,7 @@ impl RawDecoder for Decoder {
         self.prev_code = u32::MAX;
         self.finchar = 0;
         self.codes_in_group = 0;
+        self.clear_pending = false;
         self.emit_buf.clear();
         self.emit_head = 0;
         self.completed = false;

@@ -295,16 +295,19 @@ pub struct Decoder {
     /// already-emitted, no-longer-referenceable prefix. `window_base` is
     /// the absolute index of `out[0]` in the full output stream; the total
     /// number of bytes produced so far is `window_base + out.len()`.
+    /// The absolute positions are `u64`: a raw decoder's length is a `u64`
+    /// (ZIP64), so they can pass 4 GiB, which a 32-bit `usize` cannot hold.
+    /// Only window-relative offsets are `usize`.
     /// Retaining the whole stream (up to the attacker-controlled 4-byte
     /// `uncomp_len`) would be a decompression-bomb / OOM vector.
     out: Vec<u8>,
     /// Absolute index (in the full output stream) of `out[0]` — i.e. the
     /// number of leading bytes already dropped from the sliding window.
-    window_base: usize,
+    window_base: u64,
     /// Cursor: absolute index in the full output stream of the next byte
     /// to emit to the caller. Always `>= window_base` (we never drop a
     /// byte before it has been emitted).
-    emit_cursor: usize,
+    emit_cursor: u64,
     /// Last decoded byte ("prev_byte" in the spec). Initialised to 0.
     prev_byte: u8,
     /// Match copy left mid-flight from a previous call.
@@ -530,19 +533,18 @@ impl Decoder {
             while pm.remaining > 0 {
                 self.flush_emit(output, written);
                 self.slide_window(max_dist);
-                if self.produced() - self.emit_cursor >= buffer_ahead && *written >= output.len() {
+                if self.unemitted() >= buffer_ahead && *written >= output.len() {
                     self.pending = Some(pm);
                     return Ok(());
                 }
-                let pos = self.produced();
-                let b = if pm.dist > pos {
+                let b = if pm.dist as u64 > self.produced() {
                     0u8
                 } else {
-                    self.out[(pos - pm.dist) - self.window_base]
+                    self.out[self.out.len() - pm.dist]
                 };
                 self.out.push(b);
                 pm.remaining -= 1;
-                if self.produced() as u64 >= self.uncomp_len && pm.remaining > 0 {
+                if self.produced() >= self.uncomp_len && pm.remaining > 0 {
                     return Err(Error::Corrupt);
                 }
             }
@@ -551,12 +553,12 @@ impl Decoder {
         let v_len_bits: u32 = (8 - self.factor) as u32;
         let len_mask: u32 = (1u32 << v_len_bits) - 1;
 
-        while (self.produced() as u64) < self.uncomp_len {
+        while self.produced() < self.uncomp_len {
             // Periodically drain to the caller, drop the consumed prefix of
             // the window, and stop early if we've buffered too far ahead.
             self.flush_emit(output, written);
             self.slide_window(max_dist);
-            if self.produced() - self.emit_cursor >= buffer_ahead && *written >= output.len() {
+            if self.unemitted() >= buffer_ahead && *written >= output.len() {
                 return Ok(());
             }
 
@@ -624,7 +626,7 @@ impl Decoder {
             let dist_hi = (v as usize) >> v_len_bits;
             let dist = dist_hi * 256 + w as usize + 1;
 
-            let remaining_out = self.uncomp_len - self.produced() as u64;
+            let remaining_out = self.uncomp_len - self.produced();
             if len as u64 > remaining_out {
                 return Err(Error::Corrupt);
             }
@@ -646,18 +648,20 @@ impl Decoder {
             // start of the stream reads as zero. This can only be a contiguous
             // leading run (`pos` only grows).
             let pos0 = self.produced();
-            if dist > pos0 {
-                let zeros = (dist - pos0).min(remaining);
+            if dist as u64 > pos0 {
+                // `dist - pos0` is at most `dist`, so it fits a `usize`.
+                let zeros = ((dist as u64 - pos0) as usize).min(remaining);
                 for _ in 0..zeros {
                     self.out.push(0);
                 }
                 remaining -= zeros;
             }
             // Phase B: real back-reference into already-produced output. `src`
-            // is an index into `self.out`; it and the write head advance in
-            // lockstep, so split by geometry instead of recomputing per byte.
+            // is an index into `self.out` (window-relative: `dist` back from
+            // the end); it and the write head advance in lockstep, so split
+            // by geometry instead of recomputing per byte.
             if remaining > 0 {
-                let mut src = self.produced() - dist - self.window_base;
+                let mut src = self.out.len() - dist;
                 if dist == 1 {
                     // Distance-1 run: repeated byte.
                     let b = self.out[src];
@@ -685,8 +689,20 @@ impl Decoder {
 
     /// Total number of output bytes produced so far across the whole
     /// stream, including bytes already dropped from the sliding window.
-    fn produced(&self) -> usize {
-        self.window_base + self.out.len()
+    fn produced(&self) -> u64 {
+        self.window_base + self.out.len() as u64
+    }
+
+    /// Offset of the emit cursor inside the window `out`. The cursor is
+    /// never behind `window_base` nor past the end of the window, so the
+    /// difference fits a `usize`.
+    fn emit_offset(&self) -> usize {
+        (self.emit_cursor - self.window_base) as usize
+    }
+
+    /// Bytes produced but not yet handed to the caller.
+    fn unemitted(&self) -> usize {
+        self.out.len() - self.emit_offset()
     }
 
     /// Drop the consumed, no-longer-referenceable prefix of the sliding
@@ -695,38 +711,52 @@ impl Decoder {
     /// `keep` bytes of the current end so a future back-reference (bounded
     /// by `max_dist`) can still resolve. This is what keeps `out` bounded
     /// instead of growing to the attacker-controlled `uncomp_len`.
+    ///
+    /// This runs once per decoded token, and dropping a prefix moves the
+    /// rest of the window to the front. So the drop is deferred until the
+    /// droppable prefix is at least as long as what stays behind `keep`:
+    /// each drop then moves no more bytes than it frees (give or take the
+    /// not-yet-emitted tail, itself bounded by the buffer-ahead limit),
+    /// which makes the cost amortised O(1) per byte. Dropping whatever is
+    /// droppable every time would move the whole window per token. The
+    /// window peaks at about `2 × keep` plus the unemitted tail.
     fn slide_window(&mut self, max_dist: usize) {
         // Retain at least `max_dist` bytes of history for back references,
-        // plus a generous margin so we are not draining one byte at a time.
+        // plus a generous margin.
         let keep = max_dist.saturating_mul(4).max(max_dist + 1);
-        let end = self.produced();
-        // Highest absolute index we are allowed to drop *up to* (exclusive):
+        // Highest window offset we are allowed to drop *up to* (exclusive):
         // never past the emit cursor, never within `keep` of the end.
-        let drop_limit = self.emit_cursor.min(end.saturating_sub(keep));
-        if drop_limit <= self.window_base {
+        let drop = self.emit_offset().min(self.out.len().saturating_sub(keep));
+        if drop < keep {
             return;
         }
-        let drop = drop_limit - self.window_base;
         self.out.drain(0..drop);
-        self.window_base += drop;
+        self.window_base += drop as u64;
     }
 
     /// Forward bytes that have been appended to `out` past `emit_cursor`
     /// to the caller's slice. Returns when either output fills or all
     /// produced bytes have been forwarded.
     fn flush_emit(&mut self, output: &mut [u8], written: &mut usize) {
-        while self.emit_cursor < self.produced() && *written < output.len() {
-            output[*written] = self.out[self.emit_cursor - self.window_base];
-            *written += 1;
-            self.emit_cursor += 1;
-        }
+        let from = self.emit_offset();
+        let n = (self.out.len() - from).min(output.len() - *written);
+        output[*written..*written + n].copy_from_slice(&self.out[from..from + n]);
+        *written += n;
+        self.emit_cursor += n as u64;
     }
 
     /// Compact `input_buf` by dropping the prefix already consumed by
     /// the bit reader.
+    ///
+    /// Called once per `decode` call. The prefix is dropped only once it
+    /// is at least as long as the live remainder, so the bytes moved are
+    /// paid for by bytes already consumed. Dropping it every call would
+    /// move the whole remainder each time — quadratic when a large input
+    /// is handed over at once and drained through a small output buffer.
+    /// `input_buf` therefore holds at most twice the unconsumed input.
     fn compact_input(&mut self) {
         let bp = self.bits.byte_pos();
-        if bp == 0 {
+        if bp == 0 || bp < self.input_buf.len() - bp {
             return;
         }
         self.input_buf.drain(0..bp);
@@ -794,7 +824,7 @@ impl RawDecoder for Decoder {
 
         // Edge case: zero-length stream. The follower-set header is
         // still present and parsed; we go straight to Done.
-        if self.produced() as u64 >= self.uncomp_len && matches!(self.phase, Phase::Body) {
+        if self.produced() >= self.uncomp_len && matches!(self.phase, Phase::Body) {
             self.phase = Phase::Done;
         }
 
@@ -808,7 +838,7 @@ impl RawDecoder for Decoder {
             }
             // Forward any leftover internal-buffer bytes to the caller.
             self.flush_emit(output, &mut written);
-            if self.produced() as u64 >= self.uncomp_len && self.emit_cursor == self.produced() {
+            if self.produced() >= self.uncomp_len && self.emit_cursor == self.produced() {
                 self.phase = Phase::Done;
             }
         }
@@ -836,7 +866,7 @@ impl RawDecoder for Decoder {
                 }
             }
             self.flush_emit(output, &mut written);
-            if self.produced() as u64 >= self.uncomp_len && self.emit_cursor == self.produced() {
+            if self.produced() >= self.uncomp_len && self.emit_cursor == self.produced() {
                 self.phase = Phase::Done;
             }
         }
@@ -974,5 +1004,230 @@ mod tests {
             }
         }
         assert_eq!(total, 66000, "decoded length mismatch");
+    }
+
+    /// Build a payload for `factor` whose follower sets are all empty, so
+    /// every "next byte" is a plain 8-bit byte and the body can be written
+    /// by hand: literals, `DLE 0` for a literal 0x90, and `DLE V [ext] W`
+    /// matches (none if `matches` is false). Returns the payload and the
+    /// bytes it decodes to. Matches only ever reach back into bytes this
+    /// payload itself produced.
+    fn handmade_payload(
+        factor: u8,
+        total: usize,
+        matches: bool,
+    ) -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
+        let len_bits = 8 - factor as usize;
+        let len_mask = (1usize << len_bits) - 1;
+        let max_dist = ((1usize << factor) - 1) * 256 + 256;
+        // 256 follower sets × a 6-bit zero count = 192 zero bytes.
+        let mut payload = alloc::vec![0u8; 192];
+        let mut plain: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        let mut s = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 24) as usize
+        };
+        while plain.len() < total {
+            let room = total - plain.len();
+            let r = next();
+            if !matches || plain.len() < 16 || r % 3 == 0 || room < 3 {
+                // Literal (0x90 needs the DLE escape).
+                let b = (r >> 8) as u8;
+                payload.push(b);
+                if b == DLE_BYTE {
+                    payload.push(0);
+                }
+                plain.push(b);
+                continue;
+            }
+            // Match: V holds the high distance bits above a `len_bits`-bit
+            // length field; distance = hi * 256 + W + 1.
+            let dist = 1 + (next() % plain.len().min(max_dist));
+            let len = (3 + next() % (len_mask + 200)).min(room);
+            let (len_field, ext) = if len - 3 >= len_mask {
+                (len_mask, Some((len - 3 - len_mask) as u8))
+            } else {
+                (len - 3, None)
+            };
+            let v = ((((dist - 1) >> 8) << len_bits) | len_field) as u8;
+            if v == 0 {
+                // `DLE 0` is the literal escape, not a match; skip.
+                continue;
+            }
+            payload.push(DLE_BYTE);
+            payload.push(v);
+            if let Some(e) = ext {
+                payload.push(e);
+            }
+            payload.push(((dist - 1) & 0xFF) as u8);
+            for _ in 0..len {
+                let b = plain[plain.len() - dist];
+                plain.push(b);
+            }
+        }
+        (payload, plain)
+    }
+
+    /// Decode `payload` with `dec` through `out_chunk`-sized output slices.
+    fn drain_raw(dec: &mut Decoder, payload: &[u8], out_chunk: usize) -> alloc::vec::Vec<u8> {
+        let mut got = alloc::vec::Vec::new();
+        let mut buf = alloc::vec![0u8; out_chunk];
+        let mut fed = 0usize;
+        loop {
+            let p = dec.raw_decode(&payload[fed..], &mut buf).unwrap();
+            fed += p.consumed;
+            got.extend_from_slice(&buf[..p.written]);
+            if p.done {
+                return got;
+            }
+            assert!(
+                p.consumed > 0 || p.written > 0,
+                "decoder stalled after {} bytes",
+                got.len()
+            );
+        }
+    }
+
+    /// The raw decoder takes a `u64` length, so the stream position can
+    /// pass 4 GiB. The absolute position counters used to be `usize`, which
+    /// overflows there on 32-bit targets. Decoding 4 GiB in a test is not
+    /// practical, so start a decoder as if it had already produced (and
+    /// emitted, and dropped from its window) just under 4 GiB, and decode
+    /// a payload that carries it across the boundary.
+    #[test]
+    fn raw_position_counters_cross_4gib() {
+        const BASE: u64 = (1 << 32) - 3000;
+        const N: usize = 8000;
+        let (payload, plain) = handmade_payload(1, N, true);
+
+        // Sanity: the handmade payload is what we think it is.
+        let mut fresh = Decoder::raw(1, N as u64).unwrap();
+        assert_eq!(drain_raw(&mut fresh, &payload, 4096), plain);
+
+        for out_chunk in [1usize, 300, 4096] {
+            let mut dec = Decoder::raw(1, BASE + N as u64).unwrap();
+            dec.window_base = BASE;
+            dec.emit_cursor = BASE;
+            assert_eq!(
+                drain_raw(&mut dec, &payload, out_chunk),
+                plain,
+                "out_chunk={out_chunk}"
+            );
+        }
+    }
+
+    /// One-shot, one input byte per call, and one output byte per call
+    /// must all decode a large stream identically, for literal-only and
+    /// match-heavy payloads at the smallest and largest window.
+    #[test]
+    fn large_streams_decode_the_same_in_any_chunking() {
+        for (factor, n, matches) in [
+            (1u8, 60_000usize, true),
+            (4, 150_000, true),
+            (4, 150_000, false),
+        ] {
+            let (payload, plain) = handmade_payload(factor, n, matches);
+            let what = alloc::format!("factor={factor} matches={matches}");
+
+            let mut dec = Decoder::raw(factor, n as u64).unwrap();
+            assert!(
+                drain_raw(&mut dec, &payload, n + 16) == plain,
+                "{what} one-shot"
+            );
+
+            let mut dec = Decoder::raw(factor, n as u64).unwrap();
+            assert!(
+                drain_raw(&mut dec, &payload, 1) == plain,
+                "{what} 1-byte output"
+            );
+
+            let mut dec = Decoder::raw(factor, n as u64).unwrap();
+            let mut got = alloc::vec::Vec::new();
+            let mut buf = alloc::vec![0u8; 4096];
+            let mut done = false;
+            for b in payload.chunks(1) {
+                let mut input = b;
+                loop {
+                    let p = dec.raw_decode(input, &mut buf).unwrap();
+                    input = &input[p.consumed..];
+                    got.extend_from_slice(&buf[..p.written]);
+                    done = p.done;
+                    if done || p.written < buf.len() {
+                        break;
+                    }
+                }
+                if done {
+                    break;
+                }
+            }
+            while !done {
+                let p = dec.raw_finish(&mut buf).unwrap();
+                got.extend_from_slice(&buf[..p.written]);
+                done = p.done;
+            }
+            assert!(got == plain, "{what} 1-byte input");
+        }
+    }
+
+    /// The sliding window and the input buffer must be compacted in
+    /// amortised steps, not on every token: dropping a byte or two off the
+    /// front of a multi-kilobyte `Vec` per decoded token (or the consumed
+    /// prefix off a large input buffer per call) moves the whole buffer
+    /// each time. Count compactions and bytes moved instead of timing.
+    #[test]
+    fn window_and_input_compaction_is_amortised() {
+        const N: usize = 150_000;
+        let factor = 4u8;
+        let max_dist = ((1usize << factor) - 1) * 256 + 256;
+        let (payload, plain) = handmade_payload(factor, N, false);
+
+        // All input in the first call, then one output byte per call: the
+        // decoder advances about one token per call.
+        let mut dec = Decoder::raw(factor, N as u64).unwrap();
+        let mut got = alloc::vec::Vec::new();
+        let mut buf = [0u8; 1];
+        let mut fed = 0usize;
+        let (mut window_drops, mut input_moved) = (0usize, 0usize);
+        loop {
+            let base = dec.window_base;
+            // Input only ever enters `input_buf` here, so if the buffer is
+            // shorter afterwards than "what it held plus what we fed", its
+            // consumed prefix was dropped during this call.
+            let held = dec.input_buf.len() + (payload.len() - fed);
+            let p = dec.raw_decode(&payload[fed..], &mut buf).unwrap();
+            fed += p.consumed;
+            got.extend_from_slice(&buf[..p.written]);
+            if dec.window_base != base {
+                window_drops += 1;
+                let dropped = (dec.window_base - base) as usize;
+                assert!(dropped >= max_dist, "window dropped only {dropped} bytes");
+            }
+            if dec.input_buf.len() < held {
+                // What is left was moved to the front.
+                input_moved += dec.input_buf.len();
+            }
+            assert!(
+                dec.out.len() <= max_dist * 8 + 4096,
+                "window grew unbounded"
+            );
+            if p.done {
+                break;
+            }
+        }
+        assert!(got == plain);
+        assert!(
+            window_drops <= N / max_dist,
+            "window compacted {window_drops} times for {N} bytes"
+        );
+        // Each compaction may move at most as many bytes as were consumed
+        // since the previous one, so the total stays within the input size.
+        assert!(
+            input_moved <= payload.len(),
+            "input compaction moved {input_moved} bytes for {} bytes of input",
+            payload.len()
+        );
     }
 }

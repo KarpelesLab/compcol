@@ -20,14 +20,19 @@ pub(crate) struct BitReader {
     buf: Vec<u8>,
     /// Bit cursor: bit 0 of byte 0 is the MSB of `buf[0]`.
     bit_pos: usize,
+    /// Test-only instrumentation: total bits handed out by `read_bits`
+    /// (including bits re-read after a `restore`).
+    #[cfg(test)]
+    pub(crate) bits_read: u64,
+    /// Test-only instrumentation: total live bytes shifted down by
+    /// `compact`.
+    #[cfg(test)]
+    pub(crate) bytes_moved: u64,
 }
 
 impl BitReader {
     pub(crate) fn new() -> Self {
-        Self {
-            buf: Vec::new(),
-            bit_pos: 0,
-        }
+        Self::default()
     }
 
     /// Append raw bytes to the read window.
@@ -68,18 +73,41 @@ impl BitReader {
             v = (v << 1) | (((byte >> shift) & 1) as u32);
             self.bit_pos += 1;
         }
+        #[cfg(test)]
+        {
+            self.bits_read += n as u64;
+        }
         Some(v)
     }
 
     /// Compact the buffer: discard fully-consumed bytes so memory stays
     /// bounded on long streams. Should be called after a token has
     /// committed.
+    ///
+    /// Discarding the prefix shifts the live remainder down, so it is
+    /// only done once the consumed prefix is at least as large as that
+    /// remainder: each compaction then moves no more bytes than it frees
+    /// and the total work is linear in the bytes consumed. (Compacting
+    /// every 4 KiB regardless made decoding a large input slice quadratic
+    /// in its size.) The dead prefix never exceeds the live data it sits
+    /// in front of, so the buffer stays within the size of what the
+    /// caller pushed.
     pub(crate) fn compact(&mut self) {
         let drop = self.bit_pos / 8;
-        if drop >= 4096 {
+        if drop >= 4096 && drop >= self.buf.len() - drop {
+            #[cfg(test)]
+            {
+                self.bytes_moved += (self.buf.len() - drop) as u64;
+            }
             self.buf.drain(..drop);
             self.bit_pos -= drop * 8;
         }
+    }
+
+    /// Bytes currently held in the buffer (consumed or not).
+    #[cfg(test)]
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        self.buf.len()
     }
 
     /// Drop all buffered state.
@@ -187,6 +215,42 @@ mod tests {
         // First byte: 1100 0000 = 0xC0; second byte starts with the
         // final bit of the marker (0) then 7 padding 1s = 0x7F.
         assert_eq!(bytes, vec![0xC0, 0x7F]);
+    }
+
+    /// Compacting a large buffer as it is consumed must move each byte a
+    /// bounded number of times, not once per 4 KiB consumed.
+    #[test]
+    fn compact_is_amortised_linear() {
+        let len = 1usize << 20;
+        let mut r = BitReader::new();
+        r.push_bytes(&vec![0xA5; len]);
+        let mut peak_dead = 0usize;
+        for _ in 0..len {
+            assert_eq!(r.read_bits(8), Some(0xA5));
+            r.compact();
+            peak_dead = peak_dead.max(r.bit_pos / 8);
+        }
+        assert_eq!(r.read_bits(1), None);
+        assert!(
+            r.bytes_moved <= len as u64,
+            "moved {} bytes compacting a {len}-byte buffer",
+            r.bytes_moved
+        );
+        // The consumed prefix is never larger than what was live when it
+        // was last compacted, so the buffer stays within the input size.
+        assert!(peak_dead <= len / 2 + 4096);
+
+        // Small trickles still compact, so a long stream fed in small
+        // pieces keeps a small buffer.
+        let mut r = BitReader::new();
+        for _ in 0..10_000 {
+            r.push_bytes(&[0x5A; 16]);
+            for _ in 0..16 {
+                assert_eq!(r.read_bits(8), Some(0x5A));
+                r.compact();
+            }
+            assert!(r.buffered_bytes() <= 4096 + 16);
+        }
     }
 
     #[test]

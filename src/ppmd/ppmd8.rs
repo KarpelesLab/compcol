@@ -615,8 +615,14 @@ impl Ppmd8 {
         }
     }
 
-    /// Iteration bound for allocator walks: more steps than the arena has
-    /// units means the lists are damaged.
+    /// Iteration bound for one allocator walk. Every free node occupies at
+    /// least one unit of the arena, so a walk that visits each free node at
+    /// most once takes at most `size / UNIT_SIZE` steps; more means the
+    /// lists are damaged (cyclic).
+    ///
+    /// The bound is per walk: a caller making several passes over the free
+    /// nodes must count each pass separately, since a healthy arena that is
+    /// mostly free legitimately takes close to this many steps in each one.
     fn walk_limit(&self) -> u32 {
         self.size / UNIT_SIZE + 2 * NUM_INDEXES as u32 + 16
     }
@@ -628,16 +634,20 @@ impl Ppmd8 {
             self.pu32(self.lo_unit, 0);
         }
 
+        // Three walks, each bounded on its own (see `walk_limit`): chaining
+        // the free lists visits every free node once, merging absorbs each
+        // node at most once, and re-bucketing visits every node once more.
         let limit = self.walk_limit();
-        let mut steps = 0u32;
+        let mut visited = 0u32;
+        let mut merged = 0u32;
         let mut head = 0u32;
         let mut prev = Link::Local;
         for i in 0..NUM_INDEXES {
             let mut next = self.free_list[i];
             self.free_list[i] = 0;
             while next != 0 {
-                steps += 1;
-                if steps > limit || self.err {
+                visited += 1;
+                if visited > limit || self.err {
                     self.err = true;
                     return;
                 }
@@ -652,8 +662,8 @@ impl Ppmd8 {
                         if self.gu32(node2) != EMPTY_NODE || self.err {
                             break;
                         }
-                        steps += 1;
-                        if steps > limit {
+                        merged += 1;
+                        if merged > limit {
                             self.err = true;
                             return;
                         }
@@ -666,6 +676,7 @@ impl Ppmd8 {
         }
         self.set_link(prev, &mut head, 0);
 
+        let mut steps = 0u32;
         let mut n = head;
         while n != 0 {
             steps += 1;
@@ -679,7 +690,7 @@ impl Ppmd8 {
             if nu == 0 {
                 continue;
             }
-            while nu > 128 {
+            while nu > 128 && !self.err {
                 self.insert_node(node, NUM_INDEXES - 1);
                 nu -= 128;
                 node = node.wrapping_add(128 * UNIT_SIZE);
@@ -792,6 +803,9 @@ impl Ppmd8 {
         }
         self.units_start = node;
 
+        // Unlinking walks each free list at most once, so it gets its own
+        // bound rather than sharing the one the scan above used up.
+        let mut steps = 0u32;
         for i in 0..NUM_INDEXES {
             let mut cnt = count[i];
             if cnt == 0 {

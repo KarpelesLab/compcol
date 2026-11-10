@@ -23,6 +23,23 @@ decoders are written to that bar:
     use `decompress_to_vec_capped` / `decompress_to_vec_capped_with`,
     which take an explicit output cap.
 
+  An output limit bounds the bytes a decoder **hands out**, not the memory
+  it works in. Most decoders stream and keep only their window, but a few
+  build a block or the whole result internally before the caller sees a
+  byte, so the limit fires only after that memory is committed:
+
+  | Codec | What is held regardless of the output limit |
+  |---|---|
+  | `rar2`, `rar3` | the whole declared output of a member |
+  | `snappy`, `huffman`, `bwt` | the whole decoded block (snappy: at most ~21× the input) |
+  | `sit13`, `arsenic` | the whole fork, up to 256 MiB |
+  | `ppmd` (7z-style) | the whole output, up to 64 MiB |
+  | `lz5` | one decoded block, up to 256 MiB for the largest block code |
+  | `ppmd`, `ppmd-zip`, `rar3` | a model arena sized by the stream header, up to 256 MiB |
+
+  For these, also bound the **input** size and the number of concurrent
+  decodes, or do not expose them to untrusted data.
+
 These are the only guarantees claimed: no panic, no undefined behavior,
 and bomb-bounded decode when the caller supplies a limit. The crate does
 **not** claim that every encoder is constant-time, side-channel-free, or

@@ -53,10 +53,10 @@ enum DynLenSub {
     RepeatZeroLong,
 }
 
-struct HuffmanBlockWork {
+/// The literal/length and distance decoders of one Huffman block.
+struct Tables {
     lit: CanonicalDecoder<288>,
     dist: CanonicalDecoder<32>,
-    phase: HuffmanPhase,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -96,7 +96,12 @@ enum DecState {
         cl_lens: [u8; 19],
     },
     DynamicCodeLengthsData(Box<DynamicLensWork>),
-    HuffmanBlock(Box<HuffmanBlockWork>),
+    /// Inside a Huffman block; `fixed` selects which of the decoder's two
+    /// table sets it reads.
+    HuffmanBlock {
+        fixed: bool,
+        phase: HuffmanPhase,
+    },
     Done,
 }
 
@@ -111,6 +116,16 @@ pub struct Decoder {
     /// The configured preset dictionary (its last 64 KiB), kept so that
     /// `reset` can seed the window with it again.
     dictionary: Box<[u8]>,
+    /// The fixed-Huffman tables, built on the first fixed block and kept
+    /// for the decoder's lifetime (they never change): a run of empty fixed
+    /// blocks costs 10 bits each and must not cost a table build each.
+    fixed_tables: Option<Box<Tables>>,
+    /// The current dynamic block's tables; the allocation is reused from
+    /// block to block.
+    dynamic_tables: Option<Box<Tables>>,
+    /// How many times the fixed-Huffman tables were built (test hook).
+    #[cfg(test)]
+    fixed_builds: u32,
 }
 
 impl Decoder {
@@ -121,9 +136,13 @@ impl Decoder {
     }
 
     /// Align the bit reader to a byte boundary and return any whole bytes
-    /// still sitting in its accumulator. Container wrappers call this when
-    /// the deflate64 payload ends so they can recover pre-buffered trailer
-    /// bytes.
+    /// still sitting in its accumulator.
+    ///
+    /// Once the stream has ended this returns nothing: the decoder already
+    /// leaves every byte after the final block unconsumed, so whatever
+    /// follows the deflate64 payload can be read straight from the input,
+    /// at the sum of the `consumed` counts. Kept for callers written when
+    /// the decoder read ahead.
     pub fn drain_trailing_bytes(&mut self) -> alloc::vec::Vec<u8> {
         self.bit_reader.align_to_byte();
         let mut out = alloc::vec::Vec::new();
@@ -144,6 +163,10 @@ impl Decoder {
             last_block: false,
             poisoned: false,
             dictionary: Box::default(),
+            fixed_tables: None,
+            dynamic_tables: None,
+            #[cfg(test)]
+            fixed_builds: 0,
         }
     }
 
@@ -214,6 +237,35 @@ impl Decoder {
             self.state = DecState::BlockHeader;
         }
     }
+
+    /// Hand back the whole bytes still in the bit reader when the decoder
+    /// returns for any reason other than waiting on input: the stream
+    /// ended or the output is full. This keeps `consumed` exact at the end
+    /// of the stream.
+    ///
+    /// The bytes held are always the last ones fed in this call: a call
+    /// starts either with fewer than 8 bits (handed back last time) or with
+    /// bits that all belong to the pending field, which was short of them,
+    /// so those are used up before anything else.
+    fn unfeed(&mut self, consumed: &mut usize) {
+        let blocked_on_output = matches!(
+            self.state,
+            DecState::Done
+                | DecState::Stored { .. }
+                | DecState::HuffmanBlock {
+                    phase: HuffmanPhase::EmittingMatch { .. },
+                    ..
+                }
+        );
+        // Only bytes fed in this call can be handed back. Should the reader
+        // ever hold more than that, they stay where they are: `consumed`
+        // is then not exact, but no input is lost.
+        let held = (self.bit_reader.bits_available() / 8) as usize;
+        if blocked_on_output && held <= *consumed {
+            let n = self.bit_reader.unfeed_whole_bytes() as usize;
+            *consumed -= n;
+        }
+    }
 }
 
 impl Default for Decoder {
@@ -231,13 +283,15 @@ impl RawDecoder for Decoder {
         let mut written = 0usize;
 
         loop {
-            let initial_consumed = consumed;
-            let initial_written = written;
-            self.refill(input, &mut consumed);
-
+            // Past the final block nothing more is read: what follows the
+            // stream is not this decoder's.
             if matches!(self.state, DecState::Done) {
                 break;
             }
+
+            let initial_consumed = consumed;
+            let initial_written = written;
+            self.refill(input, &mut consumed);
 
             let made_progress = self.step(input, &mut consumed, output, &mut written)?;
 
@@ -245,6 +299,7 @@ impl RawDecoder for Decoder {
                 break;
             }
         }
+        self.unfeed(&mut consumed);
 
         Ok(RawProgress {
             // See the matching note in `deflate`: reporting `false` after the
@@ -266,7 +321,18 @@ impl RawDecoder for Decoder {
         // hand that out first. Only a stream that stops short with nothing
         // left to give is truncated.
         let p = self.raw_decode(&[], output)?;
-        if matches!(self.state, DecState::Done) || p.written > 0 {
+        // A match or a literal (kept as an `EmittingMatch` too) waiting for
+        // room is output still owed, not a truncated stream, even if this
+        // call had no room to take any of it: the caller comes back with
+        // a buffer.
+        let owes_output = matches!(
+            self.state,
+            DecState::HuffmanBlock {
+                phase: HuffmanPhase::EmittingMatch { .. },
+                ..
+            }
+        );
+        if matches!(self.state, DecState::Done) || p.written > 0 || owes_output {
             return Ok(RawProgress {
                 consumed: 0,
                 written: p.written,
@@ -316,15 +382,21 @@ impl Decoder {
                 match btype {
                     0 => self.state = DecState::StoredAlign,
                     1 => {
-                        let lit = CanonicalDecoder::<288>::from_lengths(&FIXED_LIT_LENGTHS)
-                            .map_err(|e| self.poison(e))?;
-                        let dist = CanonicalDecoder::<32>::from_lengths(&FIXED_DIST_LENGTHS)
-                            .map_err(|e| self.poison(e))?;
-                        self.state = DecState::HuffmanBlock(Box::new(HuffmanBlockWork {
-                            lit,
-                            dist,
+                        if self.fixed_tables.is_none() {
+                            #[cfg(test)]
+                            {
+                                self.fixed_builds += 1;
+                            }
+                            let lit = CanonicalDecoder::<288>::from_lengths(&FIXED_LIT_LENGTHS)
+                                .map_err(|e| self.poison(e))?;
+                            let dist = CanonicalDecoder::<32>::from_lengths(&FIXED_DIST_LENGTHS)
+                                .map_err(|e| self.poison(e))?;
+                            self.fixed_tables = Some(Box::new(Tables { lit, dist }));
+                        }
+                        self.state = DecState::HuffmanBlock {
+                            fixed: true,
                             phase: HuffmanPhase::NextSymbol,
-                        }));
+                        };
                     }
                     2 => self.state = DecState::DynamicHeader,
                     _ => return Err(self.poison(Error::InvalidBlockType)),
@@ -376,10 +448,14 @@ impl Decoder {
                     progress = true;
                 }
                 if remaining == 0 {
+                    // Leaving the block is progress even when it was empty
+                    // and no byte moved: the caller's loop must go on to the
+                    // next block header with the bits already held, not
+                    // stop and leave them for the next call.
                     self.transition_after_block();
-                } else {
-                    self.state = DecState::Stored { remaining };
+                    return Ok(true);
                 }
+                self.state = DecState::Stored { remaining };
                 Ok(progress)
             }
 
@@ -555,219 +631,293 @@ impl Decoder {
                     CanonicalDecoder::<288>::from_lengths(&lit_lens).map_err(|e| self.poison(e))?;
                 let dist =
                     CanonicalDecoder::<32>::from_lengths(&dist_lens).map_err(|e| self.poison(e))?;
-                self.state = DecState::HuffmanBlock(Box::new(HuffmanBlockWork {
-                    lit,
-                    dist,
+                match &mut self.dynamic_tables {
+                    Some(t) => {
+                        t.lit = lit;
+                        t.dist = dist;
+                    }
+                    None => self.dynamic_tables = Some(Box::new(Tables { lit, dist })),
+                }
+                self.state = DecState::HuffmanBlock {
+                    fixed: false,
                     phase: HuffmanPhase::NextSymbol,
-                }));
+                };
                 Ok(true)
             }
 
-            DecState::HuffmanBlock(mut work) => {
-                let mut progress = false;
-                loop {
-                    match work.phase {
-                        HuffmanPhase::NextSymbol => match work.lit.decode(&mut self.bit_reader) {
-                            Ok(Some(sym)) => {
-                                progress = true;
-                                if sym < END_OF_BLOCK {
-                                    if *written >= output.len() {
-                                        // Stash literal in the "pending literal"
-                                        // sentinel slot — same trick deflate uses.
-                                        work.phase = HuffmanPhase::EmittingMatch {
-                                            distance: u32::MAX,
-                                            remaining: sym as u32,
-                                        };
-                                        self.state = DecState::HuffmanBlock(work);
-                                        return Ok(progress);
-                                    }
-                                    self.emit_byte(sym as u8, output, written);
-                                } else if sym == END_OF_BLOCK {
-                                    self.transition_after_block();
-                                    return Ok(true);
-                                } else if (sym as usize) < NUM_LITLEN_SYMBOLS {
-                                    let idx = (sym - 257) as usize;
-                                    let base_length = LENGTH_BASE[idx];
-                                    let extra_bits = LENGTH_EXTRA[idx];
-                                    work.phase = HuffmanPhase::LengthExtra {
-                                        base_length,
-                                        extra_bits,
-                                    };
-                                } else {
-                                    return Err(self.poison(Error::Corrupt));
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(e) => return Err(self.poison(e)),
-                        },
-                        HuffmanPhase::LengthExtra {
-                            base_length,
-                            extra_bits,
-                        } => {
-                            if self.bit_reader.bits_available() < extra_bits as u32 {
-                                break;
-                            }
-                            let extra = if extra_bits == 0 {
-                                0u32
-                            } else {
-                                self.bit_reader.peek(extra_bits as u32) as u32
-                            };
-                            self.bit_reader.drop_bits(extra_bits as u32);
-                            let length = base_length + extra;
-                            work.phase = HuffmanPhase::DistanceSymbol { length };
-                            progress = true;
-                        }
-                        HuffmanPhase::DistanceSymbol { length } => {
-                            match work.dist.decode(&mut self.bit_reader) {
-                                Ok(Some(sym)) => {
-                                    progress = true;
-                                    if (sym as usize) >= NUM_DIST_SYMBOLS {
-                                        return Err(self.poison(Error::Corrupt));
-                                    }
-                                    let idx = sym as usize;
-                                    let base_dist = DIST_BASE[idx];
-                                    let extra_bits = DIST_EXTRA[idx];
-                                    work.phase = HuffmanPhase::DistanceExtra {
-                                        length,
-                                        base_dist,
-                                        extra_bits,
-                                    };
-                                }
-                                Ok(None) => break,
-                                Err(e) => return Err(self.poison(e)),
-                            }
-                        }
-                        HuffmanPhase::DistanceExtra {
-                            length,
-                            base_dist,
-                            extra_bits,
-                        } => {
-                            if self.bit_reader.bits_available() < extra_bits as u32 {
-                                break;
-                            }
-                            let extra = if extra_bits == 0 {
-                                0u32
-                            } else {
-                                self.bit_reader.peek(extra_bits as u32) as u32
-                            };
-                            self.bit_reader.drop_bits(extra_bits as u32);
-                            let distance = base_dist + extra;
-                            if distance == 0 || (distance as usize) > self.window_size {
-                                return Err(self.poison(Error::InvalidDistance));
-                            }
-                            work.phase = HuffmanPhase::EmittingMatch {
-                                distance,
-                                remaining: length,
-                            };
-                            progress = true;
-                        }
-                        HuffmanPhase::EmittingMatch {
-                            distance,
-                            mut remaining,
-                        } => {
-                            // Sentinel: distance == u32::MAX means we're emitting a
-                            // single pending literal whose value is `remaining` (0..=255).
-                            if distance == u32::MAX {
-                                if *written >= output.len() {
-                                    work.phase = HuffmanPhase::EmittingMatch {
-                                        distance,
-                                        remaining,
-                                    };
-                                    break;
-                                }
-                                let byte = remaining as u8;
-                                self.emit_byte(byte, output, written);
-                                progress = true;
-                                work.phase = HuffmanPhase::NextSymbol;
-                                continue;
-                            }
-                            // Copy the match run in contiguous, non-wrapping
-                            // spans. Non-overlapping spans use a single
-                            // copy_within + copy_from_slice; overlapping spans
-                            // (distance < remaining) replicate the d-byte
-                            // pattern with an expanding doubling copy instead
-                            // of one byte at a time.
-                            let d = distance as usize;
-                            while remaining > 0 && *written < output.len() {
-                                let out_room = output.len() - *written;
-                                let src = if self.window_pos >= d {
-                                    self.window_pos - d
-                                } else {
-                                    self.window_pos + WINDOW_SIZE - d
-                                };
-                                let dst_room = WINDOW_SIZE - self.window_pos;
-                                let src_room = WINDOW_SIZE - src;
-                                let span = (remaining as usize)
-                                    .min(out_room)
-                                    .min(dst_room)
-                                    .min(src_room);
-                                if span == 0 {
-                                    break;
-                                }
-
-                                if d >= span {
-                                    let wp = self.window_pos;
-                                    self.window.copy_within(src..src + span, wp);
-                                    output[*written..*written + span]
-                                        .copy_from_slice(&self.window[wp..wp + span]);
-                                    *written += span;
-                                    self.window_pos = wp + span;
-                                } else if src + d == self.window_pos {
-                                    let start = self.window_pos; // == src + d
-                                    let mut produced = 0usize;
-                                    while produced < span {
-                                        let copy = d.min(span - produced);
-                                        self.window.copy_within(
-                                            src + produced..src + produced + copy,
-                                            start + produced,
-                                        );
-                                        produced += copy;
-                                    }
-                                    output[*written..*written + span]
-                                        .copy_from_slice(&self.window[start..start + span]);
-                                    *written += span;
-                                    self.window_pos = start + span;
-                                } else {
-                                    // Rare: overlapping source wraps the ring.
-                                    let start = self.window_pos;
-                                    for i in 0..span {
-                                        let s = if start + i >= d {
-                                            start + i - d
-                                        } else {
-                                            start + i + WINDOW_SIZE - d
-                                        };
-                                        let b = self.window[s];
-                                        self.window[start + i] = b;
-                                        output[*written] = b;
-                                        *written += 1;
-                                    }
-                                    self.window_pos = start + span;
-                                }
-
-                                if self.window_pos == WINDOW_SIZE {
-                                    self.window_pos = 0;
-                                }
-                                if self.window_size < WINDOW_SIZE {
-                                    self.window_size = (self.window_size + span).min(WINDOW_SIZE);
-                                }
-                                remaining -= span as u32;
-                                progress = true;
-                            }
-                            if remaining == 0 {
-                                work.phase = HuffmanPhase::NextSymbol;
-                            } else {
-                                work.phase = HuffmanPhase::EmittingMatch {
-                                    distance,
-                                    remaining,
-                                };
-                                break;
-                            }
-                        }
-                    }
+            DecState::HuffmanBlock { fixed, phase } => {
+                // Lend the block's tables out of `self` for the duration of
+                // the call, so the block loop can borrow the rest freely.
+                let slot = if fixed {
+                    &mut self.fixed_tables
+                } else {
+                    &mut self.dynamic_tables
+                };
+                let Some(tables) = slot.take() else {
+                    return Err(self.poison(Error::Corrupt));
+                };
+                let r = self.huffman_block(&tables, fixed, phase, output, written);
+                if fixed {
+                    self.fixed_tables = Some(tables);
+                } else {
+                    self.dynamic_tables = Some(tables);
                 }
-                self.state = DecState::HuffmanBlock(work);
-                Ok(progress)
+                r
             }
         }
+    }
+
+    /// Decode symbols of the current Huffman block until it ends or the
+    /// input or output runs out, then store the state to resume from.
+    fn huffman_block(
+        &mut self,
+        tables: &Tables,
+        fixed: bool,
+        mut phase: HuffmanPhase,
+        output: &mut [u8],
+        written: &mut usize,
+    ) -> Result<bool, Error> {
+        let mut progress = false;
+        loop {
+            match phase {
+                HuffmanPhase::NextSymbol => match tables.lit.decode(&mut self.bit_reader) {
+                    Ok(Some(sym)) => {
+                        progress = true;
+                        if sym < END_OF_BLOCK {
+                            if *written >= output.len() {
+                                // Stash literal in the "pending literal"
+                                // sentinel slot — same trick deflate uses.
+                                phase = HuffmanPhase::EmittingMatch {
+                                    distance: u32::MAX,
+                                    remaining: sym as u32,
+                                };
+                                self.state = DecState::HuffmanBlock { fixed, phase };
+                                return Ok(progress);
+                            }
+                            self.emit_byte(sym as u8, output, written);
+                        } else if sym == END_OF_BLOCK {
+                            self.transition_after_block();
+                            return Ok(true);
+                        } else if (sym as usize) < NUM_LITLEN_SYMBOLS {
+                            let idx = (sym - 257) as usize;
+                            let base_length = LENGTH_BASE[idx];
+                            let extra_bits = LENGTH_EXTRA[idx];
+                            phase = HuffmanPhase::LengthExtra {
+                                base_length,
+                                extra_bits,
+                            };
+                        } else {
+                            return Err(self.poison(Error::Corrupt));
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => return Err(self.poison(e)),
+                },
+                HuffmanPhase::LengthExtra {
+                    base_length,
+                    extra_bits,
+                } => {
+                    if self.bit_reader.bits_available() < extra_bits as u32 {
+                        break;
+                    }
+                    let extra = if extra_bits == 0 {
+                        0u32
+                    } else {
+                        self.bit_reader.peek(extra_bits as u32) as u32
+                    };
+                    self.bit_reader.drop_bits(extra_bits as u32);
+                    let length = base_length + extra;
+                    phase = HuffmanPhase::DistanceSymbol { length };
+                    progress = true;
+                }
+                HuffmanPhase::DistanceSymbol { length } => {
+                    match tables.dist.decode(&mut self.bit_reader) {
+                        Ok(Some(sym)) => {
+                            progress = true;
+                            if (sym as usize) >= NUM_DIST_SYMBOLS {
+                                return Err(self.poison(Error::Corrupt));
+                            }
+                            let idx = sym as usize;
+                            let base_dist = DIST_BASE[idx];
+                            let extra_bits = DIST_EXTRA[idx];
+                            phase = HuffmanPhase::DistanceExtra {
+                                length,
+                                base_dist,
+                                extra_bits,
+                            };
+                        }
+                        Ok(None) => break,
+                        Err(e) => return Err(self.poison(e)),
+                    }
+                }
+                HuffmanPhase::DistanceExtra {
+                    length,
+                    base_dist,
+                    extra_bits,
+                } => {
+                    if self.bit_reader.bits_available() < extra_bits as u32 {
+                        break;
+                    }
+                    let extra = if extra_bits == 0 {
+                        0u32
+                    } else {
+                        self.bit_reader.peek(extra_bits as u32) as u32
+                    };
+                    self.bit_reader.drop_bits(extra_bits as u32);
+                    let distance = base_dist + extra;
+                    if distance == 0 || (distance as usize) > self.window_size {
+                        return Err(self.poison(Error::InvalidDistance));
+                    }
+                    phase = HuffmanPhase::EmittingMatch {
+                        distance,
+                        remaining: length,
+                    };
+                    progress = true;
+                }
+                HuffmanPhase::EmittingMatch {
+                    distance,
+                    mut remaining,
+                } => {
+                    // Sentinel: distance == u32::MAX means we're emitting a
+                    // single pending literal whose value is `remaining` (0..=255).
+                    if distance == u32::MAX {
+                        if *written >= output.len() {
+                            phase = HuffmanPhase::EmittingMatch {
+                                distance,
+                                remaining,
+                            };
+                            break;
+                        }
+                        let byte = remaining as u8;
+                        self.emit_byte(byte, output, written);
+                        progress = true;
+                        phase = HuffmanPhase::NextSymbol;
+                        continue;
+                    }
+                    // Copy the match run in contiguous, non-wrapping
+                    // spans. Non-overlapping spans use a single
+                    // copy_within + copy_from_slice; overlapping spans
+                    // (distance < remaining) replicate the d-byte
+                    // pattern with an expanding doubling copy instead
+                    // of one byte at a time.
+                    let d = distance as usize;
+                    while remaining > 0 && *written < output.len() {
+                        let out_room = output.len() - *written;
+                        let src = if self.window_pos >= d {
+                            self.window_pos - d
+                        } else {
+                            self.window_pos + WINDOW_SIZE - d
+                        };
+                        let dst_room = WINDOW_SIZE - self.window_pos;
+                        let src_room = WINDOW_SIZE - src;
+                        let span = (remaining as usize)
+                            .min(out_room)
+                            .min(dst_room)
+                            .min(src_room);
+                        if span == 0 {
+                            break;
+                        }
+
+                        if d >= span {
+                            let wp = self.window_pos;
+                            self.window.copy_within(src..src + span, wp);
+                            output[*written..*written + span]
+                                .copy_from_slice(&self.window[wp..wp + span]);
+                            *written += span;
+                            self.window_pos = wp + span;
+                        } else if src + d == self.window_pos {
+                            let start = self.window_pos; // == src + d
+                            let mut produced = 0usize;
+                            while produced < span {
+                                let copy = d.min(span - produced);
+                                self.window.copy_within(
+                                    src + produced..src + produced + copy,
+                                    start + produced,
+                                );
+                                produced += copy;
+                            }
+                            output[*written..*written + span]
+                                .copy_from_slice(&self.window[start..start + span]);
+                            *written += span;
+                            self.window_pos = start + span;
+                        } else {
+                            // Rare: overlapping source wraps the ring.
+                            let start = self.window_pos;
+                            for i in 0..span {
+                                let s = if start + i >= d {
+                                    start + i - d
+                                } else {
+                                    start + i + WINDOW_SIZE - d
+                                };
+                                let b = self.window[s];
+                                self.window[start + i] = b;
+                                output[*written] = b;
+                                *written += 1;
+                            }
+                            self.window_pos = start + span;
+                        }
+
+                        if self.window_pos == WINDOW_SIZE {
+                            self.window_pos = 0;
+                        }
+                        if self.window_size < WINDOW_SIZE {
+                            self.window_size = (self.window_size + span).min(WINDOW_SIZE);
+                        }
+                        remaining -= span as u32;
+                        progress = true;
+                    }
+                    if remaining == 0 {
+                        phase = HuffmanPhase::NextSymbol;
+                    } else {
+                        phase = HuffmanPhase::EmittingMatch {
+                            distance,
+                            remaining,
+                        };
+                        break;
+                    }
+                }
+            }
+        }
+        self.state = DecState::HuffmanBlock { fixed, phase };
+        Ok(progress)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `count` empty fixed-Huffman blocks (BFINAL=0, BTYPE=01, EOB): 10 bits
+    /// each, no output.
+    fn empty_fixed_blocks(count: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let (mut acc, mut n) = (0u64, 0u32);
+        for _ in 0..count {
+            acc |= 0b010u64 << n;
+            n += 10;
+            while n >= 8 {
+                bytes.push(acc as u8);
+                acc >>= 8;
+                n -= 8;
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn fixed_tables_are_built_once() {
+        let input = empty_fixed_blocks(2000);
+        let mut dec = Decoder::new();
+        let mut out = [0u8; 64];
+        let p = dec.raw_decode(&input, &mut out).unwrap();
+        assert_eq!(p.consumed, input.len());
+        assert_eq!(p.written, 0);
+        assert!(!p.done);
+        assert_eq!(dec.fixed_builds, 1);
+
+        // The cache survives a reset.
+        dec.raw_reset();
+        dec.raw_decode(&input, &mut out).unwrap();
+        assert_eq!(dec.fixed_builds, 1);
     }
 }

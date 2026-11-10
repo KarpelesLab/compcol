@@ -668,3 +668,59 @@ fn max_len() {
     assert_eq!(stream_to(&bomb, 1 << 20).0, Err(Error::OutputFull));
     assert_eq!(gunzip_len(&bomb[..], NO_LIMIT), Ok(1 << 30));
 }
+
+/// Two gzip members: the first stores "abcdefgh", the second is one fixed
+/// block holding a match of length 8 at distance 8, and a trailer for
+/// "abcdefgh". The match reaches into the first member's data, which is no
+/// part of the second member's history: zlib and gzip refuse it.
+const CROSS_MEMBER: [u8; 52] = [
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x01, 0x08, 0x00, 0xf7, 0xff, 0x61,
+    0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x50, 0x2a, 0xef, 0xae, 0x08, 0x00, 0x00, 0x00, 0x1f,
+    0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x83, 0xd1, 0x00, 0x50, 0x2a, 0xef, 0xae,
+    0x08, 0x00, 0x00, 0x00,
+];
+
+#[test]
+fn a_gzip_member_cannot_reference_the_previous_one() {
+    // The first member alone is fine.
+    assert_eq!(
+        to_buffer(|i, o| gunzip(i, o), &CROSS_MEMBER[..31], 8).unwrap(),
+        b"abcdefgh"
+    );
+
+    let mut out = [0u8; 64];
+    assert_eq!(
+        gunzip(&CROSS_MEMBER[..], Buffer::new(&mut out)),
+        Err(Error::InvalidDistance)
+    );
+    assert_eq!(
+        to_stream(|i, o| gunzip(i, o), &CROSS_MEMBER[..], 32_768),
+        Err(Error::InvalidDistance)
+    );
+    assert_eq!(
+        gunzip_len(&CROSS_MEMBER[..], NO_LIMIT),
+        Err(Error::InvalidDistance)
+    );
+    assert_eq!(
+        decompress(&CROSS_MEMBER[..], Buffer::new(&mut out)),
+        Err(Error::InvalidDistance)
+    );
+}
+
+/// Likewise for a stream decompressed after another one into the same
+/// output: it starts with no history.
+#[test]
+fn a_stream_cannot_reference_an_earlier_one_in_the_same_output() {
+    let mut out = [0u8; 64];
+    let mut buffer = Buffer::new(&mut out);
+    assert_eq!(gunzip(&CROSS_MEMBER[..31], &mut buffer), Ok(8));
+    assert_eq!(
+        gunzip(&CROSS_MEMBER[31..], &mut buffer),
+        Err(Error::InvalidDistance)
+    );
+    // The same deflate data, bare.
+    assert_eq!(
+        inflate(&CROSS_MEMBER[41..44], &mut buffer),
+        Err(Error::InvalidDistance)
+    );
+}

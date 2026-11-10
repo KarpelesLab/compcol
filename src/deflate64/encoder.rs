@@ -874,6 +874,13 @@ impl RawEncoder for Encoder {
                 self.window
                     .extend_from_slice(&input[consumed..consumed + to_copy]);
                 consumed += to_copy;
+                if to_copy > 0 {
+                    // New input after a flush that was cut short (its
+                    // marker is out by now, or this state would not be
+                    // `Accepting`): the next flush is a new one, and owes
+                    // a block for this input and a marker of its own.
+                    self.mid_flush = false;
+                }
 
                 let lookahead = self.window.len() - self.cursor;
                 if lookahead >= BLOCK_SIZE {
@@ -989,7 +996,17 @@ impl RawEncoder for Encoder {
                 }
             }
 
-            debug_assert!(!self.mid_flush);
+            if self.mid_flush {
+                // The marker of a flush that was cut short went out through
+                // `encode` calls, which took no input since: nothing is
+                // owed, that flush is complete.
+                self.mid_flush = false;
+                return Ok(RawProgress {
+                    consumed: 0,
+                    written,
+                    done: true,
+                });
+            }
             let remaining = self.window.len() - self.cursor;
             if remaining > 0 {
                 let end_rel = self.window.len();

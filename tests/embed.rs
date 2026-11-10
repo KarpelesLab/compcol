@@ -1092,3 +1092,43 @@ fn codecs_run_on_a_small_stack() {
         .unwrap();
     handle.join().expect("the codecs overflowed a 16 KiB stack");
 }
+
+/// Two gzip members: the first stores "abcdefgh", the second is one fixed
+/// block holding a match of length 8 at distance 8, and a trailer for
+/// "abcdefgh". The match reaches into the first member's data, which is no
+/// part of the second member's history: zlib and gzip refuse it.
+const CROSS_MEMBER: [u8; 52] = [
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x01, 0x08, 0x00, 0xf7, 0xff, 0x61,
+    0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x50, 0x2a, 0xef, 0xae, 0x08, 0x00, 0x00, 0x00, 0x1f,
+    0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x83, 0xd1, 0x00, 0x50, 0x2a, 0xef, 0xae,
+    0x08, 0x00, 0x00, 0x00,
+];
+
+#[test]
+fn a_gzip_member_cannot_reference_the_previous_one() {
+    // The first member alone is fine.
+    let mut out = [0u8; 64];
+    assert_eq!(gzip::decompress(&CROSS_MEMBER[..31], &mut out), Ok(8));
+    assert_eq!(&out[..8], b"abcdefgh");
+
+    assert_eq!(
+        gzip::decompress(&CROSS_MEMBER, &mut out),
+        Err(Error::InvalidDistance)
+    );
+    assert_eq!(
+        gzip::decompressed_len(&CROSS_MEMBER, usize::MAX),
+        Err(Error::InvalidDistance)
+    );
+    for &(in_chunk, out_chunk) in &[(usize::MAX, 64usize), (1, 1), (7, 3)] {
+        assert_eq!(
+            decode_chunked(
+                &mut gzip::Gzip::decoder(),
+                &CROSS_MEMBER,
+                in_chunk,
+                out_chunk
+            )
+            .unwrap_err(),
+            Error::InvalidDistance
+        );
+    }
+}

@@ -55,8 +55,10 @@ pub(crate) struct HuffmanDecoder {
     /// Primary lookup table: indexed by the next `PRIMARY_BITS` LSB-first
     /// stream bits. Each slot packs `(symbol, length)`; a length of 0
     /// means the code is longer than `PRIMARY_BITS` and the slow path
-    /// has to walk per-bit.
-    lut: alloc::boxed::Box<[u32; PRIMARY_SIZE]>,
+    /// has to walk per-bit. `None` for a single-symbol code, which never
+    /// looks anything up: a meta-block can carry hundreds of those, and
+    /// 8 KiB of zeroed table for each is pure waste.
+    lut: Option<alloc::boxed::Box<[u32; PRIMARY_SIZE]>>,
 }
 
 impl HuffmanDecoder {
@@ -70,7 +72,7 @@ impl HuffmanDecoder {
             first_idx: [0; 16],
             max_length: 0,
             single_symbol: Some(sym),
-            lut: alloc::boxed::Box::new([0u32; PRIMARY_SIZE]),
+            lut: None,
         }
     }
 
@@ -158,7 +160,7 @@ impl HuffmanDecoder {
             first_idx,
             max_length,
             single_symbol: None,
-            lut,
+            lut: Some(lut),
         })
     }
 
@@ -212,12 +214,10 @@ impl HuffmanDecoder {
     /// length-0 case, none required). Returns `Err(InvalidHuffmanTree)`
     /// if the read bits don't match any code.
     pub(crate) fn decode(&self, br: &mut BitSource<'_>) -> Result<u32, Error> {
-        if let Some(s) = self.single_symbol {
-            return Ok(s);
-        }
-        if self.max_length == 0 {
-            return Err(Error::InvalidHuffmanTree);
-        }
+        // No table: a single-symbol code (or an empty one).
+        let Some(lut) = self.lut.as_deref() else {
+            return self.single_symbol.ok_or(Error::InvalidHuffmanTree);
+        };
         let max = self.max_length as u32;
 
         // Fast path: peek PRIMARY_BITS bits, index the LUT, advance the
@@ -228,7 +228,7 @@ impl HuffmanDecoder {
         // accumulator intact for the next symbol.
         let (peeked, avail) = br.peek_lut_bits(PRIMARY_BITS);
         if avail >= PRIMARY_BITS {
-            let entry = self.lut[peeked as usize];
+            let entry = lut[peeked as usize];
             let len = entry >> LUT_LEN_SHIFT;
             if len > 0 {
                 br.consume(len);
@@ -283,31 +283,39 @@ const fn reverse_bits_lo(mut v: u32, n: u32) -> u32 {
 pub(crate) struct BitSource<'a> {
     data: &'a [u8],
     /// Absolute bit offset into `data` of the next bit not yet pulled
-    /// into `acc`. Always satisfies `load_pos <= data.len() * 8`.
-    load_pos: usize,
+    /// into `acc`. Always satisfies `load_pos <= data.len() * 8`. Bit
+    /// offsets are `u64`: on a 32-bit target `data.len() * 8` overflows
+    /// a `usize` for slices of 512 MiB and more.
+    load_pos: u64,
     /// Up to 64 bits, LSB-first, holding the next `nbits` bits the
     /// caller will consume.
     acc: u64,
     /// Number of valid bits currently in `acc`.
     nbits: u32,
+    /// Test instrumentation: prefix codes the decoder started reading
+    /// from this source.
+    #[cfg(test)]
+    pub(crate) prefix_codes: u64,
 }
 
 impl<'a> BitSource<'a> {
     /// Construct from an existing slice and a starting bit position.
-    pub(crate) fn at(data: &'a [u8], pos: usize) -> Self {
+    pub(crate) fn at(data: &'a [u8], pos: u64) -> Self {
         Self {
             data,
             load_pos: pos,
             acc: 0,
             nbits: 0,
+            #[cfg(test)]
+            prefix_codes: 0,
         }
     }
 
-    pub(crate) fn position(&self) -> usize {
-        self.load_pos - self.nbits as usize
+    pub(crate) fn position(&self) -> u64 {
+        self.load_pos - self.nbits as u64
     }
 
-    pub(crate) fn set_position(&mut self, p: usize) {
+    pub(crate) fn set_position(&mut self, p: u64) {
         self.load_pos = p;
         self.acc = 0;
         self.nbits = 0;
@@ -327,8 +335,15 @@ impl<'a> BitSource<'a> {
 
     /// Remaining bits available (still in `data` plus held in `acc`).
     #[allow(dead_code)]
-    pub(crate) fn remaining(&self) -> usize {
-        (self.data.len() * 8 - self.load_pos) + self.nbits as usize
+    pub(crate) fn remaining(&self) -> u64 {
+        (self.data.len() as u64 * 8 - self.load_pos) + self.nbits as u64
+    }
+
+    /// Index in `data` of the byte holding bit `load_pos`. A position
+    /// past the end of `data` (as far as `usize::MAX`) indexes nothing.
+    #[inline]
+    fn load_byte(&self) -> usize {
+        usize::try_from(self.load_pos >> 3).unwrap_or(usize::MAX)
     }
 
     /// Pull more bits from `data` into `acc` until at least 57 bits are
@@ -338,31 +353,27 @@ impl<'a> BitSource<'a> {
         // common case where the caller is mid-stream and the input slice
         // has 8 spare bytes ahead.
         if (self.load_pos & 7) == 0 && self.nbits <= 56 {
-            let byte_pos = self.load_pos >> 3;
-            if byte_pos + 8 <= self.data.len() {
-                let bytes: [u8; 8] = self.data[byte_pos..byte_pos + 8]
-                    .try_into()
-                    .expect("8-byte slice");
-                let chunk = u64::from_le_bytes(bytes);
+            let ahead = self.data.get(self.load_byte()..);
+            if let Some(bytes) = ahead.and_then(|d| d.first_chunk::<8>()) {
+                let chunk = u64::from_le_bytes(*bytes);
                 self.acc |= chunk << self.nbits;
                 let added = 64 - self.nbits;
-                self.load_pos += added as usize;
+                self.load_pos += added as u64;
                 self.nbits = 64;
                 return;
             }
         }
         // Slow path: byte-by-byte (handles unaligned start and tail).
         while self.nbits <= 56 {
-            let byte_pos = self.load_pos >> 3;
-            if byte_pos >= self.data.len() {
+            let Some(&byte) = self.data.get(self.load_byte()) else {
                 break;
-            }
+            };
             let bit_off = (self.load_pos & 7) as u32;
             let take = 8 - bit_off;
-            let chunk = (self.data[byte_pos] as u64) >> bit_off;
+            let chunk = (byte as u64) >> bit_off;
             self.acc |= chunk << self.nbits;
             self.nbits += take;
-            self.load_pos += take as usize;
+            self.load_pos += take as u64;
         }
     }
 
@@ -385,7 +396,7 @@ impl<'a> BitSource<'a> {
     #[allow(dead_code)]
     pub(crate) fn peek_bits(&mut self, n: u32) -> u32 {
         debug_assert!(n > 0 && n <= 32);
-        debug_assert!(n as usize <= self.remaining());
+        debug_assert!(n as u64 <= self.remaining());
         if self.nbits < n {
             self.refill();
         }
@@ -449,7 +460,7 @@ impl<'a> BitSource<'a> {
                 let extra = drop - self.nbits;
                 self.acc = 0;
                 self.nbits = 0;
-                self.load_pos += extra as usize;
+                self.load_pos += extra as u64;
             }
         }
     }
@@ -466,6 +477,8 @@ mod tests {
         let mut src = BitSource::at(&data, 0);
         assert_eq!(d.decode(&mut src).unwrap(), 42);
         assert_eq!(src.position(), 0);
+        // No lookup table is allocated for a code that reads no bits.
+        assert!(d.lut.is_none());
     }
 
     #[test]
@@ -546,6 +559,17 @@ mod tests {
         // After rollback, re-reading must produce the same bits.
         assert_eq!(src.read_bits(8).unwrap(), 0xFF);
         assert_eq!(src.read_bits(8).unwrap(), 0x00);
+    }
+
+    #[test]
+    fn positions_are_64_bit() {
+        // A bit offset past 2^32 (512 MiB into a buffer) must be kept
+        // exactly on every target, not wrapped into a 32-bit `usize`.
+        let pos = (1u64 << 35) + 3;
+        let mut src = BitSource::at(&[0u8; 4], pos);
+        assert_eq!(src.position(), pos);
+        assert!(src.read_bit().is_err());
+        assert_eq!(src.position(), pos);
     }
 
     #[test]

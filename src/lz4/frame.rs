@@ -71,6 +71,11 @@ const BD_BLOCK_MAX_SHIFT: u32 = 4;
 /// Sliding-window size for linked-block back-references (64 KiB).
 const WINDOW_SIZE: usize = 64 * 1024;
 
+/// How large the decoder lets its history buffer grow before trimming it
+/// back to [`WINDOW_SIZE`]. Twice the window amortises the trim's memmove
+/// to O(1) per decoded byte.
+const WINDOW_HIGH_WATER: usize = 2 * WINDOW_SIZE;
+
 // ─── BlockMaxSize ─────────────────────────────────────────────────────────
 
 /// Maximum uncompressed payload size of a single LZ4 frame block.
@@ -735,7 +740,7 @@ pub struct Decoder {
     /// Parsed flag bits.
     flg: u8,
     bd: u8,
-    /// Parsed optional descriptor fields (consumed but not retained).
+    /// Byte count of the optional descriptor fields (ContentSize, DictID).
     desc_remaining: u8,
     /// Bytes of FLG+BD+ContentSize+DictID, used to recompute HC. Capped
     /// at 14 bytes (2 + 8 + 4).
@@ -753,11 +758,17 @@ pub struct Decoder {
     /// Decoded payload of the current block.
     decoded: Vec<u8>,
     decoded_idx: usize,
-    /// Sliding 64 KiB window of the last decoded bytes, for linked-block
-    /// back-references.
+    /// History of the last decoded bytes, for linked-block back-references.
+    /// Holds between one and two windows' worth (see `push_window`); only
+    /// its trailing 64 KiB is ever referenced.
     window: Vec<u8>,
     /// Running content checksum (if enabled).
     content_hash: XxHash32,
+    /// The descriptor's ContentSize, when FLG.C.Size is set: the exact
+    /// number of bytes the frame must decode to.
+    content_size: Option<u64>,
+    /// Bytes decoded in this frame so far, checked against `content_size`.
+    content_count: u64,
     /// `true` once a malformed input was seen; further calls error.
     poisoned: bool,
 }
@@ -786,6 +797,8 @@ impl Decoder {
             decoded_idx: 0,
             window: Vec::with_capacity(WINDOW_SIZE),
             content_hash: XxHash32::new(),
+            content_size: None,
+            content_count: 0,
             poisoned: false,
         }
     }
@@ -820,6 +833,13 @@ impl Decoder {
 
     /// Push `bytes` onto the sliding-back-reference window. Only meaningful
     /// when blocks are linked.
+    ///
+    /// The buffer is allowed to grow to [`WINDOW_HIGH_WATER`] (twice the
+    /// window) before its front is dropped, so the memmove that slides it
+    /// happens once per 64 KiB of output rather than once per block — a
+    /// frame of tiny blocks would otherwise pay a 64 KiB move for each.
+    /// The block decoder is only ever handed the trailing [`WINDOW_SIZE`]
+    /// bytes.
     fn push_window(&mut self, bytes: &[u8]) {
         if self.block_independent {
             return;
@@ -831,15 +851,16 @@ impl Decoder {
                 .extend_from_slice(&bytes[bytes.len() - WINDOW_SIZE..]);
             return;
         }
-        let combined = self.window.len() + bytes.len();
-        if combined <= WINDOW_SIZE {
-            self.window.extend_from_slice(bytes);
-        } else {
-            // Drop the oldest `combined - WINDOW_SIZE` bytes.
-            let drop = combined - WINDOW_SIZE;
+        if self.window.len() + bytes.len() > WINDOW_HIGH_WATER {
+            // Keep just enough of the old tail that, with `bytes` appended,
+            // exactly one window remains. `bytes.len() < WINDOW_SIZE` here,
+            // and the buffer holds more than a full window, so both
+            // subtractions are in range.
+            let keep = WINDOW_SIZE - bytes.len();
+            let drop = self.window.len() - keep;
             self.window.drain(..drop);
-            self.window.extend_from_slice(bytes);
         }
+        self.window.extend_from_slice(bytes);
     }
 
     /// Parse FLG + BD, validate version + reserved bits, capture the
@@ -949,11 +970,17 @@ impl RawDecoder for Decoder {
                             done: false,
                         });
                     }
-                    // Capture these bytes for the HC computation but
-                    // otherwise ignore them — we don't honour DictID
-                    // and we don't enforce the ContentSize field.
+                    // Capture these bytes for the HC computation. The
+                    // ContentSize (always first when present) is kept
+                    // and enforced against the decoded byte count; the
+                    // DictID is ignored — we don't honour it.
                     self.descriptor
                         .extend_from_slice(&self.accum[..self.accum_len as usize]);
+                    if (self.flg & FLG_CONTENT_SIZE) != 0 {
+                        let mut size = [0u8; 8];
+                        size.copy_from_slice(&self.accum[..8]);
+                        self.content_size = Some(u64::from_le_bytes(size));
+                    }
                     self.phase = DecPhase::Hc;
                     self.accum_len = 0;
                     self.accum_need = 1;
@@ -991,7 +1018,15 @@ impl RawDecoder for Decoder {
                         self.accum[3],
                     ]);
                     if raw_word == 0 {
-                        // EndMark.
+                        // EndMark. A frame that declared its ContentSize
+                        // must have produced exactly that many bytes
+                        // (the reference's `frameSize_wrong`).
+                        if self
+                            .content_size
+                            .is_some_and(|size| size != self.content_count)
+                        {
+                            return self.poison(Error::Corrupt);
+                        }
                         if self.content_checksum {
                             self.phase = DecPhase::ContentChecksum;
                             self.accum_len = 0;
@@ -1093,14 +1128,25 @@ impl RawDecoder for Decoder {
                         // Linked-block decode: the back-reference search
                         // space is the 64 KiB sliding window plus what
                         // we've decoded in this block so far.
+                        let history_start = self.window.len().saturating_sub(WINDOW_SIZE);
                         if let Err(e) = decode_linked_block(
                             &self.compressed,
-                            &self.window,
+                            &self.window[history_start..],
                             &mut self.decoded,
                             self.block_max.bytes(),
                         ) {
                             return self.poison(e);
                         }
+                    }
+                    // Enforce the declared ContentSize as soon as the
+                    // output overruns it, before handing the block out.
+                    self.content_count =
+                        self.content_count.saturating_add(self.decoded.len() as u64);
+                    if self
+                        .content_size
+                        .is_some_and(|size| self.content_count > size)
+                    {
+                        return self.poison(Error::Corrupt);
                     }
                     if self.content_checksum {
                         self.content_hash.update(&self.decoded);
@@ -1229,6 +1275,8 @@ impl RawDecoder for Decoder {
         self.decoded_idx = 0;
         self.window.clear();
         self.content_hash = XxHash32::new();
+        self.content_size = None;
+        self.content_count = 0;
         self.poisoned = false;
     }
 }
@@ -1354,6 +1402,45 @@ mod tests {
     fn xxhash32_empty() {
         // Reference value for xxHash32("", seed=0).
         assert_eq!(xxhash32(b""), 0x02CC_5D05);
+    }
+
+    #[test]
+    fn decoder_window_trim_is_amortised() {
+        // Linked mode (block_independent = false is the `new()` default).
+        let mut dec = Decoder::new();
+        let mut model: Vec<u8> = Vec::new();
+        let mut trims = 0usize;
+        let mut push = |dec: &mut Decoder, model: &mut Vec<u8>, bytes: &[u8]| {
+            let before = dec.window.len();
+            dec.push_window(bytes);
+            model.extend_from_slice(bytes);
+            let trimmed = dec.window.len() < before + bytes.len();
+            if trimmed {
+                trims += 1;
+            }
+            assert!(dec.window.len() <= WINDOW_HIGH_WATER);
+            // Whatever is buffered, its tail is the true last 64 KiB
+            // (sampled for the 1-byte pushes to keep the test quick).
+            if trimmed || bytes.len() > 1 || model.len().is_multiple_of(509) {
+                let want = &model[model.len().saturating_sub(WINDOW_SIZE)..];
+                let have = &dec.window[dec.window.len().saturating_sub(WINDOW_SIZE)..];
+                assert_eq!(have, want);
+            }
+        };
+
+        let first: Vec<u8> = (0..WINDOW_SIZE as u32).map(|i| (i * 13) as u8).collect();
+        push(&mut dec, &mut model, &first);
+        // 5 windows' worth of 1-byte blocks: the front may only be dropped
+        // once per window, not once per block.
+        for i in 0..5 * WINDOW_SIZE {
+            push(&mut dec, &mut model, &[(i % 253) as u8]);
+        }
+        // Awkward sizes, and a block larger than the window.
+        for len in [1usize, 65535, 2, 65535, 40000, 40000, 40000, 70000, 3] {
+            let block: Vec<u8> = (0..len).map(|i| (i * 31 + len) as u8).collect();
+            push(&mut dec, &mut model, &block);
+        }
+        assert!(trims <= 12, "window was trimmed {trims} times");
     }
 
     #[test]

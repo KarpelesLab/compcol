@@ -107,7 +107,8 @@ struct RunCtx {
     frame_ready: bool,
     /// `finish` has appended one zero word past the end of the input. A
     /// Huffman decode looks ahead by the tree's longest code, which can run
-    /// past the last real bit; libmspack pads the input the same way.
+    /// past the last real bit; libmspack pads the input the same way. The
+    /// pad may only be looked at: consuming any of it is `UnexpectedEnd`.
     eof_padded: bool,
 }
 
@@ -390,18 +391,10 @@ impl RawDecoder for Decoder {
         }
         let mut written = 0usize;
         if let DecState::Running(ctx) = &mut self.state {
-            drain_frame(ctx, output, &mut written);
-            if !ctx.eof_padded && ctx.bit_reader.can_accept_word() {
-                ctx.bit_reader.feed(0);
-                ctx.bit_reader.feed(0);
-                ctx.eof_padded = true;
-            }
-            if let Err(e) = step(ctx) {
-                return Err(self.poison(e));
-            }
-            drain_frame(ctx, output, &mut written);
-            if ctx.output_so_far == ctx.output_total && ctx.frame_emitted == ctx.frame_buf.len() {
-                self.state = DecState::Done;
+            match finish_running(ctx, output, &mut written) {
+                Ok(true) => self.state = DecState::Done,
+                Ok(false) => {}
+                Err(e) => return Err(self.poison(e)),
             }
         }
         match &self.state {
@@ -423,17 +416,13 @@ impl RawDecoder for Decoder {
                     Err(self.poison(Error::UnexpectedEnd))
                 }
             }
-            DecState::Running(_) => {
-                if written == 0 {
-                    Err(self.poison(Error::UnexpectedEnd))
-                } else {
-                    Ok(RawProgress {
-                        consumed: 0,
-                        written,
-                        done: false,
-                    })
-                }
-            }
+            // Bytes are still owed and `output` is full (or empty). That is
+            // not an error: the caller comes back with more room.
+            DecState::Running(_) => Ok(RawProgress {
+                consumed: 0,
+                written,
+                done: false,
+            }),
         }
     }
 
@@ -443,6 +432,41 @@ impl RawDecoder for Decoder {
             have: 0,
         };
         self.poisoned = false;
+    }
+}
+
+/// Run a stream to its end once the input is exhausted. `Ok(true)`: the
+/// declared total has been delivered. `Ok(false)`: decoded bytes are waiting
+/// for room in `output`. `UnexpectedEnd` only when nothing is pending and
+/// the remaining bits cannot produce any more output.
+fn finish_running(ctx: &mut RunCtx, output: &mut [u8], written: &mut usize) -> Result<bool, Error> {
+    loop {
+        drain_frame(ctx, output, written);
+        if ctx.output_so_far == ctx.output_total && ctx.frame_emitted == ctx.frame_buf.len() {
+            return Ok(true);
+        }
+        if ctx.frame_ready {
+            // `drain_frame` stopped short: `output` is full.
+            return Ok(false);
+        }
+        if !ctx.eof_padded && ctx.bit_reader.can_pad_eof() {
+            ctx.bit_reader.pad_eof();
+            ctx.eof_padded = true;
+        }
+        let res = step(ctx);
+        // The pad is lookahead only. If any of it was consumed, the stream
+        // ended before its data did — whatever those bits then decoded to
+        // (output bytes, or some other error) is meaningless.
+        if ctx.bit_reader.eof_pad_consumed() {
+            return Err(Error::UnexpectedEnd);
+        }
+        res?;
+        // `step` returns with a frame to drain or for want of input. Out of
+        // input with the pad in place is the end; without it (the reader
+        // was too full to pad) go round again, now that bits were used.
+        if !ctx.frame_ready && (ctx.eof_padded || !ctx.bit_reader.can_pad_eof()) {
+            return Err(Error::UnexpectedEnd);
+        }
     }
 }
 
@@ -489,6 +513,16 @@ fn emit_window(ctx: &mut RunCtx, b: u8) {
     ctx.window[ctx.window_pos] = b;
     ctx.window_pos = (ctx.window_pos + 1) % win_size;
     ctx.frame_buf.push(b);
+}
+
+/// The current frame is finished: it holds a whole 32 KiB, or the stream's
+/// declared total has been reached. `step` must then close it before
+/// another symbol is read. In particular the total ends the stream even
+/// inside a block whose BLOCK_SIZE runs past it — reading on would make the
+/// result depend on how much input happens to be buffered.
+fn frame_complete(ctx: &RunCtx) -> bool {
+    ctx.frame_buf.len() >= FRAME_SIZE
+        || ctx.output_so_far + ctx.frame_buf.len() as u64 >= ctx.output_total
 }
 
 /// Run one or more state-machine substeps. Returns Ok when progress is
@@ -687,12 +721,24 @@ fn step(ctx: &mut RunCtx) -> Result<(), Error> {
                             if ctx.bit_reader.bits_available() < 16 {
                                 break;
                             }
-                            let word = ctx.bit_reader.peek(16);
-                            ctx.bit_reader.drop_bits(16);
-                            if remaining > 1 {
-                                carry = Some((word >> 8) as u8);
+                            // The block's last byte may be the last byte of
+                            // the stream, its pad byte left off.
+                            let half = if remaining == 1 {
+                                ctx.bit_reader.take_eof_half_byte()
+                            } else {
+                                None
+                            };
+                            match half {
+                                Some(b) => b,
+                                None => {
+                                    let word = ctx.bit_reader.peek(16);
+                                    ctx.bit_reader.drop_bits(16);
+                                    if remaining > 1 {
+                                        carry = Some((word >> 8) as u8);
+                                    }
+                                    (word & 0xFF) as u8
+                                }
                             }
-                            (word & 0xFF) as u8
                         }
                     };
                     emit_window(ctx, b);
@@ -813,7 +859,7 @@ fn step_huff(ctx: &mut RunCtx) -> Result<bool, Error> {
                                 ctx.block = BlockState::AwaitBlockHeader;
                                 return Ok(true);
                             }
-                            if ctx.frame_buf.len() >= FRAME_SIZE {
+                            if frame_complete(ctx) {
                                 yield_progress!(HuffPhase::NextMain);
                             }
                             ph = HuffPhase::NextMain;
@@ -996,8 +1042,11 @@ fn step_huff(ctx: &mut RunCtx) -> Result<bool, Error> {
                 }
                 // A match that ends exactly on the frame boundary must hand
                 // back to `step` (E8 pass + bitstream realign) before the
-                // next symbol is read, just like a literal does.
-                if ctx.frame_buf.len() >= FRAME_SIZE {
+                // next symbol is read, just like a literal does. So must one
+                // that reaches the declared total: the copy itself needs no
+                // input and always runs to its end (surplus bytes are
+                // dropped on drain), but nothing after it may be read.
+                if frame_complete(ctx) {
                     yield_progress!(HuffPhase::NextMain);
                 }
                 ph = HuffPhase::NextMain;

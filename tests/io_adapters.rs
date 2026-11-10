@@ -408,3 +408,157 @@ fn encoder_writer_flush_emits_sync_point() {
         b"request one\nrequest two\n"
     );
 }
+
+// ─── misbehaving codecs: stall guard and no finish-on-drop after error ──
+
+mod misbehaving {
+    use std::cell::RefCell;
+    use std::io::Write;
+    use std::rc::Rc;
+
+    use compcol::io::{DecoderWriter, EncoderWriter};
+    use compcol::{Decoder, Encoder, Error, Progress, Status};
+
+    /// What the mock codec does when handed input.
+    #[derive(Clone, Copy)]
+    enum Mode {
+        /// `OutputFull` forever, consuming and producing nothing.
+        Stall,
+        /// Fail outright, as on corrupt input.
+        Fail,
+    }
+
+    /// One mock for both traits. `finish` emits a marker so a test can tell
+    /// whether it ran. To keep a regression from hanging the suite, the mock
+    /// panics once it has been called far more often than a sane driver
+    /// would.
+    struct Mock {
+        mode: Mode,
+        calls: u32,
+    }
+
+    impl Mock {
+        fn new(mode: Mode) -> Self {
+            Self { mode, calls: 0 }
+        }
+        fn step(&mut self) -> Result<(Progress, Status), Error> {
+            self.calls += 1;
+            assert!(self.calls < 1000, "adapter spins on a stalled codec");
+            match self.mode {
+                Mode::Stall => Ok((Progress::default(), Status::OutputFull)),
+                Mode::Fail => Err(Error::Corrupt),
+            }
+        }
+        fn end(output: &mut [u8]) -> Result<(Progress, Status), Error> {
+            output[..MARKER.len()].copy_from_slice(MARKER);
+            let p = Progress {
+                consumed: 0,
+                written: MARKER.len(),
+            };
+            Ok((p, Status::StreamEnd))
+        }
+    }
+
+    const MARKER: &[u8] = b"FINISHED";
+
+    impl Encoder for Mock {
+        fn encode(&mut self, _: &[u8], _: &mut [u8]) -> Result<(Progress, Status), Error> {
+            self.step()
+        }
+        fn finish(&mut self, output: &mut [u8]) -> Result<(Progress, Status), Error> {
+            Self::end(output)
+        }
+        fn reset(&mut self) {}
+    }
+
+    impl Decoder for Mock {
+        fn decode(&mut self, _: &[u8], _: &mut [u8]) -> Result<(Progress, Status), Error> {
+            self.step()
+        }
+        fn finish(&mut self, output: &mut [u8]) -> Result<(Progress, Status), Error> {
+            Self::end(output)
+        }
+        fn reset(&mut self) {}
+        fn discard_output(&mut self, _: &[u8], _: usize) -> Result<(Progress, Status), Error> {
+            self.step()
+        }
+    }
+
+    /// A sink whose contents outlive the adapter that owns it.
+    #[derive(Clone, Default)]
+    struct SharedSink(Rc<RefCell<Vec<u8>>>);
+
+    impl Write for SharedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn decoder_writer_errors_on_a_stalled_decoder() {
+        let mut w = DecoderWriter::new(SharedSink::default(), Mock::new(Mode::Stall));
+        let err = w.write(b"pending input").unwrap_err();
+        assert!(err.to_string().contains("stalled"), "{err}");
+    }
+
+    #[test]
+    fn encoder_writer_errors_on_a_stalled_encoder() {
+        let mut w = EncoderWriter::new(SharedSink::default(), Mock::new(Mode::Stall));
+        let err = w.write(b"pending input").unwrap_err();
+        assert!(err.to_string().contains("stalled"), "{err}");
+    }
+
+    #[test]
+    fn decoder_writer_drop_skips_finish_after_a_codec_error() {
+        // Once `write` has reported a codec error the decoder's state is
+        // unspecified: Drop must not call `finish` on it and push whatever
+        // comes out into the sink.
+        for mode in [Mode::Fail, Mode::Stall] {
+            let sink = SharedSink::default();
+            {
+                let mut w = DecoderWriter::new(sink.clone(), Mock::new(mode));
+                w.write(b"corrupt input").unwrap_err();
+            }
+            assert_eq!(sink.0.borrow().as_slice(), b"");
+        }
+    }
+
+    #[test]
+    fn encoder_writer_drop_skips_finish_after_a_codec_error() {
+        for mode in [Mode::Fail, Mode::Stall] {
+            let sink = SharedSink::default();
+            {
+                let mut w = EncoderWriter::new(sink.clone(), Mock::new(mode));
+                w.write(b"input").unwrap_err();
+            }
+            assert_eq!(sink.0.borrow().as_slice(), b"");
+        }
+    }
+
+    #[test]
+    fn explicit_finish_after_a_codec_error_is_an_error() {
+        let sink = SharedSink::default();
+        let mut w = DecoderWriter::new(sink.clone(), Mock::new(Mode::Fail));
+        w.write(b"corrupt input").unwrap_err();
+        assert!(w.finish().is_err());
+        assert_eq!(sink.0.borrow().as_slice(), b"");
+
+        let sink = SharedSink::default();
+        let mut w = EncoderWriter::new(sink.clone(), Mock::new(Mode::Fail));
+        w.write(b"input").unwrap_err();
+        assert!(w.finish().is_err());
+        assert_eq!(sink.0.borrow().as_slice(), b"");
+    }
+
+    #[test]
+    fn drop_still_finishes_a_healthy_writer() {
+        // The guard must not swallow the normal finish-on-drop.
+        let sink = SharedSink::default();
+        drop(DecoderWriter::new(sink.clone(), Mock::new(Mode::Fail)));
+        assert_eq!(sink.0.borrow().as_slice(), MARKER);
+    }
+}

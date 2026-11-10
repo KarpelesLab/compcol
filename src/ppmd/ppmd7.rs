@@ -26,7 +26,6 @@
 
 extern crate alloc;
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
@@ -122,14 +121,26 @@ pub(crate) struct Ppmd7 {
 impl Ppmd7 {
     /// Build the model for `mem_size` bytes of arena. The order is supplied
     /// to [`Ppmd7::init`]. `mem_size` must be at least `UNIT_SIZE`.
+    ///
+    /// The arena (up to ~255 MiB, chosen by a stream header byte) is
+    /// allocated fallibly; failure returns [`Error::Unsupported`], as in
+    /// `Ppmd8::new`, rather than aborting the process.
     pub(crate) fn new(mem_size: u32) -> Result<Self, Error> {
         if mem_size < UNIT_SIZE {
             return Err(Error::BadHeader);
         }
         let align_offset = 4 - (mem_size & 3);
-        let total = (align_offset + mem_size + UNIT_SIZE) as usize;
+        // In usize: `mem_size` near `u32::MAX` must not wrap the total.
+        let total = (align_offset as usize)
+            .checked_add(mem_size as usize)
+            .and_then(|t| t.checked_add(UNIT_SIZE as usize))
+            .ok_or(Error::Unsupported)?;
+        let mut base = Vec::new();
+        base.try_reserve_exact(total)
+            .map_err(|_| Error::Unsupported)?;
+        base.resize(total, 0);
         let mut p = Self {
-            base: vec![0u8; total],
+            base,
             size: mem_size,
             align_offset,
             err: false,
@@ -1064,7 +1075,9 @@ impl Ppmd7 {
         let s = self.found_state;
         self.prev_success =
             (2 * self.st_freq(s) as u32 > self.ctx_summ_freq(self.min_context)) as u32;
-        self.run_length += self.prev_success as i32;
+        // Wrapping, like the reference's `Int32`: nothing resets the count
+        // during an arbitrarily long run of predicted symbols.
+        self.run_length = self.run_length.wrapping_add(self.prev_success as i32);
         let c = self.min_context;
         self.ctx_add_summ_freq(c, 4);
         self.st_add_freq(s, 4);
@@ -1079,7 +1092,7 @@ impl Ppmd7 {
         let f = self.st_freq(s);
         self.st_set_freq(s, f + (f < 128) as u8);
         self.prev_success = 1;
-        self.run_length += 1;
+        self.run_length = self.run_length.wrapping_add(1);
         self.next_context();
     }
 
@@ -1290,5 +1303,46 @@ impl Ppmd7 {
             + 2 * self.hb2flag[os_sym as usize] as usize
             + ((self.run_length >> 26) & 0x20) as usize;
         (row.min(127), col.min(63))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arena_size_and_minimum() {
+        assert!(matches!(Ppmd7::new(UNIT_SIZE - 1), Err(Error::BadHeader)));
+        // Alignment pad (1..=4 bytes) + arena + one guard unit, zero-filled.
+        for (mem, pad) in [(1u32 << 20, 4usize), ((1 << 20) + 1, 3), ((1 << 20) + 3, 1)] {
+            let p = Ppmd7::new(mem).unwrap();
+            assert_eq!(p.base.len(), pad + mem as usize + UNIT_SIZE as usize);
+            assert!(p.base.iter().all(|&b| b == 0));
+        }
+    }
+
+    /// `run_length` counts consecutive predicted symbols with nothing to
+    /// reset it on a long enough run; like the reference's `Int32` it must
+    /// wrap rather than trip an overflow check.
+    #[test]
+    fn run_length_wraps_at_i32_max() {
+        use crate::ppmd::range_dec::Mode;
+
+        // Order 6, 16 MB, 1280 bytes of a repeating 20-byte phrase: past
+        // the first few periods every symbol comes from a binary context.
+        let stream: &[u8] = include_bytes!("../../tests/fixtures/ppmd/repeat.ppmd");
+        let plain: &[u8] = include_bytes!("../../tests/fixtures/ppmd/repeat.bin");
+        let mut model = Ppmd7::new(16 << 20).unwrap();
+        model.init(6);
+        let (mut rc, _) = RangeDec::init(Mode::SevenZip, stream, 11).unwrap();
+        for &want in &plain[..640] {
+            assert_eq!(model.decode_symbol(&mut rc).unwrap(), want);
+        }
+        assert!(model.run_length > 0);
+
+        // Stand in for 2^31 predicted symbols.
+        model.run_length = i32::MAX;
+        assert_eq!(model.decode_symbol(&mut rc).unwrap(), plain[640]);
+        assert_eq!(model.run_length, i32::MIN);
     }
 }

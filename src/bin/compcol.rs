@@ -8,7 +8,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use compcol::factory;
@@ -209,7 +209,13 @@ fn stream_encode(
             consumed += p.consumed;
             match status {
                 Status::InputEmpty => break,
-                Status::OutputFull => continue,
+                // "Drain and call again" — unless nothing moved, in which
+                // case calling again would spin on unchanged state forever.
+                Status::OutputFull => {
+                    if p.consumed == 0 && p.written == 0 {
+                        return Err(io::Error::other("encoder stalled with input pending"));
+                    }
+                }
                 Status::StreamEnd => break,
             }
         }
@@ -254,7 +260,13 @@ fn stream_decode(
             consumed += p.consumed;
             match status {
                 Status::InputEmpty => break,
-                Status::OutputFull => continue,
+                // "Drain and call again" — unless nothing moved, in which
+                // case calling again would spin on unchanged state forever.
+                Status::OutputFull => {
+                    if p.consumed == 0 && p.written == 0 {
+                        return Err(io::Error::other("decoder stalled with input pending"));
+                    }
+                }
                 Status::StreamEnd => break,
             }
         }
@@ -338,21 +350,137 @@ fn derive_output(args: &Args, algo: &str) -> Result<Output, String> {
     })?;
 
     if args.decompress {
-        let s = input.to_string_lossy();
-        let suffix = format!(".{ext}");
-        if !s.ends_with(&suffix) {
-            return Err(format!(
+        match strip_extension(input, ext)? {
+            Some(stripped) => Ok(Output::File(stripped)),
+            None => Err(format!(
                 "input {} doesn't end with '.{ext}'; use -o PATH",
                 input.display()
-            ));
+            )),
         }
-        Ok(Output::File(PathBuf::from(&s[..s.len() - suffix.len()])))
     } else {
         // Append `.<ext>` to the input path.
         let mut new_name = input.clone().into_os_string();
         new_name.push(".");
         new_name.push(ext);
         Ok(Output::File(PathBuf::from(new_name)))
+    }
+}
+
+/// Strip a trailing `.<ext>` from `input`, returning `Ok(None)` when the
+/// path doesn't end with it.
+///
+/// The path is never round-tripped through a lossy string conversion: a name
+/// that isn't valid Unicode must keep its exact bytes, or the output would
+/// land under a different (mangled, possibly colliding) name while the input
+/// is removed.
+#[cfg(unix)]
+fn strip_extension(input: &Path, ext: &str) -> Result<Option<PathBuf>, String> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let suffix = format!(".{ext}");
+    Ok(input
+        .as_os_str()
+        .as_bytes()
+        .strip_suffix(suffix.as_bytes())
+        .map(|stem| PathBuf::from(OsString::from_vec(stem.to_vec()))))
+}
+
+/// Non-unix fallback: without a safe way to slice the platform's native
+/// encoding, only valid-Unicode paths are handled; anything else is refused
+/// rather than written under a mangled name.
+#[cfg(not(unix))]
+fn strip_extension(input: &Path, ext: &str) -> Result<Option<PathBuf>, String> {
+    let Some(s) = input.to_str() else {
+        return Err(format!(
+            "input {} is not valid Unicode, so the output name can't be derived; use -o PATH",
+            input.display()
+        ));
+    };
+    let suffix = format!(".{ext}");
+    Ok(s.strip_suffix(&suffix).map(PathBuf::from))
+}
+
+/// Permission bits of `f` if it is a regular file, for copying onto the
+/// output. `None` for pipes, devices and the like — and always on platforms
+/// without unix permission bits, where the output keeps its default ACL.
+fn regular_file_mode(f: &File) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        f.metadata()
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = f;
+        None
+    }
+}
+
+/// Open the output file: exclusively (`O_EXCL`) unless `force`, which
+/// truncates an existing file instead.
+///
+/// With `owner_only` (unix; set when the input is a regular file whose mode
+/// will be copied over afterwards) a newly created file starts out as 0600
+/// rather than `0666 & !umask`, so the data is never exposed more widely
+/// than the input was while it is being written. An existing `--force`
+/// target keeps its mode until then.
+fn open_output(path: &Path, force: bool, owner_only: bool) -> io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.write(true);
+    if force {
+        opts.create(true).truncate(true);
+    } else {
+        opts.create_new(true);
+    }
+    #[cfg(unix)]
+    if owner_only {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = owner_only;
+    opts.open(path)
+}
+
+/// Set the permission bits of the open output file to `mode`. Only regular
+/// files are touched (`-f -o /dev/null` must not chmod the device); a no-op
+/// on platforms without unix permission bits.
+fn set_mode(f: &File, mode: u32) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if f.metadata()?.is_file() {
+            f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (f, mode);
+    Ok(())
+}
+
+/// Whether `input` and `output` name the same existing file.
+///
+/// On unix the device/inode pair is compared, which also catches hard links
+/// and bind mounts; everywhere, the canonicalized paths are compared, which
+/// catches different spellings and symlinks. A path that doesn't exist (the
+/// usual case for the output) can't be the input, so any lookup failure
+/// means "not the same".
+fn is_same_file(input: &Path, output: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(input), std::fs::metadata(output))
+            && a.dev() == b.dev()
+            && a.ino() == b.ino()
+        {
+            return true;
+        }
+    }
+    match (std::fs::canonicalize(input), std::fs::canonicalize(output)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -421,6 +549,12 @@ impl From<io::Error> for RunError {
     }
 }
 
+/// The codec selected for this run, resolved before any output is opened.
+enum Codec {
+    Encoder(Box<dyn Encoder>),
+    Decoder(Box<dyn Decoder>),
+}
+
 /// Number of leading bytes buffered for format auto-detection. The longest
 /// magic we examine is the StuffIt-classic check, which reaches byte 13, so a
 /// 16-byte window is comfortably sufficient.
@@ -441,7 +575,9 @@ fn run(args: &Args) -> Result<(), RunError> {
     let in_place = args.input.is_some() && !args.stdout && args.output.is_none();
     let should_remove_input = in_place && !args.keep;
 
-    // Reader.
+    // Reader. When the input is a regular file, remember its permission bits
+    // so a file output can be given the same ones (see `open_output`).
+    let mut input_mode: Option<u32> = None;
     let mut reader: Box<dyn Read> = if let Some(p) = &args.input {
         let f = File::open(p).map_err(|e| {
             RunError::Io(io::Error::new(
@@ -449,6 +585,7 @@ fn run(args: &Args) -> Result<(), RunError> {
                 format!("open {}: {e}", p.display()),
             ))
         })?;
+        input_mode = regular_file_mode(&f);
         Box::new(BufReader::new(f))
     } else {
         Box::new(BufReader::new(io::stdin()))
@@ -469,7 +606,7 @@ fn run(args: &Args) -> Result<(), RunError> {
             Some(name) => name.to_string(),
             None => {
                 return Err(RunError::Usage(
-                    "could not detect format; specify with --algo (e.g. -t gzip)".into(),
+                    "could not detect format; specify with --type (e.g. -t gzip)".into(),
                 ));
             }
         }
@@ -482,13 +619,41 @@ fn run(args: &Args) -> Result<(), RunError> {
         Box::new(io::Cursor::new(peeked).chain(reader))
     };
 
+    // Resolve the codec BEFORE touching the output: an unknown algorithm must
+    // not create an empty output file, nor (with --force) truncate an
+    // existing one.
+    let unknown = || RunError::Usage(format!("unknown algorithm: '{algo}' (use --list)"));
+    let codec = if args.decompress {
+        Codec::Decoder(factory::decoder_by_name(&algo).ok_or_else(unknown)?)
+    } else {
+        Codec::Encoder(
+            match args.level {
+                Some(level) => factory::encoder_by_name_with_level(&algo, level),
+                None => factory::encoder_by_name(&algo),
+            }
+            .ok_or_else(unknown)?,
+        )
+    };
+
     let output = derive_output(args, &algo).map_err(RunError::Usage)?;
 
     // Writer + the path we'd remove on cleanup if anything goes wrong.
     let stdout = io::stdout();
+    let mut final_mode: Option<(File, u32, PathBuf)> = None;
     let (mut writer, output_path): (Box<dyn Write>, Option<PathBuf>) = match &output {
         Output::Stdout => (Box::new(BufWriter::new(stdout.lock())), None),
         Output::File(p) => {
+            // Refuse to write over the file we are about to read: opening it
+            // for writing (--force truncates) would destroy the input before
+            // a single byte of it had been consumed.
+            if let Some(input) = &args.input
+                && is_same_file(input, p)
+            {
+                return Err(RunError::Usage(format!(
+                    "input and output are the same file: {}",
+                    p.display()
+                )));
+            }
             // Without --force, create the output atomically with O_EXCL
             // (create_new). This eliminates the TOCTOU between an existence
             // check and the open, and refuses to follow a pre-existing or
@@ -502,16 +667,7 @@ fn run(args: &Args) -> Result<(), RunError> {
             // uses create_new, so a successful open there always created the
             // file — it is always safe to clean up.)
             let preexisting = args.force && p.exists();
-            let open_result = if args.force {
-                OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(p)
-            } else {
-                OpenOptions::new().write(true).create_new(true).open(p)
-            };
-            let f = open_result.map_err(|e| {
+            let f = open_output(p, args.force, input_mode.is_some()).map_err(|e| {
                 if !args.force && e.kind() == io::ErrorKind::AlreadyExists {
                     RunError::Usage(format!(
                         "output exists: {} (use -f to overwrite)",
@@ -528,34 +684,48 @@ fn run(args: &Args) -> Result<(), RunError> {
             // left in place (already truncated) rather than deleted out from
             // under the user.
             let cleanup = if preexisting { None } else { Some(p.clone()) };
+            // Keep a second handle so the input's permission bits can be
+            // applied to this very file (not to whatever the path names by
+            // then) once it is completely written. If the handle can't be
+            // duplicated the output simply stays owner-only.
+            if let Some(mode) = input_mode
+                && let Ok(handle) = f.try_clone()
+            {
+                final_mode = Some((handle, mode, p.clone()));
+            }
             (Box::new(BufWriter::new(f)), cleanup)
         }
     };
 
-    let result = if args.decompress {
-        let dec = factory::decoder_by_name(&algo)
-            .ok_or_else(|| RunError::Usage(format!("unknown algorithm: '{algo}' (use --list)")))?;
-        stream_decode(dec, &mut *reader, &mut *writer)
-    } else {
-        let enc = match args.level {
-            Some(level) => factory::encoder_by_name_with_level(&algo, level),
-            None => factory::encoder_by_name(&algo),
-        }
-        .ok_or_else(|| RunError::Usage(format!("unknown algorithm: '{algo}' (use --list)")))?;
-        stream_encode(enc, &mut *reader, &mut *writer)
-    };
+    // From here on the output exists: every failure — including the final
+    // flush — must go through the cleanup below rather than an early `?`.
+    let result = match codec {
+        Codec::Decoder(dec) => stream_decode(dec, &mut *reader, &mut *writer),
+        Codec::Encoder(enc) => stream_encode(enc, &mut *reader, &mut *writer),
+    }
+    .and_then(|()| writer.flush());
 
+    // Release the file handle before removing or reporting anything.
+    drop(writer);
     if let Err(e) = result {
-        // Best-effort: drop the writer (releases the file handle), remove the
-        // partial output, leave the input intact.
-        drop(writer);
+        // Best-effort: remove the partial output, leave the input intact.
         if let Some(p) = output_path {
             let _ = std::fs::remove_file(&p);
         }
         return Err(RunError::Io(e));
     }
-    writer.flush()?;
-    drop(writer);
+
+    // The output is complete: hand it the input's permission bits. Failing
+    // to do so leaves it no more accessible than intended (a file we created
+    // is still owner-only), so warn rather than fail the whole run.
+    if let Some((handle, mode, path)) = final_mode
+        && let Err(e) = set_mode(&handle, mode)
+    {
+        eprintln!(
+            "compcol: warning: could not set permissions on {}: {e}",
+            path.display()
+        );
+    }
 
     if should_remove_input
         && let Some(p) = &args.input
@@ -568,4 +738,75 @@ fn run(args: &Args) -> Result<(), RunError> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use compcol::{Error, Progress, Status};
+
+    /// A codec that reports `OutputFull` forever without consuming or
+    /// producing anything. No real codec does this; the streaming loops must
+    /// still terminate. To keep a regression from hanging the suite, the mock
+    /// panics once it has been called far more often than a sane driver
+    /// would.
+    #[derive(Default)]
+    struct Stalling {
+        calls: u32,
+    }
+
+    impl Stalling {
+        fn step(&mut self) -> Result<(Progress, Status), Error> {
+            self.calls += 1;
+            assert!(self.calls < 1000, "streaming loop spins on a stalled codec");
+            Ok((Progress::default(), Status::OutputFull))
+        }
+    }
+
+    impl Encoder for Stalling {
+        fn encode(&mut self, _: &[u8], _: &mut [u8]) -> Result<(Progress, Status), Error> {
+            self.step()
+        }
+        fn finish(&mut self, _: &mut [u8]) -> Result<(Progress, Status), Error> {
+            Ok((Progress::default(), Status::StreamEnd))
+        }
+        fn reset(&mut self) {}
+    }
+
+    impl Decoder for Stalling {
+        fn decode(&mut self, _: &[u8], _: &mut [u8]) -> Result<(Progress, Status), Error> {
+            self.step()
+        }
+        fn finish(&mut self, _: &mut [u8]) -> Result<(Progress, Status), Error> {
+            Ok((Progress::default(), Status::StreamEnd))
+        }
+        fn reset(&mut self) {}
+        fn discard_output(&mut self, _: &[u8], _: usize) -> Result<(Progress, Status), Error> {
+            self.step()
+        }
+    }
+
+    #[test]
+    fn stream_encode_errors_on_a_stalled_encoder() {
+        let mut out = Vec::new();
+        let err = stream_encode(
+            Box::new(Stalling::default()),
+            &mut &b"pending input"[..],
+            &mut out,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("stalled"), "{err}");
+    }
+
+    #[test]
+    fn stream_decode_errors_on_a_stalled_decoder() {
+        let mut out = Vec::new();
+        let err = stream_decode(
+            Box::new(Stalling::default()),
+            &mut &b"pending input"[..],
+            &mut out,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("stalled"), "{err}");
+    }
 }

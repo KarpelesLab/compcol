@@ -56,6 +56,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Build the source of the tag being released. On `release` this
+          # is already the default ref; on `workflow_dispatch` the default
+          # would be the dispatching branch's HEAD, whose binaries would
+          # then be uploaded (--clobber) under this tag's asset names.
+          ref: refs/tags/${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Install cross compiler (Linux aarch64)
         if: matrix.apt_packages
@@ -115,13 +121,22 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${TAG}" "${{ steps.pack.outputs.asset }}" --clobber
+          # Passed through the environment, never interpolated into the
+          # script: the asset name embeds the tag name.
+          ASSET: ${{ steps.pack.outputs.asset }}
+        run: gh release upload "${TAG}" "${ASSET}" --clobber
 
   build-macos-universal:
     name: build macos universal
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Build the source of the tag being released. On `release` this
+          # is already the default ref; on `workflow_dispatch` the default
+          # would be the dispatching branch's HEAD, whose binaries would
+          # then be uploaded (--clobber) under this tag's asset names.
+          ref: refs/tags/${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -157,4 +172,7 @@ jobs:
       - name: Upload to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${TAG}" "${{ steps.pack.outputs.asset }}" --clobber
+          # Passed through the environment, never interpolated into the
+          # script: the asset name embeds the tag name.
+          ASSET: ${{ steps.pack.outputs.asset }}
+        run: gh release upload "${TAG}" "${ASSET}" --clobber

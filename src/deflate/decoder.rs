@@ -627,7 +627,16 @@ impl RawDecoder for Decoder {
         // hand that out first. Only a stream that stops short with nothing
         // left to give is truncated.
         let p = self.raw_decode(&[], output)?;
-        if matches!(self.state, DecState::Done) || p.written > 0 {
+        // A match or a literal waiting for room is output still owed, not a
+        // truncated stream, even if this call had no room to take any of it:
+        // the caller comes back with a buffer.
+        let owes_output = matches!(
+            self.state,
+            DecState::HuffmanBlock(
+                HuffmanPhase::EmittingMatch { .. } | HuffmanPhase::PendingLiteral(_)
+            )
+        );
+        if matches!(self.state, DecState::Done) || p.written > 0 || owes_output {
             return Ok(RawProgress {
                 consumed: 0,
                 written: p.written,

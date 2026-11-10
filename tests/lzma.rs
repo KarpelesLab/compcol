@@ -210,6 +210,125 @@ fn unexpected_eof_on_finish() {
     assert_eq!(err, Error::UnexpectedEnd);
 }
 
+// ─── end of stream ───────────────────────────────────────────────────────
+
+/// A `.lzma` stream with the size in the header and no end marker, made
+/// from the marker-less ZIP framing of the same payload.
+fn known_size_stream(payload: &[u8]) -> Vec<u8> {
+    let mut enc = Encoder::zip(EncoderConfig::default(), false);
+    let z = encode_with(&mut enc, payload);
+    let mut s = z[4..9].to_vec();
+    s.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    s.extend_from_slice(&z[9..]);
+    s
+}
+
+/// Once the stream has ended, `decode` reports `StreamEnd` and consumes
+/// nothing more: it used to absorb (and buffer) every byte it was given and
+/// never report the end.
+#[test]
+fn decode_reports_stream_end_and_ignores_later_input() {
+    let payload = b"hello hello hello hello";
+    let marker = encode_one_shot(payload);
+    let known = known_size_stream(payload);
+    // A declared size followed by an end marker anyway.
+    let mut both = marker.clone();
+    both[5..13].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+
+    for (name, stream) in [("marker", &marker), ("known", &known), ("both", &both)] {
+        // Junk after the stream, in the same slice: the stream's own bytes
+        // are consumed and nothing else.
+        let mut input = stream.clone();
+        input.extend_from_slice(&[0x55; 4000]);
+        let mut dec = Decoder::new();
+        let mut out = vec![0u8; 256];
+        let (p, status) = dec.decode(&input, &mut out).unwrap();
+        assert_eq!(status, Status::StreamEnd, "{name}");
+        assert_eq!(p.consumed, stream.len(), "{name}");
+        assert_eq!(&out[..p.written], payload, "{name}");
+        for _ in 0..4 {
+            let (p, status) = dec.decode(&[0x55; 65536], &mut out).unwrap();
+            assert_eq!(
+                (p.consumed, p.written, status),
+                (0, 0, Status::StreamEnd),
+                "{name}"
+            );
+        }
+        let (p, status) = dec.finish(&mut out).unwrap();
+        assert_eq!((p.written, status), (0, Status::StreamEnd), "{name}");
+
+        // Junk arriving after the whole stream was fed: the end is reported
+        // as soon as the decoder can see it, then nothing is consumed.
+        let mut dec = Decoder::new();
+        let (p, _) = dec.decode(stream, &mut out).unwrap();
+        assert_eq!(p.consumed, stream.len(), "{name}");
+        let mut n = p.written;
+        let mut ended = false;
+        let mut taken = 0;
+        for _ in 0..8 {
+            let (p, status) = dec.decode(&[0x55; 65536], &mut out[n..]).unwrap();
+            n += p.written;
+            taken += p.consumed;
+            if ended {
+                assert_eq!((p.consumed, p.written), (0, 0), "{name}");
+            }
+            ended |= status == Status::StreamEnd;
+        }
+        assert!(ended, "{name}: decode never reported StreamEnd");
+        assert_eq!(taken, 0, "{name}: junk consumed");
+        assert_eq!(&out[..n], payload, "{name}");
+    }
+}
+
+/// A full output buffer stops the decoder from taking more input, so one
+/// large input slice is not copied into the decoder wholesale.
+#[test]
+fn decode_applies_backpressure_to_input() {
+    let payload = flush_noise(300 * 1024, 7);
+    let stream = encode_at_level(&payload, 0);
+    assert!(stream.len() > 250 * 1024);
+    let mut dec = Decoder::new();
+    let mut out = [0u8; 512];
+    let (p, status) = dec.decode(&stream, &mut out).unwrap();
+    assert_eq!((p.written, status), (512, Status::OutputFull));
+    assert!(p.consumed < 8192, "consumed {} bytes", p.consumed);
+    // And the whole thing still decodes that way.
+    assert_eq!(decode_chunked(&stream, stream.len(), 512).unwrap(), payload);
+    assert_eq!(decode_chunked(&stream, 1, 100_000).unwrap(), payload);
+}
+
+/// A declared size whose stream neither ends there nor continues with an
+/// end marker is corrupt; the trailing packets used to be ignored.
+#[test]
+fn data_past_declared_size_is_corrupt() {
+    // "hello world" with the size set to 5: a literal follows.
+    let mut stream = hex(FIX_HELLO);
+    stream[5..13].copy_from_slice(&5u64.to_le_bytes());
+    assert_eq!(decode_one_shot(&stream), Err(Error::Corrupt));
+}
+
+/// A match that runs past the declared size is corrupt too: it used to be
+/// cut at the size and the stream reported as complete.
+#[test]
+fn match_past_declared_size_is_corrupt() {
+    // 30 bytes that end inside a match.
+    let data = b"abcabcabcabcabcabcabcabcabcabc";
+    let good = encode_one_shot(data);
+    assert_eq!(decode_one_shot(&good).unwrap(), data);
+    for (size, ok) in [(30u64, true), (29, false), (26, false), (4, false)] {
+        let mut stream = good.clone();
+        stream[5..13].copy_from_slice(&size.to_le_bytes());
+        for (ic, oc) in [(stream.len(), 65536), (1, 1), (7, 3)] {
+            let r = decode_chunked(&stream, ic, oc);
+            if ok {
+                assert_eq!(r.unwrap(), data, "size {size} chunks {ic}/{oc}");
+            } else {
+                assert_eq!(r, Err(Error::Corrupt), "size {size} chunks {ic}/{oc}");
+            }
+        }
+    }
+}
+
 // ─── algorithm metadata ─────────────────────────────────────────────────
 
 #[test]
@@ -1109,4 +1228,92 @@ fn flushed_compressible_stream_round_trips() {
         let out = xz_lzma_decode(&wire);
         assert!(out.status.success() && out.stdout == given);
     }
+}
+
+// ─── more than 4 GiB of input ────────────────────────────────────────────
+//
+// The encoders' absolute input offsets used to be `usize`, so on 32-bit
+// targets they wrapped at 4 GiB: `.lzma` silently dropped data, xz and
+// lzma2 buffered without bound and then panicked. These stream a little
+// over 4 GiB through an encoder straight into a decoder and compare the
+// byte counts. They take minutes, so they are ignored by default; run on a
+// 32-bit target with
+// `cargo test --release --target i686-unknown-linux-gnu --features all
+//  --test lzma -- --ignored four_gib`.
+// The quick always-on equivalents are the `stream_encoder_crosses_4gib`
+// unit tests next to each encoder.
+
+fn four_gib_pipe<E: compcol::Encoder, D: compcol::Decoder>(mut enc: E, mut dec: D) {
+    let total: u64 = (1u64 << 32) + (64 << 20);
+    let inbuf = vec![0u8; 1 << 20];
+    let mut comp = vec![0u8; 1 << 20];
+    let mut plain = vec![0u8; 1 << 22];
+    let (mut fed, mut decoded) = (0u64, 0u64);
+    let mut feed = |b: &[u8], dec: &mut D, decoded: &mut u64| {
+        let mut c = 0;
+        loop {
+            let (p, _) = dec.decode(&b[c..], &mut plain).unwrap();
+            c += p.consumed;
+            *decoded += p.written as u64;
+            assert!(plain[..p.written].iter().all(|&x| x == 0));
+            if p.consumed == 0 && p.written == 0 {
+                break;
+            }
+        }
+    };
+    while fed < total {
+        let n = (total - fed).min(inbuf.len() as u64) as usize;
+        let mut c = 0;
+        while c < n {
+            let (p, _) = enc.encode(&inbuf[c..n], &mut comp).unwrap();
+            c += p.consumed;
+            feed(&comp[..p.written], &mut dec, &mut decoded);
+        }
+        fed += n as u64;
+    }
+    loop {
+        let (p, st) = enc.finish(&mut comp).unwrap();
+        feed(&comp[..p.written], &mut dec, &mut decoded);
+        if st == Status::StreamEnd {
+            break;
+        }
+    }
+    let mut plain = vec![0u8; 1 << 22];
+    loop {
+        let (p, st) = dec.finish(&mut plain).unwrap();
+        decoded += p.written as u64;
+        if st == Status::StreamEnd || p.written == 0 {
+            break;
+        }
+    }
+    assert_eq!(decoded, fed);
+}
+
+#[test]
+#[ignore = "streams 4 GiB; takes minutes"]
+fn four_gib_lzma() {
+    four_gib_pipe(
+        Encoder::with_config(EncoderConfig { level: 0 }),
+        Decoder::new(),
+    );
+}
+
+#[cfg(feature = "xz")]
+#[test]
+#[ignore = "streams 4 GiB; takes minutes"]
+fn four_gib_xz() {
+    four_gib_pipe(
+        compcol::xz::Encoder::with_config(compcol::xz::EncoderConfig { level: 0 }),
+        compcol::xz::Decoder::new(),
+    );
+}
+
+#[cfg(feature = "lzma2")]
+#[test]
+#[ignore = "streams 4 GiB; takes minutes"]
+fn four_gib_lzma2() {
+    four_gib_pipe(
+        compcol::lzma2::Encoder::new(),
+        compcol::lzma2::Decoder::default(),
+    );
 }

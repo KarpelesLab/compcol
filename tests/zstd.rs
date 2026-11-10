@@ -1349,3 +1349,455 @@ fn flushes_interoperate_with_system_zstd() {
     check_flushes_with_system_tool("zstd", Flush::Sync);
     check_flushes_with_system_tool("zstd", Flush::Full);
 }
+
+// ─── decoder: Frame_Content_Size validation ─────────────────────────────
+
+/// Frame = magic + `header` (FHD onwards) + `blocks`.
+fn frame_from_parts(header: &[u8], blocks: &[u8]) -> Vec<u8> {
+    let mut f = vec![0x28, 0xB5, 0x2F, 0xFD];
+    f.extend_from_slice(header);
+    f.extend_from_slice(blocks);
+    f
+}
+
+/// Decode with several input/output chunkings; all must agree.
+fn decode_all_chunkings(frame: &[u8]) -> Result<Vec<u8>, Error> {
+    let first = decode_chunked(frame, 4096, 4096);
+    for (i, o) in [(1, 1), (1, 4096), (4096, 1), (3, 2)] {
+        assert_eq!(decode_chunked(frame, i, o), first, "chunking {i}/{o}");
+    }
+    first
+}
+
+/// A frame whose header declares a `Frame_Content_Size` must decode to
+/// exactly that many bytes (reference zstd: "Data corruption detected").
+#[test]
+fn frame_content_size_is_enforced() {
+    // Single_Segment, 1-byte FCS, one last Raw_Block "abc".
+    let raw_abc = [0x19, 0x00, 0x00, b'a', b'b', b'c'];
+    assert_eq!(
+        decode_all_chunkings(&frame_from_parts(&[0x20, 3], &raw_abc)).unwrap(),
+        b"abc"
+    );
+    // Declared 5, content 3: short.
+    assert_eq!(
+        decode_all_chunkings(&frame_from_parts(&[0x20, 5], &raw_abc)),
+        Err(Error::Corrupt)
+    );
+    // Declared 1, content 3: long.
+    assert_eq!(
+        decode_all_chunkings(&frame_from_parts(&[0x20, 1], &raw_abc)),
+        Err(Error::Corrupt)
+    );
+
+    // Windowed header (1 KiB) with a 4-byte FCS, so block sizes are not
+    // limited by the content size. Blocks: Raw "abc" (not last), RLE 'x' * 4
+    // (not last), Raw "de" (last) = 9 bytes.
+    let blocks = [
+        0x18, 0x00, 0x00, b'a', b'b', b'c', // Raw, 3 bytes
+        0x22, 0x00, 0x00, b'x', // RLE, 4 bytes
+        0x11, 0x00, 0x00, b'd', b'e', // Raw, 2 bytes, last
+    ];
+    let with_fcs = |n: u32| {
+        let mut h = vec![0x80, 0x00];
+        h.extend_from_slice(&n.to_le_bytes());
+        frame_from_parts(&h, &blocks)
+    };
+    assert_eq!(decode_all_chunkings(&with_fcs(9)).unwrap(), b"abcxxxxde");
+    // 2 and 5 are exceeded by a non-last block, 8 by the last one; 10 and
+    // 1000 are never reached.
+    for n in [0, 2, 5, 8, 10, 1000] {
+        assert_eq!(
+            decode_all_chunkings(&with_fcs(n)),
+            Err(Error::Corrupt),
+            "FCS={n}"
+        );
+    }
+
+    // Compressed_Block regenerating "abcdddd" (7 bytes).
+    let comp = [
+        0x55, 0x00, 0x00, 0x20, b'a', b'b', b'c', b'd', 0x01, 0x00, 0x00, 0x8E, 0x08,
+    ];
+    let with_fcs = |n: u32| {
+        let mut h = vec![0x80, 0x00];
+        h.extend_from_slice(&n.to_le_bytes());
+        frame_from_parts(&h, &comp)
+    };
+    assert_eq!(decode_all_chunkings(&with_fcs(7)).unwrap(), b"abcdddd");
+    for n in [0, 6, 8] {
+        assert_eq!(
+            decode_all_chunkings(&with_fcs(n)),
+            Err(Error::Corrupt),
+            "FCS={n}"
+        );
+    }
+}
+
+/// Nothing past the declared size is ever handed to the caller.
+#[test]
+fn frame_content_size_overrun_emits_nothing_past_it() {
+    // FCS = 2, then a Raw_Block "ab" (not last) and an RLE_Block of 1000.
+    let frame = frame_from_parts(
+        &[0x80, 0x00, 2, 0, 0, 0],
+        &[0x10, 0x00, 0x00, b'a', b'b', 0x43, 0x1F, 0x00, b'z'],
+    );
+    let mut dec = Decoder::new();
+    let mut out = vec![0u8; 4096];
+    let mut total = 0;
+    let mut pos = 0;
+    let err = loop {
+        match dec.decode(&frame[pos..], &mut out[total..]) {
+            Ok((p, status)) => {
+                pos += p.consumed;
+                total += p.written;
+                assert_ne!(status, Status::StreamEnd, "frame accepted");
+                assert!(p.consumed + p.written > 0, "decoder stalled");
+            }
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(err, Error::Corrupt);
+    assert!(total <= 2, "emitted {total} bytes for a 2-byte frame");
+}
+
+// ─── decoder: Block_Maximum_Size ────────────────────────────────────────
+
+/// 3-byte Block_Header.
+fn block_header(last: bool, block_type: u32, size: u32) -> [u8; 3] {
+    let bh = (size << 3) | (block_type << 1) | last as u32;
+    [bh as u8, (bh >> 8) as u8, (bh >> 16) as u8]
+}
+
+/// Windowed frame (`wd` = Window_Descriptor) holding one last RLE_Block.
+fn rle_frame_in_window(wd: u8, count: u32) -> Vec<u8> {
+    let mut f = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, wd];
+    f.extend_from_slice(&block_header(true, 1, count));
+    f.push(b'z');
+    f
+}
+
+/// Windowed frame holding one last Raw_Block of `count` bytes.
+fn raw_frame_in_window(wd: u8, count: u32) -> Vec<u8> {
+    let mut f = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, wd];
+    f.extend_from_slice(&block_header(true, 0, count));
+    f.extend((0..count).map(|i| (i % 251) as u8));
+    f
+}
+
+/// RFC 8878 §3.1.1.2.4: no block may be larger, nor regenerate more, than
+/// `Block_Maximum_Size = min(Window_Size, 128 KiB)`. The RLE case used to
+/// have no bound at all: 10 input bytes produced 2 MiB in a 1 KiB window.
+#[test]
+fn block_size_is_capped_at_block_maximum_size() {
+    const WD_1K: u8 = 0x00;
+    const WD_128K: u8 = 0x38;
+    const WD_256K: u8 = 0x40;
+    const KIB128: u32 = 128 * 1024;
+
+    // The audit's reproducer: `28 B5 2F FD 00 00 FB FF FF 7A`.
+    let bomb = rle_frame_in_window(WD_1K, 0x1F_FFFF);
+    assert_eq!(bomb, [0x28, 0xB5, 0x2F, 0xFD, 0, 0, 0xFB, 0xFF, 0xFF, 0x7A]);
+    // (Lengths only: a failure must not dump megabytes of output.)
+    let len = |frame: &[u8], chunk: usize| decode_chunked(frame, chunk, chunk).map(|v| v.len());
+    assert_eq!(len(&bomb, 4096), Err(Error::Corrupt));
+    assert_eq!(len(&bomb, 1), Err(Error::Corrupt));
+
+    for (wd, max) in [(WD_1K, 1024), (WD_128K, KIB128), (WD_256K, KIB128)] {
+        // Exactly Block_Maximum_Size is fine...
+        let ok = decode_chunked(&rle_frame_in_window(wd, max), 4096, 4096).unwrap();
+        assert!(
+            ok.len() == max as usize && ok.iter().all(|&b| b == b'z'),
+            "RLE wd={wd:#x}"
+        );
+        assert_eq!(
+            len(&raw_frame_in_window(wd, max), 4096),
+            Ok(max as usize),
+            "Raw wd={wd:#x}"
+        );
+        // ...one byte more is not.
+        assert_eq!(
+            len(&rle_frame_in_window(wd, max + 1), 4096),
+            Err(Error::Corrupt),
+            "RLE wd={wd:#x}"
+        );
+        assert_eq!(
+            len(&raw_frame_in_window(wd, max + 1), 4096),
+            Err(Error::Corrupt),
+            "Raw wd={wd:#x}"
+        );
+    }
+
+    // Compressed_Block whose Block_Size exceeds a 1 KiB window: a
+    // Raw_Literals_Block of 1021 bytes (3-byte header) + a zero sequence
+    // count is 1025 bytes on the wire. In a 2 KiB window it is legal.
+    let mut body = vec![0xDC, 0x3F, 0x00]; // Raw literals, 20-bit size 1021
+    body.extend((0..1021u32).map(|i| (i % 251) as u8));
+    body.push(0x00);
+    assert_eq!(body.len(), 1025);
+    let comp_frame = |wd: u8| {
+        let mut f = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, wd];
+        f.extend_from_slice(&block_header(true, 2, body.len() as u32));
+        f.extend_from_slice(&body);
+        f
+    };
+    assert_eq!(len(&comp_frame(0x08), 4096), Ok(1021));
+    assert_eq!(len(&comp_frame(WD_1K), 4096), Err(Error::Corrupt));
+
+    // Compressed_Block that is small on the wire but regenerates 1025 bytes
+    // (RLE_Literals_Block) in a 1 KiB window.
+    let rle_lit_frame = |wd: u8, n: u32| {
+        let mut f = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, wd];
+        f.extend_from_slice(&block_header(true, 2, 4));
+        // RLE literals, Size_Format 01 (12-bit size), byte 'q', 0 sequences.
+        f.extend_from_slice(&[0x05 | ((n & 0xF) << 4) as u8, (n >> 4) as u8, b'q', 0x00]);
+        f
+    };
+    assert_eq!(len(&rle_lit_frame(WD_1K, 1024), 4096), Ok(1024));
+    assert_eq!(len(&rle_lit_frame(WD_1K, 1025), 4096), Err(Error::Corrupt));
+}
+
+/// In a Single_Segment frame `Window_Size` is the Frame_Content_Size, so
+/// Block_Maximum_Size shrinks with it (reference: `blockSizeMax =
+/// MIN(windowSize, ZSTD_BLOCKSIZE_MAX)` with `windowSize = frameContentSize`).
+#[test]
+fn single_segment_block_maximum_size_is_the_content_size() {
+    let ss = |fcs: u8, blocks: &[u8]| frame_from_parts(&[0x20, fcs], blocks);
+    // Compressed_Block of 3 bytes (RLE literal 'z' * n, no sequences).
+    let comp = |n: u8| [0x1D, 0x00, 0x00, (n << 3) | 1, b'z', 0x00];
+
+    // Raw and RLE blocks of exactly the content size are fine.
+    assert_eq!(
+        decode_all_chunkings(&ss(1, &[0x09, 0x00, 0x00, b'z'])).unwrap(),
+        b"z"
+    );
+    assert_eq!(
+        decode_all_chunkings(&ss(3, &[0x1B, 0x00, 0x00, b'z'])).unwrap(),
+        b"zzz"
+    );
+    // A 3-byte Compressed_Block fits a 3-byte frame, not a 1- or 2-byte one.
+    assert_eq!(decode_all_chunkings(&ss(3, &comp(3))).unwrap(), b"zzz");
+    assert_eq!(decode_all_chunkings(&ss(2, &comp(2))), Err(Error::Corrupt));
+    assert_eq!(decode_all_chunkings(&ss(1, &comp(1))), Err(Error::Corrupt));
+    // An empty frame can only hold empty Raw_Blocks.
+    assert_eq!(
+        decode_all_chunkings(&ss(0, &[0x01, 0x00, 0x00])).unwrap(),
+        b""
+    );
+    assert_eq!(
+        decode_all_chunkings(&ss(0, &[0x15, 0x00, 0x00, 0x00, 0x00])),
+        Err(Error::Corrupt)
+    );
+    // The same empty Compressed_Block is legal in a windowed frame.
+    assert_eq!(
+        decode_all_chunkings(&frame_from_parts(
+            &[0x00, 0x00],
+            &[0x15, 0x00, 0x00, 0x00, 0x00]
+        ))
+        .unwrap(),
+        b""
+    );
+    // Several blocks: the bound is the frame's size, not what is left of it.
+    let mut blocks = vec![0x18, 0x00, 0x00, b'a', b'b', b'c'];
+    blocks.extend_from_slice(&comp(1));
+    assert_eq!(decode_all_chunkings(&ss(4, &blocks)).unwrap(), b"abcz");
+}
+
+// ─── decoder: entropy bitstreams must be consumed exactly ───────────────
+
+/// Windowed (1 KiB) frame holding one last Compressed_Block with `body`.
+fn compressed_block_frame(body: &[u8]) -> Vec<u8> {
+    let mut f = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00];
+    f.extend_from_slice(&block_header(true, 2, body.len() as u32));
+    f.extend_from_slice(body);
+    f
+}
+
+/// The sequence bitstream must be used up exactly once the last sequence is
+/// decoded (reference: `BIT_endOfDStream` check, "corruption_detected").
+#[test]
+fn sequence_bitstream_must_be_fully_consumed() {
+    // Raw literals "abcd", one sequence (predefined tables): LL=4, ML=3,
+    // offset 1 → "abcd" + "ddd". Bitstream `00 8E 08`.
+    let exact =
+        compressed_block_frame(&[0x20, b'a', b'b', b'c', b'd', 0x01, 0x00, 0x00, 0x8E, 0x08]);
+    assert_eq!(
+        exact,
+        [
+            0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x55, 0x00, 0x00, 0x20, 0x61, 0x62, 0x63, 0x64,
+            0x01, 0x00, 0x00, 0x8E, 0x08
+        ]
+    );
+    assert_eq!(decode_all_chunkings(&exact).unwrap(), b"abcdddd");
+
+    // The audit's reproducer: one extra zero byte at the (unread) low end of
+    // the bitstream.
+    let padded = compressed_block_frame(&[
+        0x20, b'a', b'b', b'c', b'd', 0x01, 0x00, 0x00, 0x00, 0x8E, 0x08,
+    ]);
+    assert_eq!(
+        padded,
+        [
+            0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x5D, 0x00, 0x00, 0x20, 0x61, 0x62, 0x63, 0x64,
+            0x01, 0x00, 0x00, 0x00, 0x8E, 0x08
+        ]
+    );
+    assert_eq!(decode_all_chunkings(&padded), Err(Error::Corrupt));
+
+    // Two extra bytes.
+    let padded2 = compressed_block_frame(&[
+        0x20, b'a', b'b', b'c', b'd', 0x01, 0x00, 0x00, 0x00, 0x00, 0x8E, 0x08,
+    ]);
+    assert_eq!(decode_all_chunkings(&padded2), Err(Error::Corrupt));
+}
+
+/// Every Huffman-coded literal stream must end exactly on its last symbol
+/// (reference: `BIT_endOfDStream` per stream in huf_decompress.c).
+///
+/// The tree `80 10` gives symbols 0x00 and 0x01 one-bit codes (0 and 1), so
+/// a stream is just its symbols' bits below the start marker.
+#[test]
+fn huffman_literal_streams_must_be_fully_consumed() {
+    // ── 1 stream, 5 literals 0,1,1,0,1 → bits 01101 → `2D`.
+    let exact = compressed_block_frame(&[0x52, 0xC0, 0x00, 0x80, 0x10, 0x2D, 0x00]);
+    assert_eq!(decode_all_chunkings(&exact).unwrap(), [0, 1, 1, 0, 1]);
+    // One spare bit in the same byte (`5A` = marker + 011010).
+    let spare_bit = compressed_block_frame(&[0x52, 0xC0, 0x00, 0x80, 0x10, 0x5A, 0x00]);
+    assert_eq!(decode_all_chunkings(&spare_bit), Err(Error::Corrupt));
+    // A spare zero byte below the stream.
+    let spare_byte = compressed_block_frame(&[0x52, 0x00, 0x01, 0x80, 0x10, 0x00, 0x2D, 0x00]);
+    assert_eq!(decode_all_chunkings(&spare_byte), Err(Error::Corrupt));
+    // One bit short was always rejected.
+    let short = compressed_block_frame(&[0x52, 0xC0, 0x00, 0x80, 0x10, 0x16, 0x00]);
+    assert_eq!(decode_all_chunkings(&short), Err(Error::Corrupt));
+
+    // ── 4 streams, 8 literals 0,1 | 1,0 | 1,1 | 0,0 → `05`, `06`, `07`, `04`.
+    let four = |streams: [&[u8]; 4]| {
+        let total: usize = streams.iter().map(|s| s.len()).sum();
+        let comp = 2 + 6 + total; // tree + jump table + streams
+        let mut body = vec![0x86, ((comp & 3) << 6) as u8, (comp >> 2) as u8, 0x80, 0x10];
+        for s in &streams[..3] {
+            body.extend_from_slice(&(s.len() as u16).to_le_bytes());
+        }
+        for s in streams {
+            body.extend_from_slice(s);
+        }
+        body.push(0x00); // no sequences
+        compressed_block_frame(&body)
+    };
+    let good: [&[u8]; 4] = [&[0x05], &[0x06], &[0x07], &[0x04]];
+    assert_eq!(
+        four(good),
+        [
+            0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x85, 0x00, 0x00, 0x86, 0x00, 0x03, 0x80, 0x10,
+            0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x05, 0x06, 0x07, 0x04, 0x00
+        ]
+    );
+    assert_eq!(
+        decode_all_chunkings(&four(good)).unwrap(),
+        [0, 1, 1, 0, 1, 1, 0, 0]
+    );
+    // Each stream in turn with one spare bit, then with a spare zero byte.
+    let spare_bit: [&[u8]; 4] = [&[0x0A], &[0x0C], &[0x0E], &[0x08]];
+    let spare_byte: [&[u8]; 4] = [&[0x00, 0x05], &[0x00, 0x06], &[0x00, 0x07], &[0x00, 0x04]];
+    for i in 0..4 {
+        let mut s = good;
+        s[i] = spare_bit[i];
+        assert_eq!(
+            decode_all_chunkings(&four(s)),
+            Err(Error::Corrupt),
+            "stream {i}: spare bit"
+        );
+        let mut s = good;
+        s[i] = spare_byte[i];
+        assert_eq!(
+            decode_all_chunkings(&four(s)),
+            Err(Error::Corrupt),
+            "stream {i}: spare byte"
+        );
+    }
+
+    // ── 4 streams, 6 literals: the streams hold 2, 2, 2 and 0 symbols. The
+    // empty fourth stream must still be a well-formed, empty bitstream (a
+    // bare start marker), not arbitrary bytes.
+    let six = |s4: u8| {
+        compressed_block_frame(&[
+            0x66, 0x00, 0x03, 0x80, 0x10, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x05, 0x06, 0x07, s4,
+            0x00,
+        ])
+    };
+    assert_eq!(
+        decode_all_chunkings(&six(0x01)).unwrap(),
+        [0, 1, 1, 0, 1, 1]
+    );
+    assert_eq!(decode_all_chunkings(&six(0x04)), Err(Error::Corrupt));
+    assert_eq!(decode_all_chunkings(&six(0x00)), Err(Error::Corrupt));
+}
+
+/// 4-stream Huffman literals need a Regenerated_Size of at least 6
+/// (reference `MIN_LITERALS_FOR_4_STREAMS`: "Header of Literals' block
+/// doesn't respect format specification"). Four literals, one per stream,
+/// used to be accepted; six (see the test above) is the smallest legal size.
+#[test]
+fn four_stream_literals_need_six_bytes() {
+    // Same tree as above; streams `02 03 02 03` = symbols 0, 1, 0, 1.
+    let four = compressed_block_frame(&[
+        0x46, 0x00, 0x03, 0x80, 0x10, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x02, 0x03, 0x02, 0x03,
+        0x00,
+    ]);
+    assert_eq!(decode_all_chunkings(&four), Err(Error::Corrupt));
+}
+
+/// The exact-consumption checks must never reject what the crate's own
+/// encoder writes: many small inputs of different shapes (so 1- and 4-stream
+/// Huffman literals, FSE-compressed / RLE / predefined / repeat sequence
+/// tables all occur) at assorted levels, with and without flushes.
+#[test]
+fn exact_bitstream_checks_accept_encoder_output() {
+    const LEVELS: [i32; 9] = [MIN_LEVEL, -50, -3, -1, 1, 3, 7, 15, 22];
+    for case in 0..240u32 {
+        let len = (case as usize * 131) % 6000;
+        let input: Vec<u8> = match case % 4 {
+            0 => gen_words(len),
+            // Skewed small alphabet: Huffman literals, few matches.
+            1 => lcg_bytes(case, len)
+                .into_iter()
+                .map(|b| b"aaaabbbcdeefghij"[(b & 15) as usize])
+                .collect(),
+            // Words interleaved with noise.
+            2 => gen_words(len)
+                .into_iter()
+                .zip(lcg_bytes(case, len))
+                .map(|(w, n)| if n < 40 { n } else { w })
+                .collect(),
+            // Short period with occasional breaks.
+            _ => lcg_bytes(case, len)
+                .into_iter()
+                .enumerate()
+                .map(|(i, n)| if n < 8 { n } else { (i % 7) as u8 })
+                .collect(),
+        };
+        let level = LEVELS[case as usize % LEVELS.len()];
+        let mut enc = Encoder::with_config(EncoderConfig { level });
+        let mut wire = Vec::new();
+        if case % 3 == 0 && len > 2 {
+            // Two flushed segments, then the rest: several blocks in one
+            // frame, so repeat tables / treeless literals get a chance.
+            let (a, rest) = input.split_at(len / 3);
+            let (b, c) = rest.split_at(len / 3);
+            flush_test_encode(&mut enc, a, 4096, &mut wire);
+            flush_test_flush(&mut enc, Flush::Sync, 4096, &mut wire);
+            flush_test_encode(&mut enc, b, 4096, &mut wire);
+            flush_test_flush(&mut enc, Flush::Full, 4096, &mut wire);
+            flush_test_encode(&mut enc, c, 4096, &mut wire);
+            flush_test_finish(&mut enc, 4096, &mut wire);
+        } else {
+            wire = encode_chunked(&mut enc, &input, 4096, 4096);
+        }
+        let decoded = decode_chunked(&wire, 4096, 4096);
+        assert!(
+            decoded.as_deref() == Ok(&input[..]),
+            "case {case}: len {len}, level {level}: {:?}",
+            decoded.map(|v| v.len())
+        );
+    }
+}

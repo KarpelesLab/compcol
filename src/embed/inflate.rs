@@ -218,6 +218,13 @@ impl<const N: usize> Window<N> {
         self.avail = 0;
     }
 
+    /// Puts what was produced so far out of reach: a gzip member starts
+    /// with no history. Returns where it starts, as `written` does.
+    pub(super) fn member(&mut self) -> u32 {
+        self.avail = 0;
+        self.pos
+    }
+
     #[inline]
     fn put(&mut self, byte: u8) {
         if let Some(slot) = self.buf.get_mut(self.pos as usize & Self::MASK) {

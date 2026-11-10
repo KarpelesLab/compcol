@@ -38,6 +38,10 @@
 //! For an **empty input** the stream is just the single varint byte `0x00`;
 //! no table, no payload.
 //!
+//! The stream is exactly as long as its header says: the decoder rejects
+//! (as [`Error::Corrupt`]) any bytes after the payload and any padding bit
+//! that is not zero, so a stream cannot carry unauthenticated trailing data.
+//!
 //! ## Code-length table RLE
 //!
 //! The 256 code lengths (one nibble each, `0..=15`) are run-length encoded
@@ -68,7 +72,9 @@
 //!
 //! When the input is one distinct byte repeated, that byte is assigned a
 //! 1-bit code (the degenerate Huffman case). The payload is then one bit
-//! per input byte, i.e. `ceil(len/8)` bytes — a ~8× shrink.
+//! per input byte, i.e. `ceil(len/8)` bytes — a ~8× shrink. That code is the
+//! bit `0`, so the payload is all zero bytes, and the decoder requires
+//! exactly that.
 
 #![cfg_attr(docsrs, doc(cfg(feature = "huffman")))]
 
@@ -558,6 +564,28 @@ impl BitWriter {
 
 // ─── core transforms ──────────────────────────────────────────────────────
 
+/// Scale exact `u64` symbol counts down to the `u32` weights the code-length
+/// construction works with.
+///
+/// Counts that already fit are returned unchanged, so the code built for any
+/// input shorter than 4 GiB is exactly what it always was. Otherwise every
+/// count is shifted right by the same amount — just enough for the largest to
+/// fit — which preserves their relative order and (to within rounding) their
+/// ratios. A nonzero count never scales to zero: a symbol that occurs in the
+/// input must keep a code.
+fn scale_freqs(counts: &[u64; 256]) -> [u32; 256] {
+    let max = counts.iter().copied().max().unwrap_or(0);
+    let shift = (u64::BITS - max.leading_zeros()).saturating_sub(u32::BITS);
+    let mut out = [0u32; 256];
+    for (slot, &count) in out.iter_mut().zip(counts.iter()) {
+        if count != 0 {
+            // `count >> shift` fits: `max >> shift` does, by choice of shift.
+            *slot = ((count >> shift) as u32).max(1);
+        }
+    }
+    out
+}
+
 /// Encode `input` into a complete self-delimiting Huffman stream.
 fn encode_stream(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -567,11 +595,14 @@ fn encode_stream(input: &[u8]) -> Vec<u8> {
         return out;
     }
 
-    // Frequencies.
-    let mut freqs = [0u32; 256];
+    // Frequencies. Counted in `u64`: a `u32` counter wraps (or panics, with
+    // overflow checks on) once a byte value occurs 2^32 times, and a count
+    // that wraps to exactly 0 would drop the symbol from the code.
+    let mut counts = [0u64; 256];
     for &b in input {
-        freqs[b as usize] += 1;
+        counts[b as usize] += 1;
     }
+    let freqs = scale_freqs(&counts);
 
     // Length-limited canonical lengths (single-symbol → 1-bit code).
     let lengths = length_limited_lengths(&freqs, MAX_CODE_LEN);
@@ -587,12 +618,35 @@ fn encode_stream(input: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Most output bytes [`decode_stream`] reserves before it has decoded
+/// anything; beyond this the buffer grows with the output actually produced.
+const MAX_PREALLOC: usize = 64 * 1024;
+
+/// Convert a stream's declared output length to `usize`, rejecting one no
+/// allocation on this target could hold (more than `isize::MAX` bytes).
+///
+/// On 64-bit targets the payload-size bound already rules such lengths out;
+/// on 32-bit targets a few hundred MiB of input can legitimately declare
+/// more than `isize::MAX` bytes, which would otherwise truncate in an `as`
+/// cast or panic with `capacity overflow`. Such a stream is well-formed but
+/// cannot be decoded here, hence [`Error::Unsupported`].
+fn checked_output_len(declared: u64) -> Result<usize, Error> {
+    match usize::try_from(declared) {
+        Ok(n) if n <= isize::MAX as usize => Ok(n),
+        _ => Err(Error::Unsupported),
+    }
+}
+
 /// Decode a self-delimiting Huffman stream back into the original bytes.
 fn decode_stream(input: &[u8]) -> Result<Vec<u8>, Error> {
     let (orig_len, vlen) = read_varint(input)?;
     let mut rest = &input[vlen..];
 
     if orig_len == 0 {
+        // An empty stream is the length varint and nothing else.
+        if !rest.is_empty() {
+            return Err(Error::Corrupt);
+        }
         return Ok(Vec::new());
     }
 
@@ -608,15 +662,26 @@ fn decode_stream(input: &[u8]) -> Result<Vec<u8>, Error> {
     if orig_len > (rest.len() as u64).saturating_mul(8) {
         return Err(Error::UnexpectedEnd);
     }
-    let orig_len = orig_len as usize;
-    let mut out = Vec::with_capacity(orig_len);
 
-    // Degenerate single-symbol stream: every code is one bit, the symbol is
-    // fixed. We don't need to inspect the payload bits.
+    // Degenerate single-symbol stream: every code is the one bit `0` (the
+    // canonical code of a lone 1-bit symbol), so the payload is exactly
+    // `ceil(len/8)` zero bytes — the symbols and the zero padding alike.
+    // Anything else (stray bits, extra bytes) is not something the encoder
+    // produces and is rejected rather than silently ignored.
     if let Some(sym) = table.single {
-        out.resize(orig_len, sym as u8);
+        if rest.len() as u64 != orig_len.div_ceil(8) || rest.iter().any(|&b| b != 0) {
+            return Err(Error::Corrupt);
+        }
+        let mut out = Vec::new();
+        out.resize(checked_output_len(orig_len)?, sym as u8);
         return Ok(out);
     }
+
+    // The declared length is attacker-controlled and so far only known to be
+    // at most 8× the payload: reserve a modest amount up front and let the
+    // buffer grow as symbols are actually decoded.
+    let orig_len = checked_output_len(orig_len)?;
+    let mut out = Vec::with_capacity(orig_len.min(MAX_PREALLOC));
 
     let max = table.max_length as u32;
 
@@ -678,6 +743,15 @@ fn decode_stream(input: &[u8]) -> Result<Vec<u8>, Error> {
         out.push(entry as u8);
         acc <<= len;
         have -= len;
+    }
+
+    // The stream must end here: every payload byte loaded, and what is left
+    // in the accumulator is only the final byte's padding — fewer than 8
+    // bits, all zero (`acc` is zero below its `have` valid bits, so testing
+    // the whole word tests exactly those). Trailing bytes or nonzero padding
+    // are not something the encoder produces.
+    if pos != data.len() || have >= 8 || acc != 0 {
+        return Err(Error::Corrupt);
     }
 
     Ok(out)

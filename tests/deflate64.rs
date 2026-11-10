@@ -659,3 +659,153 @@ fn finish_drains_pending_output_into_a_small_buffer() {
     }
     assert_eq!(out, plain);
 }
+
+/// The decoder consumes exactly the stream and not a byte of what follows
+/// it, however the input is chunked: a container reader finds what comes
+/// next at the sum of `consumed`. (It used to pull up to 8 bytes past the
+/// final block into its bit reader and report them consumed.)
+#[test]
+fn consumption_stops_at_the_end_of_the_stream() {
+    // A small xorshift, for inputs of every shape and for the chunk sizes.
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+
+    for round in 0..24 {
+        let len = (next() % 6000) as usize;
+        let plain: Vec<u8> = match round % 3 {
+            // Incompressible: stored blocks.
+            0 => (0..len).map(|_| next() as u8).collect(),
+            // Text-like: matches and literals.
+            1 => (0..len)
+                .map(|_| b"abcdefgh "[(next() % 9) as usize])
+                .collect(),
+            _ => b"hello hello hello world ".repeat(len / 24),
+        };
+        let stream = encode_all(&plain);
+        let mut input = stream.clone();
+        input.extend_from_slice(&[0x55; 16]);
+
+        // Chunk sizes: a byte at a time, everything at once, random.
+        for mode in 0..3 {
+            let mut dec = Decoder::new();
+            let mut out = Vec::new();
+            let mut buf = vec![0u8; 1 + (next() % 300) as usize];
+            let mut consumed = 0;
+            loop {
+                let chunk = match mode {
+                    0 => 1,
+                    1 => input.len(),
+                    _ => 1 + (next() % 40) as usize,
+                };
+                let end = (consumed + chunk).min(input.len());
+                let (p, status) = dec.decode(&input[consumed..end], &mut buf).unwrap();
+                out.extend_from_slice(&buf[..p.written]);
+                consumed += p.consumed;
+                if status == Status::StreamEnd {
+                    break;
+                }
+                assert!(
+                    p.consumed > 0 || p.written > 0 || end < input.len(),
+                    "no end of stream"
+                );
+            }
+            assert_eq!(out, plain, "round {round} mode {mode}");
+            assert_eq!(consumed, stream.len(), "round {round} mode {mode}");
+            assert!(dec.is_complete());
+            assert!(dec.drain_trailing_bytes().is_empty());
+        }
+    }
+}
+
+/// `finish` with no room while a match or a literal is waiting for output
+/// is not an error: the stream is whole, the decoder just cannot hand its
+/// data out. It reports `OutputFull` and goes on when given room. (It used
+/// to fail with `UnexpectedEnd` and poison the decoder.)
+#[test]
+fn finish_with_no_room_keeps_pending_output() {
+    let plain = [b'x'; 1000];
+    let mut enc = Encoder::new();
+    let mut encoded = vec![0u8; 1024];
+    let (p, _) = enc.encode(&plain, &mut encoded).unwrap();
+    let mut len = p.written;
+    loop {
+        let (p, status) = enc.finish(&mut encoded[len..]).unwrap();
+        len += p.written;
+        if status == Status::StreamEnd {
+            break;
+        }
+    }
+    encoded.truncate(len);
+
+    let mut dec = Decoder::new();
+    let mut buf = [0u8; 10];
+    let mut out = Vec::new();
+    let (p, status) = dec.decode(&encoded, &mut buf).unwrap();
+    out.extend_from_slice(&buf[..p.written]);
+    assert_eq!(status, Status::OutputFull);
+    let rest = &encoded[p.consumed..];
+
+    for _ in 0..3 {
+        let (p, status) = dec.finish(&mut []).unwrap();
+        assert_eq!((p.written, status), (0, Status::OutputFull));
+    }
+    // The decoder goes on from there: the rest of the input, then `finish`
+    // until the stream ends, with a call that has no room before each.
+    let mut fed = 0;
+    let mut ended = false;
+    while fed < rest.len() && !ended {
+        let (p, status) = dec.decode(&rest[fed..], &mut buf).unwrap();
+        out.extend_from_slice(&buf[..p.written]);
+        fed += p.consumed;
+        ended = status == Status::StreamEnd;
+    }
+    while !ended {
+        if out.len() < plain.len() {
+            let (p, status) = dec.finish(&mut []).unwrap();
+            assert_eq!((p.written, status), (0, Status::OutputFull));
+        }
+        let (p, status) = dec.finish(&mut buf).unwrap();
+        out.extend_from_slice(&buf[..p.written]);
+        ended = status == Status::StreamEnd;
+        assert!(ended || p.written > 0, "finish stalled");
+    }
+    assert_eq!(out, plain);
+}
+
+/// An empty stored block followed by more of the stream in the same call:
+/// the decoder used to stop after the empty block with the next block's
+/// bits still in its bit reader, and the following call then handed back
+/// bytes it had never been given (found by the `decoder_deflate64` fuzz
+/// target). The whole stream must decode in one call, with `consumed`
+/// stopping exactly at its end.
+#[test]
+fn empty_stored_block_does_not_strand_the_next_block() {
+    // Stored block of length 0 (not final), then a final fixed block
+    // holding one literal (200) — 8 bytes — and one byte of trailing data.
+    let data = [0x00, 0x00, 0x00, 0xff, 0xff, 0x3b, 0x01, 0x80, 0x00];
+    for chunk in [data.len(), 1, 2, 3, 5] {
+        let mut dec = Deflate64::decoder();
+        let mut out = [0u8; 16];
+        let (mut pos, mut written, mut ended) = (0, 0, false);
+        while pos < data.len() && !ended {
+            let end = (pos + chunk).min(data.len());
+            let (p, status) = dec.decode(&data[pos..end], &mut out[written..]).unwrap();
+            pos += p.consumed;
+            written += p.written;
+            ended = status == Status::StreamEnd;
+            assert!(ended || p.consumed > 0, "stalled at {pos} (chunk {chunk})");
+        }
+        if !ended {
+            let (p, status) = dec.finish(&mut out[written..]).unwrap();
+            written += p.written;
+            assert_eq!(status, Status::StreamEnd);
+        }
+        assert_eq!(&out[..written], &[200], "chunk {chunk}");
+        assert_eq!(pos, 8, "consumed past the stream end (chunk {chunk})");
+    }
+}

@@ -22,6 +22,16 @@ pub struct BitReader {
     /// low byte arrives first and forms the *bottom* 8 bits of the 16-bit
     /// MSB-first chunk that lands in the accumulator.
     half: HalfWord,
+    /// How many bits at the tail of the accumulator were put there by
+    /// [`pad_eof`](Self::pad_eof) rather than read from the stream. Zero
+    /// until the end of input is reached. Those bits exist only so a Huffman
+    /// decode can look ahead; once `nbits` drops below this count, padding
+    /// has been consumed as if it were data.
+    eof_bits: u32,
+    /// The stream ended half-way through a word: the word just before the
+    /// zero padding holds one real byte (its low byte) and counts as
+    /// padding. See [`take_eof_half_byte`](Self::take_eof_half_byte).
+    eof_half: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -37,6 +47,8 @@ impl BitReader {
             acc: 0,
             nbits: 0,
             half: HalfWord { pending_low: None },
+            eof_bits: 0,
+            eof_half: false,
         }
     }
 
@@ -103,11 +115,59 @@ impl BitReader {
         self.drop_bits(drop);
     }
 
+    /// Room check for [`pad_eof`](Self::pad_eof), which adds up to two words.
+    pub const fn can_pad_eof(&self) -> bool {
+        self.nbits + 32 <= 64
+    }
+
+    /// Mark the end of the input: append one zero word so a Huffman decode
+    /// near the end of the stream can look ahead by the tree's longest code
+    /// (libmspack pads its input the same way). The padding may be peeked
+    /// but never consumed — see [`eof_pad_consumed`](Self::eof_pad_consumed).
+    ///
+    /// A trailing half word (the stream had an odd number of bytes) is
+    /// completed with a zero high byte and counted as padding too: its bits
+    /// cannot be told apart from the missing ones, except by
+    /// [`take_eof_half_byte`](Self::take_eof_half_byte).
+    ///
+    /// Call once, with `can_pad_eof()` true.
+    pub fn pad_eof(&mut self) {
+        debug_assert!(self.can_pad_eof());
+        debug_assert_eq!(self.eof_bits, 0);
+        if let Some(low) = self.half.pending_low.take() {
+            self.acc |= (low as u64) << (48 - self.nbits);
+            self.nbits += 16;
+            self.eof_bits = 16;
+            self.eof_half = true;
+        }
+        // The zero word itself: the accumulator is already zero there.
+        self.nbits += 16;
+        self.eof_bits += 16;
+    }
+
+    /// True once bits that came from [`pad_eof`](Self::pad_eof) have been
+    /// consumed: the stream ended before the data did.
+    pub const fn eof_pad_consumed(&self) -> bool {
+        self.nbits < self.eof_bits
+    }
+
+    /// If the next word is the trailing half word of the stream, consume it
+    /// and return its one real byte. This is the final byte of an odd-sized
+    /// uncompressed block whose pad byte was left off the end of the stream.
+    pub fn take_eof_half_byte(&mut self) -> Option<u8> {
+        if !self.eof_half || self.nbits != self.eof_bits {
+            return None;
+        }
+        let byte = (self.peek(16) & 0xFF) as u8;
+        self.drop_bits(16);
+        self.eof_half = false;
+        self.eof_bits = 16;
+        Some(byte)
+    }
+
     #[allow(dead_code)]
     pub fn reset(&mut self) {
-        self.acc = 0;
-        self.nbits = 0;
-        self.half = HalfWord { pending_low: None };
+        *self = Self::new();
     }
 }
 
@@ -130,6 +190,41 @@ mod tests {
         assert_eq!(r.peek(4), 0xD);
         r.drop_bits(4);
         assert_eq!(r.peek(8), 0xAB);
+    }
+
+    #[test]
+    fn eof_pad_may_be_peeked_but_not_consumed() {
+        let mut r = BitReader::new();
+        r.feed(0xAB);
+        r.feed(0xCD);
+        r.pad_eof();
+        assert_eq!(r.bits_available(), 32);
+        assert_eq!(r.peek(32), 0xCDAB_0000);
+        r.drop_bits(16);
+        assert!(!r.eof_pad_consumed());
+        assert_eq!(r.take_eof_half_byte(), None);
+        r.drop_bits(1);
+        assert!(r.eof_pad_consumed());
+    }
+
+    #[test]
+    fn eof_half_word_is_padding_except_as_a_byte() {
+        let mut r = BitReader::new();
+        r.feed(0x11);
+        r.feed(0x22);
+        r.feed(0x33); // odd trailing byte
+        r.pad_eof();
+        assert_eq!(r.bits_available(), 48);
+        assert_eq!(r.take_eof_half_byte(), None); // not there yet
+        r.drop_bits(16);
+        assert!(!r.eof_pad_consumed());
+        let mut bits = r;
+        bits.drop_bits(1);
+        assert!(bits.eof_pad_consumed());
+        assert_eq!(r.take_eof_half_byte(), Some(0x33));
+        assert!(!r.eof_pad_consumed());
+        assert_eq!(r.bits_available(), 16);
+        assert_eq!(r.take_eof_half_byte(), None);
     }
 
     #[test]

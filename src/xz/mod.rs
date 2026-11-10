@@ -1295,6 +1295,11 @@ pub struct Decoder {
     block_header_size_seen: u64,
     block_compressed_seen: u64,
     block_uncompressed_seen: u64,
+    /// The Compressed Size and Uncompressed Size fields of the current
+    /// Block's header, when present: the Block's compressed data (the LZMA2
+    /// chunks and end marker) and its output must come to exactly these.
+    block_compressed_declared: Option<u64>,
+    block_uncompressed_declared: Option<u64>,
 
     /// Running Block Check over the uncompressed bytes of the block, of
     /// the kind the Stream Header's check ID selects.
@@ -1303,7 +1308,9 @@ pub struct Decoder {
     /// Collected blocks for index cross-check: (unpadded_size, uncompressed).
     blocks: Vec<(u64, u64)>,
 
-    /// Once Index starts, we accumulate it for CRC32 validation.
+    /// Once Index starts, we accumulate it for CRC32 validation. It holds
+    /// only bytes of the Index itself, whose length the number of Blocks
+    /// decoded bounds (see `DecPhase::Index`).
     index_buf: Vec<u8>,
     /// Bytes of the index we still need to read after the indicator+records:
     /// 0..=3 padding bytes + 4 CRC32 bytes.
@@ -1318,14 +1325,22 @@ pub struct Decoder {
     /// properties byte. Set when a Block Header is parsed.
     lzma2_dict_size: u32,
     /// Lazily-instantiated LZMA core, persists across chunks subject to
-    /// reset bits in each chunk's control byte. Allocated on first
-    /// compressed chunk and dropped when the block ends.
+    /// reset bits in each chunk's control byte. Allocated on the first
+    /// chunk and kept across Blocks (each Block's first chunk resets its
+    /// dictionary), so neither a dictionary-reset chunk nor a new Block
+    /// costs an allocation; dropped when the Streams are over.
     lzma_core: Option<Box<LzmaCore>>,
     /// True until the first chunk of a block is parsed. The LZMA2 spec
     /// requires the first chunk of any block to be a "full reset" chunk
     /// (control byte `0xE0..=0xFF` for compressed, or `0x01` for
     /// uncompressed); reject any other first chunk.
     expecting_block_first_chunk: bool,
+    /// The next compressed chunk must carry a properties byte (control
+    /// `0xC0..=0xFF`): set at the start of a Block and by every dictionary
+    /// reset, cleared by a chunk that brings properties. This is liblzma's
+    /// `need_properties`; a `0x80..=0xBF` chunk while it is set has no
+    /// properties to decode with and is corrupt.
+    lzma2_need_props: bool,
     /// Control byte of the in-flight compressed chunk.
     comp_ctrl: u8,
     /// Uncompressed size of the in-flight chunk (1..=65_536 for
@@ -1378,6 +1393,8 @@ impl Decoder {
             block_header_size_seen: 0,
             block_compressed_seen: 0,
             block_uncompressed_seen: 0,
+            block_compressed_declared: None,
+            block_uncompressed_declared: None,
             check: BlockCheck::Unverified,
             blocks: Vec::new(),
             index_buf: Vec::new(),
@@ -1387,6 +1404,7 @@ impl Decoder {
             lzma2_dict_size: 0,
             lzma_core: None,
             expecting_block_first_chunk: false,
+            lzma2_need_props: true,
             comp_ctrl: 0,
             comp_uncomp_size: 0,
             comp_size: 0,
@@ -1404,23 +1422,43 @@ impl Decoder {
         }
     }
 
-    /// Feed raw uncompressed-chunk bytes into the LZMA2 dictionary so a later
-    /// dictionary-continuing compressed chunk can reference them. Creates the
-    /// `lzma_core` on first use (canonical default props; the next compressed
-    /// chunk's reset bits replace them) sized to the block's dictionary.
-    fn feed_uncompressed_dict(&mut self, src: &[u8]) {
-        if self.lzma_core.is_none() {
-            // Props are irrelevant for plain dict population; use the canonical
-            // default (lc=3, lp=0, pb=2). `parse` cannot fail for this byte.
-            let props = Lzma2Props::parse(LZMA2_PROPS_BYTE).unwrap_or(Lzma2Props {
-                lc: 3,
-                lp: 0,
-                pb: 2,
-            });
-            let dict_size = (self.lzma2_dict_size as usize).clamp(4096, 128 * 1024 * 1024);
-            self.lzma_core = Some(Box::new(LzmaCore::new(props, dict_size)));
-            self.last_props = LZMA2_PROPS_BYTE;
+    /// The current Block's LZMA2 dictionary size, clamped to what we are
+    /// willing to allocate: at least 4 KiB (the format's minimum) and at
+    /// most 128 MiB, to bound memory (legitimate xz outputs almost never
+    /// need more than 64 MiB). The dictionary buffer itself grows only with
+    /// the bytes actually decoded.
+    fn block_dict_size(&self) -> usize {
+        (self.lzma2_dict_size as usize).clamp(4096, 128 * 1024 * 1024)
+    }
+
+    /// Apply the dictionary reset of an uncompressed `0x01` chunk. The core
+    /// (probability tables and dictionary allocation) is reused whenever it
+    /// was built for this Block's dictionary size: a 4-byte `0x01` chunk
+    /// must not cost an allocation, let alone one of the whole dictionary.
+    /// With no usable core yet, one is created with the canonical default
+    /// props, which are irrelevant for plain dictionary population.
+    fn reset_dict_for_uncompressed(&mut self) {
+        let dict_size = self.block_dict_size();
+        match self.lzma_core.as_mut() {
+            Some(core) if core.dict_capacity() == dict_size => core.reset_dict(),
+            _ => {
+                // `parse` cannot fail for this byte.
+                let props = Lzma2Props::parse(LZMA2_PROPS_BYTE).unwrap_or(Lzma2Props {
+                    lc: 3,
+                    lp: 0,
+                    pb: 2,
+                });
+                self.lzma_core = Some(Box::new(LzmaCore::new(props, dict_size)));
+                self.last_props = LZMA2_PROPS_BYTE;
+            }
         }
+    }
+
+    /// Feed raw uncompressed-chunk bytes into the LZMA2 dictionary so a later
+    /// dictionary-continuing compressed chunk can reference them. The core
+    /// exists by then: a Block's first chunk resets the dictionary, which
+    /// creates it.
+    fn feed_uncompressed_dict(&mut self, src: &[u8]) {
         if let Some(core) = self.lzma_core.as_mut() {
             core.append_literals(src);
         }
@@ -1445,6 +1483,26 @@ impl Decoder {
     fn poison(&mut self, e: Error) -> Error {
         self.poisoned = true;
         e
+    }
+
+    /// Whether the current Block is still within the sizes its header
+    /// declared (trivially so when it declared none).
+    fn block_within_declared_sizes(&self) -> bool {
+        self.block_compressed_declared
+            .is_none_or(|n| self.block_compressed_seen <= n)
+            && self
+                .block_uncompressed_declared
+                .is_none_or(|n| self.block_uncompressed_seen <= n)
+    }
+
+    /// Move up to `n` bytes of `input[*consumed..]` into `index_buf`.
+    /// Returns `false` when there were none to take.
+    fn index_take(&mut self, input: &[u8], consumed: &mut usize, n: usize) -> bool {
+        let take = n.min(input.len() - *consumed);
+        self.index_buf
+            .extend_from_slice(&input[*consumed..*consumed + take]);
+        *consumed += take;
+        take > 0
     }
 
     /// Append bytes from `input[consumed..]` into `self.scratch` up to
@@ -1522,15 +1580,29 @@ impl Decoder {
         let mut cur = 2usize;
         let body_end = total - 4; // before CRC
 
+        // The Block is still delimited by the LZMA2 end marker; the sizes
+        // are kept to be verified against it (like liblzma, which fails
+        // such a Block with LZMA_DATA_ERROR).
+        self.block_compressed_declared = None;
+        self.block_uncompressed_declared = None;
         if has_compressed_size {
-            // Discard the value — we still bound the block by the LZMA2 end
-            // marker.
-            varint_decode(&self.scratch[..body_end], &mut cur)?
-                .ok_or_else(|| self.poison(Error::Corrupt))?;
+            let Ok(Some(size)) = varint_decode(&self.scratch[..body_end], &mut cur) else {
+                return Err(self.poison(Error::Corrupt));
+            };
+            // Zero is not a valid Compressed Size (the end marker alone is
+            // a byte), nor is one that takes the Block's Unpadded Size
+            // (header + data + Check) past what a multibyte integer holds.
+            let max = (i64::MAX as u64) - (total + self.check_size() + 3) as u64;
+            if size == 0 || size > max {
+                return Err(self.poison(Error::Corrupt));
+            }
+            self.block_compressed_declared = Some(size);
         }
         if has_uncompressed_size {
-            varint_decode(&self.scratch[..body_end], &mut cur)?
-                .ok_or_else(|| self.poison(Error::Corrupt))?;
+            let Ok(Some(size)) = varint_decode(&self.scratch[..body_end], &mut cur) else {
+                return Err(self.poison(Error::Corrupt));
+            };
+            self.block_uncompressed_declared = Some(size);
         }
         // Filter Flags: `(id varint, props size varint, props)` per filter,
         // in encode order. Only LZMA2 may (and must) be last; the others
@@ -1618,11 +1690,23 @@ impl RawDecoder for Decoder {
             // phase below runs with the chain's final bytes all handed over
             // (in particular the Block Check covers all of them).
             if !self.drain_filtered(output, &mut written) {
+                // (Also reached when the filtered output overruns the
+                // Block's declared size: the check below runs once the
+                // caller has made room.)
+                if !self.block_within_declared_sizes() {
+                    return Err(self.poison(Error::Corrupt));
+                }
                 return Ok(RawProgress {
                     consumed,
                     written,
                     done: false,
                 });
+            }
+
+            // A Block that outgrows a size declared in its header is
+            // corrupt; fail as soon as it does rather than at its end.
+            if !self.block_within_declared_sizes() {
+                return Err(self.poison(Error::Corrupt));
             }
 
             match self.phase {
@@ -1669,8 +1753,8 @@ impl RawDecoder for Decoder {
                             self.block_compressed_seen = 0;
                             self.block_uncompressed_seen = 0;
                             self.check = BlockCheck::new(self.check_id);
-                            self.lzma_core = None;
                             self.expecting_block_first_chunk = true;
+                            self.lzma2_need_props = true;
                             self.phase = DecPhase::BlockHeader;
                         }
                     } else {
@@ -1714,6 +1798,14 @@ impl RawDecoder for Decoder {
                         // End marker. Account for this byte.
                         self.block_compressed_seen += 1;
                         self.scratch.clear();
+                        // The compressed data is complete: it must be as
+                        // long as the Block Header said.
+                        if self
+                            .block_compressed_declared
+                            .is_some_and(|n| n != self.block_compressed_seen)
+                        {
+                            return Err(self.poison(Error::Corrupt));
+                        }
                         // Block Padding (0..=3 zero bytes) then Block Check.
                         let unpadded_no_pad = self.block_header_size_seen
                             + self.block_compressed_seen
@@ -1728,8 +1820,8 @@ impl RawDecoder for Decoder {
                             return Err(self.poison(e));
                         }
                         // Free the (potentially MiB-sized) compressed-chunk
-                        // working buffers now that the block has ended.
-                        self.lzma_core = None;
+                        // working buffers now that the block has ended. The
+                        // LZMA core stays for the next Block.
                         self.comp_buf = Vec::new();
                         self.comp_decoded = Vec::new();
                         self.phase = DecPhase::BlockPadding;
@@ -1741,9 +1833,14 @@ impl RawDecoder for Decoder {
                             return Err(self.poison(Error::Corrupt));
                         }
                         // 0x01 also resets the LZ dictionary in any
-                        // straddling compressed state.
+                        // straddling compressed state. (Re-running this
+                        // while the chunk header is still incomplete is
+                        // harmless: nothing is written in between.)
                         if control == 0x01 {
-                            self.lzma_core = None;
+                            self.reset_dict_for_uncompressed();
+                            // Whatever properties were in force do not
+                            // survive a dictionary reset.
+                            self.lzma2_need_props = true;
                         }
                         self.expecting_block_first_chunk = false;
                         self.scratch_want = 3;
@@ -1768,6 +1865,14 @@ impl RawDecoder for Decoder {
                         // First chunk in a block must perform a full dict
                         // reset, i.e. control byte in `0xE0..=0xFF`.
                         if self.expecting_block_first_chunk && control < 0xE0 {
+                            return Err(self.poison(Error::Corrupt));
+                        }
+                        // After a dictionary reset (and so also at the
+                        // start of a Block) the chunk must bring new
+                        // properties: 0xC0..=0xFF.
+                        if control >= 0xC0 {
+                            self.lzma2_need_props = false;
+                        } else if self.lzma2_need_props {
                             return Err(self.poison(Error::Corrupt));
                         }
                         self.comp_ctrl = control;
@@ -1808,6 +1913,14 @@ impl RawDecoder for Decoder {
                     self.comp_uncomp_size = uncomp_size;
                     self.comp_size = comp_size;
                     self.block_compressed_seen += header_len as u64;
+                    // The chunk's payload is counted once it is complete;
+                    // do not buffer one the declared size has no room for.
+                    if self
+                        .block_compressed_declared
+                        .is_some_and(|n| n - n.min(self.block_compressed_seen) < comp_size as u64)
+                    {
+                        return Err(self.poison(Error::Corrupt));
+                    }
 
                     // Apply reset semantics. Bits 5-6 of control:
                     //   11 → dict reset + props reset + state reset (needs
@@ -1830,12 +1943,9 @@ impl RawDecoder for Decoder {
                             Ok(p) => p,
                             Err(e) => return Err(self.poison(e)),
                         };
-                        let dict_size = (self.lzma2_dict_size as usize).max(4096);
-                        // Cap at 128 MiB to bound memory; legitimate xz
-                        // outputs almost never need more than 64 MiB.
-                        let dict_size = dict_size.min(128 * 1024 * 1024);
+                        let dict_size = self.block_dict_size();
                         match self.lzma_core.as_mut() {
-                            Some(core) if core.dict_capacity() == dict_size.max(1) => {
+                            Some(core) if core.dict_capacity() == dict_size => {
                                 core.reset_full(props);
                             }
                             _ => {
@@ -1939,6 +2049,13 @@ impl RawDecoder for Decoder {
                         }
                     }
                     if complete && self.comp_produced == self.comp_decoded.len() {
+                        // The chunk is decoded: its payload must end right
+                        // where the range coder did, with nothing left over.
+                        if let Some(core) = self.lzma_core.as_mut()
+                            && let Err(e) = core.finish_chunk(&self.comp_buf)
+                        {
+                            return Err(self.poison(e));
+                        }
                         self.block_compressed_seen += self.comp_size as u64;
                     } else if self.comp_produced == before {
                         // Nothing new to hand out: wait for more input.
@@ -2019,12 +2136,7 @@ impl RawDecoder for Decoder {
                         self.check.update(src);
                         // Feed the raw bytes into the LZ dictionary so a later
                         // dictionary-continuing compressed chunk (`0xC0`) can
-                        // back-reference them. Lazily create the core (with the
-                        // block's dict size and the canonical default props —
-                        // props don't affect plain dict population, and the
-                        // next compressed chunk resets them) when none exists
-                        // yet, e.g. when the block opens with an uncompressed
-                        // chunk.
+                        // back-reference them.
                         self.feed_uncompressed_dict(src);
                         self.block_compressed_seen += take as u64;
                         self.block_uncompressed_seen += take as u64;
@@ -2045,6 +2157,15 @@ impl RawDecoder for Decoder {
                     }
                 }
                 DecPhase::BlockPadding => {
+                    // All of the Block's output has been handed over (the
+                    // filters' tail included: it is drained at the top of
+                    // the loop), so its size is final.
+                    if self
+                        .block_uncompressed_declared
+                        .is_some_and(|n| n != self.block_uncompressed_seen)
+                    {
+                        return Err(self.poison(Error::Corrupt));
+                    }
                     if self.scratch_want == 0 {
                         // No padding to skip; proceed to check.
                         self.scratch.clear();
@@ -2099,27 +2220,19 @@ impl RawDecoder for Decoder {
                     }
                 }
                 DecPhase::Index => {
-                    // Consume bytes one at a time so we can incrementally
-                    // varint-parse the records, then collect padding and CRC.
-                    // We need to track: index indicator (already in
-                    // index_buf), then NumRecords varint, then for each
-                    // record two varints, then padding to align to 4, then 4
-                    // CRC bytes.
+                    // After the index indicator (already in `index_buf`):
+                    // the NumRecords varint, two varints per record, padding
+                    // to a multiple of four, then a CRC32 over all of it.
                     //
-                    // Strategy: keep slurping bytes into `index_buf`. At each
-                    // step, re-parse from a known offset to see if a
-                    // structural element is complete.
-                    //
-                    // To keep this simple, we read varints lazily: after
-                    // each new byte, attempt to parse the next pending
-                    // varint. When all records are present, switch to
-                    // "padding + CRC" mode.
-
-                    // Pull all available input into `index_buf` first.
-                    if consumed < input.len() {
-                        self.index_buf.extend_from_slice(&input[consumed..]);
-                        consumed = input.len();
-                    }
+                    // `index_buf` takes only the bytes the element being
+                    // parsed can still use — one at a time inside a varint,
+                    // whose length is not known up front — so it never
+                    // holds more than the Index itself, and the Index can
+                    // be no longer than the Blocks decoded allow: NumRecords
+                    // must equal their number (checked as soon as it is
+                    // read) and a record is at most 18 bytes. Input that
+                    // merely claims to be an Index is rejected instead of
+                    // buffered.
 
                     // Drive the state machine until either we run out of
                     // bytes or we transition to StreamFooter.
@@ -2127,30 +2240,40 @@ impl RawDecoder for Decoder {
                         if self.index_records_remaining == u64::MAX {
                             // NumRecords still to parse, starting at offset 1.
                             let mut p = self.index_pos;
-                            match varint_decode(&self.index_buf, &mut p)? {
-                                Some(n) => {
+                            match varint_decode(&self.index_buf, &mut p) {
+                                Ok(Some(n)) => {
+                                    // One Record per Block decoded. Checking
+                                    // here, not after the Records, is what
+                                    // bounds the Index: nothing more is read
+                                    // on the word of an attacker-controlled
+                                    // count (up to 2^63).
+                                    if n != self.blocks.len() as u64 {
+                                        return Err(self.poison(Error::Corrupt));
+                                    }
                                     self.index_records_total = n;
                                     self.index_records_remaining = n.saturating_mul(2);
                                     self.index_pos = p;
-                                    // NOTE: Do NOT pre-reserve based on the raw
-                                    // attacker-controlled NumRecords `n` (up to
-                                    // ~2^63): that would panic with "capacity
-                                    // overflow" or trigger an OOM-aborting
-                                    // allocation before any validation. The
-                                    // `blocks` vec is built from actually-decoded
-                                    // blocks and cross-checked against
-                                    // `index_records_total` below.
                                 }
-                                None => break, // need more bytes
+                                Ok(None) => {
+                                    if !self.index_take(input, &mut consumed, 1) {
+                                        break; // need more bytes
+                                    }
+                                }
+                                Err(e) => return Err(self.poison(e)),
                             }
                         } else if self.index_records_remaining > 0 {
                             let mut p = self.index_pos;
-                            match varint_decode(&self.index_buf, &mut p)? {
-                                Some(_v) => {
+                            match varint_decode(&self.index_buf, &mut p) {
+                                Ok(Some(_v)) => {
                                     self.index_pos = p;
                                     self.index_records_remaining -= 1;
                                 }
-                                None => break,
+                                Ok(None) => {
+                                    if !self.index_take(input, &mut consumed, 1) {
+                                        break;
+                                    }
+                                }
+                                Err(e) => return Err(self.poison(e)),
                             }
                         } else {
                             // Records done. Need padding + CRC.
@@ -2158,7 +2281,11 @@ impl RawDecoder for Decoder {
                             let pad = (4 - (body_len_so_far % 4)) % 4;
                             let need_total = body_len_so_far + pad + 4;
                             if self.index_buf.len() < need_total {
-                                break;
+                                let want = need_total - self.index_buf.len();
+                                if !self.index_take(input, &mut consumed, want) {
+                                    break;
+                                }
+                                continue;
                             }
                             for &b in &self.index_buf[body_len_so_far..body_len_so_far + pad] {
                                 if b != 0 {
@@ -2203,16 +2330,11 @@ impl RawDecoder for Decoder {
                             // Stash; we re-use `block_header_size` after
                             // blocks have been processed.
                             self.block_header_size = index_size as usize;
-                            // Any bytes slurped *past* the index belong to the
-                            // Stream Footer and whatever follows the stream.
-                            // They all arrived in this call (an earlier call
-                            // would have completed the index), so hand them
-                            // back unconsumed; the footer phase re-reads them
-                            // and anything after the footer stays the
-                            // caller's.
-                            let extra = self.index_buf.len() - need_total;
-                            consumed -= extra;
-                            self.index_buf.truncate(need_total);
+                            // Nothing past the Index was taken: the Stream
+                            // Footer and whatever follows are still in
+                            // `input`.
+                            debug_assert_eq!(self.index_buf.len(), need_total);
+                            self.index_buf = Vec::new();
                             self.scratch.clear();
                             self.scratch_want = 12;
                             self.phase = DecPhase::StreamFooter;
@@ -2275,6 +2397,7 @@ impl RawDecoder for Decoder {
                         // Nothing (or a partial magic, which is not a
                         // Stream) follows: the Streams are over.
                         self.scratch.clear();
+                        self.lzma_core = None;
                         self.phase = DecPhase::Done;
                         continue;
                     }
@@ -2313,6 +2436,7 @@ impl RawDecoder for Decoder {
                         // earlier call's had already been buffered), so the
                         // caller sees where the xz data stops.
                         self.scratch.clear();
+                        self.lzma_core = None;
                         self.phase = DecPhase::Done;
                         continue;
                     }
@@ -2376,5 +2500,90 @@ impl RawDecoder for Decoder {
 
     fn raw_reset(&mut self) {
         *self = Self::new();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lzma2_internal::lzma2_decoder::test_stats;
+    use crate::traits::Decoder as _;
+    use alloc::vec;
+
+    /// Stream Header (no Check) + a Block Header declaring LZMA2 with the
+    /// given dictionary-size flag, ready for LZMA2 chunks to be appended.
+    fn stream_prefix(dict_flag: u8) -> Vec<u8> {
+        let mut s = vec![0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0x00, 0x00];
+        let c = crc32(&s[6..8]);
+        s.extend_from_slice(&c.to_le_bytes());
+        let mut bh = vec![0x02, 0x00, 0x21, 0x01, dict_flag, 0, 0, 0];
+        let c = crc32(&bh);
+        bh.extend_from_slice(&c.to_le_bytes());
+        s.extend_from_slice(&bh);
+        s
+    }
+
+    /// Feed all of `s`, returning the number of bytes decoded.
+    fn decode_counting(s: &[u8]) -> usize {
+        let mut dec = Decoder::new();
+        let mut out = vec![0u8; 1 << 12];
+        let (mut pos, mut total) = (0, 0);
+        while pos < s.len() {
+            let (p, _) = dec.decode(&s[pos..], &mut out).unwrap();
+            pos += p.consumed;
+            total += p.written;
+            assert!(p.consumed != 0 || p.written != 0, "no progress");
+        }
+        total
+    }
+
+    /// Every `0x01` chunk used to drop the LZMA core and build a new one,
+    /// allocating and zeroing the Block's whole declared dictionary (24 MiB
+    /// here) for each 4 bytes of input.
+    #[test]
+    fn dict_reset_chunks_do_not_reallocate_the_dictionary() {
+        let mut s = stream_prefix(25);
+        for i in 0..2500u32 {
+            s.extend_from_slice(&[0x01, 0x00, 0x00, i as u8]);
+        }
+        test_stats::reset();
+        assert_eq!(decode_counting(&s), 2500);
+        assert!(
+            test_stats::cores_built() <= 1,
+            "{}",
+            test_stats::cores_built()
+        );
+        // 2500 bytes of output need nowhere near the declared 24 MiB.
+        assert!(
+            test_stats::dict_bytes() <= 1 << 16,
+            "{}",
+            test_stats::dict_bytes()
+        );
+    }
+
+    /// The core (and its dictionary) used to be dropped at the end of every
+    /// Block and rebuilt for the next one.
+    #[test]
+    fn core_is_kept_across_blocks() {
+        let mut s = stream_prefix(25);
+        s.truncate(12);
+        for i in 0..200u32 {
+            // Block Header, one 1-byte chunk, end marker, 3 bytes of Block
+            // Padding (12 + 5 = 17), no Check.
+            s.extend_from_slice(&stream_prefix(25)[12..]);
+            s.extend_from_slice(&[0x01, 0x00, 0x00, i as u8, 0x00, 0, 0, 0]);
+        }
+        test_stats::reset();
+        assert_eq!(decode_counting(&s), 200);
+        assert!(
+            test_stats::cores_built() <= 1,
+            "{}",
+            test_stats::cores_built()
+        );
+        assert!(
+            test_stats::dict_bytes() <= 1 << 16,
+            "{}",
+            test_stats::dict_bytes()
+        );
     }
 }
