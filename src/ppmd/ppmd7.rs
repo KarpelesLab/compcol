@@ -26,7 +26,6 @@
 
 extern crate alloc;
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
@@ -122,14 +121,26 @@ pub(crate) struct Ppmd7 {
 impl Ppmd7 {
     /// Build the model for `mem_size` bytes of arena. The order is supplied
     /// to [`Ppmd7::init`]. `mem_size` must be at least `UNIT_SIZE`.
+    ///
+    /// The arena (up to ~255 MiB, chosen by a stream header byte) is
+    /// allocated fallibly; failure returns [`Error::Unsupported`], as in
+    /// `Ppmd8::new`, rather than aborting the process.
     pub(crate) fn new(mem_size: u32) -> Result<Self, Error> {
         if mem_size < UNIT_SIZE {
             return Err(Error::BadHeader);
         }
         let align_offset = 4 - (mem_size & 3);
-        let total = (align_offset + mem_size + UNIT_SIZE) as usize;
+        // In usize: `mem_size` near `u32::MAX` must not wrap the total.
+        let total = (align_offset as usize)
+            .checked_add(mem_size as usize)
+            .and_then(|t| t.checked_add(UNIT_SIZE as usize))
+            .ok_or(Error::Unsupported)?;
+        let mut base = Vec::new();
+        base.try_reserve_exact(total)
+            .map_err(|_| Error::Unsupported)?;
+        base.resize(total, 0);
         let mut p = Self {
-            base: vec![0u8; total],
+            base,
             size: mem_size,
             align_offset,
             err: false,
@@ -1290,5 +1301,21 @@ impl Ppmd7 {
             + 2 * self.hb2flag[os_sym as usize] as usize
             + ((self.run_length >> 26) & 0x20) as usize;
         (row.min(127), col.min(63))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arena_size_and_minimum() {
+        assert!(matches!(Ppmd7::new(UNIT_SIZE - 1), Err(Error::BadHeader)));
+        // Alignment pad (1..=4 bytes) + arena + one guard unit, zero-filled.
+        for (mem, pad) in [(1u32 << 20, 4usize), ((1 << 20) + 1, 3), ((1 << 20) + 3, 1)] {
+            let p = Ppmd7::new(mem).unwrap();
+            assert_eq!(p.base.len(), pad + mem as usize + UNIT_SIZE as usize);
+            assert!(p.base.iter().all(|&b| b == 0));
+        }
     }
 }
