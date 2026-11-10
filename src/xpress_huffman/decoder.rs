@@ -73,11 +73,21 @@ pub struct Decoder {
     next_bits: u32,
     extra_bit_count: i32,
     block_end_emitted: u64,
-    /// Set in `raw_finish` to let the bit-stream refill treat missing
-    /// trailing bytes as zero (the encoder emits trailing zero words for
-    /// the spec's eager-refill behaviour, but in case it falls short the
-    /// finishing path still drains correctly).
+    /// Set in `raw_finish`: no further input will arrive, so a refill that
+    /// finds the input exhausted may be satisfied by the single virtual
+    /// lookahead word described on `virtual_word`.
     finishing: bool,
+    /// Whether the one permitted virtual zero word has been shifted into the
+    /// register. MS-XCA refills eagerly after every symbol, so a decoder
+    /// legitimately reads up to 16 bits past the last symbol's bits and a
+    /// complete stream may end without that final lookahead word. Exactly
+    /// one such word is tolerated, and only as lookahead: it enters below
+    /// the register's remaining real bits, so decoding can only touch it by
+    /// driving `extra_bit_count` negative again — which demands a second
+    /// refill, and that one is refused with `UnexpectedEnd`. Hence no
+    /// fabricated bit is ever consumed as data. Once set, the input is
+    /// treated as exhausted for raw byte/word reads too.
+    virtual_word: bool,
 }
 
 impl Decoder {
@@ -98,6 +108,7 @@ impl Decoder {
             extra_bit_count: 0,
             block_end_emitted: 0,
             finishing: false,
+            virtual_word: false,
         }
     }
 
@@ -177,7 +188,7 @@ impl Decoder {
     /// Read a 16-bit LE word at the current in_pos. Returns `None` if
     /// the input is too short — caller treats this as truncated input.
     fn read_word(&mut self) -> Option<u16> {
-        if self.in_pos + 2 > self.in_buf.len() {
+        if self.virtual_word || self.in_pos + 2 > self.in_buf.len() {
             return None;
         }
         let lo = self.in_buf[self.in_pos] as u16;
@@ -187,12 +198,35 @@ impl Decoder {
     }
 
     fn read_byte(&mut self) -> Option<u8> {
-        if self.in_pos >= self.in_buf.len() {
+        if self.virtual_word || self.in_pos >= self.in_buf.len() {
             return None;
         }
         let b = self.in_buf[self.in_pos];
         self.in_pos += 1;
         Some(b)
+    }
+
+    /// Top the register back up after bits were dropped: when
+    /// `extra_bit_count` went negative, shift in the next 16-bit word.
+    ///
+    /// If the input is exhausted and the stream is finishing, the first
+    /// such refill is satisfied with a virtual zero word (pure lookahead,
+    /// see `virtual_word`); any later one means real data bits are missing
+    /// and yields `UnexpectedEnd`.
+    fn refill(&mut self) -> Result<(), Error> {
+        if self.extra_bit_count < 0 {
+            let w: u32 = match self.read_word() {
+                Some(w) => w as u32,
+                None if self.finishing && !self.virtual_word => {
+                    self.virtual_word = true;
+                    0
+                }
+                None => return Err(Error::UnexpectedEnd),
+            };
+            self.next_bits |= w << (-self.extra_bit_count);
+            self.extra_bit_count += 16;
+        }
+        Ok(())
     }
 
     /// Decode as many symbols as the buffered input allows, appending to
@@ -250,19 +284,7 @@ impl Decoder {
             // Drop the code bits.
             self.next_bits = self.next_bits.wrapping_shl(len);
             self.extra_bit_count -= len as i32;
-            if self.extra_bit_count < 0 {
-                let w: u32 = match self.read_word() {
-                    Some(w) => w as u32,
-                    None if self.finishing || self.output_emitted == self.total_output => {
-                        // No more input; zero-fill the refill so the
-                        // top-of-loop end-of-output check can fire.
-                        0
-                    }
-                    None => return Err(Error::UnexpectedEnd),
-                };
-                self.next_bits |= w << (-self.extra_bit_count);
-                self.extra_bit_count += 16;
-            }
+            self.refill()?;
 
             if (symbol as usize) < 256 {
                 if self.output_emitted >= self.total_output {
@@ -315,11 +337,7 @@ impl Decoder {
                 let v = self.next_bits >> (32 - dist_hi);
                 self.next_bits = self.next_bits.wrapping_shl(dist_hi);
                 self.extra_bit_count -= dist_hi as i32;
-                if self.extra_bit_count < 0 {
-                    let w = self.read_word().ok_or(Error::UnexpectedEnd)? as u32;
-                    self.next_bits |= w << (-self.extra_bit_count);
-                    self.extra_bit_count += 16;
-                }
+                self.refill()?;
                 v
             };
             let match_offset = dist_low + (1u32 << dist_hi);
@@ -424,6 +442,7 @@ impl RawDecoder for Decoder {
                     let snap_phase = self.phase;
                     let snap_table = self.table.clone();
                     let snap_lengths = self.lengths;
+                    let snap_virtual_word = self.virtual_word;
                     // The retained history is mutated in place (appended to
                     // and trimmed), so unlike `decoded` it cannot be undone
                     // with a `truncate`. Snapshot it so an `UnexpectedEnd`
@@ -450,6 +469,7 @@ impl RawDecoder for Decoder {
                             self.phase = snap_phase;
                             self.table = snap_table;
                             self.lengths = snap_lengths;
+                            self.virtual_word = snap_virtual_word;
                             self.out_history = snap_out_history;
                             break;
                         }
@@ -549,5 +569,6 @@ impl RawDecoder for Decoder {
         self.extra_bit_count = 0;
         self.block_end_emitted = 0;
         self.finishing = false;
+        self.virtual_word = false;
     }
 }

@@ -477,6 +477,123 @@ fn finish_with_empty_output_keeps_pending_bytes() {
     assert_eq!(got, input);
 }
 
+/// One-shot decode through `decode` + `finish`, the way a caller holding the
+/// whole (possibly truncated) stream would drive it.
+fn decode_then_finish(encoded: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut dec = Decoder::new();
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut pos = 0;
+    while pos < encoded.len() {
+        let (p, status) = dec.decode(&encoded[pos..], &mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        pos += p.consumed;
+        if status == Status::StreamEnd {
+            return Ok(out);
+        }
+    }
+    for _ in 0..100_000 {
+        let (p, status) = dec.finish(&mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            return Ok(out);
+        }
+    }
+    panic!("finish() never terminated");
+}
+
+/// A truncated stream must never be reported as a successful decode of
+/// different data. Once `finish` was called the decoder used to substitute
+/// zeros for every missing refill word without limit, emitting whichever
+/// symbol owns the all-zero code until the declared length was reached and
+/// then reporting `StreamEnd` — fabricated output with no error.
+#[test]
+fn truncation_never_fabricates_output() {
+    let phrase = b"the quick brown fox jumps over the lazy dog. ";
+    let text: Vec<u8> = (0..300).map(|i| phrase[i % phrase.len()]).collect();
+    let mut noise = Vec::new();
+    let mut state = 0x1234_5678u32;
+    for _ in 0..600 {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        noise.push((state >> 24) as u8);
+    }
+    let mut long_match = vec![b'q'; 2000];
+    long_match.extend_from_slice(b"tail bytes after the run");
+    for plain in [&text, &noise, &long_match] {
+        let enc = encode_all(plain);
+        assert_eq!(decode_then_finish(&enc).unwrap(), *plain);
+        let mut rejected = 0;
+        for cut in 0..enc.len() {
+            match decode_then_finish(&enc[..cut]) {
+                Ok(got) => assert!(got == *plain, "cut {cut} accepted with wrong output"),
+                Err(e) => {
+                    assert_eq!(e, Error::UnexpectedEnd, "cut {cut}");
+                    rejected += 1;
+                }
+            }
+        }
+        // Only the trailing lookahead padding may be dropped harmlessly.
+        assert!(rejected + 8 >= enc.len(), "only {rejected} cuts rejected");
+    }
+}
+
+/// MS-XCA lets a decoder look one 16-bit word past the last symbol, so a
+/// stream whose final lookahead word is absent is still complete. An encoder
+/// stream with its trailing zero word removed must therefore still decode.
+#[test]
+fn missing_trailing_lookahead_word_is_accepted() {
+    for len in [1usize, 2, 3, 26, 300, 4097] {
+        let plain: Vec<u8> = (0..len).map(|i| b"lookahead "[i % 10]).collect();
+        let enc = encode_all(&plain);
+        assert_eq!(&enc[enc.len() - 2..], &[0, 0]);
+        let got = decode_then_finish(&enc[..enc.len() - 2]).unwrap();
+        assert_eq!(got, plain, "len {len}");
+    }
+}
+
+/// Every stream the encoder produces decodes, at sizes around the edges that
+/// matter: empty, tiny, and exact / off-by-one multiples of the 64 KiB block.
+#[test]
+fn encoder_streams_decode_at_block_edge_sizes() {
+    let mut state = 0x0BAD_5EEDu32;
+    let mut source = Vec::with_capacity(2 * 65536 + 32);
+    while source.len() < 2 * 65536 + 2 {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        // Mix of literals and repeats so both symbol kinds appear.
+        if state & 0x30000 == 0 {
+            source.extend_from_slice(b"repeat repeat repeat ");
+        } else {
+            source.push((state >> 24) as u8 & 0x3f);
+        }
+    }
+    for len in [
+        0usize,
+        1,
+        2,
+        3,
+        4,
+        15,
+        16,
+        17,
+        255,
+        4096,
+        65535,
+        65536,
+        65537,
+        2 * 65536 - 1,
+        2 * 65536,
+        2 * 65536 + 1,
+    ] {
+        let plain = &source[..len];
+        let enc = encode_all(plain);
+        assert!(decode_then_finish(&enc).unwrap() == plain, "len {len}");
+        assert!(
+            decode_chunked(&enc, 4096, 4096).unwrap() == plain,
+            "len {len}"
+        );
+    }
+}
+
 // ─── ms-xca spec fixtures ──────────────────────────────────────────────
 
 /// The MS-XCA §2.1.5 worked example: `abcdefghijklmnopqrstuvwxyz`
