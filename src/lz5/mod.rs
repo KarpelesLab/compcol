@@ -61,9 +61,11 @@
 //! every block stored raw decode without ever exercising the sequence
 //! loop. Block checksums (FLG bit 4) and external dictionaries are
 //! rejected with `Unsupported`. Content checksums (FLG bit 2) are
-//! consumed but not verified — the absence of xxHash-32 verification
-//! is documented; a corrupted payload that survives sequence-loop
-//! bounds checks will still decode without warning.
+//! verified: as in the LZ4 frame format Lizard's is derived from, the
+//! 4-byte little-endian trailer after the EndMark is xxHash-32 (seed 0)
+//! of the whole decoded content, and a mismatch fails the stream with
+//! [`Error::ChecksumMismatch`] once the trailer has been read (the
+//! content itself has been handed out by then, block by block).
 //!
 //! **Encoder**: produces a valid Lizard frame whose data is always
 //! emitted as frame-uncompressed blocks (each up to 128 KiB). The
@@ -436,6 +438,9 @@ pub struct Decoder {
     max_block_raw: usize,
     /// Per-frame: whether the content-checksum trailer is expected.
     expect_content_checksum: bool,
+    /// Running xxh32 (seed 0) of the decoded content, fed only when the
+    /// frame carries a content checksum.
+    content_hash: xxh32::Xxh32,
     /// Compressed-block scratch (filled then decoded into `decoded`).
     block_buf: Vec<u8>,
     /// Drained one block at a time into the caller's output buffer.
@@ -457,6 +462,7 @@ impl Decoder {
             bs_idx: 0,
             max_block_raw: DEFAULT_BLOCK_SIZE,
             expect_content_checksum: false,
+            content_hash: xxh32::Xxh32::new(0),
             block_buf: Vec::new(),
             decoded: Vec::new(),
             decoded_idx: 0,
@@ -675,6 +681,9 @@ impl RawDecoder for Decoder {
                         });
                     }
                     // Block complete: drain.
+                    if self.expect_content_checksum {
+                        self.content_hash.update(&self.decoded);
+                    }
                     self.total_emitted =
                         self.total_emitted.saturating_add(self.decoded.len() as u64);
                     self.decoded_idx = 0;
@@ -721,6 +730,9 @@ impl RawDecoder for Decoder {
                         self.poisoned = true;
                         return Err(Error::Corrupt);
                     }
+                    if self.expect_content_checksum {
+                        self.content_hash.update(&self.decoded);
+                    }
                     self.total_emitted =
                         self.total_emitted.saturating_add(self.decoded.len() as u64);
                     self.decoded_idx = 0;
@@ -737,9 +749,10 @@ impl RawDecoder for Decoder {
                     }
                 }
                 DecPhase::ContentChecksum { mut idx } => {
+                    // The 4 trailer bytes are gathered in `bs_buf`, which
+                    // is free once the EndMark has been read.
                     while idx < 4 && consumed < input.len() {
-                        // We discard the bytes (no xxh32 of the running
-                        // output stream is maintained in this build).
+                        self.bs_buf[idx as usize] = input[consumed];
                         consumed += 1;
                         idx += 1;
                     }
@@ -750,6 +763,11 @@ impl RawDecoder for Decoder {
                             written,
                             done: false,
                         });
+                    }
+                    // xxh32 (seed 0) of everything this frame decoded to.
+                    if u32::from_le_bytes(self.bs_buf) != self.content_hash.digest() {
+                        self.poisoned = true;
+                        return Err(Error::ChecksumMismatch);
                     }
                     self.phase = DecPhase::Done;
                     return Ok(RawProgress {
@@ -816,6 +834,7 @@ impl RawDecoder for Decoder {
         self.bs_idx = 0;
         self.max_block_raw = DEFAULT_BLOCK_SIZE;
         self.expect_content_checksum = false;
+        self.content_hash = xxh32::Xxh32::new(0);
         self.block_buf.clear();
         self.decoded.clear();
         self.decoded_idx = 0;
