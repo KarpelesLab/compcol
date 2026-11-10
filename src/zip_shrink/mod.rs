@@ -42,6 +42,18 @@
 //! that produced the last of them is decoded or validated. Parsing the ZIP
 //! local or central header to get that size is the caller's job.
 //!
+//! ## End of stream and `consumed`
+//!
+//! In both modes `decode` takes input only as the codes need it. When it
+//! reports `StreamEnd`, the `consumed` counts of all `decode` calls add up
+//! to exactly the length of the stream: the header (framed mode) plus the
+//! payload through the byte holding the last bit of the code that produced
+//! the last declared byte. Any bytes after that are left unconsumed, for
+//! any slicing of the input and output, so a caller reading a container
+//! knows where the entry ended. As with every decoder here, a call can
+//! return `OutputFull` having consumed only part of its input; offer the
+//! rest again.
+//!
 //! ```
 //! use compcol::zip_shrink::Decoder;
 //! use compcol::{Decoder as _, Status};
@@ -149,13 +161,17 @@ impl RawEncoder for Encoder {
 
 /// Streaming Shrink decoder.
 ///
-/// Streaming model: input bytes accumulate in an internal `Vec`. Codes are
-/// peeled off MSB-first into a small bit accumulator and resolved against
-/// the dictionary. Decoded characters land in `emit_buf`, which is then
-/// drained into the caller's `output` on each call. The bit stream is
-/// LSB-first; codes can straddle byte boundaries so we always assemble
-/// from the buffered input and only consume from it once a code is
-/// fully resolved.
+/// Streaming model: codes are read straight from the caller's input slice
+/// through a small bit accumulator (the stream is LSB-first) and resolved
+/// against the dictionary. Decoded characters land in `emit_buf`, which is
+/// then drained into the caller's `output` on each call.
+///
+/// No input is buffered beyond the accumulator, and a byte is taken from
+/// the caller only when the code being read still needs bits. So when the
+/// declared length is reached, the input consumed over all `decode` calls
+/// is exactly the stream — through the byte holding the last bit of the
+/// last code decoded — however the input and output were sliced. Whatever
+/// follows is left with the caller.
 #[derive(Debug)]
 pub struct Decoder {
     // ── framing ──
@@ -169,11 +185,11 @@ pub struct Decoder {
     raw_len: Option<u64>,
 
     // ── bit reader state ──
+    /// Input bits taken from the caller and not yet used by a code. Between
+    /// codes this holds fewer than 8 bits (the rest of the byte the last
+    /// code ended in); while a code is incomplete, fewer than `n_bits`.
     bit_acc: u32,
     bit_count: u8,
-    /// Buffered input we haven't yet drained into `bit_acc`.
-    in_buf: Vec<u8>,
-    in_pos: usize,
     /// Active code width.
     n_bits: u8,
 
@@ -238,8 +254,6 @@ impl Decoder {
             raw_len: None,
             bit_acc: 0,
             bit_count: 0,
-            in_buf: Vec::new(),
-            in_pos: 0,
             n_bits: INIT_BITS,
             parent,
             value,
@@ -275,40 +289,28 @@ impl Decoder {
         usize::try_from(self.target_len.saturating_sub(self.out_pos)).unwrap_or(usize::MAX)
     }
 
-    /// Compact the input buffer once we have consumed a healthy prefix —
-    /// avoids unbounded growth when the caller streams many small chunks
-    /// through a long payload.
-    ///
-    /// The consumed prefix is dropped only once it is at least as long as
-    /// the live remainder, so the bytes moved are paid for by the bytes
-    /// already consumed. Dropping it at a fixed threshold instead would
-    /// move the whole remainder each time, which is quadratic when one
-    /// large input is decoded through a small output buffer.
-    fn compact_in_buf(&mut self) {
-        if self.in_pos == self.in_buf.len() {
-            self.in_buf.clear();
-            self.in_pos = 0;
-        } else if self.in_pos >= 64 * 1024 && self.in_pos >= self.in_buf.len() - self.in_pos {
-            self.in_buf.drain(0..self.in_pos);
-            self.in_pos = 0;
-        }
-    }
-
-    /// Decode buffered input and hand the result to `output` until
-    /// `output` is full, the declared length has been delivered, or the
-    /// buffered input holds no further complete code. Returns the number
-    /// of bytes written.
+    /// Decode `input` from `*pos` on and hand the result to `output` until
+    /// `output` is full, the declared length has been delivered, or
+    /// `input` holds no further complete code. Advances `*pos` past the
+    /// input bytes taken and returns the number of bytes written.
     ///
     /// [`pump`](Self::pump) decodes in bursts of about 16 KiB, so a single
     /// pump-then-drain is not enough: it has to be repeated for as long as
     /// it makes progress. On return with `written < output.len()` and
-    /// `!self.completed`, `emit_buf` is empty and the input is exhausted.
-    fn pump_into(&mut self, output: &mut [u8]) -> Result<usize, Error> {
+    /// `!self.completed`, `emit_buf` is empty and `input` is used up. When
+    /// `output` fills first, the rest of `input` is left untaken for the
+    /// caller to offer again.
+    fn pump_into(
+        &mut self,
+        input: &[u8],
+        pos: &mut usize,
+        output: &mut [u8],
+    ) -> Result<usize, Error> {
         let mut written = 0usize;
         loop {
             // Run the LZW state machine (a no-op once completed, or while
             // a full burst is still waiting to be drained).
-            self.pump()?;
+            self.pump(input, pos)?;
 
             // Drain to the caller, capped at target_len.
             let cap = (output.len() - written).min(self.remaining());
@@ -330,16 +332,21 @@ impl Decoder {
         }
     }
 
-    /// Try to read one code at the current width. LSB-first.
-    fn try_read_code(&mut self) -> Option<u16> {
+    /// Try to read one code at the current width, LSB-first, taking bytes
+    /// from `input[*pos..]` only while the code is short of bits.
+    ///
+    /// Returns `None` when `input` runs out first; the bits gathered so
+    /// far stay in the accumulator (fewer than `n_bits`, so at most 12)
+    /// and the next call carries on from there. After a code is returned
+    /// fewer than 8 bits are left over, all from the byte that code ended
+    /// in: no byte beyond the code is ever taken.
+    fn try_read_code(&mut self, input: &[u8], pos: &mut usize) -> Option<u16> {
         let need = self.n_bits as u32;
         while self.bit_count < need as u8 {
-            if self.in_pos >= self.in_buf.len() {
-                return None;
-            }
-            self.bit_acc |= (self.in_buf[self.in_pos] as u32) << self.bit_count;
+            let &b = input.get(*pos)?;
+            self.bit_acc |= (b as u32) << self.bit_count;
             self.bit_count += 8;
-            self.in_pos += 1;
+            *pos += 1;
         }
         let mask = (1u32 << need) - 1;
         let code = (self.bit_acc & mask) as u16;
@@ -457,20 +464,20 @@ impl Decoder {
         n
     }
 
-    /// Process as much of the buffered input as we can without writing
-    /// more decoded bytes than `target_len`. Returns when we either need
-    /// more input, hit `target_len`, or fill `emit_buf`.
-    fn pump(&mut self) -> Result<(), Error> {
+    /// Decode codes from `input[*pos..]` into `emit_buf`, advancing `*pos`
+    /// past the bytes taken. Returns when we either need more input, reach
+    /// `target_len`, or fill `emit_buf`.
+    fn pump(&mut self, input: &[u8], pos: &mut usize) -> Result<(), Error> {
         loop {
             if self.completed {
                 return Ok(());
             }
             // Stop at the code that reaches the declared length. The stream
             // ends there: whatever follows is not part of it and must not
-            // be decoded (let alone rejected as corrupt). Counting the
-            // bytes still waiting in `emit_buf`, not just those already
-            // delivered, makes this independent of how much input happens
-            // to be buffered and of how fast the caller drains.
+            // be decoded (let alone rejected as corrupt), nor taken from
+            // the caller. Counting the bytes still waiting in `emit_buf`,
+            // not just those already delivered, makes this independent of
+            // how the input is sliced and of how fast the caller drains.
             let buffered = (self.emit_buf.len() - self.emit_head) as u64;
             if self.out_pos.saturating_add(buffered) >= self.target_len {
                 return Ok(());
@@ -483,21 +490,10 @@ impl Decoder {
                 return Ok(());
             }
 
-            // Save bit-reader state so we can roll back on input
-            // exhaustion mid-code.
-            let saved_acc = self.bit_acc;
-            let saved_cnt = self.bit_count;
-            let saved_pos = self.in_pos;
-
-            let code = match self.try_read_code() {
-                Some(c) => c,
-                None => {
-                    // Restore and ask for more input.
-                    self.bit_acc = saved_acc;
-                    self.bit_count = saved_cnt;
-                    self.in_pos = saved_pos;
-                    return Ok(());
-                }
+            // Out of input mid-code: the partial code stays in the bit
+            // accumulator until the caller brings more.
+            let Some(code) = self.try_read_code(input, pos) else {
+                return Ok(());
             };
 
             if self.pending_control {
@@ -593,18 +589,12 @@ impl RawDecoder for Decoder {
             self.completed = true;
         }
 
-        // Stash the rest of `input` (after the header bytes consumed
-        // above) into our buffer for the bit reader.
-        self.in_buf.extend_from_slice(&input[consumed..]);
-        consumed = input.len();
-
-        // Run the LZW state machine until `output` is full or the
-        // buffered input is used up. Stopping after one burst would leave
-        // input we have already reported as consumed undecoded, with
-        // nothing telling the caller to call again.
-        let written = self.pump_into(output)?;
-
-        self.compact_in_buf();
+        // Run the LZW state machine until `output` is full, the stream
+        // ends or `input` is used up. Only the bytes the decoded codes
+        // occupy are consumed: when `output` fills first the caller offers
+        // the rest again, and what follows the end of the stream is never
+        // taken at all.
+        let written = self.pump_into(input, &mut consumed, output)?;
 
         Ok(RawProgress {
             consumed,
@@ -615,20 +605,14 @@ impl RawDecoder for Decoder {
 
     fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.header_pos < 4 {
-            if self.header_pos == 0 && self.in_buf.is_empty() && self.emit_buf.is_empty() {
-                // No data at all → empty stream is permissible only after
-                // the full header has been seen. Strict: missing header is
-                // an error.
-                return Err(Error::UnexpectedEnd);
-            }
+            // Strict: a missing or partial header is an error, including
+            // no data at all.
             return Err(Error::UnexpectedEnd);
         }
 
-        // Decode whatever input is still buffered: `raw_decode` stops as
-        // soon as the caller's output is full, so any amount of it can be
-        // left.
-        let written = self.pump_into(output)?;
-        self.compact_in_buf();
+        // No input is buffered (at most part of one code), so this only
+        // drains what has been decoded already.
+        let written = self.pump_into(&[], &mut 0, output)?;
 
         if self.completed {
             return Ok(RawProgress {
@@ -639,8 +623,9 @@ impl RawDecoder for Decoder {
         }
 
         // More output is owed. If `output` filled up, the caller drains it
-        // and calls again. Otherwise nothing is buffered and the input ran
-        // out (less than one code is left) short of the declared length.
+        // and calls again. Otherwise nothing is left to drain and the
+        // input ran out (less than one code is pending) short of the
+        // declared length.
         let drained = self.emit_head >= self.emit_buf.len();
         if written < output.len() || (output.is_empty() && drained) {
             return Err(Error::UnexpectedEnd);
@@ -665,8 +650,6 @@ impl RawDecoder for Decoder {
         }
         self.bit_acc = 0;
         self.bit_count = 0;
-        self.in_buf.clear();
-        self.in_pos = 0;
         self.n_bits = INIT_BITS;
         for c in 0..HSIZE {
             self.parent[c] = FREE;
