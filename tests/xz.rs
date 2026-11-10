@@ -1759,3 +1759,113 @@ fn finish_drains_decoded_bytes_before_reporting_truncation() {
         }
     }
 }
+
+// ─── hand-built containers ──────────────────────────────────────────────
+
+/// A 12-byte Stream Header with the given check ID.
+fn stream_header(check_id: u8) -> Vec<u8> {
+    let mut s = vec![0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0x00, check_id];
+    let c = test_crc32(&s[6..8]);
+    s.extend_from_slice(&c.to_le_bytes());
+    s
+}
+
+/// Feed `stream` in `in_chunk`-byte pieces until the decoder fails; returns
+/// the error and how many bytes had been handed over (consumed or not) by
+/// then. Panics if the decoder never fails.
+fn first_error(stream: &[u8], in_chunk: usize) -> (Error, usize) {
+    let mut dec = Decoder::new();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut pos = 0;
+    while pos < stream.len() {
+        let end = (pos + in_chunk).min(stream.len());
+        match dec.decode(&stream[pos..end], &mut buf) {
+            Ok((p, _)) => {
+                assert!(p.consumed > 0 || p.written > 0, "stalled at {pos}");
+                pos += p.consumed;
+            }
+            Err(e) => return (e, end),
+        }
+    }
+    match dec.finish(&mut buf) {
+        Err(e) => (e, stream.len()),
+        Ok(_) => panic!("decoded without an error"),
+    }
+}
+
+/// The Index's Number of Records must equal the number of Blocks decoded;
+/// that is known as soon as the field is read. The decoder used to buffer
+/// the whole Index first — without bound, as fast as the caller supplied
+/// it — and compare the count only after reading that many Records.
+#[test]
+fn index_record_count_is_checked_as_soon_as_it_is_read() {
+    // No Blocks, an Index claiming 2^56 - 1 Records.
+    let mut s = stream_header(0x00);
+    let claims_at = s.len() + 1;
+    s.push(0x00);
+    s.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F]);
+    let count_end = s.len();
+    // What used to be swallowed: "Records" for as long as the input lasts.
+    s.extend_from_slice(&[0x01; 4096]);
+    for in_chunk in [1, 7, s.len()] {
+        let (err, fed) = first_error(&s, in_chunk);
+        assert_eq!(err, Error::Corrupt, "in_chunk {in_chunk}");
+        if in_chunk == 1 {
+            assert_eq!(fed, count_end, "error only after {fed} bytes");
+        }
+    }
+    assert!(claims_at < count_end);
+
+    // A real one-Block Stream whose Index claims two Records: rejected at
+    // that byte, with the rest of the Index (and its CRC) still unread.
+    let good = encode_all(b"hello");
+    // Index: indicator, count, Unpadded Size, Uncompressed Size, CRC32 —
+    // 8 bytes here, before the 12-byte Stream Footer.
+    let index_at = good.len() - 12 - 8;
+    assert_eq!(&good[index_at..index_at + 2], &[0x00, 0x01]);
+    assert_eq!(good[index_at + 3], 5);
+    let mut bad = good.clone();
+    bad[index_at + 1] = 0x02;
+    let (err, fed) = first_error(&bad, 1);
+    assert_eq!(err, Error::Corrupt);
+    assert_eq!(fed, index_at + 2);
+    // And claiming none.
+    bad[index_at + 1] = 0x00;
+    let (err, fed) = first_error(&bad, 1);
+    assert_eq!(err, Error::Corrupt);
+    assert_eq!(fed, index_at + 2);
+}
+
+/// Input past the end of the Index is not buffered: however much follows
+/// in the same call, the decoder takes the Index and Stream Footer and
+/// hands the rest back.
+#[test]
+fn index_consumes_only_its_own_bytes() {
+    let good = encode_all(b"hello");
+    let mut wire = good.clone();
+    wire.extend_from_slice(&[0xAB; 1 << 16]);
+    let mut dec = Decoder::new();
+    let mut buf = vec![0u8; 4096];
+    let mut pos = 0;
+    let mut out = Vec::new();
+    loop {
+        let (p, st) = dec.decode(&wire[pos..], &mut buf).unwrap();
+        out.extend_from_slice(&buf[..p.written]);
+        pos += p.consumed;
+        if st == Status::StreamEnd {
+            break;
+        }
+        assert!(p.consumed > 0 || p.written > 0);
+    }
+    assert_eq!(out, b"hello");
+    assert_eq!(pos, good.len());
+
+    // Records that never end (continuation bytes forever) are cut off at
+    // the 9-byte limit of a multibyte integer.
+    let index_at = good.len() - 12 - 8;
+    let mut bad = good[..index_at + 2].to_vec();
+    bad.extend_from_slice(&[0x80; 4096]);
+    let (err, fed) = first_error(&bad, 1);
+    assert_eq!(err, Error::Corrupt);
+    assert!(fed <= index_at + 2 + 10, "{fed}");
+}

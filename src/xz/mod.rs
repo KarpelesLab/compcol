@@ -1303,7 +1303,9 @@ pub struct Decoder {
     /// Collected blocks for index cross-check: (unpadded_size, uncompressed).
     blocks: Vec<(u64, u64)>,
 
-    /// Once Index starts, we accumulate it for CRC32 validation.
+    /// Once Index starts, we accumulate it for CRC32 validation. It holds
+    /// only bytes of the Index itself, whose length the number of Blocks
+    /// decoded bounds (see `DecPhase::Index`).
     index_buf: Vec<u8>,
     /// Bytes of the index we still need to read after the indicator+records:
     /// 0..=3 padding bytes + 4 CRC32 bytes.
@@ -1467,6 +1469,16 @@ impl Decoder {
     fn poison(&mut self, e: Error) -> Error {
         self.poisoned = true;
         e
+    }
+
+    /// Move up to `n` bytes of `input[*consumed..]` into `index_buf`.
+    /// Returns `false` when there were none to take.
+    fn index_take(&mut self, input: &[u8], consumed: &mut usize, n: usize) -> bool {
+        let take = n.min(input.len() - *consumed);
+        self.index_buf
+            .extend_from_slice(&input[*consumed..*consumed + take]);
+        *consumed += take;
+        take > 0
     }
 
     /// Append bytes from `input[consumed..]` into `self.scratch` up to
@@ -2114,27 +2126,19 @@ impl RawDecoder for Decoder {
                     }
                 }
                 DecPhase::Index => {
-                    // Consume bytes one at a time so we can incrementally
-                    // varint-parse the records, then collect padding and CRC.
-                    // We need to track: index indicator (already in
-                    // index_buf), then NumRecords varint, then for each
-                    // record two varints, then padding to align to 4, then 4
-                    // CRC bytes.
+                    // After the index indicator (already in `index_buf`):
+                    // the NumRecords varint, two varints per record, padding
+                    // to a multiple of four, then a CRC32 over all of it.
                     //
-                    // Strategy: keep slurping bytes into `index_buf`. At each
-                    // step, re-parse from a known offset to see if a
-                    // structural element is complete.
-                    //
-                    // To keep this simple, we read varints lazily: after
-                    // each new byte, attempt to parse the next pending
-                    // varint. When all records are present, switch to
-                    // "padding + CRC" mode.
-
-                    // Pull all available input into `index_buf` first.
-                    if consumed < input.len() {
-                        self.index_buf.extend_from_slice(&input[consumed..]);
-                        consumed = input.len();
-                    }
+                    // `index_buf` takes only the bytes the element being
+                    // parsed can still use — one at a time inside a varint,
+                    // whose length is not known up front — so it never
+                    // holds more than the Index itself, and the Index can
+                    // be no longer than the Blocks decoded allow: NumRecords
+                    // must equal their number (checked as soon as it is
+                    // read) and a record is at most 18 bytes. Input that
+                    // merely claims to be an Index is rejected instead of
+                    // buffered.
 
                     // Drive the state machine until either we run out of
                     // bytes or we transition to StreamFooter.
@@ -2142,30 +2146,40 @@ impl RawDecoder for Decoder {
                         if self.index_records_remaining == u64::MAX {
                             // NumRecords still to parse, starting at offset 1.
                             let mut p = self.index_pos;
-                            match varint_decode(&self.index_buf, &mut p)? {
-                                Some(n) => {
+                            match varint_decode(&self.index_buf, &mut p) {
+                                Ok(Some(n)) => {
+                                    // One Record per Block decoded. Checking
+                                    // here, not after the Records, is what
+                                    // bounds the Index: nothing more is read
+                                    // on the word of an attacker-controlled
+                                    // count (up to 2^63).
+                                    if n != self.blocks.len() as u64 {
+                                        return Err(self.poison(Error::Corrupt));
+                                    }
                                     self.index_records_total = n;
                                     self.index_records_remaining = n.saturating_mul(2);
                                     self.index_pos = p;
-                                    // NOTE: Do NOT pre-reserve based on the raw
-                                    // attacker-controlled NumRecords `n` (up to
-                                    // ~2^63): that would panic with "capacity
-                                    // overflow" or trigger an OOM-aborting
-                                    // allocation before any validation. The
-                                    // `blocks` vec is built from actually-decoded
-                                    // blocks and cross-checked against
-                                    // `index_records_total` below.
                                 }
-                                None => break, // need more bytes
+                                Ok(None) => {
+                                    if !self.index_take(input, &mut consumed, 1) {
+                                        break; // need more bytes
+                                    }
+                                }
+                                Err(e) => return Err(self.poison(e)),
                             }
                         } else if self.index_records_remaining > 0 {
                             let mut p = self.index_pos;
-                            match varint_decode(&self.index_buf, &mut p)? {
-                                Some(_v) => {
+                            match varint_decode(&self.index_buf, &mut p) {
+                                Ok(Some(_v)) => {
                                     self.index_pos = p;
                                     self.index_records_remaining -= 1;
                                 }
-                                None => break,
+                                Ok(None) => {
+                                    if !self.index_take(input, &mut consumed, 1) {
+                                        break;
+                                    }
+                                }
+                                Err(e) => return Err(self.poison(e)),
                             }
                         } else {
                             // Records done. Need padding + CRC.
@@ -2173,7 +2187,11 @@ impl RawDecoder for Decoder {
                             let pad = (4 - (body_len_so_far % 4)) % 4;
                             let need_total = body_len_so_far + pad + 4;
                             if self.index_buf.len() < need_total {
-                                break;
+                                let want = need_total - self.index_buf.len();
+                                if !self.index_take(input, &mut consumed, want) {
+                                    break;
+                                }
+                                continue;
                             }
                             for &b in &self.index_buf[body_len_so_far..body_len_so_far + pad] {
                                 if b != 0 {
@@ -2218,16 +2236,11 @@ impl RawDecoder for Decoder {
                             // Stash; we re-use `block_header_size` after
                             // blocks have been processed.
                             self.block_header_size = index_size as usize;
-                            // Any bytes slurped *past* the index belong to the
-                            // Stream Footer and whatever follows the stream.
-                            // They all arrived in this call (an earlier call
-                            // would have completed the index), so hand them
-                            // back unconsumed; the footer phase re-reads them
-                            // and anything after the footer stays the
-                            // caller's.
-                            let extra = self.index_buf.len() - need_total;
-                            consumed -= extra;
-                            self.index_buf.truncate(need_total);
+                            // Nothing past the Index was taken: the Stream
+                            // Footer and whatever follows are still in
+                            // `input`.
+                            debug_assert_eq!(self.index_buf.len(), need_total);
+                            self.index_buf = Vec::new();
                             self.scratch.clear();
                             self.scratch_want = 12;
                             self.phase = DecPhase::StreamFooter;
