@@ -393,3 +393,73 @@ mod factory {
         assert_eq!(factory::extension("ppmd"), Some("ppmd"));
     }
 }
+
+// ─── output limit ────────────────────────────────────────────────────────
+
+/// The decoder buffers its whole output, so the caller's limit has to be
+/// applied to the declared length, before the model and the output exist,
+/// rather than after 20 KiB (or 64 MiB) has been decoded.
+#[test]
+fn output_limit_is_checked_against_the_declared_length() {
+    let (stream, expected) = fixture!("mixed");
+    let n = expected.len() as u64;
+    assert!(n > 4096);
+
+    // Refused by the call that completes the header, with no output.
+    let mut dec = Decoder::new();
+    dec.set_output_limit(1024);
+    let mut buf = [0u8; 64];
+    assert_eq!(
+        dec.decode(&stream[..11], &mut buf),
+        Err(Error::OutputLimitExceeded)
+    );
+    assert_eq!(dec.finish(&mut buf), Err(Error::OutputLimitExceeded));
+
+    // The limit is configuration: it survives a reset.
+    dec.reset();
+    assert_eq!(
+        drive_to_end(&mut dec, stream),
+        Err(Error::OutputLimitExceeded)
+    );
+
+    // One byte short is refused; exactly the declared length decodes.
+    let mut dec = Decoder::new();
+    dec.set_output_limit(n - 1);
+    assert_eq!(
+        drive_to_end(&mut dec, stream),
+        Err(Error::OutputLimitExceeded)
+    );
+    let mut dec = Decoder::new();
+    dec.set_output_limit(n);
+    assert_eq!(drive_to_end(&mut dec, stream).unwrap(), expected);
+}
+
+#[test]
+fn limited_decoder_passes_its_budget_down() {
+    use compcol::limit::LimitedDecoder;
+    use compcol::vec::decompress_to_vec_capped;
+
+    let (stream, expected) = fixture!("mixed");
+    let n = expected.len() as u64;
+
+    let mut dec = LimitedDecoder::new(Decoder::new(), 1024);
+    let mut buf = [0u8; 64];
+    assert_eq!(
+        dec.decode(&stream[..11], &mut buf),
+        Err(Error::OutputLimitExceeded)
+    );
+    assert_eq!(dec.bytes_written(), 0);
+
+    assert_eq!(
+        decompress_to_vec_capped::<Ppmd>(stream, 1024),
+        Err(Error::OutputLimitExceeded)
+    );
+    assert_eq!(
+        decompress_to_vec_capped::<Ppmd>(stream, n - 1),
+        Err(Error::OutputLimitExceeded)
+    );
+    assert_eq!(
+        decompress_to_vec_capped::<Ppmd>(stream, n).unwrap(),
+        expected
+    );
+}

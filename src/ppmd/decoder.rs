@@ -6,6 +6,13 @@
 //! available. The decoded bytes are then drained to the caller across as
 //! many `finish` calls as the output buffer size requires.
 //!
+//! The decoded output (up to the 64 MiB ceiling) is therefore held in
+//! memory until drained. The framing header declares its length, so with an
+//! output limit set ([`set_output_limit`](crate::Decoder::set_output_limit),
+//! which [`LimitedDecoder`](crate::limit::LimitedDecoder) does for you) a
+//! stream declaring more is refused with [`Error::OutputLimitExceeded`] as
+//! soon as the header has arrived, before anything is allocated for it.
+//!
 //! See the module docs (`super`) for the 11-byte framing header. The model
 //! is the full PPMII variant H core in [`super::ppmd7`], driven by the 7z
 //! range decoder.
@@ -40,13 +47,16 @@ pub struct Decoder {
     /// the same error (so an early header rejection in `decode` reads the
     /// same from a follow-up `finish`).
     poisoned: Option<Error>,
+    /// Caller's output limit (`u64::MAX` = none). Configuration: kept
+    /// across `reset`.
+    limit: u64,
 }
 
 /// Validate the 11-byte framing header, returning the declared unpacked
 /// length. Called from `raw_decode` as soon as 11 bytes have been buffered
 /// (so a hostile stream with a bad header is rejected immediately instead
 /// of after buffering its whole payload) and again from `run_decode`.
-fn validate_header(h: &[u8]) -> Result<u64, Error> {
+fn validate_header(h: &[u8], limit: u64) -> Result<u64, Error> {
     let order = h[0] as u32;
     let mem_mb = h[1] as u32;
     let restoration = h[2];
@@ -76,6 +86,12 @@ fn validate_header(h: &[u8]) -> Result<u64, Error> {
     if expected_len > MAX_OUTPUT as u64 {
         return Err(Error::OutputLimitExceeded);
     }
+    // Decoding runs for exactly the declared length, so a stream that
+    // declares more than the caller will take is known to be too long
+    // before the model arena or any output is allocated.
+    if expected_len > limit {
+        return Err(Error::OutputLimitExceeded);
+    }
     Ok(expected_len)
 }
 
@@ -89,6 +105,7 @@ impl Decoder {
             header_checked: false,
             finished_decode: false,
             poisoned: None,
+            limit: u64::MAX,
         }
     }
 
@@ -105,7 +122,7 @@ impl Decoder {
         let h = &self.in_buf[..HEADER_LEN];
         let order = h[0] as u32;
         let mem_mb = h[1] as u32;
-        let expected_len = validate_header(h)?;
+        let expected_len = validate_header(h, self.limit)?;
 
         let mem_bytes = mem_mb.saturating_mul(1024 * 1024);
         let mut model = Ppmd7::new(mem_bytes)?;
@@ -176,7 +193,7 @@ impl RawDecoder for Decoder {
         self.in_buf.extend_from_slice(input);
         if !self.header_checked && self.in_buf.len() >= HEADER_LEN {
             self.header_checked = true;
-            if let Err(e) = validate_header(&self.in_buf[..HEADER_LEN]) {
+            if let Err(e) = validate_header(&self.in_buf[..HEADER_LEN], self.limit) {
                 return Err(self.poison(e));
             }
         }
@@ -219,5 +236,9 @@ impl RawDecoder for Decoder {
         self.header_checked = false;
         self.finished_decode = false;
         self.poisoned = None;
+    }
+
+    fn raw_set_output_limit(&mut self, max_output_bytes: u64) {
+        self.limit = max_output_bytes;
     }
 }
