@@ -644,9 +644,12 @@ impl Decoder {
                 }
                 Some(s) if s > pos => {
                     // Drain up to `s` from out_queue into ready.
-                    let n = (s - pos) as usize;
-                    let avail = self.out_queue.len();
-                    let take = n.min(avail);
+                    // The gap stays in u64 until it is bounded by the queue
+                    // length: a filter can start 2^32 bytes ahead, and
+                    // narrowing that gap first truncates it to 0 on a 32-bit
+                    // target, which left this loop spinning without ever
+                    // advancing `pos`.
+                    let take = (s - pos).min(self.out_queue.len() as u64) as usize;
                     for _ in 0..take {
                         if let Some(b) = self.out_queue.pop_front() {
                             self.ready.push_back(b);
@@ -655,7 +658,7 @@ impl Decoder {
                     pos += take as u64;
                     self.out_queue_start = pos;
                     self.unpack_so_far += take as u64;
-                    if (take as u64) < n as u64 {
+                    if pos < s {
                         // out_queue is empty before reaching the filter.
                         return Ok(());
                     }
@@ -946,8 +949,13 @@ fn read_filter(bits: &mut BitBuf, window_size: usize, cur_pos: u64) -> Result<Fi
         3 => FilterKind::Arm,
         _ => return Err(Error::Unsupported),
     };
+    // `cur_pos` is a u64 stream offset; refuse the (unreachable in practice)
+    // wrap rather than scheduling a filter at a bogus position.
+    let start = cur_pos
+        .checked_add(block_start as u64)
+        .ok_or(Error::Corrupt)?;
     Ok(Filter {
-        start: cur_pos + block_start as u64,
+        start,
         length: block_length,
         kind,
     })

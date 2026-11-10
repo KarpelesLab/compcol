@@ -795,3 +795,39 @@ fn overlapping_filter_does_not_stall_output() {
         assert_eq!(drive_to_end(&mut dec, &comp, out_chunk).unwrap(), want);
     }
 }
+
+/// Regression (32-bit targets): a filter's absolute start is the current
+/// position plus a 32-bit `block_start`, so it can sit 2^32 bytes ahead of
+/// the output queue. The flush computed that gap as `(s - pos) as usize`,
+/// which truncates to 0 on a 32-bit target: nothing was drained, the
+/// position never advanced, and the flush loop spun forever on a 29-byte
+/// stream. On 64-bit targets the same stream always decoded to one byte.
+#[test]
+fn filter_start_4gib_ahead_does_not_hang() {
+    let mut bw = BitWriter::default();
+    write_tables(&mut bw, &[(b'A' as usize, 1), (256, 2), (305, 2), (306, 1)]);
+    bw.put(0, 1); // 'A'
+    bw.put(0b10, 2); // filter
+    bw.put(3, 2); // block_start: 4 bytes, 0xFFFF_FFFF
+    for _ in 0..4 {
+        bw.put(0xFF, 8);
+    }
+    bw.put(0, 2); // block_length: 1 byte, 4
+    bw.put(4, 8);
+    bw.put(0, 3); // Delta
+    bw.put(0, 5); // 1 channel
+    let lb = bw.finish();
+    let comp = last_block(&bw.out, lb);
+    assert_eq!(
+        comp,
+        [
+            0xd3, 0x91, 0x18, 0x00, 0x00, 0x22, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x02, 0xdb, 0x3f, 0xfd, 0x4d, 0xa5, 0x9f, 0x82, 0xff, 0xff, 0xff, 0xff, 0xc0, 0x40,
+            0x00,
+        ]
+    );
+    for out_chunk in [1, 64] {
+        let mut dec = Decoder::new();
+        assert_eq!(drive_to_end(&mut dec, &comp, out_chunk).unwrap(), b"A");
+    }
+}
