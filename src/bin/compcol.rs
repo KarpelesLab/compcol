@@ -61,7 +61,11 @@ Decompression safety:
 
 Misc:
     -k, --keep              Keep input file even in in-place mode
-    -f, --force             Overwrite an existing output file
+    -f, --force             Replace an existing output file. The output is
+                            written to a temporary file next to it and
+                            renamed over it once complete, so a failed run
+                            leaves the old file as it was, and a symlink
+                            is replaced rather than followed.
     -L, --list              List available algorithms and exit
     -V, --version           Print version and exit
     -h, --help              Print this help and exit
@@ -496,37 +500,204 @@ fn strip_extension(input: &Path, ext: &str) -> Result<Option<PathBuf>, String> {
 /// output. `None` for pipes, devices and the like — and always on platforms
 /// without unix permission bits, where the output keeps its default ACL.
 fn regular_file_mode(f: &File) -> Option<u32> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        f.metadata()
-            .ok()
-            .filter(|m| m.is_file())
-            .map(|m| m.mode() & 0o777)
+    f.metadata()
+        .ok()
+        .filter(|m| m.is_file())
+        .and_then(|m| mode_bits(&m))
+}
+
+/// An output file being written.
+struct FileOutput {
+    file: File,
+    /// The path the data is going to, removed if the run fails: the
+    /// destination itself (created exclusively, so it is ours), or the
+    /// temporary file of a `--force` run. `None` when writing into something
+    /// that isn't a regular file (`-f -o /dev/null`), which is never removed.
+    written_at: Option<PathBuf>,
+    /// For a `--force` run: the destination `written_at` is renamed onto
+    /// once it is complete.
+    rename_to: Option<PathBuf>,
+    /// Permission bits to give the finished file (unix).
+    final_mode: Option<u32>,
+}
+
+impl FileOutput {
+    /// Undo a failed run: remove what was written, leaving any existing
+    /// destination of a `--force` run as it was.
+    fn discard(self) {
+        // Close first, so the removal is immediate on every platform.
+        drop(self.file);
+        if let Some(p) = &self.written_at {
+            let _ = std::fs::remove_file(p);
+        }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = f;
-        None
+
+    /// Finish a successful run: set the final permission bits and, for a
+    /// `--force` run, move the completed file onto its destination.
+    fn commit(self) -> io::Result<()> {
+        let Self {
+            file,
+            written_at,
+            rename_to,
+            final_mode,
+        } = self;
+        // Failing to set the mode leaves the file no more accessible than
+        // intended (a file we created is still owner-only), so warn rather
+        // than fail the whole run.
+        if let Some(mode) = final_mode
+            && let Err(e) = set_mode(&file, mode)
+            && let Some(shown) = rename_to.as_ref().or(written_at.as_ref())
+        {
+            eprintln!(
+                "compcol: warning: could not set permissions on {}: {e}",
+                shown.display()
+            );
+        }
+        // Close before renaming: not every platform lets an open file be
+        // moved over another.
+        drop(file);
+        if let (Some(temp), Some(dest)) = (&written_at, &rename_to)
+            && let Err(e) = std::fs::rename(temp, dest)
+        {
+            let _ = std::fs::remove_file(temp);
+            return Err(io::Error::new(
+                e.kind(),
+                format!("replace {}: {e}", dest.display()),
+            ));
+        }
+        Ok(())
     }
 }
 
-/// Open the output file: exclusively (`O_EXCL`) unless `force`, which
-/// truncates an existing file instead.
+/// Create the output file for `dest`.
 ///
-/// With `owner_only` (unix; set when the input is a regular file whose mode
-/// will be copied over afterwards) a newly created file starts out as 0600
-/// rather than `0666 & !umask`, so the data is never exposed more widely
-/// than the input was while it is being written. An existing `--force`
-/// target keeps its mode until then.
-fn open_output(path: &Path, force: bool, owner_only: bool) -> io::Result<File> {
-    let mut opts = OpenOptions::new();
-    opts.write(true);
-    if force {
-        opts.create(true).truncate(true);
-    } else {
-        opts.create_new(true);
+/// Without `force` the destination is created exclusively (`O_EXCL`) and
+/// written in place. That is already race-free — there is no gap between an
+/// existence check and the open — and never follows a symlink, dangling or
+/// not; nothing else can exist under that name, so there is nothing to
+/// preserve if the run fails, and the partial file is simply removed. (A
+/// temporary file put in place with a no-replace `hard_link` would give the
+/// same guarantee, but hard links don't exist on FAT/exFAT and some network
+/// file systems, where it would turn every plain run into an error.)
+///
+/// With `force` an existing destination must survive a failed run, and a
+/// symlink there must not be written through. So the data goes to a new,
+/// exclusively created file in the same directory, which [`run`] renames
+/// over the destination only once the stream is complete: the old file stays
+/// untouched until then, and `rename` replaces a symlink rather than
+/// following it. The existence of the destination is never consulted, so
+/// there is no check-then-open race either.
+///
+/// The exception is a `force` destination that exists but is neither a
+/// regular file nor a directory — a device, FIFO or socket, directly or
+/// through a symlink (`-f -o /dev/null`, `/dev/stdout`). It can't sensibly
+/// be replaced by a rename and holds no data to protect, so it is opened and
+/// written directly.
+///
+/// `input_mode` is the input's permission bits when it is a regular file.
+/// The output then starts out owner-only (0600 on unix) rather than
+/// `0666 & !umask`, so the data is never exposed more widely than the input
+/// was while it is being written, and gets `input_mode` once complete. With
+/// no input mode (stdin), a `force` run that replaces a regular file keeps
+/// that file's mode, as overwriting it in place used to.
+fn open_file_output(
+    dest: &Path,
+    force: bool,
+    input_mode: Option<u32>,
+) -> Result<FileOutput, RunError> {
+    let create_err = |e: io::Error| {
+        RunError::Io(io::Error::new(
+            e.kind(),
+            format!("create {}: {e}", dest.display()),
+        ))
+    };
+
+    if !force {
+        let file = new_file_options(input_mode.is_some())
+            .open(dest)
+            .map_err(|e| {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    RunError::Usage(format!(
+                        "output exists: {} (use -f to overwrite)",
+                        dest.display()
+                    ))
+                } else {
+                    create_err(e)
+                }
+            })?;
+        return Ok(FileOutput {
+            file,
+            written_at: Some(dest.to_path_buf()),
+            rename_to: None,
+            final_mode: input_mode,
+        });
     }
+
+    // What the destination resolves to (following symlinks), if anything.
+    if let Ok(target) = std::fs::metadata(dest) {
+        if target.is_dir() {
+            return Err(create_err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                "is a directory",
+            )));
+        }
+        if !target.is_file() {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(dest)
+                .map_err(create_err)?;
+            // Opened without create or truncate, so if the path was swapped
+            // for a regular file in the meantime nothing has been lost yet:
+            // refuse rather than overwrite it in place.
+            if file.metadata().map_err(create_err)?.is_file() {
+                return Err(create_err(io::Error::other(
+                    "changed while it was being opened",
+                )));
+            }
+            return Ok(FileOutput {
+                file,
+                written_at: None,
+                rename_to: None,
+                final_mode: None,
+            });
+        }
+    }
+
+    // The mode of the regular file being replaced. A symlink is replaced
+    // itself, so whatever it points to doesn't lend its mode.
+    let replaced_mode = std::fs::symlink_metadata(dest)
+        .ok()
+        .filter(|m| m.is_file())
+        .and_then(|m| mode_bits(&m));
+    let final_mode = input_mode.or(replaced_mode);
+
+    let dir = match dest.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let (file, temp) = create_temp_file(dir, final_mode.is_some()).map_err(|e| {
+        RunError::Io(io::Error::new(
+            e.kind(),
+            format!(
+                "create temporary file in {} for {}: {e}",
+                dir.display(),
+                dest.display()
+            ),
+        ))
+    })?;
+    Ok(FileOutput {
+        file,
+        written_at: Some(temp),
+        rename_to: Some(dest.to_path_buf()),
+        final_mode,
+    })
+}
+
+/// Options that create a new file exclusively — failing if anything, even a
+/// dangling symlink, already has the name — owner-only on unix if asked.
+fn new_file_options(owner_only: bool) -> OpenOptions {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     if owner_only {
         use std::os::unix::fs::OpenOptionsExt;
@@ -534,7 +705,47 @@ fn open_output(path: &Path, force: bool, owner_only: bool) -> io::Result<File> {
     }
     #[cfg(not(unix))]
     let _ = owner_only;
-    opts.open(path)
+    opts
+}
+
+/// Create a new, uniquely named file in `dir`.
+///
+/// The name combines the process id with a value from the standard
+/// library's randomly seeded hasher, so it can't be guessed ahead of time;
+/// and since the file is created exclusively, a name that does already exist
+/// (as a file or a planted symlink) is never opened — another one is tried.
+fn create_temp_file(dir: &Path, owner_only: bool) -> io::Result<(File, PathBuf)> {
+    use std::hash::{BuildHasher, Hasher};
+
+    let pid = std::process::id();
+    for attempt in 0u32..64 {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u32(attempt);
+        let path = dir.join(format!(".compcol-{pid}-{:016x}.tmp", hasher.finish()));
+        match new_file_options(owner_only).open(&path) {
+            Ok(file) => return Ok((file, path)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no unused temporary file name found",
+    ))
+}
+
+/// Permission bits from `m`; `None` on platforms without unix permissions.
+fn mode_bits(m: &std::fs::Metadata) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(m.mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = m;
+        None
+    }
 }
 
 /// Set the permission bits of the open output file to `mode`. Only regular
@@ -681,7 +892,7 @@ fn run(args: &Args) -> Result<(), RunError> {
     let should_remove_input = in_place && !args.keep;
 
     // Reader. When the input is a regular file, remember its permission bits
-    // so a file output can be given the same ones (see `open_output`).
+    // so a file output can be given the same ones (see `open_file_output`).
     let mut input_mode: Option<u32> = None;
     let mut reader: Box<dyn Read> = if let Some(p) = &args.input {
         let f = File::open(p).map_err(|e| {
@@ -749,15 +960,16 @@ fn run(args: &Args) -> Result<(), RunError> {
 
     let output = derive_output(args, &algo).map_err(RunError::Usage)?;
 
-    // Writer + the path we'd remove on cleanup if anything goes wrong.
+    // Writer, plus what is needed to finish or undo a file output.
     let stdout = io::stdout();
-    let mut final_mode: Option<(File, u32, PathBuf)> = None;
-    let (mut writer, output_path): (Box<dyn Write>, Option<PathBuf>) = match &output {
-        Output::Stdout => (Box::new(BufWriter::new(stdout.lock())), None),
+    let mut file_output: Option<FileOutput> = None;
+    let mut writer: Box<dyn Write> = match &output {
+        Output::Stdout => Box::new(BufWriter::new(stdout.lock())),
         Output::File(p) => {
-            // Refuse to write over the file we are about to read: opening it
-            // for writing (--force truncates) would destroy the input before
-            // a single byte of it had been consumed.
+            // Refuse to write over the file we are reading. --force no
+            // longer truncates its target up front, but replacing the input
+            // under its own name with its (de)compressed form is never what
+            // was asked for.
             if let Some(input) = &args.input
                 && is_same_file(input, p)
             {
@@ -766,51 +978,28 @@ fn run(args: &Args) -> Result<(), RunError> {
                     p.display()
                 )));
             }
-            // Without --force, create the output atomically with O_EXCL
-            // (create_new). This eliminates the TOCTOU between an existence
-            // check and the open, and refuses to follow a pre-existing or
-            // dangling symlink into an attacker-controlled target. With
-            // --force we keep the documented overwrite (truncate) behavior.
-            //
-            // For the --force path, remember whether the target already
-            // existed: if a later codec error triggers cleanup we must NOT
-            // delete a file the user already had (data loss). Only output we
-            // newly created is ours to remove on failure. (The non-force path
-            // uses create_new, so a successful open there always created the
-            // file — it is always safe to clean up.)
-            let preexisting = args.force && p.exists();
-            let f = open_output(p, args.force, input_mode.is_some()).map_err(|e| {
-                if !args.force && e.kind() == io::ErrorKind::AlreadyExists {
-                    RunError::Usage(format!(
-                        "output exists: {} (use -f to overwrite)",
-                        p.display()
-                    ))
-                } else {
-                    RunError::Io(io::Error::new(
+            let out = open_file_output(p, args.force, input_mode)?;
+            // The writer gets a second handle; the first stays in `out` so
+            // the permission bits can be applied to this very file (not to
+            // whatever the path names by then) once it is complete.
+            let handle = match out.file.try_clone() {
+                Ok(handle) => handle,
+                Err(e) => {
+                    out.discard();
+                    return Err(RunError::Io(io::Error::new(
                         e.kind(),
                         format!("create {}: {e}", p.display()),
-                    ))
+                    )));
                 }
-            })?;
-            // Cleanup only files we created. A pre-existing --force target is
-            // left in place (already truncated) rather than deleted out from
-            // under the user.
-            let cleanup = if preexisting { None } else { Some(p.clone()) };
-            // Keep a second handle so the input's permission bits can be
-            // applied to this very file (not to whatever the path names by
-            // then) once it is completely written. If the handle can't be
-            // duplicated the output simply stays owner-only.
-            if let Some(mode) = input_mode
-                && let Ok(handle) = f.try_clone()
-            {
-                final_mode = Some((handle, mode, p.clone()));
-            }
-            (Box::new(BufWriter::new(f)), cleanup)
+            };
+            file_output = Some(out);
+            Box::new(BufWriter::new(handle))
         }
     };
 
-    // From here on the output exists: every failure — including the final
-    // flush — must go through the cleanup below rather than an early `?`.
+    // From here on the output (or its temporary file) exists: every failure
+    // — including the final flush — must go through the cleanup below rather
+    // than an early `?`.
     let result = match codec {
         Codec::Decoder(dec) => {
             stream_decode(dec, &mut *reader, &mut *writer).and_then(|trailing| {
@@ -845,9 +1034,10 @@ fn run(args: &Args) -> Result<(), RunError> {
     // Release the file handle before removing or reporting anything.
     drop(writer);
     if let Err(e) = result {
-        // Best-effort: remove the partial output, leave the input intact.
-        if let Some(p) = output_path {
-            let _ = std::fs::remove_file(&p);
+        // Best-effort: remove the partial output, leave the input — and a
+        // --force destination that already existed — intact.
+        if let Some(out) = file_output {
+            out.discard();
         }
         // Name the flag and the limit rather than the library's generic
         // "configured limit" wording.
@@ -861,16 +1051,10 @@ fn run(args: &Args) -> Result<(), RunError> {
         return Err(RunError::Io(e));
     }
 
-    // The output is complete: hand it the input's permission bits. Failing
-    // to do so leaves it no more accessible than intended (a file we created
-    // is still owner-only), so warn rather than fail the whole run.
-    if let Some((handle, mode, path)) = final_mode
-        && let Err(e) = set_mode(&handle, mode)
-    {
-        eprintln!(
-            "compcol: warning: could not set permissions on {}: {e}",
-            path.display()
-        );
+    // The output is complete: give it its final permissions and name. The
+    // input is only removed once that has worked.
+    if let Some(out) = file_output {
+        out.commit()?;
     }
 
     if should_remove_input

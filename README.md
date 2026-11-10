@@ -484,7 +484,11 @@ Decompression safety:
 
 Misc:
     -k, --keep              Keep input file even in in-place mode
-    -f, --force             Overwrite an existing output file
+    -f, --force             Replace an existing output file. The output is
+                            written to a temporary file next to it and
+                            renamed over it once complete, so a failed run
+                            leaves the old file as it was, and a symlink
+                            is replaced rather than followed.
     -L, --list              List available algorithms and exit
     -V, --version           Print version and exit
     -h, --help              Print this help and exit

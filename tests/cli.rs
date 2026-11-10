@@ -104,6 +104,17 @@ fn file_contents(p: &Path) -> Vec<u8> {
     fs::read(p).expect("read")
 }
 
+/// Sorted names of the entries in `dir` — to check nothing extra (such as a
+/// temporary file) was left behind.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .expect("read_dir")
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
 // ─── help / list / version ───────────────────────────────────────────────
 
 #[test]
@@ -378,7 +389,9 @@ fn force_target_not_deleted_when_codec_errors_midstream() {
     // Regression for L12: a mid-stream codec error on an existing
     // --force target must not delete the user's pre-existing file. We
     // feed corrupt gzip so stream_decode fails after the output was
-    // opened (and truncated). The file must still exist afterwards.
+    // opened. The file must still exist afterwards — and, since --force
+    // writes to a temporary file that only replaces the target on success,
+    // with its content intact (it used to be left truncated).
     let s = Scratch::new("force_no_delete");
     let bad = s.file("bad.gz");
     // Valid gzip magic + method/flags + zeroed mtime, then garbage that
@@ -402,13 +415,18 @@ fn force_target_not_deleted_when_codec_errors_midstream() {
         bad.to_str().unwrap(),
     ]);
     assert_ne!(code, 0, "expected the corrupt input to fail");
-    // The pre-existing target must survive the error (truncated, but
-    // present — not removed). Before the fix it was unconditionally
-    // deleted.
+    // The pre-existing target must survive the error. Before the first fix
+    // it was unconditionally deleted; before the second, truncated.
     assert!(
         out.exists(),
         "pre-existing --force target was deleted on codec error"
     );
+    assert_eq!(
+        file_contents(&out),
+        b"precious user data",
+        "pre-existing --force target was modified by a failed run"
+    );
+    assert_eq!(names_in(&s.path), ["bad.gz", "preexisting.out"]);
 }
 
 #[test]
@@ -1031,4 +1049,227 @@ fn round_trips_never_report_trailing_data() {
             );
         }
     }
+}
+
+// ─── --force writes through a temporary file ────────────────────────────
+
+#[test]
+fn force_leaves_no_temporary_files() {
+    let s = Scratch::new("force_tmp");
+    let input = s.file("in.txt");
+    let out = s.file("out.gz");
+    fs::write(&input, b"new data").unwrap();
+
+    // Onto a path that doesn't exist yet, then onto the file just written.
+    for _ in 0..2 {
+        let (_out, err, code) = run(&[
+            "-t",
+            "gzip",
+            "-f",
+            "-o",
+            out.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+        assert_eq!(names_in(&s.path), ["in.txt", "out.gz"]);
+        let (back, _err, code) = run(&["-d", "-c", out.to_str().unwrap()]);
+        assert_eq!(code, 0);
+        assert_eq!(back, b"new data");
+    }
+
+    // A failing run onto a path that doesn't exist creates nothing.
+    let bad = s.file("bad.gz");
+    fs::write(
+        &bad,
+        b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xff\xff\xff\xff",
+    )
+    .unwrap();
+    let fresh = s.file("fresh");
+    let (_out, _err, code) = run(&[
+        "-d",
+        "-f",
+        "-o",
+        fresh.to_str().unwrap(),
+        bad.to_str().unwrap(),
+    ]);
+    assert_ne!(code, 0);
+    assert_eq!(names_in(&s.path), ["bad.gz", "in.txt", "out.gz"]);
+}
+
+#[test]
+fn force_in_a_relative_directory() {
+    // The temporary file goes next to the output; a bare file name has an
+    // empty parent, which must mean the current directory.
+    let s = Scratch::new("force_rel");
+    fs::write(s.file("in.txt"), b"relative").unwrap();
+    fs::write(s.file("in.txt.gz"), b"old").unwrap();
+    let out = Command::new(BIN)
+        .args(["-t", "gzip", "-f", "in.txt"])
+        .current_dir(&s.path)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn compcol");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(names_in(&s.path), ["in.txt.gz"]);
+    assert_eq!(&file_contents(&s.file("in.txt.gz"))[..2], &[0x1F, 0x8B]);
+}
+
+#[test]
+fn force_onto_a_directory_fails_cleanly() {
+    let s = Scratch::new("force_dir");
+    let input = s.file("in.txt");
+    let dir = s.file("dir");
+    fs::write(&input, b"data").unwrap();
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("inside"), b"kept").unwrap();
+
+    let (_out, err, code) = run(&[
+        "-t",
+        "gzip",
+        "-f",
+        "-o",
+        dir.to_str().unwrap(),
+        input.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 1, "stderr: {}", String::from_utf8_lossy(&err));
+    assert_eq!(names_in(&s.path), ["dir", "in.txt"]);
+    assert_eq!(names_in(&dir), ["inside"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn force_replaces_a_symlink_instead_of_writing_through_it() {
+    // `ln -s tgt link.gz; compcol -t gzip -f link` used to follow the
+    // symlink and overwrite `tgt`. Like gzip -f, replace the link itself.
+    let s = Scratch::new("force_symlink");
+    let tgt = s.file("tgt");
+    let link = s.file("link.gz");
+    let input = s.file("link");
+    fs::write(&tgt, b"the symlink's target").unwrap();
+    std::os::unix::fs::symlink(&tgt, &link).unwrap();
+    fs::write(&input, b"input data").unwrap();
+
+    let (_out, err, code) = run(&["-t", "gzip", "-f", input.to_str().unwrap()]);
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+    assert_eq!(file_contents(&tgt), b"the symlink's target");
+    assert!(
+        fs::symlink_metadata(&link).unwrap().file_type().is_file(),
+        "the symlink should have been replaced by the output file"
+    );
+    assert_eq!(&file_contents(&link)[..2], &[0x1F, 0x8B]);
+    assert_eq!(names_in(&s.path), ["link.gz", "tgt"]);
+
+    // The same for a dangling symlink: nothing is created at its target.
+    let dangling = s.file("dangling.gz");
+    std::os::unix::fs::symlink(s.file("nowhere"), &dangling).unwrap();
+    let (_out, err, code) = run(&[
+        "-d",
+        "-k",
+        "-f",
+        "-o",
+        dangling.to_str().unwrap(),
+        link.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+    assert!(!s.file("nowhere").exists());
+    assert_eq!(file_contents(&dangling), b"input data");
+}
+
+#[cfg(unix)]
+#[test]
+fn force_replaces_the_file_rather_than_rewriting_it() {
+    // The destination is swapped by rename: another hard link to the old
+    // file keeps the old content instead of seeing a truncate-and-rewrite.
+    let s = Scratch::new("force_inode");
+    let input = s.file("in.txt");
+    let out = s.file("out.gz");
+    let other = s.file("other-name");
+    fs::write(&input, b"new").unwrap();
+    fs::write(&out, b"old content").unwrap();
+    fs::hard_link(&out, &other).unwrap();
+
+    let (_out, err, code) = run(&[
+        "-t",
+        "gzip",
+        "-f",
+        "-o",
+        out.to_str().unwrap(),
+        input.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+    assert_eq!(file_contents(&other), b"old content");
+    assert_eq!(&file_contents(&out)[..2], &[0x1F, 0x8B]);
+}
+
+#[cfg(unix)]
+#[test]
+fn force_writes_straight_to_a_device() {
+    use std::os::unix::fs::FileTypeExt;
+
+    // A device (or FIFO, socket) can't be replaced by rename and holds
+    // nothing to protect: `-f -o /dev/null` must keep writing into it —
+    // also when it is reached through a symlink.
+    let s = Scratch::new("force_dev");
+    let input = s.file("in.txt");
+    let sink = s.file("sink");
+    fs::write(&input, b"discard me").unwrap();
+    std::os::unix::fs::symlink("/dev/null", &sink).unwrap();
+
+    for out in [Path::new("/dev/null"), &sink] {
+        let (_out, err, code) = run(&[
+            "-t",
+            "gzip",
+            "-f",
+            "-o",
+            out.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+    }
+    assert!(
+        fs::metadata("/dev/null")
+            .unwrap()
+            .file_type()
+            .is_char_device()
+    );
+    assert!(
+        fs::symlink_metadata(&sink)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(names_in(&s.path), ["in.txt", "sink"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn force_from_stdin_keeps_the_replaced_files_permissions() {
+    // With no input file there is no mode to copy. Overwriting in place
+    // used to leave the existing file's mode alone; replacing it must not
+    // quietly widen a private file to the umask default.
+    let s = Scratch::new("force_stdin_mode");
+    let out = s.file("out.gz");
+    fs::write(&out, b"old").unwrap();
+    set_mode(&out, 0o600);
+
+    let (_out, err, code) =
+        run_with_stdin(&["-t", "gzip", "-f", "-o", out.to_str().unwrap()], b"data");
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+    assert_eq!(mode_of(&out), 0o600);
+    assert_eq!(&file_contents(&out)[..2], &[0x1F, 0x8B]);
+
+    // And a new file gets the plain default, as without --force.
+    let reference = s.file("reference");
+    fs::write(&reference, b"x").unwrap();
+    let fresh = s.file("fresh.gz");
+    let (_out, err, code) = run_with_stdin(
+        &["-t", "gzip", "-f", "-o", fresh.to_str().unwrap()],
+        b"data",
+    );
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+    assert_eq!(mode_of(&fresh), mode_of(&reference));
 }
