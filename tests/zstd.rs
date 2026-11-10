@@ -1459,3 +1459,145 @@ fn frame_content_size_overrun_emits_nothing_past_it() {
     assert_eq!(err, Error::Corrupt);
     assert!(total <= 2, "emitted {total} bytes for a 2-byte frame");
 }
+
+// ─── decoder: Block_Maximum_Size ────────────────────────────────────────
+
+/// 3-byte Block_Header.
+fn block_header(last: bool, block_type: u32, size: u32) -> [u8; 3] {
+    let bh = (size << 3) | (block_type << 1) | last as u32;
+    [bh as u8, (bh >> 8) as u8, (bh >> 16) as u8]
+}
+
+/// Windowed frame (`wd` = Window_Descriptor) holding one last RLE_Block.
+fn rle_frame_in_window(wd: u8, count: u32) -> Vec<u8> {
+    let mut f = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, wd];
+    f.extend_from_slice(&block_header(true, 1, count));
+    f.push(b'z');
+    f
+}
+
+/// Windowed frame holding one last Raw_Block of `count` bytes.
+fn raw_frame_in_window(wd: u8, count: u32) -> Vec<u8> {
+    let mut f = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, wd];
+    f.extend_from_slice(&block_header(true, 0, count));
+    f.extend((0..count).map(|i| (i % 251) as u8));
+    f
+}
+
+/// RFC 8878 §3.1.1.2.4: no block may be larger, nor regenerate more, than
+/// `Block_Maximum_Size = min(Window_Size, 128 KiB)`. The RLE case used to
+/// have no bound at all: 10 input bytes produced 2 MiB in a 1 KiB window.
+#[test]
+fn block_size_is_capped_at_block_maximum_size() {
+    const WD_1K: u8 = 0x00;
+    const WD_128K: u8 = 0x38;
+    const WD_256K: u8 = 0x40;
+    const KIB128: u32 = 128 * 1024;
+
+    // The audit's reproducer: `28 B5 2F FD 00 00 FB FF FF 7A`.
+    let bomb = rle_frame_in_window(WD_1K, 0x1F_FFFF);
+    assert_eq!(bomb, [0x28, 0xB5, 0x2F, 0xFD, 0, 0, 0xFB, 0xFF, 0xFF, 0x7A]);
+    // (Lengths only: a failure must not dump megabytes of output.)
+    let len = |frame: &[u8], chunk: usize| decode_chunked(frame, chunk, chunk).map(|v| v.len());
+    assert_eq!(len(&bomb, 4096), Err(Error::Corrupt));
+    assert_eq!(len(&bomb, 1), Err(Error::Corrupt));
+
+    for (wd, max) in [(WD_1K, 1024), (WD_128K, KIB128), (WD_256K, KIB128)] {
+        // Exactly Block_Maximum_Size is fine...
+        let ok = decode_chunked(&rle_frame_in_window(wd, max), 4096, 4096).unwrap();
+        assert!(
+            ok.len() == max as usize && ok.iter().all(|&b| b == b'z'),
+            "RLE wd={wd:#x}"
+        );
+        assert_eq!(
+            len(&raw_frame_in_window(wd, max), 4096),
+            Ok(max as usize),
+            "Raw wd={wd:#x}"
+        );
+        // ...one byte more is not.
+        assert_eq!(
+            len(&rle_frame_in_window(wd, max + 1), 4096),
+            Err(Error::Corrupt),
+            "RLE wd={wd:#x}"
+        );
+        assert_eq!(
+            len(&raw_frame_in_window(wd, max + 1), 4096),
+            Err(Error::Corrupt),
+            "Raw wd={wd:#x}"
+        );
+    }
+
+    // Compressed_Block whose Block_Size exceeds a 1 KiB window: a
+    // Raw_Literals_Block of 1021 bytes (3-byte header) + a zero sequence
+    // count is 1025 bytes on the wire. In a 2 KiB window it is legal.
+    let mut body = vec![0xDC, 0x3F, 0x00]; // Raw literals, 20-bit size 1021
+    body.extend((0..1021u32).map(|i| (i % 251) as u8));
+    body.push(0x00);
+    assert_eq!(body.len(), 1025);
+    let comp_frame = |wd: u8| {
+        let mut f = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, wd];
+        f.extend_from_slice(&block_header(true, 2, body.len() as u32));
+        f.extend_from_slice(&body);
+        f
+    };
+    assert_eq!(len(&comp_frame(0x08), 4096), Ok(1021));
+    assert_eq!(len(&comp_frame(WD_1K), 4096), Err(Error::Corrupt));
+
+    // Compressed_Block that is small on the wire but regenerates 1025 bytes
+    // (RLE_Literals_Block) in a 1 KiB window.
+    let rle_lit_frame = |wd: u8, n: u32| {
+        let mut f = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, wd];
+        f.extend_from_slice(&block_header(true, 2, 4));
+        // RLE literals, Size_Format 01 (12-bit size), byte 'q', 0 sequences.
+        f.extend_from_slice(&[0x05 | ((n & 0xF) << 4) as u8, (n >> 4) as u8, b'q', 0x00]);
+        f
+    };
+    assert_eq!(len(&rle_lit_frame(WD_1K, 1024), 4096), Ok(1024));
+    assert_eq!(len(&rle_lit_frame(WD_1K, 1025), 4096), Err(Error::Corrupt));
+}
+
+/// In a Single_Segment frame `Window_Size` is the Frame_Content_Size, so
+/// Block_Maximum_Size shrinks with it (reference: `blockSizeMax =
+/// MIN(windowSize, ZSTD_BLOCKSIZE_MAX)` with `windowSize = frameContentSize`).
+#[test]
+fn single_segment_block_maximum_size_is_the_content_size() {
+    let ss = |fcs: u8, blocks: &[u8]| frame_from_parts(&[0x20, fcs], blocks);
+    // Compressed_Block of 3 bytes (RLE literal 'z' * n, no sequences).
+    let comp = |n: u8| [0x1D, 0x00, 0x00, (n << 3) | 1, b'z', 0x00];
+
+    // Raw and RLE blocks of exactly the content size are fine.
+    assert_eq!(
+        decode_all_chunkings(&ss(1, &[0x09, 0x00, 0x00, b'z'])).unwrap(),
+        b"z"
+    );
+    assert_eq!(
+        decode_all_chunkings(&ss(3, &[0x1B, 0x00, 0x00, b'z'])).unwrap(),
+        b"zzz"
+    );
+    // A 3-byte Compressed_Block fits a 3-byte frame, not a 1- or 2-byte one.
+    assert_eq!(decode_all_chunkings(&ss(3, &comp(3))).unwrap(), b"zzz");
+    assert_eq!(decode_all_chunkings(&ss(2, &comp(2))), Err(Error::Corrupt));
+    assert_eq!(decode_all_chunkings(&ss(1, &comp(1))), Err(Error::Corrupt));
+    // An empty frame can only hold empty Raw_Blocks.
+    assert_eq!(
+        decode_all_chunkings(&ss(0, &[0x01, 0x00, 0x00])).unwrap(),
+        b""
+    );
+    assert_eq!(
+        decode_all_chunkings(&ss(0, &[0x15, 0x00, 0x00, 0x00, 0x00])),
+        Err(Error::Corrupt)
+    );
+    // The same empty Compressed_Block is legal in a windowed frame.
+    assert_eq!(
+        decode_all_chunkings(&frame_from_parts(
+            &[0x00, 0x00],
+            &[0x15, 0x00, 0x00, 0x00, 0x00]
+        ))
+        .unwrap(),
+        b""
+    );
+    // Several blocks: the bound is the frame's size, not what is left of it.
+    let mut blocks = vec![0x18, 0x00, 0x00, b'a', b'b', b'c'];
+    blocks.extend_from_slice(&comp(1));
+    assert_eq!(decode_all_chunkings(&ss(4, &blocks)).unwrap(), b"abcz");
+}
