@@ -210,6 +210,103 @@ fn unexpected_eof_on_finish() {
     assert_eq!(err, Error::UnexpectedEnd);
 }
 
+// ─── end of stream ───────────────────────────────────────────────────────
+
+/// A `.lzma` stream with the size in the header and no end marker, made
+/// from the marker-less ZIP framing of the same payload.
+fn known_size_stream(payload: &[u8]) -> Vec<u8> {
+    let mut enc = Encoder::zip(EncoderConfig::default(), false);
+    let z = encode_with(&mut enc, payload);
+    let mut s = z[4..9].to_vec();
+    s.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    s.extend_from_slice(&z[9..]);
+    s
+}
+
+/// Once the stream has ended, `decode` reports `StreamEnd` and consumes
+/// nothing more: it used to absorb (and buffer) every byte it was given and
+/// never report the end.
+#[test]
+fn decode_reports_stream_end_and_ignores_later_input() {
+    let payload = b"hello hello hello hello";
+    let marker = encode_one_shot(payload);
+    let known = known_size_stream(payload);
+    // A declared size followed by an end marker anyway.
+    let mut both = marker.clone();
+    both[5..13].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+
+    for (name, stream) in [("marker", &marker), ("known", &known), ("both", &both)] {
+        // Junk after the stream, in the same slice: the stream's own bytes
+        // are consumed and nothing else.
+        let mut input = stream.clone();
+        input.extend_from_slice(&[0x55; 4000]);
+        let mut dec = Decoder::new();
+        let mut out = vec![0u8; 256];
+        let (p, status) = dec.decode(&input, &mut out).unwrap();
+        assert_eq!(status, Status::StreamEnd, "{name}");
+        assert_eq!(p.consumed, stream.len(), "{name}");
+        assert_eq!(&out[..p.written], payload, "{name}");
+        for _ in 0..4 {
+            let (p, status) = dec.decode(&[0x55; 65536], &mut out).unwrap();
+            assert_eq!(
+                (p.consumed, p.written, status),
+                (0, 0, Status::StreamEnd),
+                "{name}"
+            );
+        }
+        let (p, status) = dec.finish(&mut out).unwrap();
+        assert_eq!((p.written, status), (0, Status::StreamEnd), "{name}");
+
+        // Junk arriving after the whole stream was fed: the end is reported
+        // as soon as the decoder can see it, then nothing is consumed.
+        let mut dec = Decoder::new();
+        let (p, _) = dec.decode(stream, &mut out).unwrap();
+        assert_eq!(p.consumed, stream.len(), "{name}");
+        let mut n = p.written;
+        let mut ended = false;
+        let mut taken = 0;
+        for _ in 0..8 {
+            let (p, status) = dec.decode(&[0x55; 65536], &mut out[n..]).unwrap();
+            n += p.written;
+            taken += p.consumed;
+            if ended {
+                assert_eq!((p.consumed, p.written), (0, 0), "{name}");
+            }
+            ended |= status == Status::StreamEnd;
+        }
+        assert!(ended, "{name}: decode never reported StreamEnd");
+        assert_eq!(taken, 0, "{name}: junk consumed");
+        assert_eq!(&out[..n], payload, "{name}");
+    }
+}
+
+/// A full output buffer stops the decoder from taking more input, so one
+/// large input slice is not copied into the decoder wholesale.
+#[test]
+fn decode_applies_backpressure_to_input() {
+    let payload = flush_noise(300 * 1024, 7);
+    let stream = encode_at_level(&payload, 0);
+    assert!(stream.len() > 250 * 1024);
+    let mut dec = Decoder::new();
+    let mut out = [0u8; 512];
+    let (p, status) = dec.decode(&stream, &mut out).unwrap();
+    assert_eq!((p.written, status), (512, Status::OutputFull));
+    assert!(p.consumed < 8192, "consumed {} bytes", p.consumed);
+    // And the whole thing still decodes that way.
+    assert_eq!(decode_chunked(&stream, stream.len(), 512).unwrap(), payload);
+    assert_eq!(decode_chunked(&stream, 1, 100_000).unwrap(), payload);
+}
+
+/// A declared size whose stream neither ends there nor continues with an
+/// end marker is corrupt; the trailing packets used to be ignored.
+#[test]
+fn data_past_declared_size_is_corrupt() {
+    // "hello world" with the size set to 5: a literal follows.
+    let mut stream = hex(FIX_HELLO);
+    stream[5..13].copy_from_slice(&5u64.to_le_bytes());
+    assert_eq!(decode_one_shot(&stream), Err(Error::Corrupt));
+}
+
 // ─── algorithm metadata ─────────────────────────────────────────────────
 
 #[test]

@@ -48,13 +48,22 @@
 //! References: 7-Zip / lzma-sdk source (well-commented C reference) and
 //! `xz-utils` (`liblzma/lz/`, `liblzma/rangecoder/`).
 //!
-//! Streaming model: the decoder buffers compressed input in an internal
-//! `Vec<u8>`. Each call drains as much of the caller's output as possible by
-//! attempting LZMA "packets" (a literal or a match). Before each packet the
-//! range-decoder state is snapshotted; if the packet would read past the end
-//! of the buffered input it is rolled back and the codec asks for more input
-//! on the next call. This keeps the per-call buffers small while preserving
-//! the streaming `consumed`/`written` contract from `traits.rs`.
+//! Streaming model: the decoder copies compressed input into a small
+//! internal `Vec<u8>` a bounded piece at a time. Each call drains as much of
+//! the caller's output as possible by attempting LZMA "packets" (a literal
+//! or a match). A packet is only started once enough input is buffered for
+//! the largest possible packet; otherwise the codec asks for more input on
+//! the next call (`finish` lifts that gate). Input the range decoder has not
+//! read when the output fills up or the stream ends is left unconsumed, so
+//! the buffer stays small whatever the size of the caller's slices.
+//!
+//! End of stream: `decode` returns `StreamEnd` once the end marker has been
+//! read or the declared size has been reached, and consumes nothing after
+//! that. A `.lzma` stream with a declared size may still carry an end
+//! marker; it is read too. Any other data past the declared size is
+//! [`Error::Corrupt`]. Because a packet needs up to 20 bytes of lookahead,
+//! a stream whose last bytes arrive without anything following them ends in
+//! `finish` rather than in `decode`.
 //!
 //! The encoder lives in the private `encoder` submodule. It accumulates input into a buffer and
 //! emits the entire compressed stream on `finish` — LZMA's range coder
@@ -102,11 +111,10 @@ impl Algorithm for Lzma {
 const REQUIRED_INPUT_MAX: usize = 20;
 
 /// Threshold at which `drain_output` collapses the consumed prefix of
-/// `Decoder::buf`. Compacting on every packet was the dominant decode
-/// cost on incompressible inputs: each packet drained a few bytes from a
-/// buffer holding the entire compressed stream (memmove of ~N bytes per
-/// packet → O(N^2)). Holding off until the prefix is at least this large
-/// caps total memmove work at O(N · buf_max / threshold).
+/// `Decoder::buf`. Compacting on every packet would memmove the buffered
+/// tail once per packet. Input is absorbed `ABSORB_CHUNK` bytes at a time,
+/// so at most that much is moved per `COMPACT_THRESHOLD` bytes consumed and
+/// the buffer never holds more than about the sum of the two.
 const COMPACT_THRESHOLD: usize = 64 * 1024;
 
 const STATES: usize = 12;
@@ -243,7 +251,7 @@ impl RangeDecoder {
         }
     }
 
-    /// End-of-stream check (ZIP mode): normalise once more so the stream's
+    /// End-of-stream check: normalise once more so the stream's
     /// last byte is read, then report whether `code == 0`, as a cleanly
     /// flushed encoder leaves it. `None` means that byte has not arrived.
     fn finish(&mut self, buf: &[u8], at_eof: bool) -> Result<Option<bool>, Error> {
@@ -422,8 +430,9 @@ struct LzmaCore {
     lit_pos_mask: u32,
     /// Uncompressed length, or `None` for "until EOS marker".
     uncompressed_size: Option<u64>,
-    /// ZIP mode only: the entry's declared size. The stream must end at
-    /// exactly this many bytes, by the marker or by reaching the size.
+    /// The declared size (`.lzma` header field or ZIP entry size), when
+    /// known. The stream must end at exactly this many bytes, by the
+    /// marker or by reaching the size.
     expected_len: Option<u64>,
 
     // Dictionary / sliding window (decoded output buffer).
@@ -736,7 +745,7 @@ impl LzmaCore {
     /// `Error::UnexpectedEnd`.
     fn step(&mut self, buf: &[u8], at_eof: bool) -> Result<PacketOutcome, Error> {
         let outcome = self.step_inner(buf, at_eof)?;
-        // ZIP mode: the stream must end at exactly the declared size. With
+        // The stream must end at exactly the declared size. With
         // a size cap (`uncompressed_size`) matches are cut at the size; with
         // a required marker nothing may run past it.
         if let Some(t) = self.expected_len {
@@ -910,14 +919,20 @@ enum HeaderState {
 /// Streaming LZMA decoder: legacy `.lzma` (alone) streams by default, or
 /// ZIP method-14 entry data with [`Decoder::zip`].
 ///
-/// Buffers compressed input in an internal `Vec<u8>`. Decodes in
-/// "one-packet-at-a-time" mode, with the range decoder's state being
-/// snapshotted before each attempt; an input-starved attempt is rolled
-/// back and retried after the caller pushes more bytes.
+/// Copies compressed input into a small internal buffer in bounded pieces
+/// and decodes one packet at a time; a packet is only attempted once enough
+/// input for the largest possible packet is buffered (or `finish` was
+/// called).
+///
+/// When the stream ends inside a [`decode`](crate::Decoder::decode) call
+/// the decoder returns `StreamEnd` and leaves the bytes after the stream
+/// unconsumed (except for up to 20 bytes taken by earlier calls when the
+/// input arrives in very small pieces). Later `decode` calls consume
+/// nothing and return `StreamEnd` again.
 pub struct Decoder {
-    /// Compressed input buffer. We accumulate bytes here as `decode` is
-    /// called and drop the front prefix once the range decoder has moved
-    /// past it.
+    /// Compressed input buffer. Bounded pieces of the caller's input are
+    /// appended here and the front prefix is dropped once the range decoder
+    /// has moved well past it.
     buf: Vec<u8>,
     /// Pending-output: a match-copy that we couldn't fully drain into the
     /// caller's output buffer on the previous call.
@@ -941,9 +956,9 @@ struct ZipParams {
 /// then the 5 properties bytes.
 const ZIP_HEADER_LEN: usize = 9;
 
-/// Bytes of caller input copied into `buf` per step in ZIP mode, so the
-/// bytes past the end of the entry can be handed back unconsumed.
-const ZIP_ABSORB_CHUNK: usize = 4096;
+/// Bytes of caller input copied into `buf` per step, so `buf` stays small
+/// and the bytes past the end of the stream can be handed back unconsumed.
+const ABSORB_CHUNK: usize = 4096;
 
 struct PendingMatch {
     /// 0-based LZ distance for this match (already stored in `rep0`).
@@ -1101,7 +1116,7 @@ impl Decoder {
             // must end at (ZIP only).
             let (unc, expected) = match self.zip {
                 None if uncompressed_size == u64::MAX => (None, None),
-                None => (Some(uncompressed_size), None),
+                None => (Some(uncompressed_size), Some(uncompressed_size)),
                 Some(z) if z.eos_marker => (None, z.uncompressed_len),
                 Some(z) => (z.uncompressed_len, z.uncompressed_len),
             };
@@ -1118,10 +1133,11 @@ impl Decoder {
         Ok(true)
     }
 
-    /// `raw_decode` for ZIP mode: copies input in bounded chunks and hands
-    /// back the bytes the range decoder did not read when it stops for a
-    /// full output buffer or at the end of the stream.
-    fn zip_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
+    /// `raw_decode` for both framings: copies input in bounded chunks and
+    /// hands back the bytes the range decoder did not read when it stops
+    /// for a full output buffer or at the end of the stream. Once the
+    /// stream has ended nothing more is consumed.
+    fn absorb_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         if matches!(self.header_state, HeaderState::Done) {
             return Ok(RawProgress {
                 consumed: 0,
@@ -1132,7 +1148,7 @@ impl Decoder {
         let mut taken = 0usize;
         let mut written = 0usize;
         loop {
-            let take = (input.len() - taken).min(ZIP_ABSORB_CHUNK);
+            let take = (input.len() - taken).min(ABSORB_CHUNK);
             self.buf.extend_from_slice(&input[taken..taken + take]);
             taken += take;
             if self.start()? {
@@ -1168,29 +1184,7 @@ impl Decoder {
 
 impl RawDecoder for Decoder {
     fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
-        if self.zip.is_some() {
-            return self.zip_decode(input, output);
-        }
-        self.buf.extend_from_slice(input);
-        let mut written = 0usize;
-        if !self.start()? {
-            return Ok(RawProgress {
-                consumed: input.len(),
-                written: 0,
-                done: false,
-            });
-        }
-
-        // ── main decode loop ──────────────────────────────────────────
-        // The caller's input has been fully absorbed into self.buf, so we
-        // report `consumed == input.len()`; compact_buf has already dropped
-        // the prefix that the range decoder finished with.
-        self.drain_output(output, &mut written, false)?;
-        Ok(RawProgress {
-            consumed: input.len(),
-            written,
-            done: false,
-        })
+        self.absorb_decode(input, output)
     }
 
     fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
@@ -1342,23 +1336,21 @@ impl Decoder {
                 core.finished = true;
             }
             if core.finished {
-                // ZIP: read the stream's last byte and check the coder
-                // ended cleanly, so consumption is exact.
-                if self.zip.is_some() {
-                    match core.range.finish(&self.buf, at_eof)? {
-                        None => return Ok(()),
-                        Some(true) => {}
-                        Some(false) if core.uncompressed_size.is_some() => {
-                            // Size reached but the coder has not ended: an
-                            // end marker may follow even though the flag
-                            // did not say so. Read it (anything else past
-                            // the size is an error).
-                            core.uncompressed_size = None;
-                            core.finished = false;
-                            continue;
-                        }
-                        Some(false) => return Err(Error::Corrupt),
+                // Read the stream's last byte and check the coder ended
+                // cleanly, so consumption is exact.
+                match core.range.finish(&self.buf, at_eof)? {
+                    None => return Ok(()),
+                    Some(true) => {}
+                    Some(false) if core.uncompressed_size.is_some() => {
+                        // Size reached but the coder has not ended: an
+                        // end marker may follow even though the header
+                        // (or ZIP flag) did not say so. Read it (anything
+                        // else past the size is an error).
+                        core.uncompressed_size = None;
+                        core.finished = false;
+                        continue;
                     }
+                    Some(false) => return Err(Error::Corrupt),
                 }
                 self.leftover = self.buf.len() - core.range.pos;
                 self.header_state = HeaderState::Done;
@@ -1367,12 +1359,7 @@ impl Decoder {
 
             // Compact buf so range.pos doesn't drift indefinitely — but
             // only when the consumed prefix has grown large enough that
-            // the memmove cost is amortised. Compacting on *every* packet
-            // was the dominant cost on incompressible inputs: each packet
-            // would `drain(0..few_bytes)` from a buffer that may hold the
-            // entire compressed stream (~N bytes), producing O(N^2)
-            // behaviour. Defer until we've accumulated a chunk worth
-            // collapsing.
+            // the memmove cost is amortised (see `COMPACT_THRESHOLD`).
             if core.range.pos >= COMPACT_THRESHOLD {
                 let pos_before = core.range.pos;
                 self.buf.drain(0..pos_before);
@@ -1450,17 +1437,87 @@ impl Decoder {
                     }
                 }
                 PacketOutcome::Eos => {
-                    if self.zip.is_some() {
-                        // `core.finished` is set; the check above ends it.
-                        continue;
-                    }
-                    self.header_state = HeaderState::Done;
-                    return Ok(());
+                    // `core.finished` is set; the check above ends it.
+                    continue;
                 }
                 PacketOutcome::NeedInput => {
                     return Ok(());
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::{Decoder as _, Encoder as _, Status};
+
+    fn lcg_bytes(n: usize) -> Vec<u8> {
+        let mut x = 0x1234_5678u32;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn encode(data: &[u8]) -> Vec<u8> {
+        let mut enc = Encoder::with_config(EncoderConfig { level: 0 });
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 1 << 16];
+        let mut c = 0;
+        while c < data.len() {
+            let (p, _) = enc.encode(&data[c..], &mut buf).unwrap();
+            c += p.consumed;
+            out.extend_from_slice(&buf[..p.written]);
+        }
+        loop {
+            let (p, st) = enc.finish(&mut buf).unwrap();
+            out.extend_from_slice(&buf[..p.written]);
+            if st == Status::StreamEnd {
+                return out;
+            }
+        }
+    }
+
+    /// The input buffer must stay small however the input is sliced, and
+    /// must not grow once the stream has ended.
+    #[test]
+    fn input_buffer_stays_bounded() {
+        // Length stays under threshold + chunk + one packet; the capacity
+        // may be up to double that from `Vec` growth.
+        let bound = 2 * (COMPACT_THRESHOLD + 2 * ABSORB_CHUNK);
+        let plain = lcg_bytes(600 * 1024);
+        let mut stream = encode(&plain);
+        assert!(stream.len() > 500 * 1024, "payload must be incompressible");
+        let stream_len = stream.len();
+        stream.resize(stream_len + (1 << 20), 0x55);
+
+        // Whole input (stream plus 1 MiB of junk) in one slice.
+        let mut dec = Decoder::new();
+        let mut out = vec![0u8; 1 << 16];
+        let mut got = Vec::new();
+        let mut c = 0;
+        loop {
+            let (p, st) = dec.decode(&stream[c..], &mut out).unwrap();
+            c += p.consumed;
+            got.extend_from_slice(&out[..p.written]);
+            assert!(dec.buf.capacity() <= bound, "{}", dec.buf.capacity());
+            if st == Status::StreamEnd {
+                break;
+            }
+            assert!(p.consumed + p.written > 0, "stalled");
+        }
+        assert_eq!(c, stream_len);
+        assert!(got == plain);
+
+        // Junk after the end is not absorbed.
+        for _ in 0..64 {
+            let (p, st) = dec.decode(&[0x55; 65536], &mut out).unwrap();
+            assert_eq!((p.consumed, p.written, st), (0, 0, Status::StreamEnd));
+            assert!(dec.buf.capacity() <= bound, "{}", dec.buf.capacity());
         }
     }
 }
