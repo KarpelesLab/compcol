@@ -1834,8 +1834,9 @@ pub struct Decoder {
     /// here; trimmed once the bit-position passes complete bytes.
     raw: Vec<u8>,
     /// Bit position into `raw`. Always references bits we have not yet
-    /// committed to the output.
-    bit_pos: usize,
+    /// committed to the output. 64 bits wide: `raw.len() * 8` does not
+    /// fit a 32-bit `usize` once 512 MiB are buffered.
+    bit_pos: u64,
     /// Decoded output queued for the caller. Pushed to from both the
     /// uncompressed and compressed paths.
     out: Vec<u8>,
@@ -1852,8 +1853,11 @@ pub struct Decoder {
     /// Cursor into `dist_ring`: increments with each pushed distance.
     /// `dist_ring[(ring_idx + 3) & 3]` is the most recent distance.
     ring_idx: u32,
-    /// Total bytes ever decoded (sticky across meta-blocks).
-    total_out: usize,
+    /// Total bytes ever decoded (sticky across meta-blocks). 64 bits
+    /// wide whatever the target: a stream may well decode to more than
+    /// 4 GiB, and a `usize` wrapping there on 32-bit targets made every
+    /// later back-reference look out of range.
+    total_out: u64,
     /// The last two bytes ever emitted (`p1` is the most recent, `p2`
     /// is the second-most-recent), used to look up literal contexts.
     p1: u8,
@@ -1950,10 +1954,11 @@ impl Decoder {
     /// a long stream, shifting the rest down after every meta-block is
     /// quadratic.
     fn compact_raw(&mut self) {
-        let drop_bytes = self.bit_pos >> 3;
-        if drop_bytes > 0 && drop_bytes * 2 >= self.raw.len() {
+        // `bit_pos` is inside `raw`, so its byte index fits a `usize`.
+        let drop_bytes = (self.bit_pos >> 3) as usize;
+        if drop_bytes > 0 && drop_bytes >= self.raw.len() - drop_bytes {
             self.raw.drain(..drop_bytes);
-            self.bit_pos -= drop_bytes * 8;
+            self.bit_pos -= drop_bytes as u64 * 8;
         }
     }
 
@@ -2006,7 +2011,7 @@ impl Decoder {
     fn read_stream_header(&mut self) -> Result<bool, Error> {
         // Need at most 7 bits.
         let mut src = BitSource::at(&self.raw, self.bit_pos);
-        let total_bits = self.raw.len() * 8 - self.bit_pos;
+        let total_bits = self.raw.len() as u64 * 8 - self.bit_pos;
         if total_bits < 1 {
             return Ok(false);
         }
@@ -2189,13 +2194,13 @@ impl Decoder {
             src.align_to_byte();
             // Need `mskiplen` raw bytes after alignment. Check we have
             // them; otherwise UnexpectedEnd.
-            let byte_pos = src.position() / 8;
+            let byte_pos = (src.position() / 8) as usize;
             let need = byte_pos + mskiplen as usize;
             if raw.len() < need {
                 return Err(Error::UnexpectedEnd);
             }
             // Skip metadata bytes (they aren't emitted).
-            src.set_position(need * 8);
+            src.set_position(need as u64 * 8);
             self.bit_pos = src.position();
             return Ok(None);
         }
@@ -2228,7 +2233,7 @@ impl Decoder {
         if is_uncompressed {
             // Byte-align and copy MLEN raw bytes.
             src.align_to_byte();
-            let byte_pos = src.position() / 8;
+            let byte_pos = (src.position() / 8) as usize;
             let need = byte_pos + mlen as usize;
             if raw.len() < need {
                 return Err(Error::UnexpectedEnd);
@@ -2238,7 +2243,7 @@ impl Decoder {
             for b in &slice {
                 self.emit_literal(*b);
             }
-            src.set_position(need * 8);
+            src.set_position(need as u64 * 8);
             self.bit_pos = src.position();
             return Ok(None);
         }
@@ -2322,22 +2327,22 @@ impl Decoder {
     /// at least the last `distance` bytes of history for this to
     /// succeed.
     fn emit_copy(&mut self, distance: u32, len: u32) -> Result<(), Error> {
-        if distance as usize > self.total_out {
+        if distance as u64 > self.total_out {
             return Err(Error::InvalidDistance);
         }
         if len == 0 {
             return Ok(());
         }
-        let out_base = self.total_out - self.out.len();
-        let g0 = (self.total_out as u64) - (distance as u64);
-        if g0 < out_base as u64 {
+        let out_base = self.total_out - self.out.len() as u64;
+        let g0 = self.total_out - distance as u64;
+        if g0 < out_base {
             // Distance reaches further back than the retained window.
             // With our `compact_out` retaining `window_size` bytes this
             // should not happen for valid streams (Brotli back-references
             // are capped at `window_size - 16`).
             return Err(Error::InvalidDistance);
         }
-        let src_start = (g0 - out_base as u64) as usize;
+        let src_start = (g0 - out_base) as usize;
         let n = len as usize;
         if (distance as usize) >= n {
             // Non-overlapping: collapses to memcpy.
@@ -2352,7 +2357,7 @@ impl Decoder {
                 self.p2 = self.p1;
                 self.p1 = self.out[end - 1];
             }
-            self.total_out += n;
+            self.total_out += n as u64;
         } else if distance == 1 {
             // Byte-splat.
             let b = self.out[src_start];
@@ -2364,7 +2369,7 @@ impl Decoder {
                 self.p2 = self.p1;
                 self.p1 = b;
             }
-            self.total_out += n;
+            self.total_out += n as u64;
         } else {
             // Self-overlap (distance < len): expanding copy within the
             // already-produced region. Each `extend_from_within` copies a
@@ -2380,7 +2385,7 @@ impl Decoder {
             let end = self.out.len();
             self.p2 = self.out[end - 2];
             self.p1 = self.out[end - 1];
-            self.total_out += n;
+            self.total_out += n as u64;
         }
         Ok(())
     }
@@ -2788,13 +2793,10 @@ impl Decoder {
             mb.in_command = false;
 
             // Compute max-distance: min(window_size - 16, total_out so far).
-            // `total_out` is a usize accumulated over the whole stream; a plain
-            // `as u32` cast wraps after 4 GiB of output and collapses max_dist,
-            // corrupting decoding. Do the comparison at full usize width and
-            // clamp the (window-bounded) result back to u32 losslessly:
-            // max_dist <= window_size - 16, which always fits in u32.
-            let max_dist =
-                (self.window_size.saturating_sub(16) as usize).min(self.total_out) as u32;
+            // `total_out` counts the whole stream and passes 4 GiB, so the
+            // comparison is done at 64 bits; the result is at most
+            // `window_size - 16` and fits back in a u32.
+            let max_dist = (self.window_size.saturating_sub(16) as u64).min(self.total_out) as u32;
             if distance <= max_dist {
                 // Normal back-reference. Non-short distances are
                 // pushed to the ring here. Reject a copy running past the
@@ -3544,7 +3546,7 @@ impl RawDecoder for Decoder {
             // Bytes after the last meta-block are not part of the stream:
             // hand back the ones that came from this call so the caller
             // can see where the brotli data stops, and drop the rest.
-            let end = self.bit_pos.div_ceil(8);
+            let end = self.bit_pos.div_ceil(8) as usize;
             if self.raw.len() > end {
                 consumed -= (self.raw.len() - end).min(consumed);
                 self.raw.truncate(end);

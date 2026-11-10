@@ -367,3 +367,21 @@ fn header_resumes_at_any_split() {
         }
     }
 }
+
+#[test]
+fn output_count_passes_4_gib() {
+    // The count of bytes decoded so far must not be a `usize`: on 32-bit
+    // targets it wrapped (or panicked) after 4 GiB of output, after which
+    // valid back-references were rejected. Start just short of 4 GiB, as
+    // if that much had been decoded and dropped, and cross the boundary.
+    let mlen = (1u32 << 20) + 8;
+    let data = splat_stream(16, 2, mlen);
+    let total = 1 + 2 * mlen as usize;
+    let start = u32::MAX - (1 << 20);
+    let mut dec = Decoder::new();
+    dec.total_out = u64::from(start);
+    let out = decode_with(&mut dec, &data, usize::MAX, 1 << 16);
+    assert_eq!(out.len(), total);
+    assert!(out.iter().all(|&b| b == 0x41));
+    assert_eq!(dec.total_out, u64::from(start) + total as u64);
+}
