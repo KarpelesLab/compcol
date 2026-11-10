@@ -234,6 +234,17 @@ fn auto_detect_unknown_format_is_usage_error() {
 }
 
 #[test]
+fn auto_detect_failure_names_the_real_flag() {
+    // The hint must name a flag that exists: the option is `--type` / `-t`
+    // (there is no `--algo`).
+    let (_out, err, code) = run_with_stdin(&["-d"], b"this is not a compressed stream at all");
+    assert_eq!(code, 2);
+    let s = String::from_utf8_lossy(&err);
+    assert!(s.contains("--type"), "stderr: {s}");
+    assert!(!s.contains("--algo"), "stderr: {s}");
+}
+
+#[test]
 fn pipe_round_trip_zlib() {
     let input = b"compress me through zlib".to_vec();
     let (encoded, _err, code) = run_with_stdin(&["-t", "zlib"], &input);

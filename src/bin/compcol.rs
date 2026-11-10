@@ -469,7 +469,7 @@ fn run(args: &Args) -> Result<(), RunError> {
             Some(name) => name.to_string(),
             None => {
                 return Err(RunError::Usage(
-                    "could not detect format; specify with --algo (e.g. -t gzip)".into(),
+                    "could not detect format; specify with --type (e.g. -t gzip)".into(),
                 ));
             }
         }
