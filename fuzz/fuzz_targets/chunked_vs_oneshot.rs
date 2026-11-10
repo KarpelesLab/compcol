@@ -27,12 +27,6 @@ use common::{Outcome, Sizes};
 /// Decoders left out of the comparison, each with the reason. Keep this
 /// list honest: an entry is a known divergence to triage, not a fix.
 const EXCLUDED: &[&str] = &[
-    // Depends on the *output* buffer size: a stream the one-shot run
-    // decodes to StreamEnd fails with UnexpectedEnd in `finish` when
-    // drained through a small buffer (1 or 255 bytes; 64 KiB is fine).
-    // Reproducer (whole fuzz input, hex):
-    //   3f0309040001000200030000ff87ff6fff2dfffffe6d236ddb70617263b6
-    "squeeze",
     // Depends on the *input* chunk size: a stream the one-shot run rejects
     // as Corrupt decodes to StreamEnd when fed 1, 2, 3 or 7 bytes at a time
     // (4, 5, 8 and larger chunks agree with one-shot).

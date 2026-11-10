@@ -43,7 +43,8 @@
 //! Crafted streams never panic. A malformed node table (out-of-range child
 //! index, a cycle, or a leaf value > 256) returns
 //! [`Error::InvalidHuffmanTree`]; a truncated bitstream that cannot reach a
-//! leaf returns [`Error::UnexpectedEnd`]; the node count is bounded
+//! leaf returns [`Error::UnexpectedEnd`], as does an end-of-stream symbol
+//! that follows a `0x90` flag with no count byte; the node count is bounded
 //! (`<= MAX_NODES`); RLE output growth uses checked arithmetic and the run
 //! expansion is bounded.
 //!
@@ -800,6 +801,22 @@ impl RawDecoder for Decoder {
         self.compact_in_buf();
 
         let done = self.eos && self.emit_head >= self.emit_buf.len();
+        if done && self.rle.pending() {
+            // The end-of-stream symbol directly follows a 0x90 run flag
+            // that never got its count byte: the stream is malformed, and
+            // must be whether its end is reached here or in `raw_finish`
+            // (which of the two sees it depends only on the caller's
+            // output buffer). An error carries no progress, so hand over
+            // what this call wrote first and fail on the next call.
+            if written > 0 {
+                return Ok(RawProgress {
+                    consumed,
+                    written,
+                    done: false,
+                });
+            }
+            return Err(Error::UnexpectedEnd);
+        }
         if done {
             self.completed = true;
         }
@@ -852,12 +869,22 @@ impl RawDecoder for Decoder {
             });
         }
 
-        if !self.eos {
-            // Ran out of input without reaching the EOS symbol.
-            return Err(Error::UnexpectedEnd);
-        }
-        // A dangling RLE flag (0x90 with no count) at true EOF is malformed.
-        if self.rle.pending() {
+        // Ran out of input without reaching the EOS symbol, or reached it
+        // right after a dangling RLE flag (0x90 with no count): either way
+        // the stream is malformed.
+        if !self.eos || self.rle.pending() {
+            // An error carries no progress, so the bytes this call drained
+            // would be lost with it, and how many those are depends on the
+            // caller's buffer size. Hand them over and fail on the next
+            // call instead: every caller then gets the same output before
+            // the same error.
+            if written > 0 {
+                return Ok(RawProgress {
+                    consumed: 0,
+                    written,
+                    done: false,
+                });
+            }
             return Err(Error::UnexpectedEnd);
         }
 

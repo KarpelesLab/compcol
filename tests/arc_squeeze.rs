@@ -379,3 +379,116 @@ fn finish_drains_with_tiny_output_buffers() {
         assert_eq!(out, input, "out_len {out_len}");
     }
 }
+
+/// Decode `stream` the way a streaming caller does — `in_chunk` bytes per
+/// `decode` call, an `out_chunk`-byte output buffer, then `finish` until it
+/// ends — and return the verdict together with every byte handed out.
+fn decode_outcome(
+    stream: &[u8],
+    in_chunk: usize,
+    out_chunk: usize,
+) -> (Result<(), Error>, Vec<u8>) {
+    let mut dec = Decoder::new();
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; out_chunk];
+    let mut pos = 0;
+    let mut steps = 0usize;
+    while pos < stream.len() {
+        steps += 1;
+        assert!(steps < 1 << 20, "decode did not terminate");
+        let end = pos.saturating_add(in_chunk).min(stream.len());
+        match dec.decode(&stream[pos..end], &mut buf) {
+            Ok((p, status)) => {
+                out.extend_from_slice(&buf[..p.written]);
+                pos += p.consumed;
+                if status == Status::StreamEnd {
+                    return (Ok(()), out);
+                }
+            }
+            Err(e) => return (Err(e), out),
+        }
+    }
+    loop {
+        steps += 1;
+        assert!(steps < 1 << 20, "finish did not terminate");
+        match dec.finish(&mut buf) {
+            Ok((p, status)) => {
+                out.extend_from_slice(&buf[..p.written]);
+                if status == Status::StreamEnd {
+                    return (Ok(()), out);
+                }
+            }
+            Err(e) => return (Err(e), out),
+        }
+    }
+}
+
+// Found by the `chunked_vs_oneshot` fuzz target. The last symbol before the
+// end-of-stream symbol is a bare 0x90 run flag with no count byte, which is
+// malformed. `decode` used to report `StreamEnd` for it whenever the end
+// symbol was reached and the output drained within a `decode` call (a large
+// output buffer), while a small output buffer left the verdict to `finish`,
+// which rejected it: the result depended on the caller's buffer size.
+#[test]
+fn dangling_run_flag_is_rejected_for_every_chunking() {
+    let stream: [u8; 27] = [
+        0x04, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0xff, 0x87, 0xff, 0x6f, 0xff, 0x2d,
+        0xff, 0xff, 0xfe, 0x6d, 0x23, 0x6d, 0xdb, 0x70, 0x61, 0x72, 0x63, 0xb6,
+    ];
+    let reference = decode_outcome(&stream, usize::MAX, 1 << 16);
+    assert_eq!(reference.0, Err(Error::UnexpectedEnd));
+    // Everything decoded ahead of the bad flag is still delivered.
+    assert_eq!(reference.1.len(), 1101);
+    for in_chunk in [1usize, 2, 3, 5, 8, 26, 27, usize::MAX] {
+        for out_chunk in [
+            1usize,
+            2,
+            3,
+            7,
+            61,
+            255,
+            256,
+            1099,
+            1100,
+            1101,
+            4096,
+            1 << 16,
+        ] {
+            let got = decode_outcome(&stream, in_chunk, out_chunk);
+            let at = format!("in_chunk {in_chunk}, out_chunk {out_chunk}");
+            assert_eq!(
+                (&got.0, got.1.len()),
+                (&reference.0, reference.1.len()),
+                "{at}"
+            );
+            assert!(got.1 == reference.1, "{at}: delivered bytes differ");
+        }
+    }
+}
+
+// The same must hold for a stream that simply stops short of its
+// end-of-stream symbol: same verdict and same delivered bytes however the
+// caller slices it.
+#[test]
+fn truncated_stream_agrees_for_every_chunking() {
+    let input: Vec<u8> = (0..3000u32)
+        .map(|i| b"squeeze me, arc!"[(i % 16) as usize] ^ (i / 97) as u8)
+        .collect();
+    let encoded = encode_chunked(&input, input.len(), 1 << 16);
+    let cut = &encoded[..encoded.len() - 40];
+    let reference = decode_outcome(cut, usize::MAX, 1 << 16);
+    assert_eq!(reference.0, Err(Error::UnexpectedEnd));
+    assert!(!reference.1.is_empty() && input.starts_with(&reference.1));
+    for in_chunk in [1usize, 7, 256, usize::MAX] {
+        for out_chunk in [1usize, 3, 255, 4096] {
+            let got = decode_outcome(cut, in_chunk, out_chunk);
+            let at = format!("in_chunk {in_chunk}, out_chunk {out_chunk}");
+            assert_eq!(
+                (&got.0, got.1.len()),
+                (&reference.0, reference.1.len()),
+                "{at}"
+            );
+            assert!(got.1 == reference.1, "{at}: delivered bytes differ");
+        }
+    }
+}
