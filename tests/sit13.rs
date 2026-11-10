@@ -221,6 +221,24 @@ fn illegal_control_byte_is_corrupt() {
     }
 }
 
+/// A dynamic header transmitting the complete code with lengths
+/// 1, 2, …, 31, 32, 32: the canonical code after the last 32-bit one is
+/// 2^32, which the table builder must not compute in 32 bits (it used to
+/// panic under overflow checks).
+#[test]
+fn complete_code_with_32_bit_lengths_does_not_overflow() {
+    let payload: [u8; 47] = [
+        0x08, 0xd8, 0xc5, 0x02, 0x02, 0x06, 0xc0, 0xaf, 0x94, 0xf1, 0xbd, 0x40, 0x10, 0x87, 0xc1,
+        0x86, 0xbd, 0x80, 0x01, 0x1a, 0x70, 0x80, 0x0f, 0x78, 0x80, 0x04, 0x04, 0xa0, 0xb0, 0x07,
+        0xfb, 0xb1, 0x0f, 0x3b, 0xb1, 0xa3, 0x23, 0xe8, 0x47, 0x3f, 0xfa, 0x91, 0x0d, 0, 0, 0, 0,
+    ];
+    let mut dec = Decoder::new();
+    let mut out = [0u8; 64];
+    let _ = dec.decode(&payload, &mut out);
+    // The tables build; the token stream after them is cut short.
+    assert_eq!(dec.finish(&mut out), Err(Error::UnexpectedEnd));
+}
+
 // ─── poisoning + reset recovery ──────────────────────────────────────────
 
 #[test]

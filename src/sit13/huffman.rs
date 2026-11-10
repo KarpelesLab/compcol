@@ -90,11 +90,15 @@ impl Huffman {
         }
 
         // Standard canonical first-code-per-length (MSB space).
-        let mut next_code = [0u32; MAX_CODE_LENGTH as usize + 1];
-        let mut code: u32 = 0;
+        // Computed in u64: with Kraft equality the running code after the
+        // last length is exactly `2^max_len`, i.e. 2^32 for a 32-bit code,
+        // and it is doubled once more before the loop ends. Every code that
+        // is actually assigned is below `2^l` and so fits a u32.
+        let mut next_code = [0u64; MAX_CODE_LENGTH as usize + 1];
+        let mut code: u64 = 0;
         for l in 1..=max_len {
             next_code[l as usize] = code;
-            code = (code + counts[l as usize]) << 1;
+            code = (code + counts[l as usize] as u64) << 1;
         }
 
         let mut builder = TrieBuilder::new();
@@ -103,7 +107,7 @@ impl Huffman {
             if l == 0 {
                 continue;
             }
-            let msb_code = next_code[l as usize];
+            let msb_code = next_code[l as usize] as u32;
             next_code[l as usize] += 1;
             // Read LSB-first ⇒ stream value is the bit-reverse of the MSB
             // canonical code, taken to `l` bits.
@@ -288,6 +292,23 @@ mod tests {
             Huffman::from_lengths(&lens),
             Err(Error::InvalidHuffmanTree)
         ));
+    }
+
+    #[test]
+    fn complete_code_with_two_32_bit_lengths() {
+        // Lengths 1, 2, …, 31, 32, 32 satisfy Kraft equality; the canonical
+        // code following the last 32-bit one is 2^32.
+        let mut lens: Vec<u8> = (1..=32).collect();
+        lens.push(32);
+        let h = Huffman::from_lengths(&lens).unwrap();
+        // MSB-canonical codes: symbol k (k < 31) is k ones then a zero;
+        // symbols 31 and 32 are 31 ones followed by 0 and 1.
+        let mut r = BitReader::new(&[0x00]);
+        assert_eq!(h.decode(&mut r).unwrap(), 0);
+        let mut r = BitReader::new(&[0xFF, 0xFF, 0xFF, 0x7F]);
+        assert_eq!(h.decode(&mut r).unwrap(), 31);
+        let mut r = BitReader::new(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(h.decode(&mut r).unwrap(), 32);
     }
 
     #[test]
