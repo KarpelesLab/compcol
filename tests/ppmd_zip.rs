@@ -84,6 +84,14 @@ fn mixed(seed: u64, len: usize) -> Vec<u8> {
     out
 }
 
+/// Uniform random bytes over an evenly spread `symbols`-value alphabet.
+fn small_alphabet(seed: u64, len: usize, symbols: u64) -> Vec<u8> {
+    let mut r = Rng(seed);
+    (0..len)
+        .map(|_| (((r.next() >> 11) % symbols) * 255 / (symbols - 1)) as u8)
+        .collect()
+}
+
 /// The named fixture inputs. Keep in sync with `FIXTURES`.
 fn input(name: &str) -> Vec<u8> {
     match name {
@@ -95,6 +103,11 @@ fn input(name: &str) -> Vec<u8> {
         // memory several times (restart / cut-off).
         "o16_m1_restart" | "o16_m1_cutoff" => words(3, 110_000, 30_000),
         "o10_m1_cutoff_text" => words(4, 150_000, 4000),
+        // Random data over 8 symbols at order 6: the cut-off restore frees
+        // so many single-unit contexts that more than a third of the
+        // arena's units sit on the free lists when they are next glued.
+        // (This fixture was written by p7zip 17.05's `7z`, same options.)
+        "o6_m1_cutoff_sym8" => small_alphabet(0x9E37_79B9_7F4A_7C15, 66_000, 8),
         _ => panic!("unknown fixture {name}"),
     }
 }
@@ -110,6 +123,7 @@ const FIXTURES: &[(&str, u32, u32, u32)] = &[
     ("o16_m1_restart", 16, 1, 5),
     ("o16_m1_cutoff", 16, 1, 9),
     ("o10_m1_cutoff_text", 10, 1, 9),
+    ("o6_m1_cutoff_sym8", 6, 1, 9),
 ];
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -258,6 +272,19 @@ fn chunked_io() {
             assert!(got == want, "{name} {ic}/{oc} marker");
         }
     }
+}
+
+/// A cut-off stream whose free lists hold more than a third of the arena:
+/// gluing them visits every free node up to three times, which the
+/// allocator's damaged-list guard used to mistake for corruption.
+#[test]
+fn cutoff_with_many_free_nodes_decodes() {
+    let data = fixture("o6_m1_cutoff_sym8");
+    assert_eq!(data.len(), 26_592);
+    assert_eq!(data[..4], [0x05, 0x10, 0x24, 0x6e]);
+    let want = input("o6_m1_cutoff_sym8");
+    let got = decode(&data, want.len() as u64).expect("valid cut-off stream");
+    assert!(got == want, "output differs");
 }
 
 #[test]
