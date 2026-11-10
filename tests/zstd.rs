@@ -1601,3 +1601,189 @@ fn single_segment_block_maximum_size_is_the_content_size() {
     blocks.extend_from_slice(&comp(1));
     assert_eq!(decode_all_chunkings(&ss(4, &blocks)).unwrap(), b"abcz");
 }
+
+// ─── decoder: entropy bitstreams must be consumed exactly ───────────────
+
+/// Windowed (1 KiB) frame holding one last Compressed_Block with `body`.
+fn compressed_block_frame(body: &[u8]) -> Vec<u8> {
+    let mut f = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00];
+    f.extend_from_slice(&block_header(true, 2, body.len() as u32));
+    f.extend_from_slice(body);
+    f
+}
+
+/// The sequence bitstream must be used up exactly once the last sequence is
+/// decoded (reference: `BIT_endOfDStream` check, "corruption_detected").
+#[test]
+fn sequence_bitstream_must_be_fully_consumed() {
+    // Raw literals "abcd", one sequence (predefined tables): LL=4, ML=3,
+    // offset 1 → "abcd" + "ddd". Bitstream `00 8E 08`.
+    let exact =
+        compressed_block_frame(&[0x20, b'a', b'b', b'c', b'd', 0x01, 0x00, 0x00, 0x8E, 0x08]);
+    assert_eq!(
+        exact,
+        [
+            0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x55, 0x00, 0x00, 0x20, 0x61, 0x62, 0x63, 0x64,
+            0x01, 0x00, 0x00, 0x8E, 0x08
+        ]
+    );
+    assert_eq!(decode_all_chunkings(&exact).unwrap(), b"abcdddd");
+
+    // The audit's reproducer: one extra zero byte at the (unread) low end of
+    // the bitstream.
+    let padded = compressed_block_frame(&[
+        0x20, b'a', b'b', b'c', b'd', 0x01, 0x00, 0x00, 0x00, 0x8E, 0x08,
+    ]);
+    assert_eq!(
+        padded,
+        [
+            0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x5D, 0x00, 0x00, 0x20, 0x61, 0x62, 0x63, 0x64,
+            0x01, 0x00, 0x00, 0x00, 0x8E, 0x08
+        ]
+    );
+    assert_eq!(decode_all_chunkings(&padded), Err(Error::Corrupt));
+
+    // Two extra bytes.
+    let padded2 = compressed_block_frame(&[
+        0x20, b'a', b'b', b'c', b'd', 0x01, 0x00, 0x00, 0x00, 0x00, 0x8E, 0x08,
+    ]);
+    assert_eq!(decode_all_chunkings(&padded2), Err(Error::Corrupt));
+}
+
+/// Every Huffman-coded literal stream must end exactly on its last symbol
+/// (reference: `BIT_endOfDStream` per stream in huf_decompress.c).
+///
+/// The tree `80 10` gives symbols 0x00 and 0x01 one-bit codes (0 and 1), so
+/// a stream is just its symbols' bits below the start marker.
+#[test]
+fn huffman_literal_streams_must_be_fully_consumed() {
+    // ── 1 stream, 5 literals 0,1,1,0,1 → bits 01101 → `2D`.
+    let exact = compressed_block_frame(&[0x52, 0xC0, 0x00, 0x80, 0x10, 0x2D, 0x00]);
+    assert_eq!(decode_all_chunkings(&exact).unwrap(), [0, 1, 1, 0, 1]);
+    // One spare bit in the same byte (`5A` = marker + 011010).
+    let spare_bit = compressed_block_frame(&[0x52, 0xC0, 0x00, 0x80, 0x10, 0x5A, 0x00]);
+    assert_eq!(decode_all_chunkings(&spare_bit), Err(Error::Corrupt));
+    // A spare zero byte below the stream.
+    let spare_byte = compressed_block_frame(&[0x52, 0x00, 0x01, 0x80, 0x10, 0x00, 0x2D, 0x00]);
+    assert_eq!(decode_all_chunkings(&spare_byte), Err(Error::Corrupt));
+    // One bit short was always rejected.
+    let short = compressed_block_frame(&[0x52, 0xC0, 0x00, 0x80, 0x10, 0x16, 0x00]);
+    assert_eq!(decode_all_chunkings(&short), Err(Error::Corrupt));
+
+    // ── 4 streams, 8 literals 0,1 | 1,0 | 1,1 | 0,0 → `05`, `06`, `07`, `04`.
+    let four = |streams: [&[u8]; 4]| {
+        let total: usize = streams.iter().map(|s| s.len()).sum();
+        let comp = 2 + 6 + total; // tree + jump table + streams
+        let mut body = vec![0x86, ((comp & 3) << 6) as u8, (comp >> 2) as u8, 0x80, 0x10];
+        for s in &streams[..3] {
+            body.extend_from_slice(&(s.len() as u16).to_le_bytes());
+        }
+        for s in streams {
+            body.extend_from_slice(s);
+        }
+        body.push(0x00); // no sequences
+        compressed_block_frame(&body)
+    };
+    let good: [&[u8]; 4] = [&[0x05], &[0x06], &[0x07], &[0x04]];
+    assert_eq!(
+        four(good),
+        [
+            0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x85, 0x00, 0x00, 0x86, 0x00, 0x03, 0x80, 0x10,
+            0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x05, 0x06, 0x07, 0x04, 0x00
+        ]
+    );
+    assert_eq!(
+        decode_all_chunkings(&four(good)).unwrap(),
+        [0, 1, 1, 0, 1, 1, 0, 0]
+    );
+    // Each stream in turn with one spare bit, then with a spare zero byte.
+    let spare_bit: [&[u8]; 4] = [&[0x0A], &[0x0C], &[0x0E], &[0x08]];
+    let spare_byte: [&[u8]; 4] = [&[0x00, 0x05], &[0x00, 0x06], &[0x00, 0x07], &[0x00, 0x04]];
+    for i in 0..4 {
+        let mut s = good;
+        s[i] = spare_bit[i];
+        assert_eq!(
+            decode_all_chunkings(&four(s)),
+            Err(Error::Corrupt),
+            "stream {i}: spare bit"
+        );
+        let mut s = good;
+        s[i] = spare_byte[i];
+        assert_eq!(
+            decode_all_chunkings(&four(s)),
+            Err(Error::Corrupt),
+            "stream {i}: spare byte"
+        );
+    }
+
+    // ── 4 streams, 6 literals: the streams hold 2, 2, 2 and 0 symbols. The
+    // empty fourth stream must still be a well-formed, empty bitstream (a
+    // bare start marker), not arbitrary bytes.
+    let six = |s4: u8| {
+        compressed_block_frame(&[
+            0x66, 0x00, 0x03, 0x80, 0x10, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x05, 0x06, 0x07, s4,
+            0x00,
+        ])
+    };
+    assert_eq!(
+        decode_all_chunkings(&six(0x01)).unwrap(),
+        [0, 1, 1, 0, 1, 1]
+    );
+    assert_eq!(decode_all_chunkings(&six(0x04)), Err(Error::Corrupt));
+    assert_eq!(decode_all_chunkings(&six(0x00)), Err(Error::Corrupt));
+}
+
+/// The exact-consumption checks must never reject what the crate's own
+/// encoder writes: many small inputs of different shapes (so 1- and 4-stream
+/// Huffman literals, FSE-compressed / RLE / predefined / repeat sequence
+/// tables all occur) at assorted levels, with and without flushes.
+#[test]
+fn exact_bitstream_checks_accept_encoder_output() {
+    const LEVELS: [i32; 9] = [MIN_LEVEL, -50, -3, -1, 1, 3, 7, 15, 22];
+    for case in 0..240u32 {
+        let len = (case as usize * 131) % 6000;
+        let input: Vec<u8> = match case % 4 {
+            0 => gen_words(len),
+            // Skewed small alphabet: Huffman literals, few matches.
+            1 => lcg_bytes(case, len)
+                .into_iter()
+                .map(|b| b"aaaabbbcdeefghij"[(b & 15) as usize])
+                .collect(),
+            // Words interleaved with noise.
+            2 => gen_words(len)
+                .into_iter()
+                .zip(lcg_bytes(case, len))
+                .map(|(w, n)| if n < 40 { n } else { w })
+                .collect(),
+            // Short period with occasional breaks.
+            _ => lcg_bytes(case, len)
+                .into_iter()
+                .enumerate()
+                .map(|(i, n)| if n < 8 { n } else { (i % 7) as u8 })
+                .collect(),
+        };
+        let level = LEVELS[case as usize % LEVELS.len()];
+        let mut enc = Encoder::with_config(EncoderConfig { level });
+        let mut wire = Vec::new();
+        if case % 3 == 0 && len > 2 {
+            // Two flushed segments, then the rest: several blocks in one
+            // frame, so repeat tables / treeless literals get a chance.
+            let (a, rest) = input.split_at(len / 3);
+            let (b, c) = rest.split_at(len / 3);
+            flush_test_encode(&mut enc, a, 4096, &mut wire);
+            flush_test_flush(&mut enc, Flush::Sync, 4096, &mut wire);
+            flush_test_encode(&mut enc, b, 4096, &mut wire);
+            flush_test_flush(&mut enc, Flush::Full, 4096, &mut wire);
+            flush_test_encode(&mut enc, c, 4096, &mut wire);
+            flush_test_finish(&mut enc, 4096, &mut wire);
+        } else {
+            wire = encode_chunked(&mut enc, &input, 4096, 4096);
+        }
+        let decoded = decode_chunked(&wire, 4096, 4096);
+        assert!(
+            decoded.as_deref() == Ok(&input[..]),
+            "case {case}: len {len}, level {level}: {:?}",
+            decoded.map(|v| v.len())
+        );
+    }
+}

@@ -260,21 +260,28 @@ fn decode_compressed_literals(
     })
 }
 
+/// Decode exactly `n` symbols from the Huffman bitstream `data`.
+///
+/// The stream must be well-formed (non-empty, start marker in its last byte)
+/// and hold exactly the bits of those `n` symbols: bits left over after the
+/// last symbol are as much a corruption as running out early. The reference
+/// decoder enforces the same (`BIT_endOfDStream` on every stream in
+/// huf_decompress.c). This also covers a stream that carries no symbols at
+/// all (the fourth of a 4-stream block regenerating 6 or 9 bytes): it must
+/// still be a bare start marker.
 fn decode_huff_stream(
     data: &[u8],
     tree: &HuffTable,
     n: usize,
     out: &mut Vec<u8>,
 ) -> Result<(), Error> {
-    if n == 0 {
-        // Per RFC: a zero-length stream is still terminated by the start
-        // marker — but it's harmless to skip.
-        return Ok(());
-    }
     let mut br = RevBitReader::new(data)?;
     for _ in 0..n {
         let sym = tree.decode(&mut br)?;
         out.push(sym);
+    }
+    if br.remaining() != 0 {
+        return Err(Error::Corrupt);
     }
     Ok(())
 }

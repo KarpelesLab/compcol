@@ -196,6 +196,16 @@ pub fn decode_sequences(data: &[u8], state: &mut SequencesState) -> Result<Vec<S
         of_state.advance_with(of_entry, of_size, &mut br)?;
     }
 
+    // The bitstream must be used up exactly: nothing may be left between the
+    // last sequence's bits and the start of the stream. (Reading past the
+    // start already fails in `br.read`.) The reference decoder makes the same
+    // check (`BIT_endOfDStream` after the last sequence) and reports
+    // corruption; without it, bytes smuggled into the stream go unnoticed in
+    // a frame that carries no content checksum.
+    if br.remaining() != 0 {
+        return Err(Error::Corrupt);
+    }
+
     // Stash tables for potential Repeat_Mode reuse next block.
     state.ll_table = Some(ll_table);
     state.ml_table = Some(ml_table);
