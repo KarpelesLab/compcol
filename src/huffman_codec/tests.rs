@@ -307,6 +307,141 @@ fn declared_length_beyond_payload_is_rejected() {
     assert_eq!(decode(&s).unwrap(), vec![0u8; 8]);
 }
 
+// ─── exact stream length: no trailing bytes, zero padding ─────────────────
+
+/// Number of payload bits the encoder writes for `input`.
+fn payload_bits(input: &[u8]) -> usize {
+    let mut counts = [0u64; 256];
+    for &b in input {
+        counts[b as usize] += 1;
+    }
+    let lengths = length_limited_lengths(&scale_freqs(&counts), MAX_CODE_LEN);
+    input.iter().map(|&b| lengths[b as usize] as usize).sum()
+}
+
+#[test]
+fn trailing_bytes_are_corrupt() {
+    for input in [
+        &b"hello hello hello"[..],
+        b"abracadabra",
+        b"ab",
+        b"xxxxxxxxxxxxxxxx",
+        b"x",
+        b"",
+    ] {
+        let enc = encode(input);
+        assert_eq!(decode(&enc).unwrap(), input);
+        for trailer in [&b"GARBAGE-TRAILER"[..], &[0x00], &[0xFF], &[0x00; 9]] {
+            let mut s = enc.clone();
+            s.extend_from_slice(trailer);
+            assert_eq!(
+                decode(&s).unwrap_err(),
+                Error::Corrupt,
+                "input {input:?} + trailer {trailer:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nonzero_padding_bits_are_corrupt() {
+    let mut checked = 0;
+    for input in [
+        &b"hello hello hello"[..],
+        b"abracadabra",
+        b"ab",
+        b"abc",
+        b"the quick brown fox jumps over the lazy dog",
+        b"mississippi",
+    ] {
+        let enc = encode(input);
+        let pad = (8 - payload_bits(input) % 8) % 8;
+        // The encoder pads with zero bits…
+        let last = *enc.last().unwrap();
+        assert_eq!(last & ((1u16 << pad) - 1) as u8, 0, "{input:?}");
+        // …and the decoder insists on it: setting any padding bit is corrupt.
+        for bit in 0..pad {
+            let mut s = enc.clone();
+            *s.last_mut().unwrap() |= 1 << bit;
+            assert_eq!(
+                decode(&s).unwrap_err(),
+                Error::Corrupt,
+                "{input:?} bit {bit}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no input with padding bits was exercised");
+}
+
+#[test]
+fn single_symbol_payload_is_validated() {
+    // 16 × 'x': varint 16, table (101 absent, 'x' = 1 bit, 154 absent), then
+    // 16 payload bits, all zero (the lone symbol's code is `0`).
+    let good = [0x10u8, 0xF0, 0x65, 0x01, 0xF0, 0x74, 0x00, 0x00];
+    assert_eq!(encode(&[b'x'; 16]), good);
+    assert_eq!(decode(&good).unwrap(), [b'x'; 16]);
+
+    // Payload bits that are not the symbol's code.
+    for (i, b) in [(6, 0xFF), (7, 0xFF), (6, 0x80), (7, 0x01)] {
+        let mut s = good;
+        s[i] = b;
+        assert_eq!(decode(&s).unwrap_err(), Error::Corrupt, "byte {i}={b:#x}");
+    }
+    // Both payload bytes overwritten.
+    let mut s = good;
+    s[6] = 0xFF;
+    s[7] = 0xFF;
+    assert_eq!(decode(&s).unwrap_err(), Error::Corrupt);
+
+    // More payload than the declared length needs.
+    let mut s = good.to_vec();
+    s.push(0x00);
+    assert_eq!(decode(&s).unwrap_err(), Error::Corrupt);
+    // Less is truncation.
+    assert_eq!(
+        decode(&good[..good.len() - 1]).unwrap_err(),
+        Error::UnexpectedEnd
+    );
+
+    // 9 symbols need 2 bytes; the 7 padding bits must be zero too.
+    let mut s = good;
+    s[0] = 9;
+    assert_eq!(decode(&s).unwrap(), [b'x'; 9]);
+    s[7] = 0x01;
+    assert_eq!(decode(&s).unwrap_err(), Error::Corrupt);
+    // …and 8 symbols need exactly one byte, not two.
+    let mut s = good;
+    s[0] = 8;
+    assert_eq!(decode(&s).unwrap_err(), Error::Corrupt);
+    assert_eq!(decode(&s[..7]).unwrap(), [b'x'; 8]);
+}
+
+/// Every stream the encoder produces must satisfy the strict length/padding
+/// rules, across lengths that hit every padding width.
+#[test]
+fn encoder_output_always_satisfies_strict_decoder() {
+    let mut seed = 0x1234_5678_9abc_def1u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for len in 0..200usize {
+        // Single symbol, two symbols, skewed text-like, and wide alphabets.
+        let single = vec![b'q'; len];
+        let two: Vec<u8> = (0..len).map(|_| (next() % 2) as u8).collect();
+        let skew: Vec<u8> = (0..len)
+            .map(|_| b"aaaaaaaabbbbccd e"[(next() % 17) as usize])
+            .collect();
+        let wide: Vec<u8> = (0..len).map(|_| (next() >> 8) as u8).collect();
+        for input in [single, two, skew, wide] {
+            roundtrip(&input);
+        }
+    }
+}
+
 // ─── frequency scaling (inputs with ≥ 2^32 occurrences of a byte) ─────────
 //
 // The encoder used to count in `u32`, so a byte occurring 2^32 times wrapped

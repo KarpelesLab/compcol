@@ -38,6 +38,10 @@
 //! For an **empty input** the stream is just the single varint byte `0x00`;
 //! no table, no payload.
 //!
+//! The stream is exactly as long as its header says: the decoder rejects
+//! (as [`Error::Corrupt`]) any bytes after the payload and any padding bit
+//! that is not zero, so a stream cannot carry unauthenticated trailing data.
+//!
 //! ## Code-length table RLE
 //!
 //! The 256 code lengths (one nibble each, `0..=15`) are run-length encoded
@@ -68,7 +72,9 @@
 //!
 //! When the input is one distinct byte repeated, that byte is assigned a
 //! 1-bit code (the degenerate Huffman case). The payload is then one bit
-//! per input byte, i.e. `ceil(len/8)` bytes — a ~8× shrink.
+//! per input byte, i.e. `ceil(len/8)` bytes — a ~8× shrink. That code is the
+//! bit `0`, so the payload is all zero bytes, and the decoder requires
+//! exactly that.
 
 #![cfg_attr(docsrs, doc(cfg(feature = "huffman")))]
 
@@ -618,6 +624,10 @@ fn decode_stream(input: &[u8]) -> Result<Vec<u8>, Error> {
     let mut rest = &input[vlen..];
 
     if orig_len == 0 {
+        // An empty stream is the length varint and nothing else.
+        if !rest.is_empty() {
+            return Err(Error::Corrupt);
+        }
         return Ok(Vec::new());
     }
 
@@ -633,15 +643,23 @@ fn decode_stream(input: &[u8]) -> Result<Vec<u8>, Error> {
     if orig_len > (rest.len() as u64).saturating_mul(8) {
         return Err(Error::UnexpectedEnd);
     }
-    let orig_len = orig_len as usize;
-    let mut out = Vec::with_capacity(orig_len);
 
-    // Degenerate single-symbol stream: every code is one bit, the symbol is
-    // fixed. We don't need to inspect the payload bits.
+    // Degenerate single-symbol stream: every code is the one bit `0` (the
+    // canonical code of a lone 1-bit symbol), so the payload is exactly
+    // `ceil(len/8)` zero bytes — the symbols and the zero padding alike.
+    // Anything else (stray bits, extra bytes) is not something the encoder
+    // produces and is rejected rather than silently ignored.
     if let Some(sym) = table.single {
-        out.resize(orig_len, sym as u8);
+        if rest.len() as u64 != orig_len.div_ceil(8) || rest.iter().any(|&b| b != 0) {
+            return Err(Error::Corrupt);
+        }
+        let mut out = Vec::new();
+        out.resize(orig_len as usize, sym as u8);
         return Ok(out);
     }
+
+    let orig_len = orig_len as usize;
+    let mut out = Vec::with_capacity(orig_len);
 
     let max = table.max_length as u32;
 
@@ -703,6 +721,15 @@ fn decode_stream(input: &[u8]) -> Result<Vec<u8>, Error> {
         out.push(entry as u8);
         acc <<= len;
         have -= len;
+    }
+
+    // The stream must end here: every payload byte loaded, and what is left
+    // in the accumulator is only the final byte's padding — fewer than 8
+    // bits, all zero (`acc` is zero below its `have` valid bits, so testing
+    // the whole word tests exactly those). Trailing bytes or nonzero padding
+    // are not something the encoder produces.
+    if pos != data.len() || have >= 8 || acc != 0 {
+        return Err(Error::Corrupt);
     }
 
     Ok(out)
