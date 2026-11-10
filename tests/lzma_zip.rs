@@ -12,7 +12,7 @@
 #![cfg(feature = "lzma")]
 
 use compcol::lzma::{Decoder, DecoderConfig, Encoder, EncoderConfig};
-use compcol::{Decoder as _, Encoder as _, Error, Status};
+use compcol::{ContiguousDecoder as _, Decoder as _, Encoder as _, Error, Status};
 
 const METHOD_LZMA: u16 = 14;
 const GP_EOS: u16 = 0x0002;
@@ -660,4 +660,364 @@ fn decodes_fresh_7zip_and_python_entries() {
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─── contiguous output (ContiguousDecoder) ───────────────────────────────
+//
+// The ZIP modes through `decode_contiguous` / `finish_contiguous`: the
+// caller's buffer is the history, no dictionary is allocated, and the
+// marker / size rules and the errors are those of `decode` / `finish`.
+
+/// Like `run`, on the contiguous path. The buffer starts `start` bytes
+/// long; on `OutputFull` a new one `step` bytes longer replaces it (the
+/// old one is scribbled on first). `step == 0`: it must be big enough.
+fn run_contiguous(
+    dec: &mut Decoder,
+    input: &[u8],
+    in_chunk: usize,
+    start: usize,
+    step: usize,
+) -> Result<(Vec<u8>, usize), Error> {
+    fn grow(out: &mut Vec<u8>, filled: usize, step: usize) {
+        assert_eq!(filled, out.len(), "OutputFull with room left");
+        assert!(step > 0, "OutputFull with a buffer that should be enough");
+        let mut bigger = vec![0xA5u8; out.len() + step];
+        bigger[..filled].copy_from_slice(&out[..filled]);
+        out.fill(0x5A);
+        *out = bigger;
+    }
+    let mut out = vec![0xA5u8; start];
+    let mut filled = 0;
+    let mut pos = 0;
+    while pos < input.len() {
+        let end = (pos + in_chunk).min(input.len());
+        let (p, status) = dec.decode_contiguous(&input[pos..end], &mut out, filled)?;
+        pos += p.consumed;
+        filled += p.written;
+        match status {
+            Status::StreamEnd => {
+                out.truncate(filled);
+                return Ok((out, pos));
+            }
+            Status::OutputFull => grow(&mut out, filled, step),
+            Status::InputEmpty => assert_eq!(pos, end, "InputEmpty with input left"),
+        }
+    }
+    loop {
+        let (p, status) = dec.finish_contiguous(&mut out, filled)?;
+        filled += p.written;
+        if status == Status::StreamEnd {
+            out.truncate(filled);
+            return Ok((out, pos));
+        }
+        grow(&mut out, filled, step);
+    }
+}
+
+/// Decode `input` with `make`'s decoders on both paths, several ways of
+/// feeding and growing, and check that they agree. `n` is the decoded size
+/// to plan buffers with. Returns the windowed result.
+fn both_paths(
+    make: &dyn Fn() -> Decoder,
+    input: &[u8],
+    n: usize,
+    ctx: &str,
+) -> Result<(Vec<u8>, usize), Error> {
+    let whole = input.len().max(1);
+    let want = run(&mut make(), input, whole, 1 << 16);
+    let mut shapes = vec![
+        (whole, n, 0),
+        (whole, n + 100, 0),
+        (whole, 0, n / 9 + 1),
+        (300, n / 2, n / 4 + 7),
+    ];
+    if n <= 4096 {
+        shapes.extend([(1, 0, 1), (1, n, 0), (7, 3, 5)]);
+    }
+    for (in_chunk, start, step) in shapes {
+        let ctx = format!("{ctx}: in {in_chunk}, buffer {start}+{step}");
+        // The error of a stream fed in pieces is compared with the
+        // windowed path fed the same way; a good stream's output and
+        // consumption with the one-piece reference.
+        let want = match &want {
+            Err(_) if in_chunk < whole => run(&mut make(), input, in_chunk, 1 << 16),
+            w => w.clone(),
+        };
+        let mut dec = make();
+        let got = run_contiguous(&mut dec, input, in_chunk, start, step);
+        assert_eq!(dec.dict_allocated(), 0, "{ctx}: dictionary allocated");
+        match (&got, &want) {
+            (Ok((g, gc)), Ok((w, wc))) => {
+                assert!(g == w, "{ctx}: output differs");
+                if in_chunk >= whole {
+                    assert_eq!(gc, wc, "{ctx}: consumed");
+                } else {
+                    // Small pieces: up to a packet's lookahead may have
+                    // been taken past the end by earlier calls.
+                    assert!(*gc >= *wc && *gc <= *wc + 20, "{ctx}: consumed {gc}/{wc}");
+                }
+            }
+            (Err(g), Err(w)) => assert_eq!(g, w, "{ctx}"),
+            _ => panic!(
+                "{ctx}: contiguous {:?}, windowed {:?}",
+                got.as_ref().map(|r| r.0.len()),
+                want.as_ref().map(|r| r.0.len())
+            ),
+        }
+    }
+    want
+}
+
+/// Entries written by 7-Zip and Python decode the same on both paths,
+/// with the size, without it (marker only), and with bytes after them.
+#[test]
+fn contiguous_decodes_fixture_entries() {
+    for name in ["7z_eos.zip", "7z_noeos.zip", "py_stream.zip"] {
+        let zip = fixture(name);
+        for e in entries(&zip).iter().filter(|e| e.method == METHOD_LZMA) {
+            let ctx = format!("{name}/{}", e.name);
+            let n = e.size as usize;
+            let mut tail = e.data.clone();
+            tail.extend_from_slice(b"PK\x07\x08 trailing bytes after the entry data");
+            let mut lens = vec![Some(e.size)];
+            if e.gp & GP_EOS != 0 {
+                lens.push(None);
+            }
+            for len in lens {
+                for input in [&e.data, &tail] {
+                    let make = || Decoder::zip_from_gp_flags(e.gp, len);
+                    let (out, consumed) = both_paths(&make, input, n, &ctx).unwrap();
+                    assert_eq!(out.len(), n, "{ctx}");
+                    assert_eq!(crc32(&out), e.crc, "{ctx}");
+                    assert_eq!(consumed, e.data.len(), "{ctx}");
+                }
+            }
+        }
+    }
+}
+
+/// Our own entries, with and without the marker, read every way the
+/// decoder allows.
+#[test]
+fn contiguous_round_trip() {
+    for n in [0usize, 1, 2, 100, 3000, 40_000] {
+        let data = sample(n);
+        for level in [0u8, 6] {
+            for eos in [true, false] {
+                let enc = encode(&data, level, eos);
+                let size = Some(n as u64);
+                // (marker flag, size) the entry can be read with.
+                let mut modes = vec![(eos, size), (false, size)];
+                if eos {
+                    modes.push((true, None));
+                    modes.push((false, None));
+                }
+                for (flag, len) in modes {
+                    let ctx = format!("n {n} level {level} eos {eos} as {flag}/{len:?}");
+                    let make = || Decoder::zip(flag, len);
+                    let (out, consumed) = both_paths(&make, &enc, n, &ctx).unwrap();
+                    assert!(out == data, "{ctx}");
+                    assert_eq!(consumed, enc.len(), "{ctx}");
+                }
+            }
+        }
+    }
+}
+
+/// An exact-size buffer never sees `OutputFull`, marker or not.
+#[test]
+fn contiguous_exact_size_buffer() {
+    let data = sample(5000);
+    for eos in [true, false] {
+        let enc = encode(&data, 6, eos);
+        for in_chunk in [enc.len(), 1, 33] {
+            let mut dec = Decoder::zip(eos, Some(data.len() as u64));
+            let mut out = vec![0u8; data.len()];
+            let (mut filled, mut pos) = (0, 0);
+            let mut ended = false;
+            while pos < enc.len() && !ended {
+                let end = (pos + in_chunk).min(enc.len());
+                let (p, status) = dec
+                    .decode_contiguous(&enc[pos..end], &mut out, filled)
+                    .unwrap();
+                pos += p.consumed;
+                filled += p.written;
+                assert_ne!(status, Status::OutputFull, "eos {eos} in {in_chunk}");
+                ended = status == Status::StreamEnd;
+            }
+            if !ended {
+                let (p, status) = dec.finish_contiguous(&mut out, filled).unwrap();
+                filled += p.written;
+                assert_eq!(status, Status::StreamEnd, "eos {eos} in {in_chunk}");
+            }
+            assert_eq!((pos, filled), (enc.len(), data.len()));
+            assert!(out == data);
+        }
+    }
+}
+
+/// What the windowed path rejects, the contiguous one rejects the same
+/// way: truncation, marker and size disagreements, bad headers.
+#[test]
+fn contiguous_errors_match_windowed() {
+    let data = sample(2000);
+    let n = data.len() as u64;
+
+    // Truncation at every length.
+    let short = sample(700);
+    for eos in [true, false] {
+        let enc = encode(&short, 6, eos);
+        for cut in 0..enc.len() {
+            let ctx = format!("eos {eos} cut {cut}/{}", enc.len());
+            let make = || Decoder::zip(eos, Some(short.len() as u64));
+            let r = both_paths(&make, &enc[..cut], short.len(), &ctx);
+            assert_eq!(r, Err(Error::UnexpectedEnd), "{ctx}");
+        }
+    }
+    let enc = encode(b"", 6, false);
+    for cut in 0..enc.len() {
+        let make = || Decoder::zip(false, Some(0));
+        assert!(
+            both_paths(&make, &enc[..cut], 0, "empty").is_err(),
+            "cut {cut}"
+        );
+    }
+
+    // The marker and the size must agree.
+    let with_eos = encode(&data, 6, true);
+    let without = encode(&data, 6, false);
+    for len in [n - 1, n + 1, 0] {
+        for (flag, enc) in [(true, &with_eos), (false, &with_eos), (false, &without)] {
+            let ctx = format!("len {len} flag {flag}");
+            let make = || Decoder::zip(flag, Some(len));
+            assert!(
+                both_paths(&make, enc, data.len() + 1, &ctx).is_err(),
+                "{ctx}"
+            );
+        }
+    }
+    // A marker required, or the only way to end, on a stream without one.
+    for len in [Some(n), None] {
+        let make = || Decoder::zip(true, len);
+        assert!(both_paths(&make, &without, data.len(), "no marker").is_err());
+    }
+    let make = || Decoder::zip(false, None);
+    assert!(both_paths(&make, &without, data.len(), "no marker, no size").is_err());
+
+    // A match running over the declared size.
+    let abc = b"abcabcabcabcabcabcabcabcabcabc";
+    for eos in [false, true] {
+        let enc = encode(abc, 6, eos);
+        for len in [29u64, 26, 4] {
+            let make = || Decoder::zip(false, Some(len));
+            let ctx = format!("eos {eos} len {len}");
+            assert_eq!(
+                both_paths(&make, &enc, 30, &ctx),
+                Err(Error::Corrupt),
+                "{ctx}"
+            );
+        }
+    }
+
+    // Header: properties size, properties byte, range-coder first byte.
+    for (at, value, want) in [
+        (2usize, 6u8, Error::BadHeader),
+        (4, 225, Error::BadHeader),
+        (9, 1, Error::Corrupt),
+    ] {
+        let mut enc = encode(b"abc", 6, true);
+        enc[at] = value;
+        let make = || Decoder::zip(true, Some(3));
+        assert_eq!(both_paths(&make, &enc, 3, "header"), Err(want), "byte {at}");
+    }
+}
+
+/// The dictionary size in the properties is not checked against
+/// `max_dict_size` on the contiguous path — there is no dictionary to
+/// budget for — but it still bounds how far back a match may reach.
+#[test]
+fn contiguous_ignores_max_dict_size_and_keeps_the_distance_rule() {
+    // 6 KiB of noise twice: the second copy is matches at distance 6144.
+    let mut data: Vec<u8> = sample(12 * 1024)
+        .chunks(512)
+        .skip(1)
+        .step_by(2)
+        .flatten()
+        .copied()
+        .collect();
+    data.extend_from_within(..);
+    assert_eq!(data.len(), 12 * 1024);
+    let enc = encode(&data, 6, false);
+    assert!(enc.len() < 7 * 1024, "second half must be matches");
+    let size = Some(data.len() as u64);
+    let with_dict = |dict: u32| {
+        let mut e = enc.clone();
+        e[5..9].copy_from_slice(&dict.to_le_bytes());
+        e
+    };
+
+    for dict in [1u32 << 30, u32::MAX] {
+        let e = with_dict(dict);
+        // Refused by the windowed path under the default limit …
+        let mut dec = Decoder::zip(false, size);
+        assert_eq!(run(&mut dec, &e, 1 << 20, 1 << 16), Err(Error::Unsupported));
+        // … decoded by the contiguous one, even with the smallest limit.
+        for limit in [0, 64 << 20] {
+            let mut dec = Decoder::zip(false, size).with_max_dict_size(limit);
+            let (out, consumed) = run_contiguous(&mut dec, &e, 500, 10, 1000).unwrap();
+            assert!(out == data, "dict {dict} limit {limit}");
+            assert_eq!(consumed, e.len());
+            assert_eq!(dec.dict_allocated(), 0);
+        }
+    }
+    // A dictionary smaller than the distance: corrupt on both paths.
+    for dict in [0u32, 4096, 6143] {
+        let e = with_dict(dict);
+        let make = || Decoder::zip(false, size);
+        let ctx = format!("dict {dict}");
+        assert_eq!(
+            both_paths(&make, &e, data.len(), &ctx),
+            Err(Error::Corrupt),
+            "{ctx}"
+        );
+    }
+    let e = with_dict(6144);
+    let make = || Decoder::zip(false, size);
+    assert!(both_paths(&make, &e, data.len(), "dict 6144").unwrap().0 == data);
+}
+
+/// One path per stream; `reset` keeps the ZIP settings and allows either.
+#[test]
+fn contiguous_and_windowed_calls_do_not_mix() {
+    let data = sample(3000);
+    let enc = encode(&data, 6, true);
+    let mut dec = Decoder::zip(true, Some(data.len() as u64));
+    let mut out = vec![0u8; 64];
+    let mut scratch = vec![0u8; 4096];
+
+    let (p, status) = dec.decode_contiguous(&enc, &mut out, 0).unwrap();
+    assert_eq!((p.written, status), (64, Status::OutputFull));
+    assert_eq!(
+        dec.decode(&enc[p.consumed..], &mut scratch),
+        Err(Error::Unsupported)
+    );
+    assert_eq!(dec.finish(&mut scratch), Err(Error::Unsupported));
+    assert_eq!(
+        dec.decode_contiguous(&enc[p.consumed..], &mut out, 63),
+        Err(Error::Unsupported)
+    );
+    assert_eq!(dec.finish_contiguous(&mut out, 65), Err(Error::Unsupported));
+
+    dec.reset();
+    let (got, consumed) = run(&mut dec, &enc, 100, 100).unwrap();
+    assert_eq!((got, consumed), (data.clone(), enc.len()));
+    assert_eq!(
+        dec.decode_contiguous(&enc, &mut out, 0),
+        Err(Error::Unsupported)
+    );
+    assert_eq!(dec.finish_contiguous(&mut out, 0), Err(Error::Unsupported));
+
+    dec.reset();
+    let (got, consumed) = run_contiguous(&mut dec, &enc, 100, 0, 700).unwrap();
+    assert_eq!((got, consumed), (data, enc.len()));
 }
