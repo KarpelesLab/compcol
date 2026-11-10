@@ -652,7 +652,7 @@ fn lowdist_repeat_state_resets_when_fed_bytewise() {
     assert_eq!(out, LOWDIST_RESET_EXPECTED);
 }
 
-// ─── Streaming output and the output limit ───────────────────────────────
+// ─── Streaming output, output limit, filter-work bound ───────────────────
 //
 // The fixtures above are all far smaller than the 4 MiB dictionary, so the
 // properties below need streams this file builds itself: a minimal RAR3 LZ
@@ -1272,6 +1272,49 @@ fn output_limit_spans_solid_members() {
         let want = (!fits).then_some(SOLID_M3_GROUP.len() - 1);
         assert_eq!(refused_at, want, "limit {limit}");
     }
+}
+
+/// Filter work is bounded by the output produced: thousands of Delta
+/// declarations stacked on one window (each a 128 KiB pass for a few bytes
+/// of input) are refused instead of run.
+#[test]
+fn stacked_delta_filters_are_refused() {
+    const WINDOW: u32 = 0x20000;
+    let mut ops: Vec<Op> = std::iter::repeat_n(
+        Op::Delta {
+            start: 0,
+            len: WINDOW,
+            channels: 1024,
+        },
+        4000,
+    )
+    .collect();
+    ops.extend(run_ops(1, 520));
+    let syn = build_lz_stream(&ops);
+    assert!(syn.raw.len() > WINDOW as usize);
+    let (out, err, _) = decode_chunked(
+        Decoder::with_unpack_size(syn.raw.len() as u64),
+        &syn.stream,
+        usize::MAX,
+        4096,
+    );
+    assert_eq!(err, Some(Error::Corrupt));
+    assert!(out.is_empty());
+
+    // A few passes over the same window (what a real encoder's filter
+    // stacking amounts to) still decode.
+    let mut ops: Vec<Op> = std::iter::repeat_n(
+        Op::Delta {
+            start: 0,
+            len: WINDOW,
+            channels: 3,
+        },
+        4,
+    )
+    .collect();
+    ops.extend(run_ops(1, 520));
+    let syn = build_lz_stream(&ops);
+    assert!(decode_full(&syn.stream, syn.raw.len() as u64) == syn.filtered());
 }
 
 /// A filter window cannot start a whole dictionary (4 MiB) or more ahead:

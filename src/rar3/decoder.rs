@@ -370,6 +370,15 @@ const RELEASE_RETRY_STRIDE: u64 = 64 << 10;
 /// applied it — and a window never starts before its declaration.
 const HELD_AFTER_RELEASE_MAX: u64 = DICT_DEFAULT_SIZE as u64 + FILTER_MAX_BLOCK as u64;
 
+/// Total bytes in-band filters may process, as a multiple of the output
+/// decoded so far. A real encoder filters each region of a file once (the
+/// reference decoder can chain filters, but only over an identical block),
+/// and of the standard programs only three run here, so honest streams
+/// stay at or below 1x; a stream that stacks thousands of windows on the
+/// same bytes to buy a full-window pass per few input bytes is refused as
+/// corrupt once it crosses this.
+const FILTER_WORK_FACTOR: u64 = 4;
+
 /// How a run of symbol decoding ended.
 enum Segment {
     /// Decoded output is waiting for the caller; decoding resumes at the
@@ -437,6 +446,8 @@ struct RunCtx {
     /// Member offset the output may not grow past (the caller's output
     /// limit, less what earlier members produced).
     out_limit: u64,
+    /// Bytes in-band filters have processed in this member.
+    filter_work: u64,
     /// The standalone E8 pass: `Some(translate_e9)` when enabled.
     e8: Option<bool>,
     /// Decoding progress of the current member.
@@ -516,6 +527,7 @@ impl RunCtx {
             drained: 0,
             next_release_at: RELEASE_LAG,
             out_limit: u64::MAX,
+            filter_work: 0,
             e8: None,
             phase: Phase::Finished,
             window: vec![0u8; DICT_DEFAULT_SIZE],
@@ -556,6 +568,7 @@ impl RunCtx {
         self.drained = 0;
         self.next_release_at = RELEASE_LAG;
         self.out_limit = out_limit;
+        self.filter_work = 0;
         self.e8 = e8;
         self.unpack_size = unpack_size;
         // Filter *programs* persist across solid members, but scheduled
@@ -826,12 +839,19 @@ impl RunCtx {
     /// back-references read the (unfiltered) window, not `out`, and bytes
     /// at or past a pending window's start are never released, so applying
     /// a filter any time after its window completes gives the same bytes.
+    ///
+    /// The bytes filtered are charged against the member's filter-work
+    /// budget ([`FILTER_WORK_FACTOR`]).
     fn flush_completed_filters(&mut self) -> Result<(), Error> {
         let produced = self.produced();
         while let Some(&f) = self.pending_filters.front() {
             let end = f.start + f.length as u64;
             if end > produced {
                 break;
+            }
+            self.filter_work += f.length as u64;
+            if self.filter_work > produced.saturating_mul(FILTER_WORK_FACTOR) {
+                return Err(Error::Corrupt);
             }
             let lo = (f.start - self.out_base) as usize;
             let hi = (end - self.out_base) as usize;
@@ -1711,6 +1731,7 @@ mod tests {
             drained: 0,
             next_release_at: RELEASE_LAG,
             out_limit: u64::MAX,
+            filter_work: 0,
             e8: None,
             phase: Phase::Symbols,
             window: vec![0u8; 16],
@@ -2029,6 +2050,30 @@ mod tests {
             parse_declaration_payload(&mut ctx, 0x40, &mut db),
             Err(Error::Corrupt)
         );
+    }
+
+    /// Filter work is budgeted against the output produced: the window can
+    /// be filtered `FILTER_WORK_FACTOR` times over, and the next pass is
+    /// refused before it runs.
+    #[test]
+    fn filter_work_is_bounded_by_output() {
+        let mut ctx = test_ctx();
+        ctx.out = vec![1; 100];
+        let stacked = PendingFilter {
+            start: 0,
+            length: 100,
+            program: StdProgram::Delta,
+            channels: 1,
+        };
+        for _ in 0..FILTER_WORK_FACTOR {
+            ctx.pending_filters.push_back(stacked);
+        }
+        ctx.flush_completed_filters().unwrap();
+        assert!(ctx.pending_filters.is_empty());
+        let before = ctx.out.clone();
+        ctx.pending_filters.push_back(stacked);
+        assert_eq!(ctx.flush_completed_filters(), Err(Error::Corrupt));
+        assert_eq!(ctx.out, before, "the refused pass must not run");
     }
 
     /// A release pass makes final only the bytes in front of the earliest
