@@ -2049,6 +2049,13 @@ impl RawDecoder for Decoder {
                         }
                     }
                     if complete && self.comp_produced == self.comp_decoded.len() {
+                        // The chunk is decoded: its payload must end right
+                        // where the range coder did, with nothing left over.
+                        if let Some(core) = self.lzma_core.as_mut()
+                            && let Err(e) = core.finish_chunk(&self.comp_buf)
+                        {
+                            return Err(self.poison(e));
+                        }
                         self.block_compressed_seen += self.comp_size as u64;
                     } else if self.comp_produced == before {
                         // Nothing new to hand out: wait for more input.

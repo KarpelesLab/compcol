@@ -1949,6 +1949,42 @@ fn compressed_chunk_after_dict_reset_needs_properties() {
     check_hand_built("first chunk stored without reset", &stream, None);
 }
 
+/// A compressed chunk's payload must be exactly what the range coder
+/// reads: once the chunk's output is complete, every compressed byte has
+/// been consumed and the coder's `code` is zero (liblzma's
+/// `rc_is_finished` plus its Compressed Size check). Up to 64 KiB of
+/// arbitrary bytes per chunk used to ride along in a Stream that passed
+/// its Check and Index.
+#[test]
+fn compressed_chunk_must_use_its_whole_payload() {
+    let data = b"hello hello hello hello hello hello hello hello ".repeat(20);
+    let (head, props, payload) = split_first_chunk(&data);
+    let block = |payload: &[u8]| {
+        let mut lzma2 = vec![head[0], head[1], head[2]];
+        lzma2.push(((payload.len() - 1) >> 8) as u8);
+        lzma2.push((payload.len() - 1) as u8);
+        lzma2.push(props);
+        lzma2.extend_from_slice(payload);
+        lzma2.push(0x00);
+        build_xz(&PLAIN_LZMA2_BLOCK, &lzma2, &data)
+    };
+    check_hand_built("as encoded", &block(&payload), Some(&data));
+
+    // Extra bytes inside the chunk, after the LZMA data.
+    for slack in [&[0x00][..], &[0x00; 5], &[0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3]] {
+        let padded = [&payload[..], slack].concat();
+        check_hand_built("slack", &block(&padded), None);
+    }
+    let padded = [&payload[..], &[0x5A; 60_000]].concat();
+    check_hand_built("60 KB of slack", &block(&padded), None);
+
+    // The range coder's final bytes are not padding either: with the last
+    // byte changed, the coder does not end on `code == 0`.
+    let mut changed = payload.clone();
+    *changed.last_mut().unwrap() ^= 0x01;
+    check_hand_built("last byte changed", &block(&changed), None);
+}
+
 /// A Block running past a size its header declared fails as soon as it
 /// does, not at the end of the Block.
 #[test]

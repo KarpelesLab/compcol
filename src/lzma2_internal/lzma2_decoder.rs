@@ -931,13 +931,41 @@ impl LzmaCore {
     /// were already consumed by `init_range`) into `out`. The output buffer
     /// must be sized to hold the chunk's `uncomp_size` bytes.
     ///
-    /// On success the range coder must be in a "clean" terminal state
-    /// (range >= TOP and code == 0); we *don't* enforce that here because
-    /// the chunk's `comp_size` already bounds how many bytes we read, and
-    /// any trailing slack just stays in `buf`.
+    /// `buf` must be the chunk's whole compressed payload: on success the
+    /// range coder has been checked to end exactly there (see
+    /// [`Self::finish_chunk`]).
+    ///
+    /// Used by the raw [`crate::lzma2`] decoder; dead under an xz-only build.
+    #[cfg_attr(not(any(feature = "lzma2", test)), allow(dead_code))]
     pub fn decode_chunk(&mut self, buf: &[u8], out: &mut [u8]) -> Result<(), Error> {
         let mut written = 0usize;
-        self.decode_partial(buf, out, &mut written, 0)
+        self.decode_partial(buf, out, &mut written, 0)?;
+        self.finish_chunk(buf)
+    }
+
+    /// Check that the range coder ended exactly at the end of the chunk's
+    /// compressed payload `buf`, to be called once all of the chunk's
+    /// output has been decoded. Returns `Error::Corrupt` otherwise.
+    ///
+    /// This is liblzma's rule for an LZMA2 chunk: after the last symbol the
+    /// decoder normalises once more (the encoder already shifted out the
+    /// byte for it), and then `code` must be zero (`rc_is_finished`) and
+    /// the chunk's Compressed Size used up to the byte. A range encoder
+    /// flushing its 5 final bytes always ends this way; anything else is
+    /// either damage or bytes smuggled in behind the LZMA data.
+    pub fn finish_chunk(&mut self, buf: &[u8]) -> Result<(), Error> {
+        if self.range.range < RC_TOP_VALUE {
+            let Some(&b) = buf.get(self.range.pos) else {
+                return Err(Error::Corrupt);
+            };
+            self.range.range <<= 8;
+            self.range.code = (self.range.code << 8) | b as u32;
+            self.range.pos += 1;
+        }
+        if self.range.code != 0 || self.range.pos != buf.len() {
+            return Err(Error::Corrupt);
+        }
+        Ok(())
     }
 
     /// Continue decoding a chunk whose compressed bytes may not all be in

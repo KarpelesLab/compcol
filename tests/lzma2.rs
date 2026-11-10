@@ -730,6 +730,65 @@ fn compressed_chunk_after_dict_reset_needs_properties() {
     assert_eq!(decode(&[&more]), Err(Error::Corrupt));
 }
 
+/// A compressed chunk's payload must be exactly what the range coder
+/// reads: once the chunk's output is complete, every compressed byte has
+/// been consumed and the coder's `code` is zero (liblzma's
+/// `rc_is_finished` plus its Compressed Size check). Bytes riding along
+/// inside the chunk's Compressed Size used to be skipped silently.
+#[test]
+fn compressed_chunk_must_use_its_whole_payload() {
+    let data = b"hello hello hello hello hello hello hello hello ".repeat(20);
+    let s = encode_all(&data, 1 << 16);
+    // One full-reset chunk (6 header bytes), then the end marker.
+    let comp = (((s[3] as usize) << 8) | s[4] as usize) + 1;
+    assert!(s[0] >= 0xE0 && s.len() == 6 + comp + 1);
+    let decode = |s: &[u8]| decode_all(s, DecoderConfig::default(), data.len());
+    assert_eq!(decode(&s).as_deref(), Ok(&data[..]));
+
+    // Extra bytes inside the chunk, after the LZMA data.
+    for slack in [&[0x00][..], &[0x00; 5], &[0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3]] {
+        let mut bad = s[..6 + comp].to_vec();
+        let new_comp = comp + slack.len() - 1;
+        bad[3] = (new_comp >> 8) as u8;
+        bad[4] = new_comp as u8;
+        bad.extend_from_slice(slack);
+        bad.push(0x00);
+        assert_eq!(decode(&bad), Err(Error::Corrupt), "slack {slack:?}");
+        // One byte at a time, too.
+        let mut dec = Lzma2::decoder_with(DecoderConfig::default());
+        let mut out = vec![0u8; data.len() + 16];
+        let mut written = 0;
+        let mut failed = false;
+        for b in &bad {
+            match dec.decode(core::slice::from_ref(b), &mut out[written..]) {
+                Ok((p, _)) => written += p.written,
+                Err(e) => {
+                    assert_eq!(e, Error::Corrupt);
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(failed, "slack {slack:?} accepted bytewise");
+    }
+
+    // The range coder's final bytes are not padding either: with the last
+    // byte changed, the coder does not end on `code == 0`.
+    let mut bad = s.clone();
+    bad[5 + comp] ^= 0x01;
+    assert_eq!(decode(&bad), Err(Error::Corrupt));
+
+    // The hand-built chunk from above ends cleanly; cut short by a byte,
+    // or padded by one, it does not.
+    let first = stored_chunk(0x01, b"0123456789abcdef");
+    let payload = match_len2_dist9_payload();
+    let good = [&first[..], &compressed_chunk(0xC0, 2, &payload), &[0x00]].concat();
+    assert_eq!(decode(&good).as_deref(), Ok(&b"0123456789abcdef78"[..]));
+    let padded = [&payload[..], &[0x00]].concat();
+    let bad = [&first[..], &compressed_chunk(0xC0, 2, &padded), &[0x00]].concat();
+    assert_eq!(decode(&bad), Err(Error::Corrupt));
+}
+
 /// A dictionary reset keeps the decoder's dictionary buffer (re-allocating
 /// it per `0x01` chunk was a CPU DoS), so the bytes from before the reset
 /// are still in memory: no match may reach them.
