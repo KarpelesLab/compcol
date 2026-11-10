@@ -82,6 +82,12 @@ const DEFAULT_WINDOW_SIZE: usize = 0x10_0000; // 1 MiB
 /// the caller drain it.
 const READY_HIGH_WATER: usize = 1 << 20;
 
+/// Cap on filters scheduled but not yet applied, matching unrar's
+/// `MAX_UNPACK_FILTERS` and the RAR3 decoder's bound. Real archives keep a
+/// handful pending; without a cap a stream of bare filter descriptors grows
+/// the queue (and the work spent maintaining it) without producing output.
+const MAX_PENDING_FILTERS: usize = 8192;
+
 /// Streaming RAR5 LZ77+Huffman decoder. See module docs for framing.
 pub struct Decoder {
     state: State,
@@ -113,7 +119,9 @@ pub struct Decoder {
     /// back to the caller.
     out_queue: VecDeque<u8>,
     /// Pending filters waiting on their target byte range to be produced.
-    pending_filters: Vec<Filter>,
+    /// Kept sorted by `start` (equal starts in arrival order) — see
+    /// [`Decoder::schedule_filter`] — and bounded by `MAX_PENDING_FILTERS`.
+    pending_filters: VecDeque<Filter>,
     /// Output we've finalised (filters applied if applicable) and that is
     /// ready to flow to the caller. Always emitted from the front.
     ready: VecDeque<u8>,
@@ -188,7 +196,7 @@ impl Decoder {
             last_len: 0,
             tables: None,
             out_queue: VecDeque::new(),
-            pending_filters: Vec::new(),
+            pending_filters: VecDeque::new(),
             ready: VecDeque::new(),
             out_queue_start: 0,
             file_boundaries: Vec::new(),
@@ -503,7 +511,7 @@ impl Decoder {
                 256 => {
                     // Filter descriptor.
                     let filter = read_filter(bits, self.window_size, self.cur_out_pos())?;
-                    self.pending_filters.push(filter);
+                    self.schedule_filter(filter)?;
                 }
                 257 => {
                     // Repeat the *previous* match — last_len from dist_cache[0].
@@ -615,6 +623,32 @@ impl Decoder {
         self.out_queue_start + self.out_queue.len() as u64
     }
 
+    /// Queue a freshly parsed filter, keeping `pending_filters` sorted by
+    /// start. A filter goes after every queued filter with the same start,
+    /// which is exactly the order a stable sort by start would give — so
+    /// the flush never has to sort, and a stalled head filter no longer
+    /// makes every later symbol pay for re-sorting the whole queue.
+    fn schedule_filter(&mut self, filter: Filter) -> Result<(), Error> {
+        // Starts almost always arrive in increasing order: append directly.
+        let idx = match self.pending_filters.back() {
+            Some(last) if last.start > filter.start => self
+                .pending_filters
+                .partition_point(|f| f.start <= filter.start),
+            _ => self.pending_filters.len(),
+        };
+        self.pending_filters.insert(idx, filter);
+        if self.pending_filters.len() > MAX_PENDING_FILTERS {
+            // Same policy as the RAR3 decoder: drain the windows that are
+            // already complete; a stream still over the cap is hostile or
+            // malformed.
+            self.flush_ready_through_filters()?;
+            if self.pending_filters.len() > MAX_PENDING_FILTERS {
+                return Err(Error::Corrupt);
+            }
+        }
+        Ok(())
+    }
+
     /// Pull bytes out of `out_queue` into `ready`, applying any filters
     /// whose target range is fully produced. Filters that aren't yet fully
     /// covered stay in `pending_filters`.
@@ -622,16 +656,16 @@ impl Decoder {
         // First, push bytes out of out_queue into ready until we hit a
         // pending filter's start (in absolute coordinates) — those bytes
         // can flow without modification.
+        // `pending_filters` is kept sorted by start (`schedule_filter`), so
+        // the front is always the next filter to serve.
         let mut pos = self.out_queue_start;
-        // Pending filters sorted by start so we serve them in order.
-        self.pending_filters.sort_by_key(|f| f.start);
 
         loop {
             // Find the first pending filter whose start lies at or before
             // the head of out_queue.
-            let next_filter_start = self.pending_filters.first().map(|f| f.start);
+            let next_filter = self.pending_filters.front().copied();
 
-            match next_filter_start {
+            match next_filter {
                 None => {
                     // No filters — drain everything in out_queue to ready.
                     let drained = self.out_queue.len() as u64;
@@ -642,7 +676,7 @@ impl Decoder {
                     self.unpack_so_far += drained;
                     return Ok(());
                 }
-                Some(s) if s > pos => {
+                Some(Filter { start: s, .. }) if s > pos => {
                     // Drain up to `s` from out_queue into ready.
                     // The gap stays in u64 until it is bounded by the queue
                     // length: a filter can start 2^32 bytes ahead, and
@@ -663,9 +697,8 @@ impl Decoder {
                         return Ok(());
                     }
                 }
-                Some(_) => {
+                Some(f) => {
                     // Filter starts at or before `pos`.
-                    let f = self.pending_filters[0];
                     if f.start < pos {
                         // The filter starts inside bytes already emitted
                         // (it overlaps an earlier filter's region). unrar
@@ -673,7 +706,7 @@ impl Decoder {
                         // written border — so drop it too. Leaving it at
                         // the head of the queue stalled all further output
                         // while out_queue grew without bound.
-                        self.pending_filters.remove(0);
+                        self.pending_filters.pop_front();
                         continue;
                     }
                     // Check if its full range is covered by what's in
@@ -724,7 +757,7 @@ impl Decoder {
                     pos += length as u64;
                     self.unpack_so_far += length as u64;
                     self.out_queue_start = pos;
-                    self.pending_filters.remove(0);
+                    self.pending_filters.pop_front();
                 }
             }
         }

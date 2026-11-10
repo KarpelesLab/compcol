@@ -831,3 +831,134 @@ fn filter_start_4gib_ahead_does_not_hang() {
         assert_eq!(drive_to_end(&mut dec, &comp, out_chunk).unwrap(), b"A");
     }
 }
+
+/// The decoder's cap on concurrently pending filters (unrar's
+/// `MAX_UNPACK_FILTERS`, the same bound the RAR3 decoder enforces).
+const MAX_PENDING_FILTERS: usize = 8192;
+
+/// A 4097-byte distance-1 match under the `'A'`/256/305 main code.
+fn put_long_match(bw: &mut BitWriter) {
+    bw.put(0b11, 2);
+    bw.put(0x1FF, 9);
+    bw.put(0, 1);
+}
+
+/// A head filter that waits for 512 KiB of output that never arrives, 4098
+/// bytes of output (enough that every later symbol triggers a flush), then
+/// `n` more filters. No output can ever be released.
+fn stalled_head_filter_flood(n: usize) -> Vec<u8> {
+    let mut bw = BitWriter::default();
+    write_tables(&mut bw, &[(b'A' as usize, 1), (256, 2), (305, 2), (306, 1)]);
+    bw.put(0b10, 2);
+    put_delta_filter(&mut bw, 0, 0x80000);
+    bw.put(0, 1);
+    put_long_match(&mut bw);
+    for _ in 0..n {
+        bw.put(0b10, 2);
+        put_delta_filter(&mut bw, 0, 4);
+    }
+    let lb = bw.finish();
+    last_block(&bw.out, lb)
+}
+
+/// `n` filters that all start at offset 0, then 16389 bytes of output. The
+/// first filter applies; the rest are behind the written border and dropped.
+fn same_start_filter_flood(n: usize) -> Vec<u8> {
+    let mut bw = BitWriter::default();
+    write_tables(&mut bw, &[(b'A' as usize, 1), (256, 2), (305, 2), (306, 1)]);
+    for _ in 0..n {
+        bw.put(0b10, 2);
+        put_delta_filter(&mut bw, 0, 4);
+    }
+    bw.put(0, 1);
+    for _ in 0..4 {
+        put_long_match(&mut bw);
+    }
+    let lb = bw.finish();
+    last_block(&bw.out, lb)
+}
+
+/// Regression: the pending-filter list had no cap and was fully re-sorted on
+/// every flush, and a flush runs after every symbol once 4096 bytes are
+/// queued. With the head filter stalled, each further filter descriptor cost
+/// O(N log N) — quadratic CPU overall, with no output for a cap to catch.
+/// The list is now bounded like RAR3's and kept sorted on insertion.
+#[test]
+fn pending_filter_flood_behind_stalled_head_is_rejected() {
+    // Exactly at the cap (head + 8191): unchanged behaviour — the head
+    // filter's window never completes, so the stream is truncated.
+    let comp = stalled_head_filter_flood(MAX_PENDING_FILTERS - 1);
+    let mut dec = Decoder::new();
+    assert_eq!(
+        drive_to_end(&mut dec, &comp, 4096).unwrap_err(),
+        Error::UnexpectedEnd
+    );
+    // One over the cap, and far over it: rejected outright.
+    for n in [MAX_PENDING_FILTERS, 200_000] {
+        let comp = stalled_head_filter_flood(n);
+        let mut dec = Decoder::new();
+        assert_eq!(
+            drive_to_end(&mut dec, &comp, 4096).unwrap_err(),
+            Error::Corrupt,
+            "{n} filters behind a stalled head"
+        );
+    }
+}
+
+/// Regression: N filters sharing one start were dropped one at a time with
+/// `Vec::remove(0)` after the first applied — O(N²). Same cap; head removal
+/// is now O(1).
+#[test]
+fn pending_filter_flood_with_shared_start_is_rejected() {
+    // At the cap: the first filter applies, the rest are skipped.
+    let comp = same_start_filter_flood(MAX_PENDING_FILTERS);
+    let mut want = vec![b'A'; 1 + 4 * 4097];
+    let mut prev = 0u8;
+    for b in &mut want[..4] {
+        prev = prev.wrapping_sub(*b);
+        *b = prev;
+    }
+    for out_chunk in [1, 4096] {
+        let mut dec = Decoder::new();
+        assert_eq!(drive_to_end(&mut dec, &comp, out_chunk).unwrap(), want);
+    }
+    for n in [MAX_PENDING_FILTERS + 1, 200_000] {
+        let comp = same_start_filter_flood(n);
+        let mut dec = Decoder::new();
+        assert_eq!(
+            drive_to_end(&mut dec, &comp, 4096).unwrap_err(),
+            Error::Corrupt,
+            "{n} filters sharing one start"
+        );
+    }
+}
+
+/// Filters are served in start order, and filters with equal starts in
+/// arrival order, however the descriptors are interleaved in the stream.
+#[test]
+fn filters_apply_in_start_order_with_stable_ties() {
+    let mut bw = BitWriter::default();
+    write_tables(&mut bw, &[(b'A' as usize, 1), (256, 2), (305, 2), (306, 1)]);
+    // Arrival order: [200,+8) [100,+8) [200,+16) [0,+8) [100,+4).
+    // Applied: [0,+8), [100,+8), [200,+8); the later equal-start filters
+    // ([100,+4) and [200,+16)) are behind the written border and skipped.
+    for (start, len) in [(200, 8), (100, 8), (200, 16), (0, 8), (100, 4)] {
+        bw.put(0b10, 2);
+        put_delta_filter(&mut bw, start, len);
+    }
+    bw.put(0, 1);
+    put_long_match(&mut bw);
+    let lb = bw.finish();
+    let comp = last_block(&bw.out, lb);
+
+    let mut want = vec![b'A'; 1 + 4097];
+    for start in [0usize, 100, 200] {
+        let mut prev = 0u8;
+        for b in &mut want[start..start + 8] {
+            prev = prev.wrapping_sub(*b);
+            *b = prev;
+        }
+    }
+    let mut dec = Decoder::new();
+    assert_eq!(drive_to_end(&mut dec, &comp, 4096).unwrap(), want);
+}
