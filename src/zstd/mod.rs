@@ -90,15 +90,15 @@
 //! Both halves are pure streaming: caller owns the input/output buffers and
 //! the codec preserves state across `encode`/`decode` calls.
 
-mod bitreader;
+// The entropy decoders are shared with `lz5`.
+use crate::huff0::{bitreader, fse, huffman};
+
 mod decoder;
 mod encoder;
 mod encoder_bitwriter;
 mod encoder_fse;
 mod encoder_huffman;
 mod encoder_seq;
-mod fse;
-mod huffman;
 mod literals;
 mod matcher;
 mod sequences;

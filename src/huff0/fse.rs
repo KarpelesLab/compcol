@@ -16,7 +16,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::zstd::bitreader::RevBitReader;
+use crate::huff0::bitreader::RevBitReader;
 
 /// One decoded entry in the FSE decode table.
 ///
