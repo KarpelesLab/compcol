@@ -43,6 +43,28 @@ const STREAM_END_MAGIC: u64 = 0x1772_4538_5090;
 /// them, since some encoders round the count up.
 const MAX_SELECTORS: usize = 18002;
 
+/// Upper bound, in bits, on a block header (everything between the block
+/// magic and the first Huffman symbol); a longer one is `Error::Corrupt`.
+///
+/// The format itself sets no limit: each code length is reached from the
+/// previous one by `+1`/`-1` steps, and nothing stops a stream stepping
+/// up and down forever (libbzip2 keeps reading too), which would have us
+/// buffer input without end while waiting for the header to finish. But
+/// everything else in a header is bounded, and an encoder that steps
+/// straight from one length to the next needs little:
+///
+/// * CRC, randomised bit, origin, symbol map, table and selector counts:
+///   `32 + 1 + 24 + 16 + 16 * 16 + 3 + 15` = 347 bits;
+/// * selectors: at most 32 767 (a 15-bit count) of at most 6 bits;
+/// * code lengths: at most 6 tables of 258 symbols, each 5 bits to start
+///   and, per symbol, at most 19 steps of 2 bits (lengths stay within
+///   1..=20) and a stop bit.
+///
+/// That is 347 + 196 602 + 60 402 bits, under 32 KiB. 256 KiB leaves any
+/// plausible encoder a wide margin and still keeps the decoder's input
+/// buffer small.
+const MAX_BLOCK_HEADER_BITS: usize = 8 * 256 * 1024;
+
 /// bzip2 decoder configuration.
 ///
 /// `#[non_exhaustive]`: construct via [`DecoderConfig::default`] and the
@@ -441,6 +463,11 @@ impl Decoder {
                         cur -= 1;
                     }
                     if !(1..=(MAX_CODE_LEN as i32)).contains(&cur) {
+                        return Err(Error::Corrupt);
+                    }
+                    // The one loop in a header that the format does
+                    // not bound.
+                    if br.position() - pos > MAX_BLOCK_HEADER_BITS {
                         return Err(Error::Corrupt);
                     }
                 }

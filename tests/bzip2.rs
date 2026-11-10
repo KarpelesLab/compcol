@@ -1338,3 +1338,53 @@ fn finish_hands_over_all_decoded_bytes_before_truncation() {
     assert!(lengths.iter().all(|&l| l == lengths[0]), "{lengths:?}");
     assert_eq!(lengths[0], 99_981);
 }
+
+/// The code-length deltas of a block header may go up and down forever
+/// (`10` = +1, `11` = -1), so a header need never end. The decoder used
+/// to buffer such input without bound, waiting for the header to finish;
+/// no real header comes near 256 KiB, so by then it is corrupt.
+#[test]
+fn endless_block_header_is_rejected() {
+    let mut w = Bits::default();
+    for &b in b"BZh9" {
+        w.put(8, b as u64);
+    }
+    w.put(48, 0x3141_5926_5359);
+    w.put(32, 0); // block CRC
+    w.put(1, 0); // not randomised
+    w.put(24, 0); // origin
+    w.put(16, 1 << (15 - 6)); // stripe 0x60..0x6F
+    w.put(16, 1 << (15 - 1)); // 'a'
+    w.put(3, 2); // two tables
+    w.put(15, 1); // one selector
+    w.put(1, 0); // table 0
+    w.put(5, 5); // first code length
+    for _ in 0..(2 << 20) {
+        w.put(4, 0b1011); // +1, -1, +1, -1, ...
+    }
+    let stream = w.finish();
+
+    for in_chunk in [stream.len(), 4096, 1] {
+        let mut dec = Decoder::new();
+        let mut buf = [0u8; 4096];
+        let mut pos = 0;
+        let mut err = None;
+        while pos < stream.len() {
+            let end = (pos + in_chunk).min(stream.len());
+            match dec.decode(&stream[pos..end], &mut buf) {
+                Ok((p, status)) => {
+                    assert_eq!((p.written, status), (0, Status::InputEmpty));
+                    assert!(p.consumed > 0, "stalled at {pos}");
+                    pos += p.consumed;
+                }
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        assert_eq!(err, Some(Error::Corrupt), "in_chunk {in_chunk}");
+        // Given up well before the end of the input.
+        assert!(pos <= 512 << 10, "in_chunk {in_chunk}: read {pos} bytes");
+    }
+}
