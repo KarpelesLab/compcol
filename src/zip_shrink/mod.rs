@@ -38,8 +38,9 @@
 //! fit) up front and consumes the bare method-1 payload, exactly the bytes
 //! a ZIP archive stores for the entry. End-of-stream handling is the same
 //! as the framed path: the decoder reports `StreamEnd` once
-//! `uncompressed_len` bytes have been produced. Parsing the ZIP local or
-//! central header to get that size is the caller's job.
+//! `uncompressed_len` bytes have been produced, and nothing after the code
+//! that produced the last of them is decoded or validated. Parsing the ZIP
+//! local or central header to get that size is the caller's job.
 //!
 //! ```
 //! use compcol::zip_shrink::Decoder;
@@ -462,6 +463,16 @@ impl Decoder {
     fn pump(&mut self) -> Result<(), Error> {
         loop {
             if self.completed {
+                return Ok(());
+            }
+            // Stop at the code that reaches the declared length. The stream
+            // ends there: whatever follows is not part of it and must not
+            // be decoded (let alone rejected as corrupt). Counting the
+            // bytes still waiting in `emit_buf`, not just those already
+            // delivered, makes this independent of how much input happens
+            // to be buffered and of how fast the caller drains.
+            let buffered = (self.emit_buf.len() - self.emit_head) as u64;
+            if self.out_pos.saturating_add(buffered) >= self.target_len {
                 return Ok(());
             }
             // Keep emit_buf bounded so we don't allocate gigabytes when the

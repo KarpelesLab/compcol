@@ -840,3 +840,97 @@ mod factory {
         assert_eq!(factory::extension("zip-shrink"), Some("shrunk"));
     }
 }
+
+// ─── declared length reached with codes still buffered ──────────────────
+
+/// Decode with `in_chunk` input bytes per `decode` call and an
+/// `out_chunk`-byte output buffer, then `finish` until it ends; returns the
+/// verdict together with every byte handed out.
+fn decode_outcome(
+    dec: &mut Decoder,
+    stream: &[u8],
+    in_chunk: usize,
+    out_chunk: usize,
+) -> (Result<(), Error>, Vec<u8>) {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; out_chunk];
+    let mut pos = 0;
+    let mut steps = 0usize;
+    while pos < stream.len() {
+        steps += 1;
+        assert!(steps < 1 << 20, "decode did not terminate");
+        let end = pos.saturating_add(in_chunk).min(stream.len());
+        match dec.decode(&stream[pos..end], &mut buf) {
+            Ok((p, status)) => {
+                out.extend_from_slice(&buf[..p.written]);
+                pos += p.consumed;
+                if status == Status::StreamEnd {
+                    return (Ok(()), out);
+                }
+            }
+            Err(e) => return (Err(e), out),
+        }
+    }
+    loop {
+        steps += 1;
+        assert!(steps < 1 << 20, "finish did not terminate");
+        match dec.finish(&mut buf) {
+            Ok((p, status)) => {
+                out.extend_from_slice(&buf[..p.written]);
+                if status == Status::StreamEnd {
+                    return (Ok(()), out);
+                }
+            }
+            Err(e) => return (Err(e), out),
+        }
+    }
+}
+
+// Found by the `chunked_vs_oneshot` fuzz target. The stream declares one
+// byte, and its first code is that byte; the bytes after it do not form
+// valid codes. The decoder ends once the declared length has been
+// produced, so those bytes are never codes at all — but it used to go on
+// decoding whatever input happened to be buffered already, and so rejected
+// the stream as `Corrupt` when given all of it at once while accepting it
+// one byte at a time.
+#[test]
+fn codes_after_declared_length_are_not_decoded() {
+    let stream: [u8; 8] = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xd3, 0x07];
+    let expected = (Ok(()), vec![0u8]);
+    for in_chunk in [1usize, 2, 3, 4, 5, 6, 7, 8, 9, usize::MAX] {
+        for out_chunk in [1usize, 2, 7, 64, 1 << 16] {
+            let got = decode_outcome(&mut Decoder::new(), &stream, in_chunk, out_chunk);
+            assert_eq!(
+                got, expected,
+                "framed in_chunk {in_chunk}, out_chunk {out_chunk}"
+            );
+            let got = decode_outcome(&mut Decoder::raw(1), &stream[4..], in_chunk, out_chunk);
+            assert_eq!(
+                got, expected,
+                "raw in_chunk {in_chunk}, out_chunk {out_chunk}"
+            );
+        }
+    }
+}
+
+// Same property on a real stream: garbage after the last code needed for
+// the declared length never changes the result, including when the
+// declared length ends in the middle of a code's string.
+#[test]
+fn trailing_garbage_agrees_for_every_chunking() {
+    let data = wordy(6000);
+    let mut payload = shrink_lzw(&data);
+    payload.extend_from_slice(&[0xff; 64]);
+    for len in [1usize, 2, 1000, 5999, 6000] {
+        let expected = (Ok(()), data[..len].to_vec());
+        for in_chunk in [1usize, 3, 4, 61, 4096, usize::MAX] {
+            for out_chunk in [1usize, 255, 1 << 16] {
+                let got =
+                    decode_outcome(&mut Decoder::raw(len as u64), &payload, in_chunk, out_chunk);
+                let at = format!("len {len}, in_chunk {in_chunk}, out_chunk {out_chunk}");
+                assert_eq!((&got.0, got.1.len()), (&expected.0, len), "{at}");
+                assert!(got.1 == expected.1, "{at}: delivered bytes differ");
+            }
+        }
+    }
+}

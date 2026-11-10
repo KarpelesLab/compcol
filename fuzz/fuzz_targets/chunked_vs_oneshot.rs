@@ -26,13 +26,7 @@ use common::{Outcome, Sizes};
 
 /// Decoders left out of the comparison, each with the reason. Keep this
 /// list honest: an entry is a known divergence to triage, not a fix.
-const EXCLUDED: &[&str] = &[
-    // Depends on the *input* chunk size: a stream the one-shot run rejects
-    // as Corrupt decodes to StreamEnd when fed 1, 2, 3 or 7 bytes at a time
-    // (4, 5, 8 and larger chunks agree with one-shot).
-    // Reproducer (whole fuzz input, hex): 289595010000000000d307
-    "zip-shrink",
-];
+const EXCLUDED: &[&str] = &[];
 
 /// Output kept per run. Past this the run stops with `SinkFull`.
 const MAX_OUTPUT: usize = 1 << 20;
