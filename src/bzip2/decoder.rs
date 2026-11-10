@@ -43,6 +43,12 @@ const STREAM_END_MAGIC: u64 = 0x1772_4538_5090;
 /// them, since some encoders round the count up.
 const MAX_SELECTORS: usize = 18002;
 
+/// How much of the caller's input is copied into `in_buf` at a time, and
+/// how far the parser may get into `in_buf` before the bytes behind it
+/// are dropped. Input is only taken when the parser has run dry, so a
+/// call copies at most one window more than it consumes.
+const INPUT_WINDOW: usize = 64 * 1024;
+
 /// Upper bound, in bits, on a block header (everything between the block
 /// magic and the first Huffman symbol); a longer one is `Error::Corrupt`.
 ///
@@ -221,6 +227,10 @@ pub struct Decoder {
     /// requiring 1/8 more input per retry bounds the total work at a
     /// constant multiple of the header size.
     retry_at: usize,
+
+    /// Total bytes ever copied into `in_buf`, for the tests.
+    #[cfg(test)]
+    copied_in: usize,
 }
 
 impl Decoder {
@@ -242,6 +252,8 @@ impl Decoder {
             poisoned: false,
             finishing: false,
             retry_at: 0,
+            #[cfg(test)]
+            copied_in: 0,
         }
     }
 
@@ -602,6 +614,28 @@ impl Decoder {
         Ok(true)
     }
 
+    /// Drain and parse until the output is full, the stream is over, or
+    /// the buffered input runs out. Returns whether it stopped for want
+    /// of input.
+    fn run(&mut self, output: &mut [u8], written: &mut usize) -> Result<bool, Error> {
+        loop {
+            // Drain anything already decoded.
+            self.drain(output, written);
+            if matches!(self.phase, Phase::Done) && self.decoded_idx == self.decoded.len() {
+                return Ok(false);
+            }
+            if *written == output.len() && !output.is_empty() {
+                // Output full: let the caller drain.
+                return Ok(false);
+            }
+            if !self.step()? {
+                // In `DrainDecoded`, decoded bytes are waiting but the
+                // output is empty-sized.
+                return Ok(self.phase != Phase::DrainDecoded);
+            }
+        }
+    }
+
     fn drain(&mut self, output: &mut [u8], written: &mut usize) {
         let avail = self.decoded.len() - self.decoded_idx;
         let space = output.len() - *written;
@@ -655,40 +689,39 @@ impl RawDecoder for Decoder {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
-        // Take the whole input; whatever the parser does not reach is
-        // handed back below.
-        self.in_buf.extend_from_slice(input);
         let mut written = 0usize;
-        let mut starved = false;
+        // How much of `input` has been copied into `in_buf`.
+        let mut taken = 0usize;
 
-        loop {
-            // Drain anything already decoded.
-            self.drain(output, &mut written);
-            if matches!(self.phase, Phase::Done) && self.decoded_idx == self.decoded.len() {
-                break;
+        // Parse what is buffered, and take input only once the parser
+        // has run dry, a window at a time. A caller may pass everything
+        // it has left on every call; copying all of that in just to hand
+        // most of it back would cost (calls x remaining input).
+        let starved = loop {
+            if !self.run(output, &mut written)? {
+                break false;
             }
-            if written == output.len() && !output.is_empty() {
-                // Output full: let the caller drain.
-                break;
+            if taken == input.len() {
+                break true;
             }
-            if !self.step()? {
-                if self.phase != Phase::DrainDecoded {
-                    starved = true;
-                    break;
-                }
-                // Decoded bytes are waiting but the output is empty-sized.
-                break;
+            // Drop the prefix the parser is done with. What stays is at
+            // most a partial block header, so `in_buf` stays bounded by
+            // `MAX_BLOCK_HEADER_BITS` and a few windows however much
+            // input goes by (and its length in bits fits a 32-bit usize).
+            let off = self.bit_pos / 8;
+            if off >= INPUT_WINDOW {
+                self.in_buf.drain(..off);
+                self.bit_pos -= off * 8;
+                self.retry_at = self.retry_at.saturating_sub(off);
             }
-        }
-
-        // Drop the prefix the parser is done with, once it is big
-        // enough to be worth the move.
-        let off = self.bit_pos / 8;
-        if off > 1 << 20 {
-            self.in_buf.drain(..off);
-            self.bit_pos -= off * 8;
-            self.retry_at = self.retry_at.saturating_sub(off);
-        }
+            let n = (input.len() - taken).min(INPUT_WINDOW);
+            self.in_buf.extend_from_slice(&input[taken..taken + n]);
+            taken += n;
+            #[cfg(test)]
+            {
+                self.copied_in += n;
+            }
+        };
 
         // Unless the parser is waiting for more input (in which case it
         // needs everything buffered), the bytes past its position are
@@ -698,7 +731,7 @@ impl RawDecoder for Decoder {
         // again; bytes from earlier calls were already reported
         // consumed. Without `multi_stream`, the end of the stream is
         // thus exact.
-        let mut consumed = input.len();
+        let mut consumed = taken;
         if !starved {
             let frontier = self.bit_pos.div_ceil(8);
             let give_back = (self.in_buf.len() - frontier).min(consumed);
@@ -752,5 +785,80 @@ impl RawDecoder for Decoder {
         self.poisoned = false;
         self.finishing = false;
         self.retry_at = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bzip2::{Encoder, EncoderConfig};
+    use crate::traits::RawEncoder;
+
+    /// Deterministic incompressible bytes.
+    fn noise(n: usize) -> Vec<u8> {
+        let mut x: u32 = 0x9E37_79B9;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn encode(plain: &[u8], level: u8) -> Vec<u8> {
+        let mut enc = Encoder::with_config(EncoderConfig { level });
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 1 << 16];
+        let mut pos = 0;
+        while pos < plain.len() {
+            let p = enc.raw_encode(&plain[pos..], &mut buf).unwrap();
+            out.extend_from_slice(&buf[..p.written]);
+            pos += p.consumed;
+        }
+        loop {
+            let p = enc.raw_finish(&mut buf).unwrap();
+            out.extend_from_slice(&buf[..p.written]);
+            if p.done {
+                break;
+            }
+        }
+        out
+    }
+
+    /// A caller that passes everything it has left on each call (as
+    /// `vec::decompress_to_vec` does) must not make the decoder copy the
+    /// whole remainder every time: the bytes taken into `in_buf` stay
+    /// proportional to the stream, whatever follows it.
+    #[test]
+    fn whole_remaining_input_per_call_is_not_recopied() {
+        let plain = noise(300_000);
+        let stream = encode(&plain, 1); // several 100 kB blocks
+        let mut input = stream.clone();
+        input.resize(stream.len() + (4 << 20), 0xA5); // trailing junk
+
+        let mut dec = Decoder::new();
+        let mut buf = [0u8; 1024];
+        let mut got = Vec::new();
+        let mut pos = 0;
+        loop {
+            let p = dec.raw_decode(&input[pos..], &mut buf).unwrap();
+            got.extend_from_slice(&buf[..p.written]);
+            pos += p.consumed;
+            assert!(dec.in_buf.len() <= 1 << 20, "in_buf {}", dec.in_buf.len());
+            if p.done {
+                break;
+            }
+            assert!(p.consumed > 0 || p.written > 0, "stalled at {pos}");
+        }
+        assert!(got == plain);
+        assert_eq!(pos, stream.len());
+        assert!(
+            dec.copied_in <= 3 * stream.len(),
+            "copied {} bytes for a {}-byte stream",
+            dec.copied_in,
+            stream.len()
+        );
     }
 }
