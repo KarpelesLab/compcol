@@ -687,3 +687,296 @@ fn integer_decode_overflow_boundaries() {
         }
     }
 }
+
+// ─── encoder stream fed in pieces ────────────────────────────────────────
+
+/// Everything the encoder stream can change in a decoder.
+type TableState = (usize, usize, usize, Vec<(Vec<u8>, Vec<u8>)>);
+
+fn table_state(dec: &QpackDecoder) -> TableState {
+    let entries = (0..dec.insert_count())
+        .filter_map(|abs| dec.table.get_absolute(abs))
+        .map(|(n, v)| (n.to_vec(), v.to_vec()))
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), dec.table_len());
+    (
+        dec.insert_count(),
+        dec.table_capacity(),
+        dec.table_size(),
+        entries,
+    )
+}
+
+/// Set Dynamic Table Capacity = 220, then two Inserts with Literal Name
+/// (`ab: cd`, `ef: gh`).
+const TWO_INSERTS: [u8; 15] = [
+    0x3f, 0xbd, 0x01, 0x42, b'a', b'b', 0x02, b'c', b'd', 0x42, b'e', b'f', 0x02, b'g', b'h',
+];
+
+/// Several multi-instruction encoder streams covering every instruction
+/// type, Huffman and raw strings, multi-byte integers and eviction.
+fn sample_encoder_streams() -> Vec<Vec<u8>> {
+    let mut streams = vec![TWO_INSERTS.to_vec()];
+
+    // What the dynamic encoder writes for a few sections, with and without
+    // Huffman: capacity, literal-name inserts, static and dynamic name
+    // references, and eviction (capacity 220).
+    for huffman in [true, false] {
+        let mut enc = QpackEncoder::with_dynamic_table(220);
+        enc.set_huffman(huffman);
+        let mut s = Vec::new();
+        for i in 0..6u8 {
+            let fields = [
+                f(b":authority", &[b'a' + i; 9]),
+                f(b"custom-key", &[b'k' + i; 12]),
+                f(b"custom-key", b"another value"),
+                f(b"x-long", &[b'0' + i; 40]),
+            ];
+            s.extend_from_slice(&enc.encode(&fields).encoder_stream);
+        }
+        streams.push(s);
+    }
+
+    // Hand-built: a 200-byte raw value (two-byte length), Duplicate, an
+    // insert naming a dynamic entry, one naming a static entry, empty
+    // Huffman strings, and a capacity change that evicts.
+    let mut s = vec![0x3f, 0xe1, 0x1f]; // capacity 4096
+    s.extend_from_slice(&[0x43, b'k', b'e', b'y', 0x7f, 0x49]); // value len 200
+    s.extend(core::iter::repeat_n(b'v', 200));
+    s.push(0x00); // Duplicate relative 0
+    s.extend_from_slice(&[0x80, 0x03, b'd', b'y', b'n']); // name = dynamic rel 0
+    s.extend_from_slice(&[0xc1, 0x01, b'/']); // name = static 1 (:path)
+    s.extend_from_slice(&[0x60, 0x80]); // empty Huffman name and value
+    s.extend_from_slice(&[0x3f, 0x41]); // capacity 96: evicts
+    s.extend_from_slice(&[0x41, b'n', 0x01, b'v']);
+    s.push(0x00);
+    streams.push(s);
+    streams
+}
+
+/// The reported desynchronisation: a chunk that ended inside an instruction
+/// returned `UnexpectedEnd` after applying the earlier ones, so a caller that
+/// buffered and retried applied them twice.
+#[test]
+fn split_instruction_is_applied_once() {
+    let full = TWO_INSERTS;
+    let mut dec = QpackDecoder::with_limits(4096, 65536);
+    dec.feed_encoder_stream(&full[..12]).unwrap();
+    assert_eq!(dec.insert_count(), 1);
+    assert_eq!(dec.encoder_stream_pending(), 3);
+    dec.feed_encoder_stream(&full[12..]).unwrap();
+    assert_eq!(dec.insert_count(), 2);
+    assert_eq!(dec.encoder_stream_pending(), 0);
+
+    let mut whole = QpackDecoder::with_limits(4096, 65536);
+    whole.feed_encoder_stream(&full).unwrap();
+    assert_eq!(table_state(&dec), table_state(&whole));
+}
+
+#[test]
+fn encoder_stream_split_anywhere_gives_same_table() {
+    for (n, stream) in sample_encoder_streams().iter().enumerate() {
+        let mut whole = QpackDecoder::with_limits(4096, 65536);
+        whole.feed_encoder_stream(stream).unwrap();
+        assert_eq!(whole.encoder_stream_pending(), 0);
+        let want = table_state(&whole);
+        assert!(want.0 >= 2, "stream {n} should insert several entries");
+
+        // Two chunks, at every split point.
+        for cut in 0..=stream.len() {
+            let mut dec = QpackDecoder::with_limits(4096, 65536);
+            dec.feed_encoder_stream(&stream[..cut]).unwrap();
+            dec.feed_encoder_stream(&stream[cut..]).unwrap();
+            assert_eq!(dec.encoder_stream_pending(), 0, "stream {n} cut {cut}");
+            assert_eq!(table_state(&dec), want, "stream {n} cut {cut}");
+        }
+
+        // Fixed chunk sizes, down to one byte at a time (with empty feeds
+        // in between, which must change nothing).
+        for chunk in [1usize, 2, 3, 5, 7, 64] {
+            let mut dec = QpackDecoder::with_limits(4096, 65536);
+            for piece in stream.chunks(chunk) {
+                dec.feed_encoder_stream(piece).unwrap();
+                let pending = dec.encoder_stream_pending();
+                dec.feed_encoder_stream(&[]).unwrap();
+                assert_eq!(dec.encoder_stream_pending(), pending);
+            }
+            assert_eq!(dec.encoder_stream_pending(), 0, "stream {n} chunk {chunk}");
+            assert_eq!(table_state(&dec), want, "stream {n} chunk {chunk}");
+        }
+    }
+}
+
+/// A prefix of a stream applies exactly the instructions that are complete
+/// in it and holds the rest, whatever the prefix length.
+#[test]
+fn encoder_stream_prefix_holds_only_the_partial_instruction() {
+    let full = TWO_INSERTS;
+    // Instruction boundaries: 3 (capacity), 9 (first insert), 15 (second).
+    for cut in 0..=full.len() {
+        let mut dec = QpackDecoder::with_limits(4096, 65536);
+        dec.feed_encoder_stream(&full[..cut]).unwrap();
+        let boundary = [0usize, 3, 9, 15].into_iter().rfind(|&b| b <= cut).unwrap();
+        assert_eq!(dec.encoder_stream_pending(), cut - boundary, "cut {cut}");
+        let inserts = [9usize, 15].into_iter().filter(|&b| b <= cut).count();
+        assert_eq!(dec.insert_count(), inserts, "cut {cut}");
+        assert_eq!(dec.table_capacity(), if cut >= 3 { 220 } else { 0 });
+    }
+}
+
+/// An error is the same, and leaves the same table, however the bytes that
+/// lead to it are split; afterwards the stream is dead.
+#[test]
+fn encoder_stream_error_is_split_independent_and_final() {
+    // Two good inserts, then Duplicate of a relative index that does not
+    // exist, then another good insert that must never be applied.
+    let mut stream = TWO_INSERTS.to_vec();
+    stream.extend_from_slice(&[0x1f, 0x05]); // Duplicate relative 36
+    stream.extend_from_slice(&[0x41, b'n', 0x01, b'v']);
+
+    let mut whole = QpackDecoder::with_limits(4096, 65536);
+    assert_eq!(whole.feed_encoder_stream(&stream), Err(Error::Corrupt));
+    let want = table_state(&whole);
+    assert_eq!(want.0, 2);
+
+    for chunk in 1..=stream.len() {
+        let mut dec = QpackDecoder::with_limits(4096, 65536);
+        let mut failed = false;
+        for piece in stream.chunks(chunk) {
+            match dec.feed_encoder_stream(piece) {
+                Ok(()) => assert!(!failed, "chunk {chunk}: fed after the error"),
+                Err(e) => {
+                    assert_eq!(e, Error::Corrupt);
+                    failed = true;
+                }
+            }
+        }
+        assert!(failed, "chunk {chunk}");
+        assert_eq!(table_state(&dec), want, "chunk {chunk}");
+        assert_eq!(dec.encoder_stream_pending(), 0);
+        // Still dead, even for bytes that would be valid on their own.
+        assert_eq!(
+            dec.feed_encoder_stream(&[0x41, b'n', 0x01, b'v']),
+            Err(Error::Corrupt)
+        );
+        assert_eq!(dec.feed_encoder_stream(&[]), Err(Error::Corrupt));
+        assert_eq!(table_state(&dec), want, "chunk {chunk}");
+    }
+}
+
+/// An insert that can never fit is rejected from its length prefix, so the
+/// decoder never buffers a string it would have to refuse anyway.
+#[test]
+fn oversized_insert_rejected_before_buffering() {
+    let new = || {
+        let mut dec = QpackDecoder::with_limits(4096, 65536);
+        dec.feed_encoder_stream(&[0x3f, 0xbd, 0x01]).unwrap(); // capacity 220
+        dec
+    };
+    // Room for name + value is 220 - 32 = 188 bytes.
+
+    // Raw value of 189 bytes with a static name reference: length only.
+    let mut dec = new();
+    assert_eq!(
+        dec.feed_encoder_stream(&[0xc1, 0x7f, 0x3e]),
+        Err(Error::Corrupt)
+    );
+    assert_eq!(dec.encoder_stream_pending(), 0);
+
+    // 188 bytes may still fit: held until the string arrives.
+    let mut dec = new();
+    dec.feed_encoder_stream(&[0xc1, 0x7f, 0x3d]).unwrap();
+    assert_eq!(dec.encoder_stream_pending(), 3);
+    dec.feed_encoder_stream(&[b'v'; 187]).unwrap();
+    assert_eq!(dec.insert_count(), 0);
+    assert_eq!(dec.encoder_stream_pending(), 190);
+    // ... and here it does not, because the name (`:path`) takes 5 bytes.
+    assert_eq!(dec.feed_encoder_stream(b"v"), Err(Error::Corrupt));
+
+    // Raw literal name of 189 bytes: rejected at the name length.
+    let mut dec = new();
+    assert_eq!(
+        dec.feed_encoder_stream(&[0x5f, 0x9e, 0x01]),
+        Err(Error::Corrupt)
+    );
+
+    // Name and value are charged together: 100 + 89 > 188.
+    let mut ins = vec![0x5f, 0x45]; // raw name, length 100
+    ins.extend(core::iter::repeat_n(b'n', 100));
+    let mut dec = new();
+    dec.feed_encoder_stream(&ins).unwrap();
+    assert_eq!(dec.feed_encoder_stream(&[0x59]), Err(Error::Corrupt));
+    let mut dec = new();
+    ins.push(0x58); // value length 88: fits exactly
+    dec.feed_encoder_stream(&ins).unwrap();
+    assert_eq!(dec.encoder_stream_pending(), 103);
+    dec.feed_encoder_stream(&[b'v'; 88]).unwrap();
+    assert_eq!(dec.insert_count(), 1);
+    assert_eq!(dec.table_size(), 220);
+
+    // Huffman value: `len` octets hold at least (8 * len - 7) / 30 symbols
+    // (rounded up), so 705 octets (>= 188 symbols) may fit and 706
+    // (>= 189) cannot.
+    let huff_value = |len: usize| {
+        let mut v = vec![0xc1];
+        encode_int(&mut v, len, 7, 0x80);
+        v
+    };
+    let mut dec = new();
+    assert_eq!(
+        dec.feed_encoder_stream(&huff_value(706)),
+        Err(Error::Corrupt)
+    );
+    let mut dec = new();
+    dec.feed_encoder_stream(&huff_value(705)).unwrap();
+    assert_eq!(dec.encoder_stream_pending(), 4);
+
+    // Before any Set Dynamic Table Capacity nothing fits, not even an
+    // empty entry: rejected at the first byte of the insert.
+    let mut dec = QpackDecoder::with_limits(4096, 65536);
+    assert_eq!(dec.feed_encoder_stream(&[0xc1]), Err(Error::Corrupt));
+    let mut dec = QpackDecoder::with_limits(4096, 65536);
+    assert_eq!(dec.feed_encoder_stream(&[0x41]), Err(Error::Corrupt));
+}
+
+/// What is held for a partial instruction is bounded by the table capacity,
+/// however long the peer keeps the instruction open.
+#[test]
+fn pending_encoder_stream_bytes_are_bounded() {
+    // The largest Huffman string that may still fit at capacity 4096, never
+    // completed: everything fed is held, and it is under 4 × capacity.
+    let mut dec = QpackDecoder::with_limits(4096, 65536);
+    dec.feed_encoder_stream(&[0x3f, 0xe1, 0x1f]).unwrap();
+    // 8 * 15240 - 7 bits hold at least 4064 = 4096 - 32 symbols of 30 bits.
+    let max_len = 15_240usize;
+    let mut ins = vec![0xc1];
+    encode_int(&mut ins, max_len, 7, 0x80);
+    let head = ins.len();
+    dec.feed_encoder_stream(&ins).unwrap();
+    for _ in 0..max_len - 1 {
+        dec.feed_encoder_stream(&[0xff]).unwrap();
+    }
+    assert_eq!(dec.encoder_stream_pending(), head + max_len - 1);
+    assert!(dec.encoder_stream_pending() < 4 * 4096);
+    assert_eq!(dec.insert_count(), 0);
+    // One octet longer could not fit and is refused outright.
+    let mut dec = QpackDecoder::with_limits(4096, 65536);
+    dec.feed_encoder_stream(&[0x3f, 0xe1, 0x1f]).unwrap();
+    let mut ins = vec![0xc1];
+    encode_int(&mut ins, max_len + 1, 7, 0x80);
+    assert_eq!(dec.feed_encoder_stream(&ins), Err(Error::Corrupt));
+
+    // An integer that never ends is cut off by the overflow guard.
+    let mut dec = QpackDecoder::with_limits(4096, 65536);
+    dec.feed_encoder_stream(&[0x3f]).unwrap();
+    let mut fed = 1;
+    let err = loop {
+        match dec.feed_encoder_stream(&[0x80]) {
+            Ok(()) => fed += 1,
+            Err(e) => break e,
+        }
+        assert_eq!(dec.encoder_stream_pending(), fed);
+        assert!(fed < 16, "unterminated integer was buffered without bound");
+    };
+    assert_eq!(err, Error::Corrupt);
+}

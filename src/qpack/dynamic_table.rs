@@ -62,7 +62,6 @@ impl DynamicTable {
     }
 
     /// Current capacity.
-    #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
