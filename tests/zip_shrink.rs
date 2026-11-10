@@ -534,6 +534,290 @@ fn raw_accepts_sizes_above_u32() {
     assert_eq!(res, Err(Error::UnexpectedEnd));
 }
 
+// ─── large streams (more than one internal 16 KiB decode burst) ────────
+//
+// The decoder buffers decoded bytes internally in bursts of about 16 KiB.
+// A stream that decodes to more than that used to stall: `decode` took all
+// the input, handed back the first burst, said `InputEmpty`, and `finish`
+// then reported `UnexpectedEnd` with the rest of the input still undecoded.
+
+fn xorshift_bytes(n: usize, mut s: u64) -> Vec<u8> {
+    (0..n)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s as u8
+        })
+        .collect()
+}
+
+/// LSB-first code writer for the test encoders below.
+struct CodeWriter {
+    out: Vec<u8>,
+    acc: u32,
+    cnt: u32,
+}
+
+impl CodeWriter {
+    fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            acc: 0,
+            cnt: 0,
+        }
+    }
+    fn push(&mut self, code: u32, bits: u32) {
+        self.acc |= code << self.cnt;
+        self.cnt += bits;
+        while self.cnt >= 8 {
+            self.out.push(self.acc as u8);
+            self.acc >>= 8;
+            self.cnt -= 8;
+        }
+    }
+    fn finish(mut self) -> Vec<u8> {
+        if self.cnt > 0 {
+            self.out.push(self.acc as u8);
+        }
+        self.out
+    }
+}
+
+/// Encode `data` as 9-bit literal codes, with a partial clear every 7000
+/// bytes so the dictionary (which only ever holds leaves here) never fills.
+fn shrink_literals(data: &[u8]) -> Vec<u8> {
+    let mut w = CodeWriter::new();
+    for (i, &b) in data.iter().enumerate() {
+        if i > 0 && i % 7000 == 0 {
+            w.push(256, 9);
+            w.push(2, 9);
+        }
+        w.push(b as u32, 9);
+    }
+    w.finish()
+}
+
+/// A small real Shrink encoder for tests: greedy LZW that widens codes with
+/// `256,1` and issues `256,2` (partial clear) when the dictionary is full.
+/// It keeps the same dictionary bookkeeping as Info-ZIP's `unshrink.c`
+/// (lowest free slot above the last one used; partial clear frees leaves up
+/// to the last slot used), so its streams use string codes, KwKwK codes,
+/// every code width and many partial clears.
+fn shrink_lzw(data: &[u8]) -> Vec<u8> {
+    use std::collections::HashMap;
+    const HSIZE: usize = 8192;
+    const FREE: u16 = 0xFFFF;
+    const LITERAL: u16 = 0xFFFE;
+
+    fn next_free(parent: &[u16], from: usize) -> Option<usize> {
+        (from + 1..HSIZE).find(|&s| parent[s] == FREE)
+    }
+
+    let mut parent = vec![FREE; HSIZE];
+    for p in parent.iter_mut().take(257) {
+        *p = LITERAL;
+    }
+    // (parent code, next byte) -> code, for entries the encoder may use.
+    let mut child: HashMap<(u16, u8), u16> = HashMap::new();
+    let mut last_free = 256usize;
+    let mut bits = 9u32;
+    let mut w = CodeWriter::new();
+    let mut prev: Option<u16> = None;
+    let mut i = 0usize;
+    while i < data.len() {
+        // The decoder adds (prev, first byte of this string) on receiving
+        // this code. Mirror that first, clearing if no slot is left.
+        if let Some(p) = prev {
+            let mut slot = next_free(&parent, last_free);
+            if slot.is_none() {
+                w.push(256, bits);
+                w.push(2, bits);
+                let mut has_child = vec![false; HSIZE];
+                for &par in &parent[257..=last_free] {
+                    if par != FREE && par != LITERAL && par > 256 {
+                        has_child[par as usize] = true;
+                    }
+                }
+                for (par, &kept) in parent[257..=last_free]
+                    .iter_mut()
+                    .zip(&has_child[257..=last_free])
+                {
+                    if !kept {
+                        *par = FREE;
+                    }
+                }
+                last_free = 256;
+                child.retain(|_, c| parent[*c as usize] != FREE);
+                slot = next_free(&parent, last_free);
+            }
+            let slot = slot.expect("partial clear freed nothing");
+            // Usable only if its prefix survived the clear; otherwise the
+            // slot is occupied but the encoder never refers to it.
+            let usable = parent[p as usize] != FREE && slot != p as usize;
+            parent[slot] = p;
+            last_free = slot;
+            if usable {
+                child.insert((p, data[i]), slot as u16);
+            }
+        }
+        let mut code = data[i] as u16;
+        let mut len = 1;
+        while i + len < data.len() {
+            match child.get(&(code, data[i + len])) {
+                Some(&c) => {
+                    code = c;
+                    len += 1;
+                }
+                None => break,
+            }
+        }
+        while (code as u32) >= (1 << bits) {
+            w.push(256, bits);
+            w.push(1, bits);
+            bits += 1;
+        }
+        w.push(code as u32, bits);
+        prev = Some(code);
+        i += len;
+    }
+    w.finish()
+}
+
+/// Compressible data with enough variety to fill the dictionary many times.
+fn wordy(n: usize) -> Vec<u8> {
+    let noise = xorshift_bytes(n, 0x0bad_5eed_1234_5678);
+    let mut out = Vec::with_capacity(n + 64);
+    let mut k = 0usize;
+    while out.len() < n {
+        let r = noise[k % noise.len()] as usize;
+        k += 1;
+        match r % 5 {
+            0 => out.extend_from_slice(b"the quick brown fox "),
+            1 => out.extend_from_slice(b"jumps over "),
+            2 => out.extend_from_slice(&noise[k % (n - 8)..][..(r % 7) + 1]),
+            3 => out.extend_from_slice(b"ABCABCABCABC"),
+            _ => out.extend_from_slice(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        }
+    }
+    out.truncate(n);
+    out
+}
+
+/// The decode loop from the `compcol::Decoder` docs: feed until the input
+/// is taken, then `finish` until `StreamEnd`. No extra `decode(&[])` calls.
+fn decode_documented(dec: &mut Decoder, input: &[u8], out_chunk: usize) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; out_chunk];
+    let mut consumed = 0;
+    loop {
+        let (p, status) = dec.decode(&input[consumed..], &mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        consumed += p.consumed;
+        match status {
+            Status::OutputFull => continue,
+            Status::InputEmpty | Status::StreamEnd => break,
+        }
+    }
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            break;
+        }
+        assert!(p.written > 0, "finish stalled");
+    }
+    Ok(out)
+}
+
+#[test]
+fn large_literal_stream_framed_one_shot() {
+    let data = xorshift_bytes(200_000, 0x1234_5678_9abc_def0);
+    let f = framed(&shrink_literals(&data), data.len() as u32);
+    let r = compcol::vec::decompress_to_vec_capped::<ZipShrink>(&f, 1 << 30);
+    assert!(
+        r.as_deref() == Ok(&data[..]),
+        "got {:?}",
+        r.map(|v| v.len())
+    );
+}
+
+#[test]
+fn large_stream_documented_loop_framed_and_raw() {
+    let lit = xorshift_bytes(200_000, 0x1234_5678_9abc_def0);
+    let words = wordy(300_000);
+    let cases = [(shrink_literals(&lit), lit), (shrink_lzw(&words), words)];
+    for (payload, data) in &cases {
+        let f = framed(payload, data.len() as u32);
+        // Output buffers smaller than, equal to and larger than the
+        // decoder's internal burst, and larger than the whole output.
+        for out_chunk in [1000, 16 * 1024, 64 * 1024, 1 << 20] {
+            let got = decode_documented(&mut Decoder::new(), &f, out_chunk);
+            assert!(
+                got.as_ref() == Ok(data),
+                "framed, out_chunk={out_chunk}: {:?}",
+                got.map(|v| v.len())
+            );
+            let mut raw = Decoder::raw(data.len() as u64);
+            let got = decode_documented(&mut raw, payload, out_chunk);
+            assert!(
+                got.as_ref() == Ok(data),
+                "raw, out_chunk={out_chunk}: {:?}",
+                got.map(|v| v.len())
+            );
+        }
+    }
+}
+
+#[test]
+fn large_stream_all_input_in_decode_then_finish_drains() {
+    // One `decode` with a small output buffer, then only `finish`: finish
+    // has to keep decoding the buffered input, not just drain one burst.
+    let data = wordy(300_000);
+    let payload = shrink_lzw(&data);
+    assert!(
+        payload.len() < data.len() / 2,
+        "test encoder should compress"
+    );
+    let mut dec = Decoder::raw(data.len() as u64);
+    let mut buf = vec![0u8; 4096];
+    let (p, status) = dec.decode(&payload, &mut buf).unwrap();
+    assert_eq!(p.consumed, payload.len());
+    assert_eq!(status, Status::OutputFull);
+    let mut out = buf[..p.written].to_vec();
+    loop {
+        let (p, status) = dec.finish(&mut buf).unwrap();
+        out.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            break;
+        }
+        assert!(p.written > 0, "finish stalled");
+    }
+    assert!(out == data);
+}
+
+#[test]
+fn large_stream_chunked_input_matches() {
+    let data = wordy(250_000);
+    let payload = shrink_lzw(&data);
+    let f = framed(&payload, data.len() as u32);
+    for (ic, oc) in [(1, 100_000), (7, 3), (4096, 4096), (100_000, 1 << 20)] {
+        let got = decode_chunked(&f, ic, oc).unwrap();
+        assert!(got == data, "in_chunk={ic} out_chunk={oc}");
+    }
+}
+
+#[test]
+fn large_stream_truncated_still_errors() {
+    let data = wordy(250_000);
+    let payload = shrink_lzw(&data);
+    for cut in [payload.len() - 1, payload.len() / 2, 20_000] {
+        let mut dec = Decoder::raw(data.len() as u64);
+        let r = decode_documented(&mut dec, &payload[..cut], 64 * 1024);
+        assert_eq!(r.err(), Some(Error::UnexpectedEnd), "cut={cut}");
+    }
+}
+
 // ─── factory lookup ────────────────────────────────────────────────────
 
 #[cfg(feature = "factory")]
