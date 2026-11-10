@@ -103,6 +103,35 @@ const RC_MOVE_BITS: u32 = 5;
 const RC_TOP_VALUE: u32 = 0x0100_0000;
 const PROB_INIT: u16 = (RC_BIT_MODEL_TOTAL / 2) as u16;
 
+/// Default limit on the dictionary a stream may declare for the decoders
+/// that keep a window ([`crate::xz`], [`crate::lzma2`]): 128 MiB.
+pub const DEFAULT_MAX_DICT_SIZE: u64 = 128 * 1024 * 1024;
+
+/// Largest dictionary such a limit can allow: what the LZMA2 dictionary
+/// size property can express (4 GiB − 1), or the largest allocation the
+/// target supports if that is smaller (2 GiB − 1 on 32-bit targets).
+pub const MAX_DICT_SIZE: u64 = if (isize::MAX as u64) < u32::MAX as u64 {
+    isize::MAX as u64
+} else {
+    u32::MAX as u64
+};
+
+/// Smallest LZMA2 dictionary; a stream (or a limit) asking for less is
+/// treated as asking for this.
+pub const MIN_DICT_SIZE: u64 = 4096;
+
+/// A configured dictionary-size limit brought into
+/// `MIN_DICT_SIZE..=MAX_DICT_SIZE`.
+pub const fn effective_max_dict_size(bytes: u64) -> u64 {
+    if bytes < MIN_DICT_SIZE {
+        MIN_DICT_SIZE
+    } else if bytes > MAX_DICT_SIZE {
+        MAX_DICT_SIZE
+    } else {
+        bytes
+    }
+}
+
 /// Smallest step the lazily grown dictionary buffer is extended by.
 const DICT_GROW_MIN: usize = 4096;
 
@@ -1458,7 +1487,10 @@ pub const IN_REQUIRED: usize = 21;
 ///
 /// Spec (xz-file-format.txt §5.3.1): a value `b` in `0..=39` decodes to
 /// `(2 | (b & 1)) << (b/2 + 11)`; `b = 40` is the special "max" value
-/// `0xFFFFFFFF`. We clamp to a sane upper bound when allocating.
+/// `0xFFFFFFFF`. The value is the stream's true dictionary size: the
+/// callers check it against their configured limit before allocating a
+/// window for it, and never shrink it (a smaller distance bound would make
+/// valid far matches look corrupt).
 pub fn lzma2_dict_size(b: u8) -> Result<u32, Error> {
     if b > 40 {
         return Err(Error::Corrupt);

@@ -111,9 +111,27 @@
 //! damaged LZMA data further on can fail with [`Error::Corrupt`] for the
 //! size where the streaming mode reports the damage.)
 //!
+//! [`DecoderConfig::max_dict_size`] is a memory budget for the window, so
+//! it is not applied to the Blocks decoded without one: a plain LZMA2 Block
+//! decodes in this mode whatever dictionary it declares, up to the format's
+//! 4 GiB − 1, with distances bounded by that declared size. The limit still
+//! holds for the filtered Blocks, which do allocate a window.
+//!
 //! Using both conventions on one input, or passing a `filled` that is not
 //! the number of bytes the decoder has written, fails with
 //! [`Error::Unsupported`] without disturbing the decoder.
+//!
+//! ## Memory
+//!
+//! The streaming decoder's one large allocation is the LZMA2 window, whose
+//! size each Block Header declares (up to 4 GiB − 1). [`DecoderConfig`]
+//! bounds it: a Block declaring more than
+//! [`max_dict_size`](DecoderConfig::max_dict_size) (128 MiB by default;
+//! `xz -9` writes 64 MiB) is [`Error::Unsupported`], reported when its
+//! header is read — rather than decoded with a smaller window, which would
+//! call the first match reaching further back corrupt. The window is grown
+//! as output is produced, so a Block costs at most the smaller of its
+//! declared dictionary and its decoded length.
 //!
 //! ## Integrity checks
 //!
@@ -147,8 +165,9 @@ use crate::traits::{
 // (`crate::lzma2_internal`) so it can also back the public raw LZMA2
 // decoder exposed under the `lzma2` feature without pulling in this xz
 // container. See `lib.rs`.
+pub use crate::lzma2_internal::lzma2_decoder::{DEFAULT_MAX_DICT_SIZE, MAX_DICT_SIZE};
 use crate::lzma2_internal::lzma2_decoder::{
-    IN_REQUIRED, Lzma2Props, LzmaCore, OutputMode, lzma2_dict_size,
+    IN_REQUIRED, Lzma2Props, LzmaCore, OutputMode, effective_max_dict_size, lzma2_dict_size,
 };
 use crate::lzma2_internal::lzma2_encoder::{
     EncoderParams, LZMA2_PROPS_BYTE, Lzma2Chunk, Lzma2StreamEncoder,
@@ -557,6 +576,55 @@ impl Default for EncoderConfig {
     }
 }
 
+/// Decoder tunables.
+///
+/// The one setting is a memory budget: the largest LZMA2 dictionary a
+/// Block may declare for the decoder to keep a window of that size. It is
+/// not applied where no window is kept — plain LZMA2 Blocks decoded through
+/// [`ContiguousDecoder`] (see the [module docs](self#contiguous-output)).
+///
+/// The struct is `#[non_exhaustive]`: build it with [`DecoderConfig::new`]
+/// (or `default()`) or [`DecoderConfig::with_max_dict_size`].
+///
+/// ```
+/// use compcol::xz::{Decoder, DecoderConfig};
+///
+/// // Accept the 1 GiB dictionaries of `xz --lzma2=dict=1GiB`.
+/// let dec = Decoder::with_config(DecoderConfig::with_max_dict_size(1 << 30));
+/// assert_eq!(dec.max_dict_size(), 1 << 30);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DecoderConfig {
+    /// Largest dictionary size (in bytes) a Block Header may declare.
+    /// Defaults to [`DEFAULT_MAX_DICT_SIZE`] (128 MiB). Values below 4 KiB
+    /// are treated as 4 KiB and values above [`MAX_DICT_SIZE`] as
+    /// [`MAX_DICT_SIZE`].
+    pub max_dict_size: u64,
+}
+
+impl DecoderConfig {
+    /// The default configuration: a [`DEFAULT_MAX_DICT_SIZE`] limit.
+    pub const fn new() -> Self {
+        Self {
+            max_dict_size: DEFAULT_MAX_DICT_SIZE,
+        }
+    }
+
+    /// Configuration accepting dictionaries of up to `bytes` bytes.
+    pub const fn with_max_dict_size(bytes: u64) -> Self {
+        Self {
+            max_dict_size: bytes,
+        }
+    }
+}
+
+impl Default for DecoderConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Zero-sized marker type implementing [`Algorithm`] for xz.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Xz;
@@ -566,12 +634,12 @@ impl Algorithm for Xz {
     type Encoder = Encoder;
     type Decoder = Decoder;
     type EncoderConfig = EncoderConfig;
-    type DecoderConfig = ();
+    type DecoderConfig = DecoderConfig;
     fn encoder_with(c: Self::EncoderConfig) -> Encoder {
         Encoder::with_config(c)
     }
-    fn decoder_with(_: ()) -> Decoder {
-        Decoder::new()
+    fn decoder_with(c: Self::DecoderConfig) -> Decoder {
+        Decoder::with_config(c)
     }
 }
 
@@ -1419,6 +1487,11 @@ pub struct Decoder {
     /// last Stream (nothing, or a lone partial magic) settles the end.
     finishing: bool,
 
+    /// Largest dictionary a Block may declare for a window to be kept for
+    /// it (already brought into `4 KiB..=MAX_DICT_SIZE`). Configuration:
+    /// `reset` keeps it.
+    max_dict_size: u64,
+
     /// Streaming or contiguous output, whichever the input was started
     /// with.
     mode: OutputMode,
@@ -1430,8 +1503,22 @@ pub struct Decoder {
 }
 
 impl Decoder {
+    /// A decoder with the default [`DecoderConfig`].
     pub fn new() -> Self {
+        Self::with_config(DecoderConfig::new())
+    }
+
+    /// The dictionary size limit in effect, in bytes: the configured
+    /// [`DecoderConfig::max_dict_size`] brought into
+    /// `4 KiB..=`[`MAX_DICT_SIZE`].
+    pub const fn max_dict_size(&self) -> u64 {
+        self.max_dict_size
+    }
+
+    /// A decoder with the given configuration.
+    pub fn with_config(config: DecoderConfig) -> Self {
         Self {
+            max_dict_size: effective_max_dict_size(config.max_dict_size),
             phase: DecPhase::StreamHeader,
             scratch: Vec::new(),
             scratch_want: 12,
@@ -1481,13 +1568,14 @@ impl Decoder {
         self.mode.is_contiguous() && self.filters.is_none()
     }
 
-    /// The current Block's LZMA2 dictionary size, clamped to what we are
-    /// willing to allocate: at least 4 KiB (the format's minimum) and at
-    /// most 128 MiB, to bound memory (legitimate xz outputs almost never
-    /// need more than 64 MiB). The dictionary buffer itself grows only with
-    /// the bytes actually decoded.
+    /// The current Block's LZMA2 dictionary size: what its header declares
+    /// (at least 4 KiB, the format's minimum), never less — it is the bound
+    /// on match distances. Memory is bounded where the header is parsed: a
+    /// Block that needs a window larger than `max_dict_size` is refused
+    /// there. The window itself grows only with the bytes actually decoded.
     fn block_dict_size(&self) -> usize {
-        (self.lzma2_dict_size as usize).clamp(4096, 128 * 1024 * 1024)
+        // (`u32::MAX` fits `usize` on every supported target.)
+        (self.lzma2_dict_size as usize).max(4096)
     }
 
     /// Apply the dictionary reset of an uncompressed `0x01` chunk. The core
@@ -1730,6 +1818,14 @@ impl Decoder {
         match lzma2_dict_size(dict_flag) {
             Ok(v) => self.lzma2_dict_size = v,
             Err(e) => return Err(self.poison(e)),
+        }
+        // The window is this decoder's memory budget: refuse a Block that
+        // asks for more than the caller allowed, rather than decode it with
+        // a smaller window and fail on the first match that reaches further
+        // back. A Block decoded straight into the caller's contiguous
+        // buffer has no window, so nothing to refuse.
+        if !self.direct() && self.block_dict_size() as u64 > self.max_dict_size {
+            return Err(self.poison(Error::Unsupported));
         }
         // Any remaining bytes before the CRC must be zero padding.
         while cur < body_end {
@@ -2672,11 +2768,14 @@ impl RawDecoder for Decoder {
     }
 
     fn raw_reset(&mut self) {
-        *self = Self::new();
+        *self = Self::with_config(DecoderConfig::with_max_dict_size(self.max_dict_size));
     }
 }
 
 /// See the [module docs](self#contiguous-output).
+///
+/// [`DecoderConfig::max_dict_size`] is not applied to the Blocks decoded
+/// straight into `output` (plain LZMA2): no window is allocated for them.
 impl ContiguousDecoder for Decoder {
     fn decode_contiguous(
         &mut self,
@@ -2948,5 +3047,103 @@ mod tests {
         );
         let core = dec.lzma_core.as_ref().unwrap();
         assert_eq!(core.window_allocated(), 0);
+    }
+
+    /// A Block declaring a dictionary above 128 MiB used to be decoded with
+    /// a 128 MiB window — and distance bound, so that a valid match
+    /// reaching further back was "corrupt". Now the declared size is the
+    /// bound, and the window is a budget: over `max_dict_size` the Block is
+    /// `Unsupported` as soon as its header is read; with the limit raised
+    /// it decodes (the window growing with the output, not the
+    /// declaration); and the contiguous mode, which has no window, decodes
+    /// it under any limit.
+    #[test]
+    fn dictionary_size_is_a_budget_not_a_distance_clamp() {
+        let data = sample(100_000);
+        // 31: 192 MiB; 36: 1 GiB; 40: 4 GiB − 1.
+        for (flag, size) in [(31u8, 192u64 << 20), (36, 1 << 30), (40, u32::MAX as u64)] {
+            let s = encode_declaring(&data, flag);
+            let mut out = vec![0u8; data.len() + 1];
+
+            // Stream Header + Block Header are enough to refuse it.
+            let mut dec = Decoder::new();
+            assert_eq!(dec.decode(&s[..24], &mut out), Err(Error::Unsupported));
+            let just_under = DecoderConfig::with_max_dict_size(size - 1);
+            let mut dec = Decoder::with_config(just_under);
+            assert_eq!(dec.decode(&s, &mut out), Err(Error::Unsupported));
+
+            if size <= MAX_DICT_SIZE {
+                test_stats::reset();
+                let mut dec = Decoder::with_config(DecoderConfig::with_max_dict_size(size));
+                assert_eq!(dec.max_dict_size(), size);
+                let (p, _) = dec.decode(&s, &mut out).unwrap();
+                assert!(out[..p.written] == data, "flag {flag}");
+                // The window grew with the 100 kB decoded, no further.
+                let grown = test_stats::dict_bytes();
+                assert!(grown >= data.len() as u64 && grown <= 1 << 20, "{grown}");
+                // The distance bound is the declared size.
+                let core = dec.lzma_core.as_ref().unwrap();
+                assert_eq!(core.dict_capacity() as u64, size);
+                // `reset` keeps the limit.
+                dec.reset();
+                assert_eq!(dec.max_dict_size(), size);
+                let (p, _) = dec.decode(&s, &mut out).unwrap();
+                assert!(out[..p.written] == data);
+            }
+
+            // Contiguous: no window, so no limit — and the true bound.
+            test_stats::reset();
+            let mut dec = Decoder::new();
+            let (p, status) = dec.decode_contiguous(&s, &mut out, 0).unwrap();
+            assert_eq!((p.consumed, status), (s.len(), Status::InputEmpty));
+            assert!(out[..p.written] == data, "flag {flag}");
+            assert_eq!(test_stats::dict_bytes(), 0);
+            let core = dec.lzma_core.as_ref().unwrap();
+            assert_eq!(core.dict_capacity() as u64, size);
+        }
+
+        // Exactly the default limit is still accepted.
+        let s = encode_declaring(&data, 30);
+        let mut out = vec![0u8; data.len() + 1];
+        let (p, _) = Decoder::new().decode(&s, &mut out).unwrap();
+        assert!(out[..p.written] == data);
+        assert_eq!(Decoder::new().max_dict_size(), DEFAULT_MAX_DICT_SIZE);
+        // Limits out of range are brought into it.
+        let tiny = Decoder::with_config(DecoderConfig::with_max_dict_size(0));
+        assert_eq!(tiny.max_dict_size(), 4096);
+        let huge = Decoder::with_config(DecoderConfig::with_max_dict_size(u64::MAX));
+        assert_eq!(huge.max_dict_size(), MAX_DICT_SIZE);
+    }
+
+    /// In contiguous mode a Block with a filter before LZMA2 does keep a
+    /// window, so the limit holds for it there too.
+    #[test]
+    fn contiguous_mode_applies_the_limit_to_filtered_blocks() {
+        // `printf 'abcdabcdabcd' | xz --delta=dist=4 --lzma2 --check=crc32`
+        let mut s = [
+            0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x01, 0x69, 0x22, 0xde, 0x36, 0x04, 0xc1,
+            0x12, 0x0c, 0x03, 0x01, 0x03, 0x21, 0x01, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x7f, 0x9f, 0x62, 0x18, 0xe0, 0x00, 0x0b, 0x00, 0x0a, 0x5d, 0x00, 0x30, 0x98, 0x88,
+            0x98, 0x39, 0xa0, 0xa0, 0x60, 0x80, 0x00, 0x00, 0x00, 0x00, 0xb7, 0xe5, 0xb9, 0xd5,
+            0x00, 0x01, 0x2a, 0x0c, 0x28, 0x35, 0x5b, 0x46, 0x90, 0x42, 0x99, 0x0d, 0x01, 0x00,
+            0x00, 0x00, 0x00, 0x01, 0x59, 0x5a,
+        ];
+        // Declare a 1 GiB dictionary (36) instead of 8 MiB (0x16).
+        assert_eq!(s[19..22], [0x21, 0x01, 0x16]);
+        s[21] = 36;
+        let c = crc32(&s[12..28]);
+        s[28..32].copy_from_slice(&c.to_le_bytes());
+
+        let mut out = [0u8; 12];
+        let mut dec = Decoder::new();
+        assert_eq!(
+            dec.decode_contiguous(&s, &mut out, 0),
+            Err(Error::Unsupported)
+        );
+        test_stats::reset();
+        let mut dec = Decoder::with_config(DecoderConfig::with_max_dict_size(1 << 30));
+        let (p, _) = dec.decode_contiguous(&s, &mut out, 0).unwrap();
+        assert_eq!(&out[..p.written], b"abcdabcdabcd");
+        assert!(test_stats::dict_bytes() <= 4096);
     }
 }

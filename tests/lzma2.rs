@@ -314,7 +314,7 @@ fn xz_cross_validates_framing() {
     xz.extend_from_slice(&[0x59, 0x5A]);
 
     // Decode the whole thing through the public xz decoder.
-    let mut dec = Xz::decoder_with(());
+    let mut dec = Xz::decoder();
     let mut out = vec![0u8; data.len() + 64];
     let mut consumed = 0;
     let mut written = 0;
