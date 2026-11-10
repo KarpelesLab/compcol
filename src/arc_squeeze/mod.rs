@@ -220,12 +220,12 @@ impl RleDecoder {
 /// drops a symbol (a nonzero count stays at least 1), and with every count
 /// scaled to 1 the tree is balanced (9 levels for 257 symbols), so the loop
 /// terminates.
-fn build_tree(freq: &[u32; NUM_SYMBOLS]) -> (Vec<Node>, Vec<Code>) {
+fn build_tree(freq: &[u64; NUM_SYMBOLS]) -> (Vec<Node>, Vec<Code>) {
     let (table, codes, depth) = build_huffman(freq);
     if depth <= MAX_CODE_LEN as usize {
         return (table, codes);
     }
-    let mut ceiling: u32 = 0xFFFF;
+    let mut ceiling: u64 = 0xFFFF;
     loop {
         let scaled = scale_freqs(freq, ceiling);
         let (table, codes, depth) = build_huffman(&scaled);
@@ -237,13 +237,24 @@ fn build_tree(freq: &[u32; NUM_SYMBOLS]) -> (Vec<Node>, Vec<Code>) {
     }
 }
 
+/// Add the byte counts of `bytes` to `freq`. The counts are 64-bit: a
+/// 32-bit counter overflows on more than 4 GiB of one byte value (a panic
+/// in debug builds; in release it wrapped, and a count that wrapped to
+/// exactly zero dropped the symbol from the tree). [`build_tree`] scales
+/// the counts down itself when it needs to.
+fn count_symbols(freq: &mut [u64; NUM_SYMBOLS], bytes: &[u8]) {
+    for &b in bytes {
+        freq[b as usize] += 1;
+    }
+}
+
 /// Scale the frequencies down so the largest is at most `ceiling`, keeping
 /// every nonzero count nonzero.
-fn scale_freqs(freq: &[u32; NUM_SYMBOLS], ceiling: u32) -> [u32; NUM_SYMBOLS] {
+fn scale_freqs(freq: &[u64; NUM_SYMBOLS], ceiling: u64) -> [u64; NUM_SYMBOLS] {
     let ceiling = ceiling.max(1);
     let max = freq.iter().copied().max().unwrap_or(0);
     let divisor = max.div_ceil(ceiling).max(1);
-    let mut scaled = [0u32; NUM_SYMBOLS];
+    let mut scaled = [0u64; NUM_SYMBOLS];
     for (s, &f) in scaled.iter_mut().zip(freq.iter()) {
         if f > 0 {
             *s = (f / divisor).max(1);
@@ -255,7 +266,7 @@ fn scale_freqs(freq: &[u32; NUM_SYMBOLS], ceiling: u32) -> [u32; NUM_SYMBOLS] {
 /// Plain (unlimited-depth) Huffman construction. Returns the node table,
 /// the per-symbol codes and the length of the longest code; the codes are
 /// only meaningful when that length is at most [`MAX_CODE_LEN`].
-fn build_huffman(freq: &[u32; NUM_SYMBOLS]) -> (Vec<Node>, Vec<Code>, usize) {
+fn build_huffman(freq: &[u64; NUM_SYMBOLS]) -> (Vec<Node>, Vec<Code>, usize) {
     // Heap entries: (weight, node_ref). node_ref < 0 ⇒ leaf for -(ref)-1;
     // node_ref >= 0 ⇒ internal node index.
     #[derive(Clone, Copy)]
@@ -271,7 +282,7 @@ fn build_huffman(freq: &[u32; NUM_SYMBOLS]) -> (Vec<Node>, Vec<Code>, usize) {
     for (sym, &f) in freq.iter().enumerate() {
         if f > 0 {
             heap.push(Item {
-                weight: f as u64,
+                weight: f,
                 node: -(sym as i32) - 1,
                 order,
             });
@@ -444,10 +455,8 @@ impl Encoder {
         let rle = rle_encode(&self.input);
 
         // 2. Frequency count over RLE bytes + SPEOF.
-        let mut freq = [0u32; NUM_SYMBOLS];
-        for &b in &rle {
-            freq[b as usize] += 1;
-        }
+        let mut freq = [0u64; NUM_SYMBOLS];
+        count_symbols(&mut freq, &rle);
         freq[SPEOF as usize] = 1; // EOS always present once.
 
         let (table, codes) = build_tree(&freq);
@@ -885,7 +894,7 @@ mod tests {
     /// Check that `codes` is a complete prefix code no longer than
     /// `MAX_CODE_LEN` covering exactly the symbols with a nonzero
     /// frequency, and that each code walks `table` to its own leaf.
-    fn assert_valid_tree(freq: &[u32; NUM_SYMBOLS], table: &[Node], codes: &[Code]) {
+    fn assert_valid_tree(freq: &[u64; NUM_SYMBOLS], table: &[Node], codes: &[Code]) {
         assert!(table.len() <= MAX_NODES);
         let mut kraft = 0u64;
         let mut used = 0usize;
@@ -914,9 +923,9 @@ mod tests {
 
     /// Fibonacci frequencies give the deepest possible Huffman tree: `n`
     /// symbols produce an `n - 1`-bit code unless the depth is limited.
-    fn fib_freq(n: usize) -> [u32; NUM_SYMBOLS] {
-        let mut freq = [0u32; NUM_SYMBOLS];
-        let (mut a, mut b) = (1u32, 1u32);
+    fn fib_freq(n: usize) -> [u64; NUM_SYMBOLS] {
+        let mut freq = [0u64; NUM_SYMBOLS];
+        let (mut a, mut b) = (1u64, 1u64);
         for f in freq.iter_mut().take(n) {
             *f = a;
             (a, b) = (b, a + b);
@@ -927,7 +936,7 @@ mod tests {
 
     #[test]
     fn fibonacci_frequencies_are_length_limited() {
-        for n in [2, 10, 16, 17, 18, 26, 27, 33, 40, 45] {
+        for n in [2, 10, 16, 17, 18, 26, 27, 33, 40, 45, 64, 90] {
             let freq = fib_freq(n);
             let (table, codes) = build_tree(&freq);
             assert_valid_tree(&freq, &table, &codes);
@@ -937,15 +946,15 @@ mod tests {
     #[test]
     fn assorted_frequency_tables_are_valid() {
         // Everything present once; one dominant symbol; powers of two.
-        let mut flat = [1u32; NUM_SYMBOLS];
+        let mut flat = [1u64; NUM_SYMBOLS];
         let (table, codes) = build_tree(&flat);
         assert_valid_tree(&flat, &table, &codes);
 
-        flat[b'x' as usize] = u32::MAX;
+        flat[b'x' as usize] = u64::MAX / 2;
         let (table, codes) = build_tree(&flat);
         assert_valid_tree(&flat, &table, &codes);
 
-        let mut pow = [0u32; NUM_SYMBOLS];
+        let mut pow = [0u64; NUM_SYMBOLS];
         for (i, f) in pow.iter_mut().take(32).enumerate() {
             *f = 1 << i;
         }
@@ -954,18 +963,38 @@ mod tests {
         assert_valid_tree(&pow, &table, &codes);
 
         // Only the end-of-stream symbol.
-        let mut only = [0u32; NUM_SYMBOLS];
+        let mut only = [0u64; NUM_SYMBOLS];
         only[SPEOF as usize] = 1;
         let (table, codes) = build_tree(&only);
         assert_eq!(table.len(), 1);
         assert_eq!(codes[SPEOF as usize].1, 1);
     }
 
+    /// More than `u32::MAX` occurrences of one byte must neither overflow
+    /// the counter nor wrap it to zero (which dropped the symbol from the
+    /// tree). Seeds the table instead of counting 4 GiB of input.
+    #[test]
+    fn counts_past_4gib_do_not_wrap() {
+        let mut freq = [0u64; NUM_SYMBOLS];
+        freq[b'a' as usize] = u32::MAX as u64;
+        freq[b'b' as usize] = u32::MAX as u64 - 1;
+        count_symbols(&mut freq, b"aabbc");
+        freq[SPEOF as usize] = 1;
+        assert_eq!(freq[b'a' as usize], u32::MAX as u64 + 2);
+        assert_eq!(freq[b'b' as usize], u32::MAX as u64 + 1);
+        assert_eq!(freq[b'c' as usize], 1);
+
+        let (table, codes) = build_tree(&freq);
+        assert_valid_tree(&freq, &table, &codes);
+        assert!(codes[b'a' as usize].1 <= 2);
+        assert!(codes[b'b' as usize].1 <= 2);
+    }
+
     /// A tree that already fits is exactly what plain Huffman builds:
     /// frequencies are only rescaled when the depth limit is hit.
     #[test]
     fn shallow_trees_are_not_rescaled() {
-        let mut freq = [0u32; NUM_SYMBOLS];
+        let mut freq = [0u64; NUM_SYMBOLS];
         freq[b'a' as usize] = 40;
         freq[b'b' as usize] = 45;
         freq[b'c' as usize] = 10_000_000;
