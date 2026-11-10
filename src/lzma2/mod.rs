@@ -48,6 +48,23 @@
 //! dictionary, which is sufficient for any stream whose dictionary code
 //! resolves to ≤ 4 MiB (the common case).
 //!
+//! ## Contiguous output
+//!
+//! [`Decoder`] implements [`ContiguousDecoder`]:
+//! when the whole decoded stream goes into one buffer, that buffer is the
+//! dictionary. Matches are copied within it, uncompressed chunks are copied
+//! into it, and **no window is allocated** whatever dictionary size is
+//! configured; what remains is the model (probability tables) and one
+//! chunk's compressed bytes (at most 64 KiB). A dictionary reset is where
+//! history starts anew: a match reaching before it — or further back than
+//! the configured dictionary size — is rejected exactly as in the streaming
+//! mode, so both modes accept the same streams and fail the others with the
+//! same error.
+//!
+//! Using both conventions on one stream, or passing a `filled` that is not
+//! the number of bytes the decoder has written, fails with
+//! [`Error::Unsupported`] without disturbing the decoder.
+//!
 //! ## Reuse
 //!
 //! The LZMA range coder, probability tables, and LZ window are the exact
@@ -93,8 +110,10 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::lzma2_internal::lzma2_decoder::{Lzma2Props, LzmaCore, lzma2_dict_size};
-use crate::traits::{Algorithm, Flush, RawDecoder, RawEncoder, RawProgress};
+use crate::lzma2_internal::lzma2_decoder::{Lzma2Props, LzmaCore, OutputMode, lzma2_dict_size};
+use crate::traits::{
+    Algorithm, ContiguousDecoder, Flush, Progress, RawDecoder, RawEncoder, RawProgress, Status,
+};
 
 /// Hard cap on the LZMA2 dictionary we will allocate, regardless of the
 /// dictionary-size code. Bounds memory against a crafted property byte;
@@ -609,7 +628,8 @@ enum Phase {
     CompHeader,
     /// Buffering `comp_size` compressed bytes.
     CompBuffer,
-    /// Draining the decoded chunk to the caller.
+    /// Draining the decoded chunk to the caller (contiguous mode: decoding
+    /// the buffered chunk straight into the caller's buffer).
     CompDrain,
     /// Saw the `0x00` end control; stream complete.
     Done,
@@ -619,6 +639,9 @@ enum Phase {
 ///
 /// Drive through the [`Decoder`](crate::Decoder) trait (or
 /// [`crate::io::DecoderReader`]). Self-terminates on the `0x00` control byte.
+///
+/// Also a [`ContiguousDecoder`]: see the
+/// [module docs](self#contiguous-output).
 pub struct Decoder {
     dict_size: usize,
     lzma_core: Option<Box<LzmaCore>>,
@@ -649,6 +672,13 @@ pub struct Decoder {
 
     // Uncompressed (stored) chunk byte counter.
     chunk_remaining: usize,
+
+    /// Streaming or contiguous output, whichever the stream was started
+    /// with.
+    mode: OutputMode,
+    /// The last [`Self::run`] stopped for want of output room (rather than
+    /// of input).
+    out_blocked: bool,
 }
 
 impl Decoder {
@@ -677,6 +707,8 @@ impl Decoder {
             comp_decoded: Vec::new(),
             comp_decoded_pos: 0,
             chunk_remaining: 0,
+            mode: OutputMode::default(),
+            out_blocked: false,
         }
     }
 
@@ -709,9 +741,16 @@ impl Decoder {
     /// dictionary-continuing compressed chunk (`0xC0`) can reference them.
     /// The core exists by then: the stream's first chunk resets the
     /// dictionary, which creates it.
+    ///
+    /// In contiguous mode the bytes are history where the caller has them,
+    /// in the output buffer; the core is only told how many there are.
     fn feed_uncompressed_dict(&mut self, src: &[u8]) {
         if let Some(core) = self.lzma_core.as_mut() {
-            core.append_literals(src);
+            if self.mode.is_contiguous() {
+                core.append_contiguous(src.len());
+            } else {
+                core.append_literals(src);
+            }
         }
     }
 
@@ -726,13 +765,21 @@ impl Decoder {
     }
 }
 
-impl RawDecoder for Decoder {
-    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
-        if self.poisoned {
-            return Err(Error::Corrupt);
-        }
+impl Decoder {
+    /// The chunk state machine, shared by both output conventions. Decoded
+    /// bytes are written from `output[start..]`; the returned `written` is
+    /// the *absolute* position reached in `output`.
+    ///
+    /// In streaming mode `start` is 0 and `output` is whatever buffer the
+    /// caller passed to this call. In contiguous mode `output` is the whole
+    /// decoded stream so far and `start` the caller's `filled`: compressed
+    /// chunks are then decoded straight into it and read their history
+    /// from it. Sets `out_blocked` when it returns for want of room.
+    fn run(&mut self, input: &[u8], output: &mut [u8], start: usize) -> Result<RawProgress, Error> {
+        let contiguous = self.mode.is_contiguous();
+        self.out_blocked = false;
         let mut consumed = 0usize;
-        let mut written = 0usize;
+        let mut written = start;
 
         loop {
             match self.phase {
@@ -829,6 +876,7 @@ impl RawDecoder for Decoder {
                     if self.chunk_remaining == 0 {
                         self.phase = Phase::Control;
                     } else {
+                        self.out_blocked = consumed < input.len();
                         return Ok(RawProgress {
                             consumed,
                             written,
@@ -912,13 +960,22 @@ impl RawDecoder for Decoder {
                             done: false,
                         });
                     }
-                    // Decode the whole chunk into comp_decoded.
-                    self.comp_decoded.clear();
-                    self.comp_decoded.resize(self.comp_uncomp_size, 0u8);
                     let core = match self.lzma_core.as_mut() {
                         Some(c) => c,
                         None => return Err(self.poison(Error::Corrupt)),
                     };
+                    if contiguous {
+                        // Decoded by `CompDrain`, into the caller's buffer.
+                        if let Err(e) = core.init_range(&self.comp_buf) {
+                            return Err(self.poison(e));
+                        }
+                        self.comp_decoded_pos = 0;
+                        self.phase = Phase::CompDrain;
+                        continue;
+                    }
+                    // Decode the whole chunk into comp_decoded.
+                    self.comp_decoded.clear();
+                    self.comp_decoded.resize(self.comp_uncomp_size, 0u8);
                     if let Err(e) = core.init_range(&self.comp_buf) {
                         return Err(self.poison(e));
                     }
@@ -927,6 +984,35 @@ impl RawDecoder for Decoder {
                     }
                     self.comp_decoded_pos = 0;
                     self.phase = Phase::CompDrain;
+                }
+                Phase::CompDrain if contiguous => {
+                    // `comp_decoded_pos` counts the chunk's bytes decoded so
+                    // far. Whatever does not fit in `output` — possibly the
+                    // rest of a match — is decoded by a later call, with a
+                    // longer buffer.
+                    let left = self.comp_uncomp_size - self.comp_decoded_pos;
+                    let before = written;
+                    let core = match self.lzma_core.as_mut() {
+                        Some(c) => c,
+                        None => return Err(self.poison(Error::Corrupt)),
+                    };
+                    let r = core.decode_contiguous(&self.comp_buf, output, &mut written, left, 0);
+                    self.comp_decoded_pos += written - before;
+                    if let Err(e) = r {
+                        return Err(self.poison(e));
+                    }
+                    if self.comp_decoded_pos < self.comp_uncomp_size {
+                        self.out_blocked = true;
+                        return Ok(RawProgress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                    if let Err(e) = core.finish_chunk(&self.comp_buf) {
+                        return Err(self.poison(e));
+                    }
+                    self.phase = Phase::Control;
                 }
                 Phase::CompDrain => {
                     let total = self.comp_decoded.len();
@@ -941,6 +1027,7 @@ impl RawDecoder for Decoder {
                     if self.comp_decoded_pos >= total {
                         self.phase = Phase::Control;
                     } else {
+                        self.out_blocked = true;
                         return Ok(RawProgress {
                             consumed,
                             written,
@@ -951,11 +1038,22 @@ impl RawDecoder for Decoder {
             }
         }
     }
+}
+
+impl RawDecoder for Decoder {
+    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
+        if self.poisoned {
+            return Err(Error::Corrupt);
+        }
+        self.mode.enter_streaming()?;
+        self.run(input, output, 0)
+    }
 
     fn raw_finish(&mut self, _output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
+        self.mode.enter_streaming()?;
         // Self-terminating: finishing before the 0x00 control is truncation.
         if self.phase == Phase::Done {
             Ok(RawProgress {
@@ -983,6 +1081,83 @@ impl RawDecoder for Decoder {
         self.comp_decoded.clear();
         self.comp_decoded_pos = 0;
         self.chunk_remaining = 0;
+        self.mode = OutputMode::default();
+        self.out_blocked = false;
+    }
+}
+
+/// See the [module docs](self#contiguous-output).
+impl ContiguousDecoder for Decoder {
+    fn decode_contiguous(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        filled: usize,
+    ) -> Result<(Progress, Status), Error> {
+        if self.poisoned {
+            return Err(Error::Corrupt);
+        }
+        self.mode.enter_contiguous(output.len(), filled)?;
+        // Any error is final here: the caller cannot know how much of
+        // `output` the failed call wrote, so nothing can follow it.
+        let p = match self.run(input, output, filled) {
+            Ok(p) => p,
+            Err(e) => return Err(self.poison(e)),
+        };
+        let written = p.written - filled;
+        self.mode.advance(written);
+        let status = if p.done {
+            Status::StreamEnd
+        } else if self.out_blocked || p.consumed < input.len() {
+            Status::OutputFull
+        } else {
+            Status::InputEmpty
+        };
+        Ok((
+            Progress {
+                consumed: p.consumed,
+                written,
+            },
+            status,
+        ))
+    }
+
+    fn finish_contiguous(
+        &mut self,
+        output: &mut [u8],
+        filled: usize,
+    ) -> Result<(Progress, Status), Error> {
+        if self.poisoned {
+            return Err(Error::Corrupt);
+        }
+        self.mode.enter_contiguous(output.len(), filled)?;
+        // A buffered chunk may still have output to give.
+        let p = match self.run(&[], output, filled) {
+            Ok(p) => p,
+            Err(e) => return Err(self.poison(e)),
+        };
+        let written = p.written - filled;
+        self.mode.advance(written);
+        let status = if p.done {
+            Status::StreamEnd
+        } else if self.out_blocked || written > 0 {
+            // More is waiting for room in `output`; or this call still
+            // wrote something, which an error would throw away: the
+            // truncation is reported by the next call, the first with
+            // nothing to hand over.
+            Status::OutputFull
+        } else {
+            // Self-terminating: no `0x00` control and no input left to find
+            // it in is truncation.
+            return Err(self.poison(Error::UnexpectedEnd));
+        };
+        Ok((
+            Progress {
+                consumed: 0,
+                written,
+            },
+            status,
+        ))
     }
 }
 
@@ -1426,5 +1601,48 @@ mod tests {
             "{}",
             test_stats::dict_bytes()
         );
+    }
+
+    /// In contiguous mode the caller's buffer is the dictionary: none is
+    /// allocated, however large the one configured and however much is
+    /// decoded — through compressed chunks and stored ones.
+    #[test]
+    fn contiguous_mode_allocates_no_dictionary() {
+        use crate::lzma2_internal::lzma2_decoder::test_stats;
+        let mut data: Vec<u8> = (0u32..200_000)
+            .map(|i| (i.wrapping_mul(31) >> 3) as u8)
+            .collect();
+        let mut x = 0x1234_5678u32;
+        for b in data[90_000..160_000].iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = (x >> 24) as u8;
+        }
+        let stream = encode_all(&data, 1 << 17);
+        assert!(
+            stream.len() > 70_000,
+            "expected the noise to be stored uncompressed"
+        );
+        // 30: a 128 MiB dictionary.
+        let cfg = DecoderConfig::with_dict_prop(30);
+
+        // The streaming mode keeps a window as large as what it decoded.
+        test_stats::reset();
+        let mut dec = Decoder::new(cfg);
+        let mut out = vec![0u8; data.len() + 1];
+        let (p, status) = dec.decode(&stream, &mut out).unwrap();
+        assert_eq!(status, Status::StreamEnd);
+        assert!(out[..p.written] == data);
+        assert!(test_stats::dict_bytes() >= data.len() as u64);
+
+        test_stats::reset();
+        let mut dec = Decoder::new(cfg);
+        let mut out = vec![0u8; data.len()];
+        let (p, status) = dec.decode_contiguous(&stream, &mut out, 0).unwrap();
+        assert_eq!((p.consumed, status), (stream.len(), Status::StreamEnd));
+        assert!(out[..p.written] == data);
+        assert_eq!(test_stats::dict_bytes(), 0);
+        assert_eq!(test_stats::cores_built(), 1);
     }
 }
