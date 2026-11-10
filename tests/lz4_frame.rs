@@ -491,6 +491,99 @@ fn content_size_smaller_than_content_is_rejected() {
     assert_eq!(try_decode(&frame), Err(compcol::Error::Corrupt));
 }
 
+/// Append an uncompressed block to a hand-built frame.
+fn push_raw_block(frame: &mut Vec<u8>, data: &[u8]) {
+    frame.extend_from_slice(&(data.len() as u32 | 0x8000_0000).to_le_bytes());
+    frame.extend_from_slice(data);
+}
+
+/// Append a compressed block holding one 4-byte match at `offset` followed
+/// by the single literal `tail`.
+fn push_match_block(frame: &mut Vec<u8>, offset: u16, tail: u8) {
+    let [lo, hi] = offset.to_le_bytes();
+    frame.extend_from_slice(&5u32.to_le_bytes());
+    frame.extend_from_slice(&[0x00, lo, hi, 0x10, tail]);
+}
+
+#[test]
+fn linked_frame_of_tiny_blocks() {
+    // A linked-mode frame (FLG = 0x40) made of one 64 KiB block followed by
+    // a long run of 1-byte blocks. The decoder used to slide its 64 KiB
+    // history window with a full memmove for every one of them (~30x
+    // slower than the same frame in independent mode); the window is now
+    // trimmed in amortised O(1) per byte. No timing assertion here — this
+    // pins the output of that path.
+    const TINY: usize = 100_000;
+    let mut expected: Vec<u8> = (0..64 * 1024u32)
+        .map(|i| (i * 7 + (i >> 8)) as u8)
+        .collect();
+    let mut frame = frame_header(&[0x40, 0x40]);
+    push_raw_block(&mut frame, &expected);
+    for i in 0..TINY {
+        let b = (i % 251) as u8;
+        frame.extend_from_slice(&[0x01, 0x00, 0x00, 0x80, b]);
+        expected.push(b);
+    }
+    frame.extend_from_slice(&[0, 0, 0, 0]);
+    assert_eq!(try_decode(&frame).unwrap(), expected);
+}
+
+#[test]
+fn linked_matches_reach_exactly_64k_back_across_window_trims() {
+    // Interleave uncompressed blocks of awkward sizes with compressed
+    // blocks whose only match reaches a chosen distance back into earlier
+    // blocks — up to 65535, the farthest an LZ4 offset can express. The
+    // history kept for linked blocks must serve every one of them no
+    // matter where its internal trim points fall.
+    let mut frame = frame_header(&[0x40, 0x40]);
+    let mut expected: Vec<u8> = Vec::new();
+    let mut state = 0x2545_F491u32;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    let first: Vec<u8> = (0..64 * 1024).map(|_| next() as u8).collect();
+    push_raw_block(&mut frame, &first);
+    expected.extend_from_slice(&first);
+    let offsets = [65535u16, 4, 65534, 4096, 65535, 32768, 1000];
+    for round in 0..600 {
+        let len = 1 + (next() as usize % 997);
+        let raw: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+        push_raw_block(&mut frame, &raw);
+        expected.extend_from_slice(&raw);
+
+        let offset = offsets[round % offsets.len()];
+        let tail = next() as u8;
+        push_match_block(&mut frame, offset, tail);
+        let start = expected.len() - offset as usize;
+        expected.extend_from_within(start..start + 4);
+        expected.push(tail);
+    }
+    frame.extend_from_slice(&[0, 0, 0, 0]);
+    assert!(expected.len() > 5 * 64 * 1024);
+    assert_eq!(try_decode(&frame).unwrap(), expected);
+}
+
+#[test]
+fn linked_match_beyond_history_is_rejected() {
+    // Only 10 bytes of history exist; an offset of 11 points before the
+    // start of the frame.
+    let mut frame = frame_header(&[0x40, 0x40]);
+    push_raw_block(&mut frame, b"0123456789");
+    push_match_block(&mut frame, 11, b'!');
+    frame.extend_from_slice(&[0, 0, 0, 0]);
+    assert_eq!(try_decode(&frame), Err(compcol::Error::InvalidDistance));
+
+    // Offset 10 is the oldest byte and is fine.
+    let mut frame = frame_header(&[0x40, 0x40]);
+    push_raw_block(&mut frame, b"0123456789");
+    push_match_block(&mut frame, 10, b'!');
+    frame.extend_from_slice(&[0, 0, 0, 0]);
+    assert_eq!(try_decode(&frame).unwrap(), b"01234567890123!");
+}
+
 // ─── Linked blocks (default) ─────────────────────────────────────────────
 
 #[test]
