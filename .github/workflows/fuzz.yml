@@ -1,7 +1,11 @@
-# Smoke fuzz: each decoder fuzz target gets a brief libfuzzer run on every
-# PR. 30 seconds × 9 targets ≈ 5 min wall-clock. Not a coverage campaign —
-# the goal is "do recent changes regress an obvious crash?". For deep
-# campaigns, run locally or wire OSS-Fuzz.
+# Smoke fuzz: every fuzz target in fuzz/Cargo.toml gets a brief libfuzzer
+# run on every PR, one matrix job per target (30 seconds of fuzzing each,
+# run in parallel). Not a coverage campaign: the goal is "do recent changes
+# regress an obvious crash?". For deep campaigns, run locally or wire
+# OSS-Fuzz.
+#
+# The matrix below must list exactly the [[bin]] targets of fuzz/Cargo.toml;
+# a target that is not listed here never runs in CI.
 
 name: Fuzz smoke
 
@@ -66,6 +70,20 @@ jobs:
           - decoder_rar3
           - decoder_rar5
           - roundtrip
+          - decoder_snappy
+          - decoder_lzw
+          - decoder_lzo
+          - decoder_lzx
+          - decoder_quantum
+          - decoder_lzfse
+          - decoder_adc
+          - decoder_lzma2
+          - decoder_huffman
+          - decoder_range
+          - decoder_bwt
+          - hpack_qpack
+          - limited_dispatch
+          - chunked_vs_oneshot
     steps:
       - uses: actions/checkout@v6
       - name: Install nightly toolchain
