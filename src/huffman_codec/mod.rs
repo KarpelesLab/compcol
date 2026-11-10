@@ -558,6 +558,28 @@ impl BitWriter {
 
 // ─── core transforms ──────────────────────────────────────────────────────
 
+/// Scale exact `u64` symbol counts down to the `u32` weights the code-length
+/// construction works with.
+///
+/// Counts that already fit are returned unchanged, so the code built for any
+/// input shorter than 4 GiB is exactly what it always was. Otherwise every
+/// count is shifted right by the same amount — just enough for the largest to
+/// fit — which preserves their relative order and (to within rounding) their
+/// ratios. A nonzero count never scales to zero: a symbol that occurs in the
+/// input must keep a code.
+fn scale_freqs(counts: &[u64; 256]) -> [u32; 256] {
+    let max = counts.iter().copied().max().unwrap_or(0);
+    let shift = (u64::BITS - max.leading_zeros()).saturating_sub(u32::BITS);
+    let mut out = [0u32; 256];
+    for (slot, &count) in out.iter_mut().zip(counts.iter()) {
+        if count != 0 {
+            // `count >> shift` fits: `max >> shift` does, by choice of shift.
+            *slot = ((count >> shift) as u32).max(1);
+        }
+    }
+    out
+}
+
 /// Encode `input` into a complete self-delimiting Huffman stream.
 fn encode_stream(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -567,11 +589,14 @@ fn encode_stream(input: &[u8]) -> Vec<u8> {
         return out;
     }
 
-    // Frequencies.
-    let mut freqs = [0u32; 256];
+    // Frequencies. Counted in `u64`: a `u32` counter wraps (or panics, with
+    // overflow checks on) once a byte value occurs 2^32 times, and a count
+    // that wraps to exactly 0 would drop the symbol from the code.
+    let mut counts = [0u64; 256];
     for &b in input {
-        freqs[b as usize] += 1;
+        counts[b as usize] += 1;
     }
+    let freqs = scale_freqs(&counts);
 
     // Length-limited canonical lengths (single-symbol → 1-bit code).
     let lengths = length_limited_lengths(&freqs, MAX_CODE_LEN);
