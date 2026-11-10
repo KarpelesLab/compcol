@@ -637,9 +637,14 @@ fn checked_output_len(declared: u64) -> Result<usize, Error> {
     }
 }
 
-/// Decode a self-delimiting Huffman stream back into the original bytes.
-fn decode_stream(input: &[u8]) -> Result<Vec<u8>, Error> {
+/// Decode a self-delimiting Huffman stream back into the original bytes,
+/// refusing a stream that declares more than `output_limit` of them before
+/// decoding anything.
+fn decode_stream(input: &[u8], output_limit: u64) -> Result<Vec<u8>, Error> {
     let (orig_len, vlen) = read_varint(input)?;
+    if orig_len > output_limit {
+        return Err(Error::OutputLimitExceeded);
+    }
     let mut rest = &input[vlen..];
 
     if orig_len == 0 {
@@ -834,12 +839,28 @@ impl RawEncoder for Encoder {
 /// resumable bit-reader state machine), decodes once the stream ends, then
 /// drains the decoded bytes. Output is bounded by the in-stream length
 /// header, so a crafted small input cannot expand without limit.
+///
+/// With an output limit set
+/// ([`Decoder::set_output_limit`](crate::Decoder::set_output_limit), which
+/// [`LimitedDecoder`](crate::limit::LimitedDecoder) calls), a stream whose
+/// length header declares more than the limit is refused with
+/// [`Error::OutputLimitExceeded`] by the `decode` call that completes the
+/// header varint, before the stream is buffered or anything is decoded.
 #[derive(Debug)]
 pub struct Decoder {
     input: Vec<u8>,
     output: Vec<u8>,
     cursor: usize,
     decoded: bool,
+    /// Most bytes the caller will take; `u64::MAX` means no limit.
+    /// Configuration: survives `reset`.
+    output_limit: u64,
+    /// The length varint has been looked at against `output_limit` (or is
+    /// malformed, which `finish` reports).
+    header_checked: bool,
+    /// The stream declares more than `output_limit`; every call fails
+    /// until `reset`.
+    over_limit: bool,
 }
 
 impl Decoder {
@@ -850,7 +871,44 @@ impl Decoder {
             output: Vec::new(),
             cursor: 0,
             decoded: false,
+            output_limit: u64::MAX,
+            header_checked: false,
+            over_limit: false,
         }
+    }
+
+    /// Check the stream's declared length against the output limit as soon
+    /// as the varint is complete, looking at the bytes already buffered
+    /// followed by `incoming` (which is not buffered yet).
+    fn check_header(&mut self, incoming: &[u8]) -> Result<(), Error> {
+        if self.over_limit {
+            return Err(Error::OutputLimitExceeded);
+        }
+        if self.header_checked || self.output_limit == u64::MAX {
+            return Ok(());
+        }
+        // A u64 varint is at most 10 bytes; with 11 in hand a failure to
+        // parse means it is malformed, not merely incomplete.
+        let mut head = [0u8; 11];
+        let mut n = 0;
+        for &b in self.input.iter().chain(incoming).take(head.len()) {
+            head[n] = b;
+            n += 1;
+        }
+        match read_varint(&head[..n]) {
+            Ok((declared, _)) => {
+                if declared > self.output_limit {
+                    self.over_limit = true;
+                    return Err(Error::OutputLimitExceeded);
+                }
+                self.header_checked = true;
+            }
+            // Malformed: `finish` reports it, as it does without a limit.
+            Err(_) if n == head.len() => self.header_checked = true,
+            // Varint not complete yet: look again when more input arrives.
+            Err(_) => {}
+        }
+        Ok(())
     }
 
     fn drain(&mut self, output: &mut [u8]) -> RawProgress {
@@ -875,6 +933,8 @@ impl Default for Decoder {
 impl RawDecoder for Decoder {
     fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         if !self.decoded {
+            // Before buffering: a stream over the limit is not worth keeping.
+            self.check_header(input)?;
             self.input.extend_from_slice(input);
             return Ok(RawProgress {
                 consumed: input.len(),
@@ -886,8 +946,11 @@ impl RawDecoder for Decoder {
     }
 
     fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
+        if self.over_limit {
+            return Err(Error::OutputLimitExceeded);
+        }
         if !self.decoded {
-            self.output = decode_stream(&self.input)?;
+            self.output = decode_stream(&self.input, self.output_limit)?;
             self.decoded = true;
         }
         Ok(self.drain(output))
@@ -898,8 +961,19 @@ impl RawDecoder for Decoder {
         self.output.clear();
         self.cursor = 0;
         self.decoded = false;
+        // `output_limit` is configuration and is kept.
+        self.header_checked = false;
+        self.over_limit = false;
+    }
+
+    fn raw_set_output_limit(&mut self, max_output_bytes: u64) {
+        self.output_limit = max_output_bytes;
+        // Look at the header again under the new limit.
+        self.header_checked = false;
     }
 }
 
+#[cfg(test)]
+mod limit_tests;
 #[cfg(test)]
 mod tests;
