@@ -69,6 +69,16 @@
 //! bytes, or a declared length the payload cannot satisfy, yields
 //! [`Error::UnexpectedEnd`]; a length so large it could not have been
 //! produced by this coder yields [`Error::Corrupt`].
+//!
+//! ## Memory
+//!
+//! Both directions buffer their whole *input* (the encoder needs the length
+//! for the header; the decoder cannot tell where the stream ends before
+//! `finish`). The decoder does not buffer its output: `finish` decodes
+//! straight into the caller's buffer, a buffer-full at a time, so the
+//! declared length never sizes an allocation and a stream truncated
+//! relative to it is reported only once decoding reaches the missing part
+//! (the bytes before it are produced first).
 
 #![cfg_attr(docsrs, doc(cfg(feature = "rangecoder")))]
 
@@ -335,15 +345,29 @@ impl RangeEncoder {
 
 /// Streaming adaptive order-0 range decoder.
 ///
-/// Buffers the entire compressed stream, then decodes the framed payload on
-/// [`finish`](crate::Decoder::finish). Truncated or malformed input is
+/// Buffers the entire compressed stream during
+/// [`decode`](crate::Decoder::decode), then decodes it on
+/// [`finish`](crate::Decoder::finish) straight into the caller's output
+/// buffer, as much as fits per call. The decoded data is never held in
+/// memory, so the length declared in the header costs nothing until the
+/// caller actually asks for the bytes, and a caller that stops early (an
+/// output limit, say) bounds the work done. Truncated or malformed input is
 /// reported as an [`Error`] — the decoder never panics.
 #[derive(Debug)]
 pub struct Decoder {
     input: Vec<u8>,
-    out: Vec<u8>,
-    head: usize,
-    finished: bool,
+    /// Decoding state, set up by the first `finish` call.
+    state: Option<DecodeState>,
+}
+
+/// Where the decoder is in the payload (`Decoder::input[8..]`).
+#[derive(Debug)]
+struct DecodeState {
+    rc: RangeDecoder,
+    model: Model,
+    /// Bytes still to produce. Kept as `u64`: the output is streamed, so it
+    /// may exceed the address space on 32-bit targets.
+    remaining: u64,
 }
 
 impl Decoder {
@@ -351,14 +375,12 @@ impl Decoder {
     pub fn new() -> Self {
         Self {
             input: Vec::new(),
-            out: Vec::new(),
-            head: 0,
-            finished: false,
+            state: None,
         }
     }
 
-    fn decode_all(&mut self) -> Result<(), Error> {
-        self.out.clear();
+    /// Parse the header and prime the range decoder. Allocates nothing.
+    fn start(&self) -> Result<DecodeState, Error> {
         if self.input.len() < 8 {
             // A valid stream always carries the 8-byte length header.
             // An empty stream (0 bytes) is also too short — there is no
@@ -368,46 +390,37 @@ impl Decoder {
         let mut len_bytes = [0u8; 8];
         len_bytes.copy_from_slice(&self.input[..8]);
         let out_len = u64::from_le_bytes(len_bytes);
+        let payload = &self.input[8..];
 
         if out_len == 0 {
             // Header says zero bytes — payload must be empty.
-            if self.input.len() != 8 {
+            if !payload.is_empty() {
                 return Err(Error::Corrupt);
             }
-            return Ok(());
+            return Ok(DecodeState {
+                rc: RangeDecoder::idle(),
+                model: Model::new(),
+                remaining: 0,
+            });
         }
 
         // Guard against an absurd declared length that no real payload of
-        // this size could produce (decompression-bomb / corruption guard).
-        // Each output byte needs at least ~1 bit; the payload is
-        // `input.len() - 8` bytes. Allow generous slack (256x) before
-        // rejecting, since low-entropy data compresses hugely.
-        let payload_len = self.input.len() - 8;
-        let max_plausible = (payload_len as u64)
+        // this size could produce (corruption guard). Each output byte
+        // needs at least ~1 bit; allow generous slack (256x) before
+        // rejecting, since low-entropy data compresses hugely. This is only
+        // a sanity check: nothing is allocated from `out_len`.
+        let max_plausible = (payload.len() as u64)
             .saturating_mul(256)
             .saturating_add(1024);
         if out_len > max_plausible {
             return Err(Error::Corrupt);
         }
-        let out_len = out_len as usize;
-        self.out.reserve(out_len);
 
-        let payload = core::mem::take(&mut self.input);
-        let result = (|| {
-            let mut rc = RangeDecoder::new(&payload[8..])?;
-            let mut model = Model::new();
-            rc.decode_bytes(&mut model.probs, out_len, &mut self.out)
-        })();
-        self.input = payload;
-        result
-    }
-
-    fn drain(&mut self, output: &mut [u8]) -> usize {
-        let avail = self.out.len() - self.head;
-        let n = avail.min(output.len());
-        output[..n].copy_from_slice(&self.out[self.head..self.head + n]);
-        self.head += n;
-        n
+        Ok(DecodeState {
+            rc: RangeDecoder::new(payload)?,
+            model: Model::new(),
+            remaining: out_len,
+        })
     }
 }
 
@@ -429,30 +442,39 @@ impl RawDecoder for Decoder {
     }
 
     fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
-        if !self.finished {
-            self.decode_all()?;
-            self.finished = true;
+        if self.state.is_none() {
+            self.state = Some(self.start()?);
         }
-        let written = self.drain(output);
-        let done = self.head >= self.out.len();
+        let Some(state) = self.state.as_mut() else {
+            return Err(Error::Corrupt);
+        };
+        let n = usize::try_from(state.remaining)
+            .unwrap_or(usize::MAX)
+            .min(output.len());
+        if n > 0 {
+            state
+                .rc
+                .decode_bytes(&self.input[8..], &mut state.model.probs, &mut output[..n])?;
+            state.remaining -= n as u64;
+        }
         Ok(RawProgress {
             consumed: 0,
-            written,
-            done,
+            written: n,
+            done: state.remaining == 0,
         })
     }
 
     fn raw_reset(&mut self) {
         self.input.clear();
-        self.out.clear();
-        self.head = 0;
-        self.finished = false;
+        self.state = None;
     }
 }
 
-/// The binary range decoder, mirror of [`RangeEncoder`].
-struct RangeDecoder<'a> {
-    payload: &'a [u8],
+/// The binary range decoder, mirror of [`RangeEncoder`]. It does not hold
+/// the payload: every call is handed the same payload slice, so the state
+/// can live in the [`Decoder`] between `finish` calls.
+#[derive(Debug)]
+struct RangeDecoder {
     pos: usize,
     range: u32,
     code: u32,
@@ -462,8 +484,18 @@ struct RangeDecoder<'a> {
     overran: bool,
 }
 
-impl<'a> RangeDecoder<'a> {
-    fn new(payload: &'a [u8]) -> Result<Self, Error> {
+impl RangeDecoder {
+    /// A decoder for an empty stream: never asked to decode anything.
+    fn idle() -> Self {
+        Self {
+            pos: 0,
+            range: 0xFFFF_FFFF,
+            code: 0,
+            overran: false,
+        }
+    }
+
+    fn new(payload: &[u8]) -> Result<Self, Error> {
         // The encoder's first shift_low emits a leading 0x00 cache byte;
         // the decoder reads (and ignores) it, then primes `code` with the
         // next 4 bytes. So a non-empty payload is always at least 5 bytes.
@@ -471,59 +503,40 @@ impl<'a> RangeDecoder<'a> {
             return Err(Error::UnexpectedEnd);
         }
         // First byte is the leading zero — skip it.
-        let mut d = Self {
-            payload,
-            pos: 1,
+        Ok(Self {
+            pos: 5,
             range: 0xFFFF_FFFF,
-            code: 0,
+            code: u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]),
             overran: false,
-        };
-        for _ in 0..4 {
-            d.code = (d.code << 8) | d.next_byte() as u32;
-        }
-        Ok(d)
+        })
     }
 
-    #[inline]
-    fn next_byte(&mut self) -> u8 {
-        // Past-end reads return 0 and flag `overran`. A correct, complete
-        // stream never over-reads (the encoder's 5 flush bytes cover every
-        // renormalization the decoder performs). A stream truncated
-        // relative to its declared length will over-read, which the caller
-        // turns into `Error::UnexpectedEnd`. Bounds are always respected
-        // (no panic, no out-of-range index).
-        match self.payload.get(self.pos) {
-            Some(&b) => {
-                self.pos += 1;
-                b
-            }
-            None => {
-                self.pos += 1;
-                self.overran = true;
-                0
-            }
-        }
-    }
-
-    /// Decode `out_len` bytes into `out`, each an 8-bit bit-tree walk against
-    /// `probs`. Mirrors [`RangeEncoder::encode_bytes`]: hoists `range`/`code`
-    /// /`pos` into locals so they stay in registers across the inner loop, and
-    /// indexes `probs` with `node & 0xFF` (the walk only reads nodes
-    /// `1..=255`, a no-op mask that elides the bounds check). The over-read
-    /// flag is consulted once per byte — a complete stream never sets it, and
-    /// a truncated one is reported as soon as the first short byte is decoded.
+    /// Decode `out.len()` bytes into `out`, each an 8-bit bit-tree walk
+    /// against `probs`. Mirrors [`RangeEncoder::encode_bytes`]: hoists
+    /// `range`/`code`/`pos` into locals so they stay in registers across the
+    /// inner loop, and indexes `probs` with `node & 0xFF` (the walk only
+    /// reads nodes `1..=255`, a no-op mask that elides the bounds check).
+    ///
+    /// Past-end reads return 0 and flag `overran`; bounds are always
+    /// respected. A correct, complete stream never over-reads (the encoder's
+    /// 5 flush bytes cover every renormalization the decoder performs). The
+    /// flag is consulted once per byte, so a stream truncated relative to
+    /// its declared length is reported as [`Error::UnexpectedEnd`] as soon
+    /// as the first short byte is decoded — and again on any later call.
     fn decode_bytes(
         &mut self,
+        payload: &[u8],
         probs: &mut [u16; TREE_NODES],
-        out_len: usize,
-        out: &mut Vec<u8>,
+        out: &mut [u8],
     ) -> Result<(), Error> {
+        if self.overran {
+            return Err(Error::UnexpectedEnd);
+        }
         let mut range = self.range;
         let mut code = self.code;
         let mut pos = self.pos;
-        let payload = self.payload;
-        out.reserve(out_len);
-        for _ in 0..out_len {
+        let mut result = Ok(());
+        for o in out.iter_mut() {
             let mut node = 1usize;
             for _ in 0..8 {
                 let slot = node & (TREE_NODES - 1);
@@ -542,30 +555,29 @@ impl<'a> RangeDecoder<'a> {
                 node = (node << 1) | bit;
                 while range < TOP {
                     range <<= 8;
-                    // Inline of next_byte with the hoisted `pos`.
                     let b = match payload.get(pos) {
-                        Some(&b) => b,
+                        Some(&b) => {
+                            pos += 1;
+                            b
+                        }
                         None => {
                             self.overran = true;
                             0
                         }
                     };
-                    pos += 1;
                     code = (code << 8) | b as u32;
                 }
             }
             if self.overran {
-                self.range = range;
-                self.code = code;
-                self.pos = pos;
-                return Err(Error::UnexpectedEnd);
+                result = Err(Error::UnexpectedEnd);
+                break;
             }
-            out.push((node & 0xFF) as u8);
+            *o = (node & 0xFF) as u8;
         }
         self.range = range;
         self.code = code;
         self.pos = pos;
-        Ok(())
+        result
     }
 }
 
