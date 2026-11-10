@@ -14,8 +14,9 @@
 //! Each data block is preceded by a 4-byte little-endian word whose
 //! high bit (`0x80000000`) marks the block as **frame-uncompressed**
 //! (raw bytes follow). Otherwise the block is a Lizard-compressed
-//! payload starting with a 1-byte `compressionLevel` (10..=49). Inside
-//! a compressed block a 1-byte flag mask decides the layout: if the
+//! payload starting with a 1-byte `compressionLevel` (10..=49), then one
+//! sub-block per 128 KiB of input, all sharing one sliding window. Inside
+//! a sub-block a 1-byte flag mask decides the layout: if the
 //! `0x80` bit is set the block is **block-uncompressed** (3-byte LE
 //! length + raw bytes); otherwise five sub-streams follow in order
 //! (lengths, offset16, offset24, flags, literals), each prefixed by
@@ -31,6 +32,9 @@
 //! reference CLI at levels 10..=19 on non-tiny inputs). Frames whose
 //! blocks use the LIZv1 sequence format (levels 20..=29, 40..=49) or any
 //! Huffman-coded sub-stream are rejected with [`Error::Unsupported`].
+//! Within that scope, frame blocks of any size (`-B1`..`-B7`) and
+//! block-dependent frames (`-BD`) decode, and are checked against files
+//! written by the reference CLI at every level from 10 to 19.
 //!
 //! The Huffman path stays `Unsupported` for a concrete, validation-first
 //! reason rather than mere absence of effort. Lizard's entropy stage is
@@ -128,6 +132,10 @@ impl Algorithm for Lz5 {
 }
 
 // ─── shared frame constants ─────────────────────────────────────────────
+
+/// History kept between the blocks of a block-dependent frame. The
+/// LZ4-codeword path, the only one decoded here, has 16-bit offsets.
+const HISTORY_SIZE: usize = 64 * 1024;
 
 const FLG_VERSION_MASK: u8 = 0b1100_0000;
 const FLG_VERSION_01: u8 = 0b0100_0000;
@@ -446,6 +454,12 @@ pub struct Decoder {
     /// Drained one block at a time into the caller's output buffer.
     decoded: Vec<u8>,
     decoded_idx: usize,
+    /// How many bytes at the front of `decoded` are history kept from the
+    /// previous blocks of a block-dependent frame, already handed out.
+    hist_len: usize,
+    /// Blocks of this frame may refer back into the blocks before them
+    /// (FLG's block-independence bit is clear).
+    dependent: bool,
     /// Total decoded bytes emitted in this frame so far.
     total_emitted: u64,
     phase: DecPhase,
@@ -466,6 +480,8 @@ impl Decoder {
             block_buf: Vec::new(),
             decoded: Vec::new(),
             decoded_idx: 0,
+            hist_len: 0,
+            dependent: false,
             total_emitted: 0,
             phase: DecPhase::Header,
             poisoned: false,
@@ -491,8 +507,10 @@ impl Decoder {
         if flg & FLG_RESERVED_MASK != 0 {
             return Err(Error::BadHeader);
         }
-        // Block independence is informational for us — the decoder never
-        // exposes cross-block back-references anyway in this build.
+        // With the independence bit clear (`lizard -BD`) a block's matches
+        // may reach back into the output of the blocks before it, so the
+        // tail of that output is kept as history.
+        self.dependent = flg & FLG_BLOCK_INDEPENDENCE == 0;
         if flg & FLG_BLOCK_CHECKSUM != 0 {
             // We'd need xxh32 of every raw block — supported in principle
             // (xxh32 is already in this module), but the stream then
@@ -532,11 +550,37 @@ impl Decoder {
             *written += n;
         }
         if self.decoded_idx == self.decoded.len() {
-            self.decoded.clear();
-            self.decoded_idx = 0;
+            self.retire_block();
             self.phase = DecPhase::BlockSize;
             self.bs_idx = 0;
         }
+    }
+}
+
+impl Decoder {
+    /// The block in `decoded` has been handed out in full: drop it, or in
+    /// a block-dependent frame keep its tail as history for the next one.
+    fn retire_block(&mut self) {
+        if self.dependent {
+            let drop = self.decoded.len().saturating_sub(HISTORY_SIZE);
+            self.decoded.drain(..drop);
+        } else {
+            self.decoded.clear();
+        }
+        self.hist_len = self.decoded.len();
+        self.decoded_idx = self.hist_len;
+    }
+
+    /// A block has been decoded after the history in `decoded`: account
+    /// for it and start handing it out.
+    fn stage_block(&mut self) {
+        let fresh = &self.decoded[self.hist_len..];
+        if self.expect_content_checksum {
+            self.content_hash.update(fresh);
+        }
+        self.total_emitted = self.total_emitted.saturating_add(fresh.len() as u64);
+        self.decoded_idx = self.hist_len;
+        self.phase = DecPhase::Draining;
     }
 }
 
@@ -642,13 +686,11 @@ impl RawDecoder for Decoder {
                             self.poisoned = true;
                             return Err(Error::Corrupt);
                         }
-                        self.decoded.clear();
                         // `payload_len` is attacker-declared and validated only
                         // against max_block_raw, not bytes remaining, so reserve
                         // a bounded floor and let extend_from_slice grow as real
                         // bytes arrive (mirrors lz4's frame-decoder reserve cap).
                         self.decoded.reserve(payload_len.min(64 * 1024));
-                        self.decoded_idx = 0;
                         self.phase = DecPhase::RawBlock {
                             remaining: payload_len,
                         };
@@ -681,13 +723,7 @@ impl RawDecoder for Decoder {
                         });
                     }
                     // Block complete: drain.
-                    if self.expect_content_checksum {
-                        self.content_hash.update(&self.decoded);
-                    }
-                    self.total_emitted =
-                        self.total_emitted.saturating_add(self.decoded.len() as u64);
-                    self.decoded_idx = 0;
-                    self.phase = DecPhase::Draining;
+                    self.stage_block();
                 }
                 DecPhase::CompressedBlock {
                     block_len,
@@ -714,7 +750,6 @@ impl RawDecoder for Decoder {
                         });
                     }
                     // Block fully gathered — decompress.
-                    self.decoded.clear();
                     if let Err(e) = block::decode_compressed_block(
                         &self.block_buf,
                         &mut self.decoded,
@@ -726,17 +761,11 @@ impl RawDecoder for Decoder {
                     // Redundant given the per-append cap inside
                     // decode_compressed_block, but kept as a cheap
                     // defense-in-depth backstop.
-                    if self.decoded.len() > self.max_block_raw {
+                    if self.decoded.len() - self.hist_len > self.max_block_raw {
                         self.poisoned = true;
                         return Err(Error::Corrupt);
                     }
-                    if self.expect_content_checksum {
-                        self.content_hash.update(&self.decoded);
-                    }
-                    self.total_emitted =
-                        self.total_emitted.saturating_add(self.decoded.len() as u64);
-                    self.decoded_idx = 0;
-                    self.phase = DecPhase::Draining;
+                    self.stage_block();
                 }
                 DecPhase::Draining => {
                     self.drain_decoded(output, &mut written);
@@ -838,6 +867,8 @@ impl RawDecoder for Decoder {
         self.block_buf.clear();
         self.decoded.clear();
         self.decoded_idx = 0;
+        self.hist_len = 0;
+        self.dependent = false;
         self.total_emitted = 0;
         self.phase = DecPhase::Header;
         self.poisoned = false;

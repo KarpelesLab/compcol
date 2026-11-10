@@ -48,12 +48,23 @@ const ML_MASK_LZ4: u8 = (1 << RUN_BITS_LZ4) - 1;
 /// frame-level [`Decoder`](super::Decoder) is the normal entry point.
 pub struct Lz4ModeDecoder;
 
-/// Decode a single Lizard compressed block (everything between the
+/// Decode a single Lizard compressed frame block (everything between the
 /// frame's 4-byte block-size word and the start of the next block).
-/// `out` is appended to — the caller is expected to clear it first if
-/// they want only this block's bytes.
 ///
-/// `cap` is the per-frame ceiling on this block's decoded size. Output
+/// That payload is one `compressionLevel` byte followed by one or more
+/// *sub-blocks*, each covering at most 128 KiB of input ("Division into
+/// blocks" in `doc/lizard_Block_format.md`): a flag byte, then either a
+/// stored run or the five sub-streams. Sub-blocks share one sliding
+/// window, so a match may reach back into the sub-blocks before it. The
+/// reference CLI's default frame block is 4 MiB, so any input over
+/// 128 KiB yields several sub-blocks per frame block.
+///
+/// `out` is appended to. What it already holds is history: the output
+/// of the earlier blocks of a block-dependent frame, which matches may
+/// refer to as well.
+///
+/// `cap` is the per-frame ceiling on this block's decoded size, not
+/// counting that history. Output
 /// is checked against it *before* every append (literal run, match copy,
 /// in-block-uncompressed payload, trailing literals) so a malformed
 /// stream cannot balloon `out` to gigabytes before the size is rejected.
@@ -63,6 +74,8 @@ pub fn decode_compressed_block(input: &[u8], out: &mut Vec<u8>, cap: usize) -> R
     if input.is_empty() {
         return Err(Error::UnexpectedEnd);
     }
+    // From here on `cap` is a ceiling on `out.len()`, history included.
+    let cap = out.len().saturating_add(cap);
     let mut ip = 0usize;
 
     // compressionLevel byte.
@@ -85,10 +98,24 @@ pub fn decode_compressed_block(input: &[u8], out: &mut Vec<u8>, cap: usize) -> R
         return Err(Error::Unsupported);
     }
 
-    // res flag byte.
+    // At least one sub-block follows the level byte.
     if ip >= input.len() {
         return Err(Error::UnexpectedEnd);
     }
+    while ip < input.len() {
+        ip = decode_sub_block(input, ip, out, cap)?;
+    }
+    Ok(())
+}
+
+/// Decode the sub-block starting at `input[ip]` (its flag byte) onto the
+/// end of `out`, and return the position just past it.
+fn decode_sub_block(
+    input: &[u8],
+    mut ip: usize,
+    out: &mut Vec<u8>,
+    cap: usize,
+) -> Result<usize, Error> {
     let res = input[ip];
     ip += 1;
 
@@ -106,7 +133,7 @@ pub fn decode_compressed_block(input: &[u8], out: &mut Vec<u8>, cap: usize) -> R
             return Err(Error::Corrupt);
         }
         out.extend_from_slice(&input[ip..ip + length]);
-        return Ok(());
+        return Ok(ip + length);
     }
 
     // LIZARD_FLAG_LEN being set on the block-flag byte is the reference
@@ -159,9 +186,6 @@ pub fn decode_compressed_block(input: &[u8], out: &mut Vec<u8>, cap: usize) -> R
     let offset24 = read_raw_stream(input, &mut ip)?;
     let flags = read_raw_stream(input, &mut ip)?;
     let literals = read_raw_stream(input, &mut ip)?;
-    if ip != input.len() {
-        return Err(Error::Corrupt);
-    }
 
     // In LZ4 mode the lengths/offset16/offset24 streams must be empty
     // — the encoder packs all length-extensions and offsets inline in
@@ -170,7 +194,8 @@ pub fn decode_compressed_block(input: &[u8], out: &mut Vec<u8>, cap: usize) -> R
         return Err(Error::Corrupt);
     }
 
-    decode_lz4_sequences(flags, literals, out, cap)
+    decode_lz4_sequences(flags, literals, out, cap)?;
+    Ok(ip)
 }
 
 /// Read one raw (non-Huffman) sub-stream: 3-byte LE length + bytes.

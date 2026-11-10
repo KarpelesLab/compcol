@@ -491,6 +491,124 @@ fn rejects_lizv1_mode() {
     assert_eq!(err, Error::Unsupported);
 }
 
+// ─── reference fixtures larger than one 128 KiB sub-block ─────────────
+
+// Generated with Lizard CLI 2.1.0 (inikep/lizard) from `records_input()`:
+//
+//     lizard -10 <input> records_l10_multi_subblock.liz
+//     lizard -15 -B1 -BD <input> records_l15_b1_dependent.liz
+//
+// Both carry the content checksum the CLI writes by default, so decoding
+// them also checks this crate's reading of that field (xxh32, seed 0, of
+// the decoded content) against the reference.
+
+/// 300 000 bytes of repetitive records: more than two 128 KiB sub-blocks.
+fn records_input() -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0u64;
+    while out.len() < 300_000 {
+        out.extend_from_slice(
+            format!(
+                "record {}: the quick brown fox jumps over the lazy dog, batch {}\n",
+                i % 37,
+                (i * i) % 11
+            )
+            .as_bytes(),
+        );
+        i += 1;
+    }
+    out.truncate(300_000);
+    out
+}
+
+fn assert_decodes_to_records(encoded: &[u8]) {
+    let want = records_input();
+    for (in_chunk, out_chunk) in [(encoded.len(), 1 << 20), (1, 4096), (4096, 1), (777, 333)] {
+        let got = decode_chunked(encoded, in_chunk, out_chunk).unwrap();
+        assert!(got == want, "mismatch with chunks {in_chunk}/{out_chunk}");
+    }
+}
+
+/// One 4 MiB frame block (the CLI default) holding three sub-blocks that
+/// share a window. The decoder used to stop after the first sub-block and
+/// call the rest of the block corrupt, so no default-settings file over
+/// 128 KiB decoded.
+#[test]
+fn decode_reference_multiple_sub_blocks() {
+    let encoded = include_bytes!("fixtures/lz5/records_l10_multi_subblock.liz");
+    // FLG: version 01, independent blocks, content checksum.
+    assert_eq!(encoded[4], 0x64);
+    assert_decodes_to_records(encoded);
+}
+
+/// `-BD`: 128 KiB frame blocks whose matches reach back into the blocks
+/// before them. The decoder used to treat every block as independent.
+#[test]
+fn decode_reference_dependent_blocks() {
+    let encoded = include_bytes!("fixtures/lz5/records_l15_b1_dependent.liz");
+    // FLG: version 01, block-independence bit clear, content checksum.
+    assert_eq!(encoded[4], 0x44);
+    assert_decodes_to_records(encoded);
+}
+
+/// The reference's own checksum trailer is what gets verified: flip one
+/// bit of it and the frame fails, after its content has been handed out.
+#[test]
+fn reference_content_checksum_is_checked() {
+    for fixture in [
+        &include_bytes!("fixtures/lz5/records_l10_multi_subblock.liz")[..],
+        &include_bytes!("fixtures/lz5/records_l15_b1_dependent.liz")[..],
+    ] {
+        let mut bad = fixture.to_vec();
+        *bad.last_mut().unwrap() ^= 0x01;
+        assert_eq!(
+            decode_chunked(&bad, bad.len(), 1 << 20),
+            Err(Error::ChecksumMismatch)
+        );
+    }
+}
+
+/// A match in a dependent block may not reach before the history kept.
+#[test]
+fn dependent_block_cannot_reach_before_the_frame() {
+    // FLG 0x40: version 01, dependent blocks, no checksums. BD 0x10.
+    let mut frame = vec![0x06, 0x22, 0x4d, 0x18, 0x40, 0x10];
+    let hc = (0..=255u8)
+        .find(|&hc| {
+            let mut f = frame.clone();
+            f.push(hc);
+            f.extend_from_slice(&[0, 0, 0, 0]);
+            decode_chunked(&f, f.len(), 64).is_ok()
+        })
+        .expect("some header checksum byte is right");
+    frame.push(hc);
+    // First block, stored: "abcd". Second block, compressed (level 10):
+    // one token, no literals, a 4-byte match at offset 5 — one byte
+    // before the start of the frame.
+    frame.extend_from_slice(&(4u32 | 0x8000_0000).to_le_bytes());
+    frame.extend_from_slice(b"abcd");
+    let block = [
+        10, 0, // level, sub-block flags
+        0, 0, 0, 0, 0, 0, 0, 0, 0, // lengths, offset16, offset24: empty
+        1, 0, 0, 0x00, // flags: one token
+        2, 0, 0, 5, 0, // literals: the offset
+    ];
+    frame.extend_from_slice(&(block.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&block);
+    frame.extend_from_slice(&[0, 0, 0, 0]);
+    assert_eq!(
+        decode_chunked(&frame, frame.len(), 64),
+        Err(Error::InvalidDistance)
+    );
+    // The same match at offset 4 is the first block again.
+    let at = frame.len() - 4 - 2;
+    frame[at] = 4;
+    assert_eq!(
+        decode_chunked(&frame, frame.len(), 64).unwrap(),
+        b"abcdabcd"
+    );
+}
+
 // ─── cross-validate with reference `lizard -d` (if available) ─────────
 
 #[cfg(feature = "std")]
