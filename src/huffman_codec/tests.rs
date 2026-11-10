@@ -442,6 +442,48 @@ fn encoder_output_always_satisfies_strict_decoder() {
     }
 }
 
+// ─── declared output length vs. the address space ─────────────────────────
+//
+// On a 32-bit target a large (but possible) input can declare more than
+// `isize::MAX` output bytes, which used to truncate in an `as usize` cast or
+// panic in `Vec::with_capacity`. That cannot be reproduced with a real
+// stream on a 64-bit host, so the conversion is tested directly.
+
+#[test]
+fn declared_length_must_fit_an_allocation() {
+    assert_eq!(checked_output_len(0), Ok(0));
+    assert_eq!(checked_output_len(1), Ok(1));
+    let max = isize::MAX as u64;
+    assert_eq!(checked_output_len(max), Ok(isize::MAX as usize));
+    for declared in [max + 1, usize::MAX as u64, u64::MAX] {
+        assert_eq!(
+            checked_output_len(declared),
+            Err(Error::Unsupported),
+            "{declared}"
+        );
+    }
+    // Lengths that fit `u64` but not a 32-bit `usize` must not truncate.
+    #[cfg(target_pointer_width = "32")]
+    for declared in [1u64 << 31, 1u64 << 32, (1u64 << 32) + 5] {
+        assert_eq!(checked_output_len(declared), Err(Error::Unsupported));
+    }
+}
+
+/// Output larger than the up-front reservation is grown into as it is
+/// decoded, for both the general and the single-symbol path.
+#[test]
+fn output_beyond_initial_reservation_round_trips() {
+    let n = MAX_PREALLOC * 2 + 123;
+    let text: Vec<u8> = (0..n).map(|i| b"abcdefgh"[(i * 7 + i / 5) % 8]).collect();
+    let enc = encode_stream(&text);
+    assert_eq!(decode_stream(&enc).unwrap(), text);
+
+    let run = vec![b'z'; n];
+    let enc = encode_stream(&run);
+    assert_eq!(enc.len(), 3 + 5 + n.div_ceil(8));
+    assert_eq!(decode_stream(&enc).unwrap(), run);
+}
+
 // ─── frequency scaling (inputs with ≥ 2^32 occurrences of a byte) ─────────
 //
 // The encoder used to count in `u32`, so a byte occurring 2^32 times wrapped

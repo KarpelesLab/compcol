@@ -618,6 +618,25 @@ fn encode_stream(input: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Most output bytes [`decode_stream`] reserves before it has decoded
+/// anything; beyond this the buffer grows with the output actually produced.
+const MAX_PREALLOC: usize = 64 * 1024;
+
+/// Convert a stream's declared output length to `usize`, rejecting one no
+/// allocation on this target could hold (more than `isize::MAX` bytes).
+///
+/// On 64-bit targets the payload-size bound already rules such lengths out;
+/// on 32-bit targets a few hundred MiB of input can legitimately declare
+/// more than `isize::MAX` bytes, which would otherwise truncate in an `as`
+/// cast or panic with `capacity overflow`. Such a stream is well-formed but
+/// cannot be decoded here, hence [`Error::Unsupported`].
+fn checked_output_len(declared: u64) -> Result<usize, Error> {
+    match usize::try_from(declared) {
+        Ok(n) if n <= isize::MAX as usize => Ok(n),
+        _ => Err(Error::Unsupported),
+    }
+}
+
 /// Decode a self-delimiting Huffman stream back into the original bytes.
 fn decode_stream(input: &[u8]) -> Result<Vec<u8>, Error> {
     let (orig_len, vlen) = read_varint(input)?;
@@ -654,12 +673,15 @@ fn decode_stream(input: &[u8]) -> Result<Vec<u8>, Error> {
             return Err(Error::Corrupt);
         }
         let mut out = Vec::new();
-        out.resize(orig_len as usize, sym as u8);
+        out.resize(checked_output_len(orig_len)?, sym as u8);
         return Ok(out);
     }
 
-    let orig_len = orig_len as usize;
-    let mut out = Vec::with_capacity(orig_len);
+    // The declared length is attacker-controlled and so far only known to be
+    // at most 8× the payload: reserve a modest amount up front and let the
+    // buffer grow as symbols are actually decoded.
+    let orig_len = checked_output_len(orig_len)?;
+    let mut out = Vec::with_capacity(orig_len.min(MAX_PREALLOC));
 
     let max = table.max_length as u32;
 
