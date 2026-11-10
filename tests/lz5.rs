@@ -530,10 +530,9 @@ fn assert_decodes_to_records(encoded: &[u8]) {
     }
 }
 
-/// One 4 MiB frame block (the CLI default) holding three sub-blocks that
-/// share a window. The decoder used to stop after the first sub-block and
-/// call the rest of the block corrupt, so no default-settings file over
-/// 128 KiB decoded.
+/// One frame block holding three sub-blocks that share a window. The decoder used to stop after the first sub-block and
+/// call the rest of the block corrupt, so no file written with the CLI's
+/// default settings and larger than 128 KiB decoded.
 #[test]
 fn decode_reference_multiple_sub_blocks() {
     let encoded = include_bytes!("fixtures/lz5/records_l10_multi_subblock.liz");

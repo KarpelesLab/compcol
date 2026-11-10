@@ -393,17 +393,31 @@ fn has_more_input(reader: &mut dyn Read) -> io::Result<bool> {
     }
 }
 
+/// A codec error carried inside an `io::Error`. The library's `Error` is
+/// only a `std::error::Error` with its `std` feature on, which this binary
+/// does not require.
+#[derive(Debug)]
+struct CodecError(compcol::Error);
+
+impl std::fmt::Display for CodecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for CodecError {}
+
 /// Wrap a codec error, keeping the typed value so `run` can tell which one
 /// it was (the `Display` output is the codec error's own).
 fn codec_err(e: compcol::Error) -> io::Error {
-    io::Error::other(e)
+    io::Error::other(CodecError(e))
 }
 
 /// Whether `e` is the codec error `kind`, as wrapped by [`codec_err`].
 fn is_codec_err(e: &io::Error, kind: compcol::Error) -> bool {
     e.get_ref()
-        .and_then(|inner| inner.downcast_ref::<compcol::Error>())
-        == Some(&kind)
+        .and_then(|inner| inner.downcast_ref::<CodecError>())
+        .is_some_and(|inner| inner.0 == kind)
 }
 
 /// Read up to `n` bytes from `reader`, returning what was available (possibly

@@ -11,8 +11,8 @@ use libfuzzer_sys::fuzz_target;
 // RAR2 streams don't self-delimit — the decompressed length lives in
 // the archive container's file header — so we read a 4-byte LE length
 // prefix (capped to 1 MiB so a hostile size field can't make the
-// harness itself allocate unbounded output). `decode` only buffers;
-// the real decompression runs on the first `finish` call.
+// harness itself run unbounded). The decoder streams: `decode` emits
+// output as it goes and `finish` drains what is left.
 fn drive(mut dec: Decoder, payload: &[u8]) {
     let mut out = vec![0u8; 64 * 1024];
     let mut consumed = 0;
@@ -52,8 +52,8 @@ fuzz_target!(|data: &[u8]| {
     let (len_bytes, payload) = if data.len() >= 4 {
         data.split_at(4)
     } else {
-        // Too short to carry a length prefix: still fuzz the
-        // no-declared-size path with the whole input as payload.
+        // Too short to carry a length prefix: a decoder with no declared
+        // size must reject the input rather than decode it.
         drive(Decoder::new(), data);
         return;
     };
