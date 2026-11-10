@@ -563,3 +563,85 @@ fn bvx2_reference_zeros() {
     );
     assert_eq!(decode_chunked(fixture, 1, 4096), vec![0u8; 300_000]);
 }
+
+/// Differential check for the incremental `bvxn` decoder: fixtures and
+/// encoder output (small inputs become `bvxn` blocks) decode identically
+/// one-shot, with 1-byte input slices, and with tiny output buffers.
+#[test]
+fn decode_is_chunking_independent() {
+    use compcol::vec::{compress_to_vec, decompress_to_vec};
+
+    let mut streams: Vec<Vec<u8>> = vec![
+        include_bytes!("fixtures/lzfse/sample_400000.lzfse").to_vec(),
+        include_bytes!("fixtures/lzfse/zeros_300000.lzfse").to_vec(),
+    ];
+    for n in [0usize, 1, 2, 15, 16, 300, 1000, 4095, 4096, 20_000] {
+        streams.push(compress_to_vec::<Lzfse>(&lzfse_sample(n)).unwrap());
+        streams.push(compress_to_vec::<Lzfse>(&vec![b'z'; n]).unwrap());
+    }
+    // A hand-built `bvxn` block several decode steps long: one literal,
+    // then 300_000 more bytes of it through `lrg_m` / `sml_m` opcodes.
+    let mut p = vec![0xE1, b'q', 0x00, 0x01];
+    let mut made = 4usize;
+    while made < 300_001 {
+        let m = (300_001 - made).min(271);
+        if m >= 16 {
+            p.extend_from_slice(&[0xF0, (m - 16) as u8]);
+        } else {
+            p.push(0xF0 | m as u8);
+        }
+        made += m;
+    }
+    p.extend_from_slice(&[0x06, 0, 0, 0, 0, 0, 0, 0]);
+    let mut big = make_lzvn_block(300_001, &p);
+    big.extend_from_slice(&eos());
+    streams.push(big);
+
+    for (i, stream) in streams.iter().enumerate() {
+        let expected = decompress_to_vec::<Lzfse>(stream).unwrap();
+        for (in_chunk, out_chunk) in [(1, 1 << 16), (stream.len(), 1), (1, 3), (5, 4097)] {
+            assert!(
+                decode_chunked(stream, in_chunk, out_chunk) == expected,
+                "stream {i}: in_chunk={in_chunk} out_chunk={out_chunk}"
+            );
+        }
+    }
+    assert_eq!(
+        decompress_to_vec::<Lzfse>(streams.last().unwrap()).unwrap(),
+        vec![b'q'; 300_001]
+    );
+}
+
+/// A highly expanding `bvxn` block under an output cap is refused without
+/// decoding the block whole (it is produced ~64 KiB at a time).
+#[test]
+fn lzvn_bomb_respects_output_cap() {
+    use compcol::vec::decompress_to_vec_capped;
+
+    const N_RAW: u32 = 8 << 20;
+    let mut p = vec![0xE1, b'a', 0x00, 0x01]; // 1 literal; sml_d M=3 D=1
+    let mut made: u64 = 4;
+    while made + 271 <= N_RAW as u64 {
+        p.extend_from_slice(&[0xF0, 0xFF]); // lrg_m
+        made += 271;
+    }
+    while made < N_RAW as u64 {
+        let m = (N_RAW as u64 - made).min(15) as u8;
+        p.push(0xF0 | m);
+        made += m as u64;
+    }
+    p.extend_from_slice(&[0x06, 0, 0, 0, 0, 0, 0, 0]); // eos
+    let mut s = make_lzvn_block(N_RAW, &p);
+    s.extend_from_slice(&eos());
+    assert_eq!(
+        decompress_to_vec_capped::<Lzfse>(&s, 1024),
+        Err(Error::OutputLimitExceeded)
+    );
+    // The same block claiming u32::MAX bytes costs no more: nothing is
+    // reserved from the header.
+    s[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(
+        decompress_to_vec_capped::<Lzfse>(&s, 1024),
+        Err(Error::OutputLimitExceeded)
+    );
+}

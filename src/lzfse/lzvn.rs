@@ -1,9 +1,10 @@
 //! LZVN block decoder and encoder.
 //!
-//! Faithful port of Apple's `lzvn_decode_base.c` (BSD-3-Apple), restricted
-//! to the single-call shape this crate uses (the input block is fully
-//! buffered by the outer decoder before we run, so we don't need Apple's
-//! mid-instruction save/resume machinery).
+//! Faithful port of Apple's `lzvn_decode_base.c` (BSD-3-Apple). The input
+//! block is fully buffered by the outer decoder before we run, so we never
+//! stop mid-instruction; the output side is resumable between opcodes
+//! ([`decode_step`]) so a highly expanding block is produced a bounded
+//! slice at a time instead of being materialised whole.
 //!
 //! The opcode dispatch table comes directly from Apple's reference; see
 //! the comments next to each label for the bit-layout of that opcode.
@@ -250,34 +251,62 @@ const OPC_TBL: [OpClass; 256] = {
     t
 };
 
-/// Decode a complete LZVN block.
+/// Largest number of bytes one opcode can produce: `lrg_l` / `lrg_m` carry
+/// up to 271, the distance opcodes at most 3 literals plus a 34-byte match.
+pub(crate) const MAX_OPCODE_OUTPUT: usize = 271;
+
+/// Resumable position inside one LZVN block; `Default` is the block start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BlockState {
+    /// Offset of the next opcode in the payload.
+    sp: usize,
+    /// Distance of the last match (0 = none yet), reused by `pre_d`,
+    /// `sml_m` and `lrg_m`.
+    d_prev: usize,
+    /// Bytes this block has produced so far.
+    produced: usize,
+}
+
+/// Decode part of an LZVN block, appending to `out`.
 ///
-/// `src` is the LZVN payload (caller-buffered, exactly `n_payload` bytes
-/// long when called by our outer decoder). `expected_decoded_size` is the
-/// `n_raw_bytes` field from the `bvxn` header — Apple's encoder produces
-/// blocks whose decoded length matches this exactly.
-pub(crate) fn decode_block(
+/// `src` is the whole LZVN payload (the outer decoder buffers exactly
+/// `n_payload_bytes`) and `expected` the `n_raw_bytes` field of the `bvxn`
+/// header — the block must decode to exactly that many bytes. `st` carries
+/// the position between calls; start a block with `BlockState::default()`.
+///
+/// Opcodes are executed until the block ends (`Ok(true)`) or this call has
+/// appended at least `budget` bytes (`Ok(false)`; call again with the same
+/// `src`, `expected` and `st`). One call therefore appends fewer than
+/// `budget + MAX_OPCODE_OUTPUT` bytes.
+///
+/// Matches are resolved against the tail of `out`, which must still end
+/// with this block's previous output: the caller may drop bytes from the
+/// front between calls as long as the last `min(produced, 65535)` stay.
+/// A match never reaches before the start of the block.
+pub(crate) fn decode_step(
     src: &[u8],
-    n_payload: usize,
-    expected_decoded_size: usize,
+    expected: usize,
+    st: &mut BlockState,
     out: &mut Vec<u8>,
-) -> Result<(), Error> {
-    if src.len() < n_payload {
-        return Err(Error::UnexpectedEnd);
-    }
-    let src = &src[..n_payload];
-    let start_out_len = out.len();
-    let mut sp = 0usize;
-    let mut d_prev: usize = 0;
+    budget: usize,
+) -> Result<bool, Error> {
+    let step_start = out.len();
+    let mut sp = st.sp;
 
     loop {
         if sp >= src.len() {
             // No more bytes. Either the block ended cleanly via Eos or it's
             // truncated.
-            if out.len() - start_out_len == expected_decoded_size {
-                return Ok(());
+            if st.produced == expected {
+                return Ok(true);
             }
             return Err(Error::Corrupt);
+        }
+        if out.len() - step_start >= budget {
+            // Pause on an opcode boundary; `d_prev` and `produced` are
+            // already up to date in `st`.
+            st.sp = sp;
+            return Ok(false);
         }
         let op = src[sp];
         let class = OPC_TBL[op as usize];
@@ -309,9 +338,10 @@ pub(crate) fn decode_block(
                 // Copy literal.
                 out.extend_from_slice(&src[sp..sp + l]);
                 sp += l;
+                st.produced += l;
                 // Match copy.
-                lz_copy(out, d, m, start_out_len, expected_decoded_size)?;
-                d_prev = d;
+                lz_copy(out, d, m, &mut st.produced, expected)?;
+                st.d_prev = d;
             }
             OpClass::MedD => {
                 // op = 101LLMMM; bytes [1..3] = DDDDDDMM DDDDDDDD (LE16).
@@ -329,8 +359,9 @@ pub(crate) fn decode_block(
                 sp += opc_len;
                 out.extend_from_slice(&src[sp..sp + l]);
                 sp += l;
-                lz_copy(out, d, m, start_out_len, expected_decoded_size)?;
-                d_prev = d;
+                st.produced += l;
+                lz_copy(out, d, m, &mut st.produced, expected)?;
+                st.d_prev = d;
             }
             OpClass::LrgD => {
                 // op = LLMMM111; bytes [1..3] = D_lo D_hi (LE16).
@@ -347,8 +378,9 @@ pub(crate) fn decode_block(
                 sp += opc_len;
                 out.extend_from_slice(&src[sp..sp + l]);
                 sp += l;
-                lz_copy(out, d, m, start_out_len, expected_decoded_size)?;
-                d_prev = d;
+                st.produced += l;
+                lz_copy(out, d, m, &mut st.produced, expected)?;
+                st.d_prev = d;
             }
             OpClass::PreD => {
                 // op = LLMMM110; L literals follow, then implicit match of
@@ -365,10 +397,11 @@ pub(crate) fn decode_block(
                 sp += opc_len;
                 out.extend_from_slice(&src[sp..sp + l]);
                 sp += l;
-                if d_prev == 0 {
+                st.produced += l;
+                if st.d_prev == 0 {
                     return Err(Error::Corrupt);
                 }
-                lz_copy(out, d_prev, m, start_out_len, expected_decoded_size)?;
+                lz_copy(out, st.d_prev, m, &mut st.produced, expected)?;
             }
             OpClass::SmlL => {
                 // op = 1110LLLL; L literals follow (no match).
@@ -383,6 +416,7 @@ pub(crate) fn decode_block(
                 sp += opc_len;
                 out.extend_from_slice(&src[sp..sp + l]);
                 sp += l;
+                st.produced += l;
             }
             OpClass::LrgL => {
                 // op = 11100000; byte [1] = L - 16; then L literals.
@@ -400,6 +434,7 @@ pub(crate) fn decode_block(
                 sp += opc_len;
                 out.extend_from_slice(&src[sp..sp + l]);
                 sp += l;
+                st.produced += l;
             }
             OpClass::SmlM => {
                 // op = 1111MMMM; no literal; match of length M at d_prev.
@@ -409,10 +444,10 @@ pub(crate) fn decode_block(
                     return Err(Error::Corrupt);
                 }
                 sp += opc_len;
-                if d_prev == 0 {
+                if st.d_prev == 0 {
                     return Err(Error::Corrupt);
                 }
-                lz_copy(out, d_prev, m, start_out_len, expected_decoded_size)?;
+                lz_copy(out, st.d_prev, m, &mut st.produced, expected)?;
             }
             OpClass::LrgM => {
                 // op = 11110000 MMMMMMMM; M = byte[1] + 16; uses d_prev.
@@ -422,10 +457,10 @@ pub(crate) fn decode_block(
                 }
                 let m = (src[sp + 1] as usize) + 16;
                 sp += opc_len;
-                if d_prev == 0 {
+                if st.d_prev == 0 {
                     return Err(Error::Corrupt);
                 }
-                lz_copy(out, d_prev, m, start_out_len, expected_decoded_size)?;
+                lz_copy(out, st.d_prev, m, &mut st.produced, expected)?;
             }
             OpClass::Eos => {
                 // op = 0x06; followed by 7 bytes (8 total = opc_len).
@@ -435,10 +470,10 @@ pub(crate) fn decode_block(
                 }
                 // Done. We don't enforce a specific byte content for the
                 // 7 trailing bytes — Apple's reference doesn't check either.
-                if out.len() - start_out_len != expected_decoded_size {
+                if st.produced != expected {
                     return Err(Error::Corrupt);
                 }
-                return Ok(());
+                return Ok(true);
             }
             OpClass::Nop => {
                 // 1-byte no-op.
@@ -459,19 +494,26 @@ pub(crate) fn decode_block(
 /// ceiling a malicious block could balloon far past its declared size
 /// before the termination check catches the mismatch. Reject any copy
 /// that would push this block's output past `expected`.
+///
+/// `produced` is the number of bytes the block has emitted so far (they
+/// are the tail of `out`); a match may not reach before them. It is
+/// advanced by `n` on success.
 fn lz_copy(
     out: &mut Vec<u8>,
     d: usize,
     n: usize,
-    start: usize,
+    produced: &mut usize,
     expected: usize,
 ) -> Result<(), Error> {
-    if d == 0 || d > out.len() - start {
+    // `d > out.len()` cannot happen while the caller keeps the block's last
+    // 65535 bytes in `out`; checked anyway so a bad caller cannot panic us.
+    if d == 0 || d > *produced || d > out.len() {
         return Err(Error::Corrupt);
     }
-    if (out.len() - start).saturating_add(n) > expected {
+    if produced.saturating_add(n) > expected {
         return Err(Error::Corrupt);
     }
+    *produced += n;
     let src_pos = out.len() - d;
     if d >= n {
         // Non-overlapping: collapses to memcpy.

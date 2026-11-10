@@ -2,7 +2,10 @@
 //!
 //! Buffers input until a whole block (magic + header + payload) can be
 //! decoded, then drains the decoded payload into the caller's output slice
-//! across as many `decode` calls as the caller needs.
+//! across as many `decode` calls as the caller needs. A `bvxn` (LZVN) block
+//! is decoded incrementally from its buffered payload, at most about
+//! 64 KiB ahead of what the caller has taken, so its expansion is bounded
+//! by the caller's output handling rather than by the block header.
 
 use alloc::vec::Vec;
 
@@ -38,7 +41,15 @@ pub struct Decoder {
     /// that much has been produced). `bvx2` match distances may reach back
     /// into earlier blocks, so each v2 block is decoded on top of this.
     history: Vec<u8>,
+    /// Position inside the `bvxn` block being decoded (its payload is the
+    /// front of `input_buf`); meaningful only in the LZVN payload state.
+    lzvn: lzvn::BlockState,
 }
+
+/// Decoded bytes one `bvxn` step may add to the output backlog before the
+/// caller has to drain it (a step can overshoot by less than one opcode's
+/// output, [`lzvn::MAX_OPCODE_OUTPUT`]).
+const LZVN_STEP: usize = 64 * 1024;
 
 /// Largest match distance a `bvx2` block can encode (D symbol 63: base
 /// 229_372 plus 15 extra bits), rounded up.
@@ -51,6 +62,8 @@ enum State {
     /// Read magic; waiting for the block-specific header bytes.
     AwaitHeader(BlockKind),
     /// Header parsed; waiting for the rest of the payload, then decode + drain.
+    /// An LZVN block stays in this state, payload buffered, until all of
+    /// its output has been produced.
     AwaitPayload {
         kind: BlockKind,
         /// For uncompressed blocks: bytes to copy. For LZVN: compressed bytes
@@ -86,15 +99,8 @@ impl Decoder {
             eos: false,
             poisoned: false,
             history: Vec::new(),
+            lzvn: lzvn::BlockState::default(),
         }
-    }
-
-    /// Record freshly decoded bytes as match history, keeping the buffer
-    /// bounded. The front is only discarded once it holds two windows' worth,
-    /// so the memmove is amortised O(1) per byte even for tiny blocks.
-    fn remember(&mut self, bytes: &[u8]) {
-        self.history.extend_from_slice(bytes);
-        self.trim_history();
     }
 
     /// Total bytes `input_buf` must hold for the current state to advance.
@@ -110,6 +116,9 @@ impl Decoder {
         }
     }
 
+    /// Keep the match history bounded. The front is only discarded once it
+    /// holds two windows' worth, so the memmove is amortised O(1) per byte
+    /// even for tiny blocks.
     fn trim_history(&mut self) {
         if self.history.len() > 2 * HISTORY_WINDOW {
             let excess = self.history.len() - HISTORY_WINDOW;
@@ -252,6 +261,7 @@ impl Decoder {
                             self.input_buf[7],
                         ]) as usize;
                         self.input_buf.drain(..8);
+                        self.lzvn = lzvn::BlockState::default();
                         self.state = State::AwaitPayload {
                             kind: BlockKind::Lzvn,
                             payload_len: n_payload,
@@ -340,32 +350,38 @@ impl Decoder {
                             self.state = State::AwaitMagic;
                         }
                         BlockKind::Lzvn => {
-                            // Decode in one shot into output_buf.
-                            //
-                            // Bound the capacity hint by what the payload could
-                            // plausibly produce so an attacker-controlled
-                            // `decoded_size` (n_raw_bytes) cannot force a huge
-                            // up-front allocation (DoS / OOM): a single 1-byte
-                            // LZVN opcode expands to at most ~16 output bytes.
-                            // `decode_block` still enforces the real output size
-                            // against `decoded_size`, so under-hinting only makes
-                            // the Vec grow as actual bytes are produced.
-                            let capacity_hint =
-                                decoded_size.min(payload_len.saturating_mul(16).saturating_add(64));
-                            let mut block_out = Vec::with_capacity(capacity_hint);
-                            if let Err(e) = lzvn::decode_block(
+                            // The payload is buffered, but it can expand
+                            // ~135x, so produce it a slice at a time: the
+                            // backlog (empty here — step 1 drained it or
+                            // returned) must reach the caller before the
+                            // next slice is decoded. Matches are resolved
+                            // in `history`, which the slice is appended to.
+                            debug_assert!(self.output_buf.is_empty());
+                            let before = self.history.len();
+                            let block_done = match lzvn::decode_step(
                                 &self.input_buf[..payload_len],
-                                payload_len,
                                 decoded_size,
-                                &mut block_out,
+                                &mut self.lzvn,
+                                &mut self.history,
+                                LZVN_STEP,
                             ) {
-                                self.poisoned = true;
-                                return Err(e);
+                                Ok(d) => d,
+                                Err(e) => {
+                                    self.poisoned = true;
+                                    return Err(e);
+                                }
+                            };
+                            self.output_buf.extend_from_slice(&self.history[before..]);
+                            debug_assert!(
+                                self.output_buf.len() < LZVN_STEP + lzvn::MAX_OPCODE_OUTPUT
+                            );
+                            // Keeps at least `HISTORY_WINDOW` bytes, more
+                            // than any LZVN distance (65535).
+                            self.trim_history();
+                            if block_done {
+                                self.input_buf.drain(..payload_len);
+                                self.state = State::AwaitMagic;
                             }
-                            self.remember(&block_out);
-                            self.output_buf.append(&mut block_out);
-                            self.input_buf.drain(..payload_len);
-                            self.state = State::AwaitMagic;
                         }
                         BlockKind::V2 => {
                             // The whole block (header + both payload streams)
@@ -471,5 +487,197 @@ impl RawDecoder for Decoder {
         self.eos = false;
         self.poisoned = false;
         self.history.clear();
+        self.lzvn = lzvn::BlockState::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::RawDecoder;
+    use alloc::vec;
+
+    /// Wrap an LZVN payload as a complete `bvxn` + `bvx$` stream.
+    fn bvxn_stream(n_raw: usize, payload: &[u8]) -> Vec<u8> {
+        let mut s = b"bvxn".to_vec();
+        s.extend_from_slice(&(n_raw as u32).to_le_bytes());
+        s.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        s.extend_from_slice(payload);
+        s.extend_from_slice(b"bvx$");
+        s
+    }
+
+    /// Decode `stream` with `in_chunk`-byte input slices and an
+    /// `out_chunk`-byte output buffer, calling `check` after every call.
+    fn decode_with(
+        stream: &[u8],
+        in_chunk: usize,
+        out_chunk: usize,
+        mut check: impl FnMut(&Decoder),
+    ) -> Result<Vec<u8>, Error> {
+        let mut dec = Decoder::new();
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; out_chunk];
+        let mut pos = 0usize;
+        loop {
+            let end = pos.saturating_add(in_chunk).min(stream.len());
+            let p = dec.raw_decode(&stream[pos..end], &mut buf)?;
+            check(&dec);
+            pos += p.consumed;
+            out.extend_from_slice(&buf[..p.written]);
+            if p.done {
+                return Ok(out);
+            }
+            if p.consumed == 0 && p.written == 0 {
+                assert_eq!(pos, stream.len(), "decoder stalled at {pos}");
+                let p = dec.raw_finish(&mut buf)?;
+                assert!(p.done && p.written == 0);
+                return Ok(out);
+            }
+        }
+    }
+
+    /// A `bvxn` block expands up to ~135x (`lrg_m`: 2 bytes -> 271). It used
+    /// to be decoded whole — into a block buffer, the history and the output
+    /// backlog — before one byte reached the caller, so the caller's output
+    /// limit could not bound the decoder's memory.
+    #[test]
+    fn lzvn_block_is_decoded_with_back_pressure() {
+        const N_RAW: usize = 8 << 20;
+        let mut p = vec![0xE1, b'a', 0x00, 0x01]; // 1 literal; sml_d M=3 D=1
+        let mut made = 4usize;
+        while made + 271 <= N_RAW {
+            p.extend_from_slice(&[0xF0, 0xFF]); // lrg_m, 271 bytes
+            made += 271;
+        }
+        while made < N_RAW {
+            let m = (N_RAW - made).min(15);
+            p.push(0xF0 | m as u8); // sml_m
+            made += m;
+        }
+        p.extend_from_slice(&[0x06, 0, 0, 0, 0, 0, 0, 0]); // eos
+        let stream = bvxn_stream(N_RAW, &p);
+
+        let mut peak_backlog = 0usize;
+        let mut peak_history = 0usize;
+        let out = decode_with(&stream, usize::MAX, 4096, |dec| {
+            peak_backlog = peak_backlog.max(dec.output_buf.capacity());
+            peak_history = peak_history.max(dec.history.capacity());
+        })
+        .unwrap();
+        assert_eq!(out.len(), N_RAW);
+        assert!(out.iter().all(|&b| b == b'a'));
+        assert!(peak_backlog <= 256 << 10, "output backlog {peak_backlog}");
+        assert!(peak_history <= 2 << 20, "history {peak_history}");
+    }
+
+    /// Text with literal runs and repeats up to 65535 bytes back — every
+    /// LZVN opcode class shows up in its encoding.
+    fn lzvn_sample(n: usize) -> Vec<u8> {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut v: Vec<u8> = Vec::with_capacity(n + 512);
+        while v.len() < n {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            if v.len() > 100 && s.is_multiple_of(3) {
+                let d = 1 + ((s >> 8) as usize) % v.len().min(65_535);
+                let l = 3 + ((s >> 40) as usize) % 400;
+                let st = v.len() - d;
+                for i in 0..l {
+                    let b = v[st + i % d];
+                    v.push(b);
+                }
+            } else {
+                for i in 0..1 + ((s >> 30) as usize) % 40 {
+                    v.push(b"abcdefgh ijk\n"[((s >> (i % 20)) as usize) % 13]);
+                }
+            }
+        }
+        v.truncate(n);
+        v
+    }
+
+    /// A `bvxn` block far larger than one decode step must come out the
+    /// same however the input and output are chunked, including matches
+    /// that reach back across step boundaries and history trims.
+    #[test]
+    fn large_lzvn_block_is_chunking_independent() {
+        let data = lzvn_sample(700_000);
+        let payload = lzvn::encode_block(&data);
+        assert!(payload.len() < data.len() / 2);
+        // A stored block first, so the LZVN block starts on non-empty history.
+        let mut stream = b"bvx-".to_vec();
+        stream.extend_from_slice(&5u32.to_le_bytes());
+        stream.extend_from_slice(b"hello");
+        stream.extend_from_slice(&bvxn_stream(data.len(), &payload));
+        let mut expected = b"hello".to_vec();
+        expected.extend_from_slice(&data);
+
+        for (in_chunk, out_chunk) in [
+            (usize::MAX, 1 << 21),
+            (usize::MAX, 1),
+            (1, 1 << 16),
+            (3, 7),
+            (4093, 70_001),
+            (usize::MAX, LZVN_STEP),
+        ] {
+            let out = decode_with(&stream, in_chunk, out_chunk, |dec| {
+                let step = LZVN_STEP + lzvn::MAX_OPCODE_OUTPUT;
+                assert!(dec.output_buf.len() - dec.output_pos <= step);
+                assert!(dec.history.len() <= 2 * HISTORY_WINDOW + step);
+            })
+            .unwrap();
+            assert!(
+                out == expected,
+                "mismatch with in_chunk={in_chunk} out_chunk={out_chunk}"
+            );
+        }
+    }
+
+    /// Step size must not change what `decode_step` produces or accepts.
+    #[test]
+    fn lzvn_decode_step_matches_single_pass() {
+        let data = lzvn_sample(150_000);
+        let payload = lzvn::encode_block(&data);
+        for budget in [1usize, 2, 271, 1000, usize::MAX] {
+            let mut out = b"prefix".to_vec();
+            let mut st = lzvn::BlockState::default();
+            let mut steps = 0usize;
+            while !lzvn::decode_step(&payload, data.len(), &mut st, &mut out, budget).unwrap() {
+                steps += 1;
+            }
+            assert_eq!(steps == 0, budget == usize::MAX);
+            assert!(out[6..] == data[..], "budget {budget}");
+        }
+    }
+
+    /// The declared size is enforced exactly, also when the mismatch only
+    /// shows up several steps into the block.
+    #[test]
+    fn lzvn_block_size_mismatch_is_corrupt() {
+        let data = lzvn_sample(200_000);
+        let payload = lzvn::encode_block(&data);
+        for n_raw in [0, 1, 100_000, data.len() - 1, data.len() + 1, 1 << 30] {
+            let stream = bvxn_stream(n_raw, &payload);
+            for out_chunk in [1 << 20, 4096] {
+                assert_eq!(
+                    decode_with(&stream, usize::MAX, out_chunk, |_| ()),
+                    Err(Error::Corrupt),
+                    "n_raw={n_raw}"
+                );
+            }
+        }
+        // A match may not reach before the start of its block.
+        let mut stream = b"bvx-".to_vec();
+        stream.extend_from_slice(&4u32.to_le_bytes());
+        stream.extend_from_slice(b"abcd");
+        // 1 literal, then sml_d M=3 D=2; eos.
+        let p = [0x40, 0x02, b'x', 0x06, 0, 0, 0, 0, 0, 0, 0];
+        stream.extend_from_slice(&bvxn_stream(4, &p));
+        assert_eq!(
+            decode_with(&stream, usize::MAX, 64, |_| ()),
+            Err(Error::Corrupt)
+        );
     }
 }
