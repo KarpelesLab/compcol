@@ -480,15 +480,16 @@ fn invalid_clevel_rejected() {
 }
 
 #[test]
-fn rejects_lizv1_mode() {
-    // Frame OK; block compressionLevel = 20 (LIZv1 mode) — Unsupported.
+fn truncated_lizv1_block_rejected() {
+    // Frame OK; block compressionLevel = 20 (LIZv1), one sub-block flag
+    // byte and then nothing: its sub-streams are missing.
     let encoded: &[u8] = &[
         0x06, 0x22, 0x4d, 0x18, 0x60, 0x10, 0x8e, // header
         0x02, 0x00, 0x00, 0x00, // block size = 2 (compressed)
-        0x14, 0x00, // clevel=20, res=0 (need at least 2 bytes to enter the LIZv1 check)
+        0x14, 0x00, // clevel=20, sub-block flags=0
     ];
     let err = decode_chunked(encoded, 1024, 1024).unwrap_err();
-    assert_eq!(err, Error::Unsupported);
+    assert_eq!(err, Error::UnexpectedEnd);
 }
 
 // ─── reference fixtures larger than one 128 KiB sub-block ─────────────
@@ -607,6 +608,114 @@ fn dependent_block_cannot_reach_before_the_frame() {
         decode_chunked(&frame, frame.len(), 64).unwrap(),
         b"abcdabcd"
     );
+}
+
+// ─── reference fixtures for LIZv1 codewords and Huffman sub-streams ───
+
+// Generated with Lizard CLI 2.1.0 (inikep/lizard) from `words_input()`:
+//
+//     lizard -24 <input> words_l24_lizv1.liz
+//     lizard -39 <input> words_l39_lz4_huffman.liz
+//     lizard -45 -B1 -BD <input> words_l45_b1_dependent.liz
+
+/// 150 000 bytes of skewed pseudo-random words, with the first 20 000
+/// bytes repeated 100 000 bytes later: far enough for a 24-bit offset,
+/// and skewed enough for the Huffman stage to be worth it.
+fn words_input() -> Vec<u8> {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut vocab: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..64 {
+        let n = 2 + next() % 7;
+        vocab.push((0..n).map(|_| b'a' + (next() % 26) as u8).collect());
+    }
+    let mut out = Vec::new();
+    let mut fill = |out: &mut Vec<u8>, target: usize| {
+        while out.len() < target {
+            let (a, b) = (next() % 64, next() % 64);
+            out.extend_from_slice(&vocab[a.min(b) as usize]);
+            out.push(b' ');
+        }
+        out.truncate(target);
+    };
+    fill(&mut out, 100_000);
+    out.extend_from_within(..20_000);
+    fill(&mut out, 150_000);
+    out
+}
+
+fn assert_decodes_to_words(encoded: &[u8], level: u8) {
+    // First block: 4-byte size word after the 7-byte header, then the
+    // compression level byte.
+    assert_eq!(encoded[11], level);
+    let want = words_input();
+    for (in_chunk, out_chunk) in [(encoded.len(), 1 << 20), (1, 4096), (4096, 1), (777, 333)] {
+        let got = decode_chunked(encoded, in_chunk, out_chunk).unwrap();
+        assert!(got == want, "mismatch with chunks {in_chunk}/{out_chunk}");
+    }
+}
+
+/// LIZv1 codewords with every sub-stream stored raw, including a match
+/// through the 24-bit offset stream.
+#[test]
+fn decode_reference_lizv1() {
+    let encoded = include_bytes!("fixtures/lz5/words_l24_lizv1.liz");
+    assert_eq!(encoded[12], 0x00, "no Huffman-coded sub-stream");
+    assert_decodes_to_words(encoded, 24);
+}
+
+/// LZ4 codewords with a Huffman-coded sub-stream.
+#[test]
+fn decode_reference_lz4_codewords_with_huffman() {
+    let encoded = include_bytes!("fixtures/lz5/words_l39_lz4_huffman.liz");
+    assert_ne!(encoded[12] & 0x1f, 0, "a Huffman-coded sub-stream");
+    assert_decodes_to_words(encoded, 39);
+}
+
+/// LIZv1 codewords with Huffman-coded sub-streams, in a block-dependent
+/// frame of 128 KiB blocks: the far match of the second block reaches
+/// 100 000 bytes back into the first.
+#[test]
+fn decode_reference_lizv1_huffman_dependent() {
+    let encoded = include_bytes!("fixtures/lz5/words_l45_b1_dependent.liz");
+    assert_eq!(encoded[4] & 0x20, 0, "block-dependent frame");
+    assert_ne!(encoded[12] & 0x1f, 0, "a Huffman-coded sub-stream");
+    assert_decodes_to_words(encoded, 45);
+}
+
+/// Every proper prefix of a reference stream is an error or a short
+/// result, never a panic or wrong bytes; and no single corrupted byte
+/// makes the decoder panic or hand out wrong bytes as a clean result.
+#[test]
+fn reference_fixtures_survive_truncation_and_corruption() {
+    let want = words_input();
+    for fixture in [
+        &include_bytes!("fixtures/lz5/words_l24_lizv1.liz")[..],
+        &include_bytes!("fixtures/lz5/words_l39_lz4_huffman.liz")[..],
+        &include_bytes!("fixtures/lz5/words_l45_b1_dependent.liz")[..],
+    ] {
+        for cut in (0..fixture.len()).step_by(997) {
+            if let Ok(got) = decode_chunked(&fixture[..cut], 4096, 4096) {
+                assert!(want.starts_with(&got), "wrong bytes at cut {cut}");
+            }
+        }
+        for at in (7..fixture.len()).step_by(211) {
+            let mut bad = fixture.to_vec();
+            bad[at] ^= 0x55;
+            // The content checksum catches whatever the block decoder lets
+            // through, so a corrupted frame that still decodes can only be
+            // one whose content came out the same (a match offset moved
+            // to another copy of the same bytes).
+            if let Ok(got) = decode_chunked(&bad, bad.len(), 1 << 16) {
+                assert!(got == want, "wrong bytes accepted with byte {at} corrupted");
+            }
+        }
+    }
 }
 
 // ─── cross-validate with reference `lizard -d` (if available) ─────────

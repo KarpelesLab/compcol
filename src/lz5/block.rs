@@ -1,32 +1,25 @@
-//! Single-block Lizard decode (compressed-block payload only).
+//! Lizard block decode (the payload of one compressed frame block).
 //!
-//! The frame-level state machine in [`super`] hands us the bytes of a
-//! single compressed block — everything between the 4-byte block-size
-//! word and the start of the next block. We parse the block-internal
-//! 1-byte `compressionLevel`, then the 1-byte `res` flag, then either
-//! the in-block uncompressed payload (when `res == 0x80`) or the
-//! five sub-streams (lengths, offset16, offset24, flags, literals).
+//! The frame-level state machine in [`super`] hands us the bytes of one
+//! compressed frame block — everything between the 4-byte block-size
+//! word and the start of the next block: a 1-byte `compressionLevel`,
+//! then one sub-block per 128 KiB of input. A sub-block is a flag byte
+//! followed by a stored run (flag `0x80`) or by five sub-streams
+//! (lengths, offset16, offset24, tokens, literals), each stored raw or
+//! Huffman-coded as its flag bit says.
 //!
-//! Only the LZ4-codeword sequence loop (levels 10..=19, 30..=39) with
-//! all sub-streams stored raw (no Huffman entropy stage) is
-//! implemented; everything else returns [`Error::Unsupported`].
-//!
-//! Two paths stay `Unsupported` for documented, validation-driven
-//! reasons (see the inline comments at the `huffman_bits` and LIZv1
-//! rejections below):
-//!
-//!  * **Huff0 entropy stage** (any sub-stream flag bit set): Lizard's
-//!    generic `HUF_decompress` recomputes an X1-vs-X2 decoder choice
-//!    that is never carried in the stream; the crate has only an X1
-//!    Huff0 decoder (private to `zstd`), and there is no `lizard` CLI
-//!    or fixture here to validate an X2 decoder against. A round-trip
-//!    against our own X1-only encoder would prove nothing.
-//!  * **LIZv1 codewords** (levels 20..=29, 40..=49): a separate, larger
-//!    sequence format, out of scope for this round.
+//! Both sequence formats are decoded: LZ4 codewords (levels 10..=19 and
+//! 30..=39) and LIZv1 codewords (20..=29 and 40..=49). The layouts follow
+//! `doc/lizard_Block_format.md` of the reference distribution; where that
+//! document is silent or ambiguous they were settled against streams
+//! written by the reference CLI, which is also what the fixtures in
+//! `tests/lz5.rs` come from.
 
 use alloc::vec::Vec;
 
 use crate::error::Error;
+use crate::huff0::bitreader::RevBitReader;
+use crate::huff0::huffman::{HuffTable, decode_huffman_tree};
 
 const LIZARD_MIN_CLEVEL: u8 = 10;
 const LIZARD_MAX_CLEVEL: u8 = 49;
@@ -37,6 +30,18 @@ const FLAG_OFFSET16: u8 = 0x04;
 const FLAG_OFFSET24: u8 = 0x08;
 const FLAG_LEN: u8 = 0x10;
 const FLAG_UNCOMPRESSED: u8 = 0x80;
+
+const FLAG_ALL_STREAMS: u8 = FLAG_LITERALS | FLAG_FLAGS | FLAG_OFFSET16 | FLAG_OFFSET24 | FLAG_LEN;
+
+/// Ceiling on what one Huffman-coded sub-stream may regenerate. A
+/// sub-block covers at most 128 KiB of input, and no stream of it is
+/// larger than that by more than a small factor.
+const MAX_HUFFMAN_STREAM: usize = 512 * 1024;
+
+/// A LIZv1 token below 32 carries a match of `token + 16` bytes.
+const LIZV1_OFF24_MIN_MATCH: usize = 16;
+/// The "last offset" a LIZv1 block starts with.
+const LIZV1_INITIAL_OFFSET: usize = 0;
 
 const MINMATCH: usize = 4;
 const RUN_BITS_LZ4: u32 = 4;
@@ -84,26 +89,22 @@ pub fn decode_compressed_block(input: &[u8], out: &mut Vec<u8>, cap: usize) -> R
     if !(LIZARD_MIN_CLEVEL..=LIZARD_MAX_CLEVEL).contains(&clevel) {
         return Err(Error::Corrupt);
     }
-    // Lizard groups levels by decompression strategy:
-    //   10..=19, 30..=39  →  LZ4 codewords (this build supports)
-    //   20..=29, 40..=49  →  LIZv1 codewords (not supported)
-    //
-    // LIZv1 is a distinct, larger sequence format (`Lizard_decompress_LIZv1`
-    // vs `Lizard_decompress_LZ4` in the reference): different token layout,
-    // explicit `lengths`/`offset16`/`offset24` streams, and a 24-bit offset
-    // path. Implementing it is a separate effort from the Huffman stage and
-    // is out of scope for this round, so it stays `Unsupported`.
-    let is_lz4_mode = matches!(clevel, 10..=19 | 30..=39);
-    if !is_lz4_mode {
-        return Err(Error::Unsupported);
-    }
+    // Lizard groups levels by sequence format:
+    //   10..=19, 30..=39  →  LZ4 codewords
+    //   20..=29, 40..=49  →  LIZv1 codewords
+    // (30 and up are the same two formats with the Huffman stage enabled,
+    // but each sub-stream says for itself whether it is Huffman-coded.)
+    let lizv1 = matches!(clevel, 20..=29 | 40..=49);
 
     // At least one sub-block follows the level byte.
     if ip >= input.len() {
         return Err(Error::UnexpectedEnd);
     }
+    // The offset a LIZv1 "repeat" token reuses carries over from one
+    // sub-block to the next.
+    let mut last_offset = LIZV1_INITIAL_OFFSET;
     while ip < input.len() {
-        ip = decode_sub_block(input, ip, out, cap)?;
+        ip = decode_sub_block(input, ip, out, cap, lizv1, &mut last_offset)?;
     }
     Ok(())
 }
@@ -115,87 +116,264 @@ fn decode_sub_block(
     mut ip: usize,
     out: &mut Vec<u8>,
     cap: usize,
+    lizv1: bool,
+    last_offset: &mut usize,
 ) -> Result<usize, Error> {
     let res = input[ip];
     ip += 1;
 
-    if res == FLAG_UNCOMPRESSED {
-        // In-block uncompressed: 3-byte LE length + raw bytes.
+    if res & FLAG_UNCOMPRESSED != 0 {
+        // Stored sub-block: 3-byte LE length + raw bytes.
+        if res != FLAG_UNCOMPRESSED {
+            return Err(Error::Corrupt);
+        }
         if ip + 3 > input.len() {
             return Err(Error::UnexpectedEnd);
         }
         let length = read_u24_le(&input[ip..]);
         ip += 3;
-        if ip + length > input.len() {
+        if length > input.len() - ip {
             return Err(Error::UnexpectedEnd);
         }
-        if out.len() + length > cap {
+        if length > cap - out.len() {
             return Err(Error::Corrupt);
         }
         out.extend_from_slice(&input[ip..ip + length]);
         return Ok(ip + length);
     }
-
-    // LIZARD_FLAG_LEN being set on the block-flag byte is the reference
-    // implementation's "reserved / not used" marker; reject so unknown
-    // future variants don't decode silently to wrong output.
-    if res & FLAG_LEN != 0 {
-        return Err(Error::Corrupt);
-    }
-    // Any Huffman bit set on a sub-stream means the stream is entropy-coded
-    // with Huff0 (Yann Collet's FiniteStateEntropy library) and must be
-    // `HUF_decompress`'d before the sequence loop runs. Each such sub-stream
-    // is framed as a 6-byte header (3-byte LE regenerated size + 3-byte LE
-    // compressed size) followed by `compressed_size` bytes of Huff0 payload
-    // (`Lizard_readStream` → `HUF_decompress(op, regenSize, ip + 6, comprLen)`).
-    //
-    // This stays `Unsupported`. The decision is deliberate, not a TODO —
-    // there is no faithful way to *validate* such a decoder in this
-    // environment, and the crate's policy (see `lzham`, `sit13`) is to mark
-    // formats we cannot validate bit-exactly as `Unsupported` rather than
-    // ship a blind decoder. Concretely:
-    //
-    //   * The crate already has a Huff0 decoder in `src/zstd/huffman.rs`, but
-    //     it is (a) private to the `zstd` module (`mod huffman;`, not
-    //     reachable from here without re-exporting it) and (b) implements
-    //     only the **X1** (single-symbol) decode table that zstd's *literals*
-    //     spec restricts itself to.
-    //   * Lizard calls the *generic* `HUF_decompress`, which selects **X1 or
-    //     X2** (double-symbol) at runtime via `HUF_selectDecoder`. That
-    //     choice is **recomputed from (regenSize, comprLen)** and is **never
-    //     stored in the stream**, so a conformant decoder must implement both
-    //     X1 and X2 *and* reproduce `HUF_selectDecoder`'s timing heuristic
-    //     exactly. The crate has no X2 decoder anywhere. (The 4-stream jump
-    //     table — three LE u16 sizes — does match zstd's literals framing, so
-    //     that part would be reusable; the X1/X2 split is the blocker.)
-    //   * The lz5 encoder here is store-only, and there is no `lizard` CLI or
-    //     Huff0 fixture in this environment. A round-trip against a
-    //     hand-written X1-only encoder would always select X1 and "pass"
-    //     while proving nothing about a real (possibly X2) Lizard block — a
-    //     self-validating fiction. Absent a real fixture or reference
-    //     encoder there is no honest round-trip, so we do not ship.
-    let huffman_bits = res & (FLAG_LITERALS | FLAG_FLAGS | FLAG_OFFSET16 | FLAG_OFFSET24);
-    if huffman_bits != 0 {
-        return Err(Error::Unsupported);
-    }
-
-    // Parse five raw streams: lengths, offset16, offset24, flags, literals.
-    // Each starts with a 3-byte LE length.
-    let lengths = read_raw_stream(input, &mut ip)?;
-    let offset16 = read_raw_stream(input, &mut ip)?;
-    let offset24 = read_raw_stream(input, &mut ip)?;
-    let flags = read_raw_stream(input, &mut ip)?;
-    let literals = read_raw_stream(input, &mut ip)?;
-
-    // In LZ4 mode the lengths/offset16/offset24 streams must be empty
-    // — the encoder packs all length-extensions and offsets inline in
-    // the literals stream. Reject any extra bytes there as malformed.
-    if !lengths.is_empty() || !offset16.is_empty() || !offset24.is_empty() {
+    if res & !FLAG_ALL_STREAMS != 0 {
         return Err(Error::Corrupt);
     }
 
-    decode_lz4_sequences(flags, literals, out, cap)?;
+    // Five sub-streams, in this order, each stored raw or Huffman-coded
+    // as its flag bit says.
+    let lengths = read_stream(input, &mut ip, res & FLAG_LEN != 0)?;
+    let offset16 = read_stream(input, &mut ip, res & FLAG_OFFSET16 != 0)?;
+    let offset24 = read_stream(input, &mut ip, res & FLAG_OFFSET24 != 0)?;
+    let tokens = read_stream(input, &mut ip, res & FLAG_FLAGS != 0)?;
+    let literals = read_stream(input, &mut ip, res & FLAG_LITERALS != 0)?;
+
+    if lizv1 {
+        decode_lizv1_sequences(
+            &Streams {
+                lengths: &lengths,
+                offset16: &offset16,
+                offset24: &offset24,
+                tokens: &tokens,
+                literals: &literals,
+            },
+            out,
+            cap,
+            last_offset,
+        )?;
+    } else {
+        // In LZ4 mode the lengths/offset16/offset24 streams are unused: the
+        // encoder packs all length extensions and offsets inline in the
+        // literals stream. Reject any bytes there as malformed.
+        if !lengths.is_empty() || !offset16.is_empty() || !offset24.is_empty() {
+            return Err(Error::Corrupt);
+        }
+        decode_lz4_sequences(&tokens, &literals, out, cap)?;
+    }
     Ok(ip)
+}
+
+/// One sub-stream: borrowed from the block when stored raw, owned when
+/// it had to be Huffman-decoded.
+enum Stream<'a> {
+    Raw(&'a [u8]),
+    Decoded(Vec<u8>),
+}
+
+impl core::ops::Deref for Stream<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Stream::Raw(s) => s,
+            Stream::Decoded(v) => v,
+        }
+    }
+}
+
+/// Read one sub-stream and advance `ip` past it.
+///
+/// Raw: a 3-byte LE length, then that many bytes. Huffman-coded: a 3-byte
+/// LE regenerated length, a 3-byte LE compressed length, then the
+/// compressed bytes.
+fn read_stream<'a>(input: &'a [u8], ip: &mut usize, huffman: bool) -> Result<Stream<'a>, Error> {
+    if !huffman {
+        return read_raw_stream(input, ip).map(Stream::Raw);
+    }
+    if input.len() - *ip < 6 {
+        return Err(Error::UnexpectedEnd);
+    }
+    let regen = read_u24_le(&input[*ip..]);
+    let comp = read_u24_le(&input[*ip + 3..]);
+    *ip += 6;
+    if comp > input.len() - *ip {
+        return Err(Error::UnexpectedEnd);
+    }
+    let payload = &input[*ip..*ip + comp];
+    *ip += comp;
+    if regen > MAX_HUFFMAN_STREAM {
+        return Err(Error::Corrupt);
+    }
+    huff0_decompress(payload, regen).map(Stream::Decoded)
+}
+
+/// Decode a Huff0 block as the generic `HUF_compress` of Yann Collet's
+/// FiniteStateEntropy library writes it: a Huffman tree description (the
+/// same one zstd uses for its literals), a 6-byte jump table of three LE
+/// u16 stream sizes, then four bitstreams, the first three regenerating
+/// `ceil(n / 4)` bytes each and the fourth the rest.
+///
+/// Which decoding table a decoder builds for it (single- or
+/// double-symbol) is its own business and does not change the result.
+fn huff0_decompress(src: &[u8], regen: usize) -> Result<Vec<u8>, Error> {
+    let (table, used) = decode_huffman_tree(src)?;
+    let body = &src[used..];
+    if body.len() < 6 {
+        return Err(Error::Corrupt);
+    }
+    let l1 = u16::from_le_bytes([body[0], body[1]]) as usize;
+    let l2 = u16::from_le_bytes([body[2], body[3]]) as usize;
+    let l3 = u16::from_le_bytes([body[4], body[5]]) as usize;
+    let streams = &body[6..];
+    let l123 = l1 + l2 + l3;
+    if l123 > streams.len() {
+        return Err(Error::Corrupt);
+    }
+    let per = regen.div_ceil(4);
+    let last = regen.checked_sub(3 * per).ok_or(Error::Corrupt)?;
+    let mut out = Vec::with_capacity(regen);
+    decode_huff_stream(&streams[..l1], &table, per, &mut out)?;
+    decode_huff_stream(&streams[l1..l1 + l2], &table, per, &mut out)?;
+    decode_huff_stream(&streams[l1 + l2..l123], &table, per, &mut out)?;
+    decode_huff_stream(&streams[l123..], &table, last, &mut out)?;
+    Ok(out)
+}
+
+/// Decode exactly `n` symbols from one Huffman bitstream, which must hold
+/// those symbols and nothing more.
+fn decode_huff_stream(
+    data: &[u8],
+    table: &HuffTable,
+    n: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), Error> {
+    let mut br = RevBitReader::new(data)?;
+    for _ in 0..n {
+        out.push(table.decode(&mut br)?);
+    }
+    if br.remaining() != 0 {
+        return Err(Error::Corrupt);
+    }
+    Ok(())
+}
+
+/// The five sub-streams of a LIZv1 sub-block.
+struct Streams<'a> {
+    lengths: &'a [u8],
+    offset16: &'a [u8],
+    offset24: &'a [u8],
+    tokens: &'a [u8],
+    literals: &'a [u8],
+}
+
+/// LIZv1 sequence loop (levels 20..=29 and 40..=49), as described under
+/// "Lizard token decompression" in `doc/lizard_Block_format.md`.
+///
+/// Each token byte is one of:
+///
+/// * `0..=31` — no literals; a 24-bit offset from the offset24 stream;
+///   match length `token + 16`, and for token 31 a further length from
+///   the lengths stream.
+/// * `0_MMMM_LLL` with `MMMM >= 4` — `LLL` literals, a 16-bit offset from
+///   the offset16 stream, match length `MMMM`.
+/// * `1_MMMM_LLL` — `LLL` literals, the last offset again, match length
+///   `MMMM` (which may be 0: literals only).
+///
+/// `LLL == 7` and `MMMM == 15` each add a length from the lengths stream.
+/// Whatever is left of the literals stream after the last token ends the
+/// sub-block.
+fn decode_lizv1_sequences(
+    s: &Streams<'_>,
+    out: &mut Vec<u8>,
+    cap: usize,
+    last_offset: &mut usize,
+) -> Result<(), Error> {
+    let (mut lenp, mut o16p, mut o24p, mut litp) = (0usize, 0usize, 0usize, 0usize);
+    // Without a lengths stream the length extensions sit inline in the
+    // literals stream, where each is read at the point it is needed.
+    let inline_lengths = s.lengths.is_empty();
+    macro_rules! length_ext {
+        () => {
+            if inline_lengths {
+                read_length_ext(s.literals, &mut litp)?
+            } else {
+                read_length_ext(s.lengths, &mut lenp)?
+            }
+        };
+    }
+
+    for &token in s.tokens {
+        let match_len = if token < 32 {
+            if s.offset24.len() - o24p < 3 {
+                return Err(Error::Corrupt);
+            }
+            *last_offset = read_u24_le(&s.offset24[o24p..]);
+            o24p += 3;
+            let mut len = token as usize + LIZV1_OFF24_MIN_MATCH;
+            if token == 31 {
+                len = len.checked_add(length_ext!()).ok_or(Error::Corrupt)?;
+            }
+            len
+        } else {
+            let mut lit_len = (token & 7) as usize;
+            if lit_len == 7 {
+                lit_len += length_ext!();
+            }
+            if lit_len > s.literals.len() - litp {
+                return Err(Error::Corrupt);
+            }
+            if lit_len > cap - out.len() {
+                return Err(Error::Corrupt);
+            }
+            out.extend_from_slice(&s.literals[litp..litp + lit_len]);
+            litp += lit_len;
+
+            if token & 0x80 == 0 {
+                if s.offset16.len() - o16p < 2 {
+                    return Err(Error::Corrupt);
+                }
+                *last_offset =
+                    u16::from_le_bytes([s.offset16[o16p], s.offset16[o16p + 1]]) as usize;
+                o16p += 2;
+            }
+            let mut len = ((token >> 3) & 15) as usize;
+            if len == 15 {
+                len += length_ext!();
+            }
+            len
+        };
+        if match_len > 0 {
+            if *last_offset == 0 {
+                return Err(Error::InvalidDistance);
+            }
+            copy_match(out, *last_offset, match_len, cap)?;
+        }
+    }
+
+    // Every stream but the literals must be used up exactly.
+    if lenp != s.lengths.len() || o16p != s.offset16.len() || o24p != s.offset24.len() {
+        return Err(Error::Corrupt);
+    }
+    let tail = &s.literals[litp..];
+    if tail.len() > cap - out.len() {
+        return Err(Error::Corrupt);
+    }
+    out.extend_from_slice(tail);
+    Ok(())
 }
 
 /// Read one raw (non-Huffman) sub-stream: 3-byte LE length + bytes.
@@ -404,23 +582,111 @@ mod tests {
         assert_eq!(out, b"hello");
     }
 
+    /// A LIZv1 sub-block built by hand: every token kind, with the
+    /// length extensions inline in the literals stream.
     #[test]
-    fn rejects_lizv1_mode() {
-        let block = alloc::vec![20u8, 0u8]; // clevel 20 → LIZv1
+    fn lizv1_tokens() {
+        // tokens:
+        //   0x2f = 0_0101_111: 7+ literals (ext 1 -> 8), offset16, match 5
+        //   0xf9 = 1_1111_001: 1 literal, last offset, match 15+ (ext 3 -> 18)
+        //   0x81 = 1_0000_001: 1 literal, no match
+        //   0x00: offset24, match 16
+        let literals = b"\x01abcdefgh!\x03?tail";
+        let mut block = alloc::vec![20u8, 0];
+        block.extend_from_slice(&[0, 0, 0]); // lengths
+        block.extend_from_slice(&[2, 0, 0, 8, 0]); // offset16: 8
+        block.extend_from_slice(&[3, 0, 0, 27, 0, 0]); // offset24: 27
+        block.extend_from_slice(&[4, 0, 0, 0x2f, 0xf9, 0x81, 0x00]);
+        block.extend_from_slice(&[literals.len() as u8, 0, 0]);
+        block.extend_from_slice(literals);
+
+        let mut want = b"abcdefgh".to_vec();
+        want.extend_from_slice(b"abcde"); // match 5 at 8
+        want.push(b'!');
+        for _ in 0..18 {
+            want.push(want[want.len() - 8]); // match 18 at 8
+        }
+        want.push(b'?');
+        for _ in 0..16 {
+            want.push(want[want.len() - 27]); // match 16 at 27
+        }
+        want.extend_from_slice(b"tail");
+
         let mut out = Vec::new();
+        decode_compressed_block(&block, &mut out, usize::MAX).unwrap();
+        assert_eq!(out, want);
+
+        // The same sequences with a separate lengths stream.
+        let literals = b"abcdefgh!?tail";
+        let mut block = alloc::vec![20u8, 0];
+        block.extend_from_slice(&[2, 0, 0, 1, 3]); // lengths
+        block.extend_from_slice(&[2, 0, 0, 8, 0]);
+        block.extend_from_slice(&[3, 0, 0, 27, 0, 0]);
+        block.extend_from_slice(&[4, 0, 0, 0x2f, 0xf9, 0x81, 0x00]);
+        block.extend_from_slice(&[literals.len() as u8, 0, 0]);
+        block.extend_from_slice(literals);
+        let mut out = Vec::new();
+        decode_compressed_block(&block, &mut out, usize::MAX).unwrap();
+        assert_eq!(out, want);
+    }
+
+    #[test]
+    fn lizv1_rejects_bad_sequences() {
+        let build = |off16: &[u8], off24: &[u8], tokens: &[u8], literals: &[u8]| {
+            let mut b = alloc::vec![20u8, 0, 0, 0, 0];
+            for s in [off16, off24, tokens, literals] {
+                b.extend_from_slice(&[s.len() as u8, 0, 0]);
+                b.extend_from_slice(s);
+            }
+            b
+        };
+        let run = |b: &[u8]| {
+            let mut out = Vec::new();
+            decode_compressed_block(b, &mut out, 1 << 16)
+        };
+        // A repeat match before any offset was set.
         assert_eq!(
-            decode_compressed_block(&block, &mut out, usize::MAX),
-            Err(Error::Unsupported)
+            run(&build(&[], &[], &[0xa1], b"x")),
+            Err(Error::InvalidDistance)
+        );
+        // An offset reaching before the start of the output.
+        assert_eq!(
+            run(&build(&[2, 0], &[], &[0x21], b"x")),
+            Err(Error::InvalidDistance)
+        );
+        // A token with no offset left to read.
+        assert_eq!(run(&build(&[], &[], &[0x21], b"x")), Err(Error::Corrupt));
+        assert_eq!(run(&build(&[], &[1, 0], &[0x00], b"")), Err(Error::Corrupt));
+        // Offsets nobody used.
+        assert_eq!(
+            run(&build(&[1, 0, 1, 0], &[], &[0x21], b"x")),
+            Err(Error::Corrupt)
+        );
+        // A match longer than the block may hold.
+        assert_eq!(
+            run(&build(&[1, 0], &[], &[0x79], b"x\xff\xff\xff\xff")),
+            Err(Error::Corrupt)
         );
     }
 
     #[test]
-    fn rejects_huffman_flag() {
-        let block = alloc::vec![10u8, FLAG_LITERALS]; // Huffman literals stream
+    fn rejects_truncated_huffman_stream() {
+        // Huffman-coded literals stream whose header is cut short, then
+        // one whose payload is not a Huffman block.
         let mut out = Vec::new();
         assert_eq!(
+            decode_compressed_block(&[10u8, FLAG_LITERALS], &mut out, usize::MAX),
+            Err(Error::UnexpectedEnd)
+        );
+        let mut block = alloc::vec![10u8, FLAG_LITERALS, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        block.extend_from_slice(&[4, 0, 0, 3, 0, 0, 0xff, 0xff, 0xff]);
+        assert!(decode_compressed_block(&block, &mut out, usize::MAX).is_err());
+        // A regenerated size beyond what a sub-block can need.
+        let mut block = alloc::vec![10u8, FLAG_LITERALS, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        block.extend_from_slice(&[0xff, 0xff, 0xff, 1, 0, 0, 0]);
+        assert_eq!(
             decode_compressed_block(&block, &mut out, usize::MAX),
-            Err(Error::Unsupported)
+            Err(Error::Corrupt)
         );
     }
 

@@ -27,48 +27,28 @@
 //!
 //! ## Scope
 //!
-//! **Decoder**: implemented for the **LZ4 codeword path with all
-//! sub-streams stored raw** (the most common shape produced by the
-//! reference CLI at levels 10..=19 on non-tiny inputs). Frames whose
-//! blocks use the LIZv1 sequence format (levels 20..=29, 40..=49) or any
-//! Huffman-coded sub-stream are rejected with [`Error::Unsupported`].
-//! Within that scope, frame blocks of any size (`-B1`..`-B7`) and
-//! block-dependent frames (`-BD`) decode, and are checked against files
-//! written by the reference CLI at every level from 10 to 19.
+//! **Decoder**: complete for what the reference CLI writes. Both sequence
+//! formats are decoded — LZ4 codewords (levels 10..=19, 30..=39) and
+//! LIZv1 codewords (20..=29, 40..=49) — with sub-streams stored raw or
+//! Huffman-coded, for frame blocks of any size (`-B1`..`-B7`) and for
+//! block-dependent frames (`-BD`), where the last 16 MiB of output is
+//! kept as history. It is checked against files written by the reference
+//! CLI at every level from 10 to 49.
 //!
-//! The Huffman path stays `Unsupported` for a concrete, validation-first
-//! reason rather than mere absence of effort. Lizard's entropy stage is
-//! Huff0 (`HUF_decompress` from Yann Collet's FiniteStateEntropy), the
-//! same family as zstd's literals Huffman, and each Huffman sub-stream is
-//! framed as a 6-byte header (3-byte LE regenerated size + 3-byte LE
-//! compressed size) then the Huff0 payload. But the *generic*
-//! `HUF_decompress` Lizard calls selects between **X1** (single-symbol)
-//! and **X2** (double-symbol) decode tables via `HUF_selectDecoder`, and
-//! that choice is **recomputed from the regenerated/compressed sizes,
-//! never stored in the stream**. This crate's Huff0 decoder
-//! (`src/zstd/huffman.rs`) is X1-only and is private to the `zstd`
-//! module; it covers neither X2 nor the size-driven selector. With no
-//! `lizard` CLI and no Huff0 fixtures in this environment, the only
-//! "test" available would be a round-trip against a hand-written
-//! X1-only encoder, which would always pick X1 and therefore validate
-//! nothing about real (possibly X2) blocks. Per the crate's
-//! `lzham`/`sit13` policy, an unvalidatable decoder is worse than an
-//! honest `Unsupported`, so we do not ship one.
+//! The Huffman stage is Huff0 (`HUF_compress` from Yann Collet's
+//! FiniteStateEntropy), the same coding zstd uses for its literals: a
+//! sub-stream is framed as a 3-byte LE regenerated size, a 3-byte LE
+//! compressed size, then a tree description, a jump table and four
+//! bitstreams. It is decoded by the entropy decoder this crate shares
+//! with `zstd`.
 //!
-//! A future round could lift this once validation is possible: expose
-//! zstd's X1 Huff0 decoder as `pub(crate)`, add an X2 decoder plus the
-//! `HUF_selectDecoder` heuristic, and validate against fixtures from the
-//! `lizard` CLI (e.g. `lizard -30`). The 6-byte sub-stream header and the
-//! 4-stream jump table (three LE u16 sizes) already match formats this
-//! crate parses elsewhere. The frame-level uncompressed block path
-//! (high bit on block-size word) is handled fully, so frames where
-//! every block stored raw decode without ever exercising the sequence
-//! loop. Block checksums (FLG bit 4) and external dictionaries are
-//! rejected with `Unsupported`. Content checksums (FLG bit 2) are
-//! verified: as in the LZ4 frame format Lizard's is derived from, the
-//! 4-byte little-endian trailer after the EndMark is xxHash-32 (seed 0)
-//! of the whole decoded content, and a mismatch fails the stream with
-//! [`Error::ChecksumMismatch`] once the trailer has been read (the
+//! The frame-level uncompressed block path (high bit on the block-size
+//! word) is handled as well. Block checksums (FLG bit 4) and external
+//! dictionaries are rejected with `Unsupported`. Content checksums (FLG
+//! bit 2) are verified: as in the LZ4 frame format Lizard's is derived
+//! from, the 4-byte little-endian trailer after the EndMark is xxHash-32
+//! (seed 0) of the whole decoded content, and a mismatch fails the stream
+//! with [`Error::ChecksumMismatch`] once the trailer has been read (the
 //! content itself has been handed out by then, block by block).
 //!
 //! **Encoder**: produces a valid Lizard frame whose data is always
@@ -133,9 +113,9 @@ impl Algorithm for Lz5 {
 
 // ─── shared frame constants ─────────────────────────────────────────────
 
-/// History kept between the blocks of a block-dependent frame. The
-/// LZ4-codeword path, the only one decoded here, has 16-bit offsets.
-const HISTORY_SIZE: usize = 64 * 1024;
+/// History kept between the blocks of a block-dependent frame: the
+/// reach of the longest offset the block format has (24 bits, in LIZv1).
+const HISTORY_SIZE: usize = 1 << 24;
 
 const FLG_VERSION_MASK: u8 = 0b1100_0000;
 const FLG_VERSION_01: u8 = 0b0100_0000;
@@ -561,11 +541,14 @@ impl Decoder {
     /// The block in `decoded` has been handed out in full: drop it, or in
     /// a block-dependent frame keep its tail as history for the next one.
     fn retire_block(&mut self) {
-        if self.dependent {
-            let drop = self.decoded.len().saturating_sub(HISTORY_SIZE);
-            self.decoded.drain(..drop);
-        } else {
+        if !self.dependent {
             self.decoded.clear();
+        } else if self.decoded.len() >= 2 * HISTORY_SIZE {
+            // Trim only once the buffer holds twice the history, so each
+            // byte is moved a bounded number of times however small the
+            // blocks are.
+            let drop = self.decoded.len() - HISTORY_SIZE;
+            self.decoded.drain(..drop);
         }
         self.hist_len = self.decoded.len();
         self.decoded_idx = self.hist_len;

@@ -51,7 +51,7 @@ flag accept; *Ext* is what `factory::extension(name)` returns.
 | Gzip (RFC 1952) | `gzip` | `gzip` | `.gz` | full | full | `gzip(1)` |
 | LZ4 frame format | `lz4` | `lz4-frame` | `.lz4` | full (greedy or HC hash-chain + lazy / optimal parse; linked blocks) | full (block + content checksums) | `lz4(1)` both directions |
 | LZ4 block format | `lz4` | `lz4` | `.lz4` | same matcher, wrapped in a minimal length-prefixed block framing | full | — |
-| LZ5 / Lizard (frame) | `lz5` | `lz5` | `.liz` | store-only frames (valid, no compression) | LZ4-codeword path with raw sub-streams (levels 10..=19); LIZv1 / Huffman sub-streams `Unsupported` | `lizard(1)` 2.1.0 fixtures + CLI cross-decode |
+| LZ5 / Lizard (frame) | `lz5` | `lz5` | `.liz` | store-only frames (valid, no compression) | all levels (10..=49): LZ4 and LIZv1 codewords, raw or Huffman-coded sub-streams, dependent blocks | `lizard(1)` 2.1.0 fixtures + CLI cross-decode |
 | Snappy | `snappy` | `snappy` | `.sz` | LZ77 hash matcher (raw block format) | full | — |
 | LZW (`compress(1)` `.Z`) | `lzw` | `lzw` | `.lzw` | full | full | `compress(1)` / `uncompress(1)` |
 | LZSS (Okumura `lzss.c` layout) | `lzss` | `lzss` | `.lzss` | hash-chain match finder | full (4-byte length header + raw payload) | fixtures from a port of Okumura's `lzss.c` (`docs/lzss-ref.py`) |
