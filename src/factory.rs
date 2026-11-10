@@ -278,6 +278,16 @@ pub fn encoder_by_name_with_level(name: &str, level: u8) -> Option<Box<dyn Encod
     }
 }
 
+/// Build a decoder for the algorithm named `name` that can decode into one
+/// contiguous output buffer without a window of its own (see
+/// [`ContiguousDecoder`](crate::ContiguousDecoder)), or `None` if the
+/// algorithm is not compiled in or has no such mode.
+pub fn contiguous_decoder_by_name(name: &str) -> Option<Box<dyn crate::ContiguousDecoder>> {
+    // Arms are added by the codecs that implement the trait.
+    let _ = name;
+    None
+}
+
 /// Build a decoder for the algorithm named `name`, or `None` if no algorithm
 /// is compiled in under that name.
 pub fn decoder_by_name(name: &str) -> Option<Box<dyn Decoder>> {
