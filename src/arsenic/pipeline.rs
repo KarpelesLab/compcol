@@ -104,9 +104,28 @@ impl Derandomizer {
     }
 }
 
+/// Most BWT bytes a block may hold when only `remaining` more output bytes
+/// are allowed.
+///
+/// The final-RLE layer never drops more than one byte in five (a count byte
+/// follows four equal bytes, and every other byte is emitted), so a block of
+/// `n` bytes decodes to at least `n - n / 5`. Any block longer than
+/// `remaining * 5 / 4` (plus slack for the rounding) is therefore certain to
+/// overrun, and can be refused before its inverse-BWT tables are built.
+fn block_budget(remaining: u64) -> u64 {
+    remaining.saturating_add(remaining / 4).saturating_add(2)
+}
+
 /// Decode a complete Arsenic stream. Returns `NeedMore` on input underflow
 /// before the terminator; `Err(Corrupt)` on a malformed but complete stream.
-pub(crate) fn decode_stream(data: &[u8]) -> Result<DecodeOutcome, Error> {
+///
+/// `limit` is the caller's output limit (`u64::MAX` for none). A stream that
+/// decodes to more fails with [`Error::OutputLimitExceeded`] before the byte
+/// that crosses it is appended, and a block is abandoned as soon as it holds
+/// more bytes than the remaining budget could take (see
+/// [`block_budget`]), so neither the output nor the per-block scratch grows
+/// past what the limit allows.
+pub(crate) fn decode_stream(data: &[u8], limit: u64) -> Result<DecodeOutcome, Error> {
     if data.is_empty() {
         return Ok(DecodeOutcome::NeedMore);
     }
@@ -162,6 +181,8 @@ pub(crate) fn decode_stream(data: &[u8]) -> Result<DecodeOutcome, Error> {
 
         // ── Token loop (§5.2): produce BWT last-column bytes ────────────
         block.clear();
+        // Longest block the caller's remaining output budget can absorb.
+        let block_limit = block_budget(limit.saturating_sub(out.len() as u64));
         let mut sel = rc.decode_value(&mut selector)? as u32;
         check_underflow!();
         loop {
@@ -187,6 +208,9 @@ pub(crate) fn decode_stream(data: &[u8]) -> Result<DecodeOutcome, Error> {
                 let count = count as usize;
                 if block.len() + count > block_size {
                     return Err(Error::Corrupt);
+                }
+                if (block.len() + count) as u64 > block_limit {
+                    return Err(Error::OutputLimitExceeded);
                 }
                 let zero_val = unmtf.front();
                 for _ in 0..count {
@@ -216,6 +240,9 @@ pub(crate) fn decode_stream(data: &[u8]) -> Result<DecodeOutcome, Error> {
             };
             if block.len() >= block_size {
                 return Err(Error::Corrupt);
+            }
+            if block.len() as u64 >= block_limit {
+                return Err(Error::OutputLimitExceeded);
             }
             let byte = unmtf.apply(m);
             block.push(byte);
@@ -302,6 +329,19 @@ pub(crate) fn decode_stream(data: &[u8]) -> Result<DecodeOutcome, Error> {
             }};
         }
 
+        // Append one output byte, unless that would cross the caller's
+        // limit: checked per byte, before the byte is stored.
+        macro_rules! emit {
+            ($b:expr) => {{
+                let b: u8 = $b;
+                if out.len() as u64 >= limit {
+                    return Err(Error::OutputLimitExceeded);
+                }
+                out.push(b);
+                crc = crc32_update(crc, b);
+            }};
+        }
+
         // The final-RLE layer emits one logical output byte per loop turn,
         // consuming `numbytes` inverse-BWT bytes total.
         while byte_count < numbytes as u64 || rle_repeat > 0 {
@@ -312,8 +352,7 @@ pub(crate) fn decode_stream(data: &[u8]) -> Result<DecodeOutcome, Error> {
                 return Err(Error::Corrupt);
             }
             if rle_repeat > 0 {
-                out.push(rle_last);
-                crc = crc32_update(crc, rle_last);
+                emit!(rle_last);
                 rle_repeat -= 1;
                 continue;
             }
@@ -329,8 +368,7 @@ pub(crate) fn decode_stream(data: &[u8]) -> Result<DecodeOutcome, Error> {
                     continue;
                 }
                 rle_repeat = (byte - 1) as u32;
-                out.push(rle_last);
-                crc = crc32_update(crc, rle_last);
+                emit!(rle_last);
             } else {
                 if byte == rle_last {
                     rle_count += 1;
@@ -338,8 +376,7 @@ pub(crate) fn decode_stream(data: &[u8]) -> Result<DecodeOutcome, Error> {
                     rle_count = 1;
                     rle_last = byte;
                 }
-                out.push(byte);
-                crc = crc32_update(crc, byte);
+                emit!(byte);
             }
         }
 
@@ -414,7 +451,26 @@ mod tests {
 
     #[test]
     fn empty_input_is_need_more() {
-        assert!(matches!(decode_stream(&[]), Ok(DecodeOutcome::NeedMore)));
+        assert!(matches!(
+            decode_stream(&[], u64::MAX),
+            Ok(DecodeOutcome::NeedMore)
+        ));
+    }
+
+    /// `block_budget` must never refuse a block that could still fit: the
+    /// densest block (four equal bytes then a zero count, repeated) decodes
+    /// to four bytes per five.
+    #[test]
+    fn block_budget_admits_every_block_that_can_fit() {
+        for remaining in 0u64..2000 {
+            // Largest n whose minimum output, n - n / 5, is <= remaining.
+            let mut n = remaining;
+            while (n + 1) - (n + 1) / 5 <= remaining {
+                n += 1;
+            }
+            assert!(block_budget(remaining) >= n, "remaining {remaining}");
+        }
+        assert_eq!(block_budget(u64::MAX), u64::MAX);
     }
 
     #[test]
