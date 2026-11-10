@@ -1786,8 +1786,11 @@ fn write_symbol(
 //      output also feeds `out`. Metadata is silently discarded.
 //   4. Drain `out` into the caller's `output` slice as room permits.
 //
-// `raw` keeps growing until a meta-block is fully consumed, at which
-// point we compact it to the current bit position.
+// A compressed meta-block is decoded as its bytes come: both its header
+// (`MetaBlockHeader`) and its command loop (`MetaBlock`) keep their state
+// across calls and pick up at `bit_pos`, so `raw` only ever holds bytes
+// not decoded yet (plus, for the other meta-block kinds, which are parsed
+// in one go, the bytes of the one being waited for).
 
 const NUM_LITERAL_SYMBOLS: u32 = 256;
 const NUM_COMMAND_SYMBOLS: u32 = 704;
@@ -1858,9 +1861,16 @@ pub struct Decoder {
     /// The compressed meta-block being decoded, once its header is read
     /// and until its last command is done.
     meta_block: Option<Box<MetaBlock>>,
+    /// The header of a compressed meta-block, while it is being read
+    /// (then `meta_block` is `None`): the tables read so far, with
+    /// `bit_pos` at the next piece to read.
+    header: Option<Box<MetaBlockHeader>>,
     /// Test instrumentation: bytes of `out` shifted down by `compact_out`.
     #[cfg(test)]
     out_moved: u64,
+    /// Test instrumentation: prefix codes read (or started) so far.
+    #[cfg(test)]
+    prefix_codes_read: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1903,8 +1913,11 @@ impl Decoder {
             p1: 0,
             p2: 0,
             meta_block: None,
+            header: None,
             #[cfg(test)]
             out_moved: 0,
+            #[cfg(test)]
+            prefix_codes_read: 0,
         }
     }
 
@@ -2049,9 +2062,10 @@ impl Decoder {
             Ok(()) => Ok(true),
             Err(Error::UnexpectedEnd) => {
                 // Roll back to where we were so a later call retries —
-                // unless a compressed meta-block is part-way through, in
-                // which case `bit_pos` already marks where it resumes.
-                if self.meta_block.is_none() {
+                // unless a compressed meta-block is part-way through (its
+                // header or its commands), in which case `bit_pos` already
+                // marks where it resumes.
+                if !self.in_compressed_meta_block() {
                     self.bit_pos = start_bit_pos;
                 }
                 Ok(false)
@@ -2070,13 +2084,23 @@ impl Decoder {
         let raw = core::mem::take(&mut self.raw);
         let r = self.try_process_meta_block_in(&raw);
         self.raw = raw;
-        if r.is_ok() || (r == Err(Error::UnexpectedEnd) && self.meta_block.is_some()) {
+        if r.is_ok() || (r == Err(Error::UnexpectedEnd) && self.in_compressed_meta_block()) {
             self.compact_raw();
         }
         r
     }
 
+    /// A compressed meta-block is part-way through: `bit_pos` is inside
+    /// it, at the piece of its header or the command to read next.
+    fn in_compressed_meta_block(&self) -> bool {
+        self.meta_block.is_some() || self.header.is_some()
+    }
+
     fn try_process_meta_block_in(&mut self, raw: &[u8]) -> Result<(), Error> {
+        // The bit source is a local of the function the command loop is
+        // inlined into (it has this one caller), so that the loop can
+        // keep it in registers.
+        let mut src = BitSource::at(raw, self.bit_pos);
         if core::option_env!("BROTLI_DEBUG").is_some() {
             let s: alloc::string::String = raw
                 .iter()
@@ -2090,11 +2114,33 @@ impl Decoder {
                 s
             ));
         }
-        let mut src = BitSource::at(raw, self.bit_pos);
-        if let Some(mb) = self.meta_block.take() {
-            return self.continue_meta_block(&mut src, mb);
-        }
-        let initial_pos = self.bit_pos;
+        let mb = match self.meta_block.take() {
+            Some(mb) => mb,
+            None => {
+                let header = match self.header.take() {
+                    Some(header) => header,
+                    None => match self.read_meta_block_start(raw, &mut src)? {
+                        Some(header) => header,
+                        None => return Ok(()),
+                    },
+                };
+                self.read_header(&mut src, header)?
+            }
+        };
+        self.continue_meta_block(&mut src, mb)
+    }
+
+    /// Read the start of a meta-block: ISLAST, MLEN, and for anything
+    /// but a compressed meta-block (the stream's end, metadata,
+    /// uncompressed bytes) all of it, which returns `None`. For a
+    /// compressed one, return its header with no table read yet; from
+    /// there on nothing is read twice — the tables, then the command
+    /// loop, each stop wherever the input does and resume there.
+    fn read_meta_block_start(
+        &mut self,
+        raw: &[u8],
+        src: &mut BitSource<'_>,
+    ) -> Result<Option<Box<MetaBlockHeader>>, Error> {
         let is_last = src.read_bit()? != 0;
         let mut is_last_empty = false;
         if is_last {
@@ -2104,7 +2150,7 @@ impl Decoder {
                 // byte must be zero per spec; we don't enforce it.
                 self.bit_pos = src.position();
                 self.state = DecState::Done;
-                return Ok(());
+                return Ok(None);
             }
         }
         // MNIBBLES
@@ -2151,7 +2197,7 @@ impl Decoder {
             // Skip metadata bytes (they aren't emitted).
             src.set_position(need * 8);
             self.bit_pos = src.position();
-            return Ok(());
+            return Ok(None);
         }
 
         let nibbles = nibbles + 4; // 4, 5, or 6 nibbles
@@ -2194,30 +2240,49 @@ impl Decoder {
             }
             src.set_position(need * 8);
             self.bit_pos = src.position();
-            return Ok(());
+            return Ok(None);
         }
 
-        // ─── compressed meta-block ───
-        // Its tables are read in one go (they are bounded in size), and
-        // running out of input there rewinds to the meta-block's start
-        // for a retry. The command loop after them can stop anywhere and
-        // resume where it stopped.
-        let mb = match Self::read_meta_block_header(&mut src, mlen, is_last) {
-            Ok(mb) => Box::new(mb),
+        Ok(Some(Box::new(MetaBlockHeader::new(mlen, is_last))))
+    }
+
+    /// Read (or go on reading) the tables at the head of a compressed
+    /// meta-block and return the state its commands start from. If input
+    /// runs out, keep the tables read so far in `self.header` with
+    /// `bit_pos` at the piece to read next.
+    ///
+    /// Kept out of line: this runs once per meta-block, and inlining it
+    /// next to the command loop only gets in that loop's way.
+    #[inline(never)]
+    fn read_header(
+        &mut self,
+        src: &mut BitSource<'_>,
+        mut header: Box<MetaBlockHeader>,
+    ) -> Result<Box<MetaBlock>, Error> {
+        let r = header.read(src);
+        #[cfg(test)]
+        {
+            self.prefix_codes_read += core::mem::take(&mut src.prefix_codes);
+        }
+        match r {
+            Ok(()) => Ok(Box::new(header.into_meta_block())),
+            Err(Error::UnexpectedEnd) => {
+                self.bit_pos = src.position();
+                self.header = Some(header);
+                Err(Error::UnexpectedEnd)
+            }
             Err(e) => {
                 if core::option_env!("BROTLI_DEBUG").is_some() {
                     self.dbg_msgs.push(alloc::format!(
                         "read_meta_block_header ERR: {:?}, mlen={}, src.position()={}",
                         e,
-                        mlen,
+                        header.mlen,
                         src.position()
                     ));
                 }
-                self.bit_pos = initial_pos;
-                return Err(e);
+                Err(e)
             }
-        };
-        self.continue_meta_block(&mut src, mb)
+        }
     }
 
     /// Run (or resume) the command loop of `mb`. If input runs out, keep it
@@ -2346,6 +2411,10 @@ impl Decoder {
         src: &mut BitSource<'_>,
         alphabet_size: u32,
     ) -> Result<HuffmanDecoder, Error> {
+        #[cfg(test)]
+        {
+            src.prefix_codes += 1;
+        }
         let kind = src.read_bits(2)?;
         if kind == 1 {
             // Simple prefix code.
@@ -2584,95 +2653,6 @@ impl Decoder {
         }
         let extra = src.read_bits(BLOCK_LEN_EXTRA[sym as usize])?;
         Ok(BLOCK_LEN_BASE[sym as usize] + extra)
-    }
-
-    /// Read the tables at the head of a compressed meta-block (block-type
-    /// groups, distance parameters, context modes and maps, prefix codes)
-    /// and return the decode state positioned at its first command.
-    fn read_meta_block_header(
-        src: &mut BitSource<'_>,
-        mlen: u32,
-        is_last: bool,
-    ) -> Result<MetaBlock, Error> {
-        // 1) Block-type / block-count groups for L, I, D.
-        let group_l = read_block_group(src)?;
-        let group_i = read_block_group(src)?;
-        let group_d = read_block_group(src)?;
-
-        // 2) Distance parameters.
-        let npostfix = src.read_bits(2)?;
-        let ndirect_bits = src.read_bits(4)?;
-        let ndirect = ndirect_bits << npostfix;
-        let num_dist_codes: u32 = 16 + ndirect + (48u32 << npostfix);
-
-        // 3) Context modes for literals: NBLTYPESL × 2 bits each.
-        let mut cmodes: Vec<ContextMode> = Vec::with_capacity(group_l.nbltypes as usize);
-        for _ in 0..group_l.nbltypes {
-            cmodes.push(ContextMode::from_bits(src.read_bits(2)?));
-        }
-
-        // 4) Literal context map.
-        let ntreesl = Self::read_nbltypes(src)?;
-        let cmapl_size = 64 * group_l.nbltypes;
-        let cmapl = if ntreesl >= 2 {
-            read_context_map(src, cmapl_size, ntreesl)?
-        } else {
-            vec![0u8; cmapl_size as usize]
-        };
-
-        // 5) Distance context map.
-        let ntreesd = Self::read_nbltypes(src)?;
-        let cmapd_size = 4 * group_d.nbltypes;
-        let cmapd = if ntreesd >= 2 {
-            read_context_map(src, cmapd_size, ntreesd)?
-        } else {
-            vec![0u8; cmapd_size as usize]
-        };
-
-        // 6) Literal prefix codes (NTREESL of them, alphabet 256).
-        let mut htree_l: Vec<HuffmanDecoder> = Vec::with_capacity(ntreesl as usize);
-        for _ in 0..ntreesl {
-            htree_l.push(Self::read_prefix_code(src, NUM_LITERAL_SYMBOLS)?);
-        }
-        // 7) Insert-and-copy prefix codes (NBLTYPESI of them, alphabet 704).
-        let mut htree_i: Vec<HuffmanDecoder> = Vec::with_capacity(group_i.nbltypes as usize);
-        for _ in 0..group_i.nbltypes {
-            htree_i.push(Self::read_prefix_code(src, NUM_COMMAND_SYMBOLS)?);
-        }
-        // 8) Distance prefix codes (NTREESD of them, alphabet num_dist_codes).
-        let mut htree_d: Vec<HuffmanDecoder> = Vec::with_capacity(ntreesd as usize);
-        for _ in 0..ntreesd {
-            htree_d.push(Self::read_prefix_code(src, num_dist_codes)?);
-        }
-
-        Ok(MetaBlock {
-            is_last,
-            mlen,
-            emitted: 0,
-            cur_l: BlockCursor::new(&group_l),
-            cur_i: BlockCursor::new(&group_i),
-            cur_d: BlockCursor::new(&group_d),
-            group_l,
-            group_i,
-            group_d,
-            npostfix,
-            ndirect,
-            num_dist_codes,
-            cmodes,
-            cmapl,
-            cmapd,
-            htree_l,
-            htree_i,
-            htree_d,
-            // When there is a single literal Huffman tree the context map
-            // is all zeroes, so literal decoding can skip the per-byte
-            // context lookup entirely (the tree index is constant 0).
-            single_literal_tree: ntreesl == 1,
-            in_command: false,
-            insert_left: 0,
-            copy_len: 0,
-            use_last_dist: false,
-        })
     }
 
     /// Run the command loop of a compressed meta-block until `mlen` bytes
@@ -3040,41 +3020,107 @@ fn decode_ic_command(cmd: u32) -> (u32, u32, bool) {
     (ins_code, copy_code, use_last)
 }
 
-/// Read a context map of `size` entries with `ntrees` distinct trees.
-fn read_context_map(src: &mut BitSource<'_>, size: u32, ntrees: u32) -> Result<Vec<u8>, Error> {
-    // RLEMAX: 1 bit; if 1, 4 more bits give RLEMAX in 1..=16.
-    let has_rle = src.read_bit()?;
-    let rlemax = if has_rle == 1 {
-        src.read_bits(4)? + 1
-    } else {
-        0
-    };
-    let alphabet = ntrees + rlemax;
-    let tree = Decoder::read_prefix_code(src, alphabet)?;
-    let mut map: Vec<u8> = Vec::with_capacity(size as usize);
-    while (map.len() as u32) < size {
-        let sym = tree.decode(src)?;
-        if sym == 0 {
-            map.push(0);
-        } else if sym <= rlemax {
-            // Run-length-coded run of zeros.
-            let extra = src.read_bits(sym)?;
-            let run = (1u32 << sym) + extra;
-            for _ in 0..run {
-                if (map.len() as u32) >= size {
-                    return Err(Error::Corrupt);
-                }
-                map.push(0);
-            }
+/// Run `f`, a read that must happen whole or not at all; if it fails
+/// (input ran out part-way), put `src` back where it was.
+fn all_or_nothing<T>(
+    src: &mut BitSource<'_>,
+    f: impl FnOnce(&mut BitSource<'_>) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let pos = src.position();
+    let r = f(src);
+    if r.is_err() {
+        src.set_position(pos);
+    }
+    r
+}
+
+/// A context map being read: its prefix code and the entries decoded so
+/// far. The body can be long (up to 16384 entries), so it resumes entry
+/// by entry rather than from its start.
+#[derive(Debug)]
+struct ContextMapReader {
+    size: u32,
+    rlemax: u32,
+    tree: HuffmanDecoder,
+    map: Vec<u8>,
+}
+
+impl ContextMapReader {
+    /// Read the head of a context map of `size` entries over `ntrees`
+    /// trees: RLEMAX and the prefix code. Not resumable; the caller
+    /// rewinds `src` if it fails.
+    fn start(src: &mut BitSource<'_>, size: u32, ntrees: u32) -> Result<Self, Error> {
+        // RLEMAX: 1 bit; if 1, 4 more bits give RLEMAX in 1..=16.
+        let has_rle = src.read_bit()?;
+        let rlemax = if has_rle == 1 {
+            src.read_bits(4)? + 1
         } else {
-            map.push((sym - rlemax) as u8);
+            0
+        };
+        let tree = Decoder::read_prefix_code(src, ntrees + rlemax)?;
+        Ok(Self {
+            size,
+            rlemax,
+            tree,
+            map: Vec::with_capacity(size as usize),
+        })
+    }
+
+    /// Read entries until the map is full. If input runs out, `src` is
+    /// left at the first symbol not read and `map` holds the ones before.
+    fn fill(&mut self, src: &mut BitSource<'_>) -> Result<(), Error> {
+        while (self.map.len() as u32) < self.size {
+            // One symbol with its extra bits: a value, or a run of zeros.
+            let pos = src.position();
+            let rlemax = self.rlemax;
+            let unit = self.tree.decode(src).and_then(|sym| {
+                if sym == 0 {
+                    Ok((0u8, 1u32))
+                } else if sym <= rlemax {
+                    let extra = src.read_bits(sym)?;
+                    Ok((0, (1u32 << sym) + extra))
+                } else {
+                    Ok(((sym - rlemax) as u8, 1))
+                }
+            });
+            let (value, run) = match unit {
+                Ok(u) => u,
+                Err(e) => {
+                    src.set_position(pos);
+                    return Err(e);
+                }
+            };
+            if run > self.size - self.map.len() as u32 {
+                return Err(Error::Corrupt);
+            }
+            let filled = self.map.len() + run as usize;
+            self.map.resize(filled, value);
         }
+        Ok(())
     }
-    if map.len() as u32 != size {
-        return Err(Error::Corrupt);
-    }
+}
+
+/// Read a context map of `size` entries with `ntrees` distinct trees,
+/// going on from `reader` if an earlier call started it. If input runs
+/// out, `reader` and `src` are left ready for the next call.
+fn read_context_map(
+    src: &mut BitSource<'_>,
+    reader: &mut Option<ContextMapReader>,
+    size: u32,
+    ntrees: u32,
+) -> Result<Vec<u8>, Error> {
+    let r = match reader {
+        Some(r) => r,
+        None => {
+            let r = all_or_nothing(src, |src| ContextMapReader::start(src, size, ntrees))?;
+            reader.insert(r)
+        }
+    };
+    r.fill(src)?;
     // Inverse MTF if requested.
     let imtf = src.read_bit()?;
+    let mut map = core::mem::take(&mut r.map);
+    *reader = None;
     if imtf == 1 {
         inverse_mtf(&mut map);
     }
@@ -3109,6 +3155,19 @@ struct BlockGroup {
     first_count: u32,
 }
 
+impl BlockGroup {
+    /// The group of a category with one block type (NBLTYPES = 1).
+    fn single() -> Self {
+        Self {
+            nbltypes: 1,
+            type_tree: None,
+            count_tree: None,
+            // Effectively infinite block (will never reach zero).
+            first_count: 1u32 << 24,
+        }
+    }
+}
+
 fn read_block_group(src: &mut BitSource<'_>) -> Result<BlockGroup, Error> {
     let nbltypes = Decoder::read_nbltypes(src)?;
     if nbltypes >= 2 {
@@ -3123,13 +3182,7 @@ fn read_block_group(src: &mut BitSource<'_>) -> Result<BlockGroup, Error> {
             first_count,
         })
     } else {
-        Ok(BlockGroup {
-            nbltypes,
-            type_tree: None,
-            count_tree: None,
-            // Effectively infinite block (will never reach zero).
-            first_count: 1u32 << 24,
-        })
+        Ok(BlockGroup::single())
     }
 }
 
@@ -3194,6 +3247,204 @@ impl BlockCursor {
         }
         self.len -= 1;
         Ok(())
+    }
+}
+
+/// Which piece of a compressed meta-block's header comes next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderStage {
+    /// Block-type groups for literals, insert-and-copy, distances.
+    Groups,
+    /// NPOSTFIX and NDIRECT.
+    DistParams,
+    /// One context mode per literal block type.
+    ContextModes,
+    /// NTREESL, then the literal context map.
+    TreeCountL,
+    ContextMapL,
+    /// NTREESD, then the distance context map.
+    TreeCountD,
+    ContextMapD,
+    /// The literal, insert-and-copy and distance prefix codes.
+    Codes,
+}
+
+/// The header of a compressed meta-block, as far as it has been read.
+///
+/// These tables can be large — 256 block types per category, context
+/// maps of 16384 and 1024 entries, up to 768 prefix codes: kilobytes of
+/// input — and may arrive over any number of calls. Reading them again
+/// from the meta-block's start whenever input ran out made every call
+/// cost as much as the whole header (a millisecond or more), so a peer
+/// sending it a few bytes at a time could keep a decoder busy
+/// indefinitely. Instead each finished piece (a block-type group, a
+/// field, a context-map entry, a prefix code) is kept here and the bit
+/// position moves past it; only the piece that ran out of input is read
+/// again, and no piece is larger than one prefix code.
+#[derive(Debug)]
+struct MetaBlockHeader {
+    is_last: bool,
+    mlen: u32,
+    stage: HeaderStage,
+    /// Groups for L, I, D; the first `ngroups` have been read.
+    groups: [BlockGroup; 3],
+    ngroups: usize,
+    npostfix: u32,
+    ndirect: u32,
+    num_dist_codes: u32,
+    cmodes: Vec<ContextMode>,
+    ntreesl: u32,
+    ntreesd: u32,
+    cmapl: Vec<u8>,
+    cmapd: Vec<u8>,
+    /// The context map being read in `ContextMapL` / `ContextMapD`.
+    cmap: Option<ContextMapReader>,
+    htree_l: Vec<HuffmanDecoder>,
+    htree_i: Vec<HuffmanDecoder>,
+    htree_d: Vec<HuffmanDecoder>,
+}
+
+impl MetaBlockHeader {
+    fn new(mlen: u32, is_last: bool) -> Self {
+        Self {
+            is_last,
+            mlen,
+            stage: HeaderStage::Groups,
+            groups: [
+                BlockGroup::single(),
+                BlockGroup::single(),
+                BlockGroup::single(),
+            ],
+            ngroups: 0,
+            npostfix: 0,
+            ndirect: 0,
+            num_dist_codes: 0,
+            cmodes: Vec::new(),
+            ntreesl: 0,
+            ntreesd: 0,
+            cmapl: Vec::new(),
+            cmapd: Vec::new(),
+            cmap: None,
+            htree_l: Vec::new(),
+            htree_i: Vec::new(),
+            htree_d: Vec::new(),
+        }
+    }
+
+    /// Read the tables (block-type groups, distance parameters, context
+    /// modes and maps, prefix codes), going on from where an earlier
+    /// call ran out of input. On `UnexpectedEnd`, `self` holds every
+    /// piece finished so far and `src` is at the start of the one that
+    /// was cut short; on `Ok`, `src` is at the first command.
+    fn read(&mut self, src: &mut BitSource<'_>) -> Result<(), Error> {
+        loop {
+            match self.stage {
+                HeaderStage::Groups => {
+                    while self.ngroups < 3 {
+                        self.groups[self.ngroups] = all_or_nothing(src, read_block_group)?;
+                        self.ngroups += 1;
+                    }
+                    self.stage = HeaderStage::DistParams;
+                }
+                HeaderStage::DistParams => {
+                    // NPOSTFIX (2 bits), then NDIRECT >> NPOSTFIX (4 bits).
+                    let bits = src.read_bits(6)?;
+                    self.npostfix = bits & 3;
+                    self.ndirect = (bits >> 2) << self.npostfix;
+                    self.num_dist_codes = 16 + self.ndirect + (48u32 << self.npostfix);
+                    self.stage = HeaderStage::ContextModes;
+                }
+                HeaderStage::ContextModes => {
+                    // NBLTYPESL × 2 bits.
+                    let n = self.groups[0].nbltypes as usize;
+                    self.cmodes.reserve_exact(n - self.cmodes.len());
+                    while self.cmodes.len() < n {
+                        self.cmodes.push(ContextMode::from_bits(src.read_bits(2)?));
+                    }
+                    self.stage = HeaderStage::TreeCountL;
+                }
+                HeaderStage::TreeCountL => {
+                    self.ntreesl = all_or_nothing(src, Decoder::read_nbltypes)?;
+                    self.stage = HeaderStage::ContextMapL;
+                }
+                HeaderStage::ContextMapL => {
+                    let size = 64 * self.groups[0].nbltypes;
+                    self.cmapl = if self.ntreesl >= 2 {
+                        read_context_map(src, &mut self.cmap, size, self.ntreesl)?
+                    } else {
+                        vec![0u8; size as usize]
+                    };
+                    self.stage = HeaderStage::TreeCountD;
+                }
+                HeaderStage::TreeCountD => {
+                    self.ntreesd = all_or_nothing(src, Decoder::read_nbltypes)?;
+                    self.stage = HeaderStage::ContextMapD;
+                }
+                HeaderStage::ContextMapD => {
+                    let size = 4 * self.groups[2].nbltypes;
+                    self.cmapd = if self.ntreesd >= 2 {
+                        read_context_map(src, &mut self.cmap, size, self.ntreesd)?
+                    } else {
+                        vec![0u8; size as usize]
+                    };
+                    self.stage = HeaderStage::Codes;
+                }
+                HeaderStage::Codes => {
+                    // Literal codes (NTREESL of them, alphabet 256),
+                    // insert-and-copy codes (NBLTYPESI, alphabet 704),
+                    // distance codes (NTREESD, alphabet `num_dist_codes`).
+                    let num_dist_codes = self.num_dist_codes;
+                    let ntreesi = self.groups[1].nbltypes;
+                    for (trees, n, alphabet) in [
+                        (&mut self.htree_l, self.ntreesl, NUM_LITERAL_SYMBOLS),
+                        (&mut self.htree_i, ntreesi, NUM_COMMAND_SYMBOLS),
+                        (&mut self.htree_d, self.ntreesd, num_dist_codes),
+                    ] {
+                        let n = n as usize;
+                        trees.reserve_exact(n - trees.len());
+                        while trees.len() < n {
+                            trees.push(all_or_nothing(src, |src| {
+                                Decoder::read_prefix_code(src, alphabet)
+                            })?);
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// The decode state for the commands that follow a fully read header.
+    fn into_meta_block(self) -> MetaBlock {
+        let [group_l, group_i, group_d] = self.groups;
+        MetaBlock {
+            is_last: self.is_last,
+            mlen: self.mlen,
+            emitted: 0,
+            cur_l: BlockCursor::new(&group_l),
+            cur_i: BlockCursor::new(&group_i),
+            cur_d: BlockCursor::new(&group_d),
+            group_l,
+            group_i,
+            group_d,
+            npostfix: self.npostfix,
+            ndirect: self.ndirect,
+            num_dist_codes: self.num_dist_codes,
+            cmodes: self.cmodes,
+            cmapl: self.cmapl,
+            cmapd: self.cmapd,
+            htree_l: self.htree_l,
+            htree_i: self.htree_i,
+            htree_d: self.htree_d,
+            // When there is a single literal Huffman tree the context map
+            // is all zeroes, so literal decoding can skip the per-byte
+            // context lookup entirely (the tree index is constant 0).
+            single_literal_tree: self.ntreesl == 1,
+            in_command: false,
+            insert_left: 0,
+            copy_len: 0,
+            use_last_dist: false,
+        }
     }
 }
 
@@ -3394,5 +3645,6 @@ impl RawDecoder for Decoder {
         self.p1 = 0;
         self.p2 = 0;
         self.meta_block = None;
+        self.header = None;
     }
 }

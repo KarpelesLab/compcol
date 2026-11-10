@@ -55,8 +55,10 @@ pub(crate) struct HuffmanDecoder {
     /// Primary lookup table: indexed by the next `PRIMARY_BITS` LSB-first
     /// stream bits. Each slot packs `(symbol, length)`; a length of 0
     /// means the code is longer than `PRIMARY_BITS` and the slow path
-    /// has to walk per-bit.
-    lut: alloc::boxed::Box<[u32; PRIMARY_SIZE]>,
+    /// has to walk per-bit. `None` for a single-symbol code, which never
+    /// looks anything up: a meta-block can carry hundreds of those, and
+    /// 8 KiB of zeroed table for each is pure waste.
+    lut: Option<alloc::boxed::Box<[u32; PRIMARY_SIZE]>>,
 }
 
 impl HuffmanDecoder {
@@ -70,7 +72,7 @@ impl HuffmanDecoder {
             first_idx: [0; 16],
             max_length: 0,
             single_symbol: Some(sym),
-            lut: alloc::boxed::Box::new([0u32; PRIMARY_SIZE]),
+            lut: None,
         }
     }
 
@@ -158,7 +160,7 @@ impl HuffmanDecoder {
             first_idx,
             max_length,
             single_symbol: None,
-            lut,
+            lut: Some(lut),
         })
     }
 
@@ -212,12 +214,10 @@ impl HuffmanDecoder {
     /// length-0 case, none required). Returns `Err(InvalidHuffmanTree)`
     /// if the read bits don't match any code.
     pub(crate) fn decode(&self, br: &mut BitSource<'_>) -> Result<u32, Error> {
-        if let Some(s) = self.single_symbol {
-            return Ok(s);
-        }
-        if self.max_length == 0 {
-            return Err(Error::InvalidHuffmanTree);
-        }
+        // No table: a single-symbol code (or an empty one).
+        let Some(lut) = self.lut.as_deref() else {
+            return self.single_symbol.ok_or(Error::InvalidHuffmanTree);
+        };
         let max = self.max_length as u32;
 
         // Fast path: peek PRIMARY_BITS bits, index the LUT, advance the
@@ -228,7 +228,7 @@ impl HuffmanDecoder {
         // accumulator intact for the next symbol.
         let (peeked, avail) = br.peek_lut_bits(PRIMARY_BITS);
         if avail >= PRIMARY_BITS {
-            let entry = self.lut[peeked as usize];
+            let entry = lut[peeked as usize];
             let len = entry >> LUT_LEN_SHIFT;
             if len > 0 {
                 br.consume(len);
@@ -290,6 +290,10 @@ pub(crate) struct BitSource<'a> {
     acc: u64,
     /// Number of valid bits currently in `acc`.
     nbits: u32,
+    /// Test instrumentation: prefix codes the decoder started reading
+    /// from this source.
+    #[cfg(test)]
+    pub(crate) prefix_codes: u64,
 }
 
 impl<'a> BitSource<'a> {
@@ -300,6 +304,8 @@ impl<'a> BitSource<'a> {
             load_pos: pos,
             acc: 0,
             nbits: 0,
+            #[cfg(test)]
+            prefix_codes: 0,
         }
     }
 
@@ -466,6 +472,8 @@ mod tests {
         let mut src = BitSource::at(&data, 0);
         assert_eq!(d.decode(&mut src).unwrap(), 42);
         assert_eq!(src.position(), 0);
+        // No lookup table is allocated for a code that reads no bits.
+        assert!(d.lut.is_none());
     }
 
     #[test]
