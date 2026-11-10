@@ -422,15 +422,21 @@ fn emit_window(ctx: &mut RunCtx, b: u8) {
     ctx.stage.push(b);
 }
 
+/// Decoding must pause: a chunk is staged for the caller to drain, or the
+/// stream's declared total has been reached. The total ends the stream even
+/// inside a block whose BLOCK_SIZE runs past it — reading on would make the
+/// result depend on how much input happens to be buffered.
+fn stage_complete(ctx: &RunCtx) -> bool {
+    ctx.stage.len() >= STAGE_BYTES || ctx.output_so_far + ctx.stage.len() as u64 >= ctx.output_total
+}
+
 /// Run one or more state-machine substeps. Returns Ok when progress is
 /// blocked on more input or the staging buffer is full (callers re-enter).
 fn step(ctx: &mut RunCtx) -> Result<(), Error> {
     loop {
-        // Yield once we've staged a chunk so the caller can drain.
-        if ctx.stage.len() >= STAGE_BYTES {
-            return Ok(());
-        }
-        if ctx.output_so_far + ctx.stage.len() as u64 >= ctx.output_total {
+        // Yield once we've staged a chunk so the caller can drain, or once
+        // the stream is complete.
+        if stage_complete(ctx) {
             return Ok(());
         }
 
@@ -669,7 +675,7 @@ fn step_huff(ctx: &mut RunCtx) -> Result<bool, Error> {
                                 ctx.block = BlockState::AwaitBlockHeader;
                                 return Ok(true);
                             }
-                            if ctx.stage.len() >= STAGE_BYTES {
+                            if stage_complete(ctx) {
                                 yield_progress!(HuffPhase::NextMain);
                             }
                             ph = HuffPhase::NextMain;
@@ -807,6 +813,12 @@ fn step_huff(ctx: &mut RunCtx) -> Result<bool, Error> {
                         ctx.block = BlockState::AwaitBlockHeader;
                         return Ok(true);
                     }
+                }
+                // The copy needs no input and always runs to its end
+                // (bytes past the declared total are dropped on drain),
+                // but nothing after the total may be read.
+                if stage_complete(ctx) {
+                    yield_progress!(HuffPhase::NextMain);
                 }
                 ph = HuffPhase::NextMain;
             }

@@ -885,6 +885,78 @@ fn odd_final_uncompressed_block_without_pad_byte() {
     assert_eq!(check_prefixes(&s, &data), 1);
 }
 
+/// Pretree with all 20 lengths = 5 (so code == symbol), then one 5-bit
+/// delta per code length (first block: the previous lengths are all 0).
+fn put_lens_fixed5(w: &mut BitW, lens: &[u8]) {
+    for _ in 0..20 {
+        w.put(4, 5);
+    }
+    for &l in lens {
+        w.put(5, (17 - u32::from(l)) % 17);
+    }
+}
+
+/// Header of a verbatim block (window 15) whose main tree is: literal 0 =
+/// "0" and `sym10` = "10"; "11" is not a code. No length tree.
+fn put_overshoot_header(w: &mut BitW, block_size: u32, sym10: usize) {
+    w.put(1, 0);
+    w.put(3, 1);
+    w.put(24, block_size);
+    let mut main = vec![0u8; 256 + 30 * 8];
+    main[0] = 1;
+    main[sym10] = 2;
+    put_lens_fixed5(w, &main[..256]);
+    put_lens_fixed5(w, &main[256..]);
+    put_lens_fixed5(w, &[0u8; 249]);
+}
+
+/// The declared total ends the stream, even inside a block whose
+/// BLOCK_SIZE runs past it. The symbol loop used to keep decoding as long
+/// as bits were buffered, so garbage after the last byte was an error when
+/// it arrived in the same `decode` call and ignored when it did not.
+#[test]
+fn total_reached_mid_block_ignores_what_follows() {
+    // How many bits are left in the current word after the header.
+    let mut probe = BitW::new();
+    put_overshoot_header(&mut probe, 5, 1);
+    let fill = 16 - probe.n;
+    // `k` zero literals then a lone "1": a word boundary, and a decoder that
+    // reads on is one bit short of a symbol.
+    let k = if fill > 1 { fill - 1 } else { 16 };
+    let mut w = BitW::new();
+    put_overshoot_header(&mut w, k + 5, 1);
+    for _ in 0..k {
+        w.put(1, 0);
+    }
+    w.put(1, 1);
+    assert_eq!(w.n, 0);
+    w.raw(&[0xFF; 8]); // "11" is not a code
+    let s = w.framed(15, k as usize);
+    assert_eq!(try_decode_all_ways(&s), Ok(vec![0u8; k as usize]));
+}
+
+/// Same, with the total falling inside a match: the match's surplus byte
+/// is dropped and nothing after it is read.
+#[test]
+fn total_reached_mid_match_ignores_what_follows() {
+    // Symbol 256: match, position slot 0 (R0 = 1), length 2.
+    let mut probe = BitW::new();
+    put_overshoot_header(&mut probe, 5, 256);
+    let fill = 16 - probe.n;
+    let k = if fill > 3 { fill - 3 } else { fill + 13 };
+    let mut w = BitW::new();
+    put_overshoot_header(&mut w, k + 7, 256);
+    for _ in 0..k {
+        w.put(1, 0);
+    }
+    w.put(2, 0b10); // 2 bytes at distance 1; the second is past the total
+    w.put(1, 1);
+    assert_eq!(w.n, 0);
+    w.raw(&[0xFF; 8]);
+    let s = w.framed(15, k as usize + 1);
+    assert_eq!(try_decode_all_ways(&s), Ok(vec![0u8; k as usize + 1]));
+}
+
 // ─── factory ─────────────────────────────────────────────────────────────
 
 #[cfg(feature = "factory")]

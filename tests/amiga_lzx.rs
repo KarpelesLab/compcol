@@ -622,6 +622,127 @@ fn fixture_verbatim_decoder_only() {
     assert_eq!(out, b"X");
 }
 
+// ─── audit regressions: end of input, declared total, finish ────────────
+
+/// Like `decode_chunked`, but returns the decoder's error instead of
+/// panicking on it.
+fn try_decode(stream: &[u8], in_chunk: usize, out_chunk: usize) -> Result<Vec<u8>, Error> {
+    let mut dec = Decoder::new();
+    let mut decoded = Vec::new();
+    let mut buf = vec![0u8; out_chunk.max(1)];
+    for chunk in stream.chunks(in_chunk.max(1)) {
+        let mut consumed = 0;
+        while consumed < chunk.len() {
+            let (p, status) = dec.decode(&chunk[consumed..], &mut buf)?;
+            decoded.extend_from_slice(&buf[..p.written]);
+            consumed += p.consumed;
+            match status {
+                Status::StreamEnd => return Ok(decoded),
+                Status::InputEmpty => break,
+                Status::OutputFull => {}
+            }
+        }
+    }
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        decoded.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            return Ok(decoded);
+        }
+        assert_ne!(p.written, 0, "finish stalled after {} bytes", decoded.len());
+    }
+}
+
+/// Every chunking must agree on the result, error or not.
+fn try_decode_all_ways(stream: &[u8]) -> Result<Vec<u8>, Error> {
+    let whole = try_decode(stream, stream.len(), 1 << 20);
+    for (i, o) in [(1, 1), (1, 4096), (3, 7), (4096, 1)] {
+        let got = try_decode(stream, i, o);
+        match (&whole, &got) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "chunking {i}/{o}"),
+            (Err(_), Err(_)) => {}
+            _ => panic!("chunking {i}/{o}: {got:?} vs one-shot {whole:?}"),
+        }
+    }
+    whole
+}
+
+/// Pretree with all 20 lengths = 5 (so code == symbol), then one 5-bit
+/// delta per code length (first block: the previous lengths are all 0).
+fn put_lens_fixed5(w: &mut BitPacker, lens: &[u8]) {
+    for _ in 0..20 {
+        w.push(5, 4);
+    }
+    for &l in lens {
+        w.push((17 - u32::from(l)) % 17, 5);
+    }
+}
+
+/// Header of a verbatim block whose main tree has the given code lengths
+/// for the listed symbols. No length tree.
+fn put_verbatim_header(w: &mut BitPacker, block_size: u32, lens: &[(usize, u8)]) {
+    w.push(1, 3);
+    w.push(block_size, 24);
+    let mut main = vec![0u8; 512];
+    for &(sym, len) in lens {
+        main[sym] = len;
+    }
+    put_lens_fixed5(w, &main[..256]);
+    put_lens_fixed5(w, &main[256..]);
+    put_lens_fixed5(w, &[0u8; 249]);
+}
+
+fn framed(total: usize, bitstream: &[u8]) -> Vec<u8> {
+    let mut s = (total as u32).to_le_bytes().to_vec();
+    s.extend_from_slice(bitstream);
+    s
+}
+
+/// The declared total ends the stream, even inside a block whose
+/// BLOCK_SIZE runs past it. The symbol loop used to keep decoding as long
+/// as bits were buffered, so garbage after the last byte was an error when
+/// it arrived in the same `decode` call and ignored when it did not.
+#[test]
+fn total_reached_mid_block_ignores_what_follows() {
+    // Main tree: literal 0 = "0", `sym10` = "10"; "11" is not a code.
+    // `lead` bits of symbols, then a lone "1", must end on a word boundary
+    // so that a decoder reading on is one bit short of a symbol.
+    let build = |sym10: usize, tail_bits: u32| -> (Vec<u8>, u32) {
+        let mut probe = BitPacker::default();
+        put_verbatim_header(&mut probe, 5, &[(0, 1), (sym10, 2)]);
+        let fill = 16 - probe.nbits;
+        let k = if fill > tail_bits {
+            fill - tail_bits
+        } else {
+            fill + 16 - tail_bits
+        };
+        let mut w = BitPacker::default();
+        put_verbatim_header(&mut w, k + 7, &[(0, 1), (sym10, 2)]);
+        for _ in 0..k {
+            w.push(0, 1);
+        }
+        if tail_bits == 3 {
+            w.push(0b10, 2);
+        }
+        w.push(1, 1);
+        assert_eq!(w.nbits, 0);
+        let mut bits = w.finish();
+        bits.extend_from_slice(&[0xFF; 8]);
+        (bits, k)
+    };
+
+    // Total reached by a literal.
+    let (bits, k) = build(1, 1);
+    let s = framed(k as usize, &bits);
+    assert_eq!(try_decode_all_ways(&s), Ok(vec![0u8; k as usize]));
+
+    // Total reached inside a match (symbol 256: slot 0 = R0 = 1, length
+    // 2): its surplus byte is dropped and nothing after it is read.
+    let (bits, k) = build(256, 3);
+    let s = framed(k as usize + 1, &bits);
+    assert_eq!(try_decode_all_ways(&s), Ok(vec![0u8; k as usize + 1]));
+}
+
 // ─── factory ─────────────────────────────────────────────────────────────
 
 #[cfg(feature = "factory")]

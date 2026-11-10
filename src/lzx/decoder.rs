@@ -498,6 +498,16 @@ fn emit_window(ctx: &mut RunCtx, b: u8) {
     ctx.frame_buf.push(b);
 }
 
+/// The current frame is finished: it holds a whole 32 KiB, or the stream's
+/// declared total has been reached. `step` must then close it before
+/// another symbol is read. In particular the total ends the stream even
+/// inside a block whose BLOCK_SIZE runs past it — reading on would make the
+/// result depend on how much input happens to be buffered.
+fn frame_complete(ctx: &RunCtx) -> bool {
+    ctx.frame_buf.len() >= FRAME_SIZE
+        || ctx.output_so_far + ctx.frame_buf.len() as u64 >= ctx.output_total
+}
+
 /// Run one or more state-machine substeps. Returns Ok when progress is
 /// blocked on more input or the frame buffer is full (callers re-enter).
 fn step(ctx: &mut RunCtx) -> Result<(), Error> {
@@ -832,7 +842,7 @@ fn step_huff(ctx: &mut RunCtx) -> Result<bool, Error> {
                                 ctx.block = BlockState::AwaitBlockHeader;
                                 return Ok(true);
                             }
-                            if ctx.frame_buf.len() >= FRAME_SIZE {
+                            if frame_complete(ctx) {
                                 yield_progress!(HuffPhase::NextMain);
                             }
                             ph = HuffPhase::NextMain;
@@ -1015,8 +1025,11 @@ fn step_huff(ctx: &mut RunCtx) -> Result<bool, Error> {
                 }
                 // A match that ends exactly on the frame boundary must hand
                 // back to `step` (E8 pass + bitstream realign) before the
-                // next symbol is read, just like a literal does.
-                if ctx.frame_buf.len() >= FRAME_SIZE {
+                // next symbol is read, just like a literal does. So must one
+                // that reaches the declared total: the copy itself needs no
+                // input and always runs to its end (surplus bytes are
+                // dropped on drain), but nothing after it may be read.
+                if frame_complete(ctx) {
                     yield_progress!(HuffPhase::NextMain);
                 }
                 ph = HuffPhase::NextMain;
