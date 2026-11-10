@@ -1763,10 +1763,10 @@ mod mmap_output {
             let out = s.file("out");
             let out = out.to_str().unwrap();
 
-            // To a file: mapped if this build has a contiguous decoder for
-            // the format, streamed otherwise — never anything else.
+            // To a file: these formats have a contiguous decoder, so the
+            // output is mapped.
             let path = io_path(&["-d", "-t", codec.0, "-f", "-o", out], &encoded);
-            assert!(path == "mmap" || path == "stream", "{}: {path}", codec.0);
+            assert_eq!(path, "mmap", "{}", codec.0);
             assert_eq!(file_contents(Path::new(out)), payload);
 
             // Asked not to, or with nothing to map: always streamed.
