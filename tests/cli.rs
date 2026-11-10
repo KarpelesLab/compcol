@@ -586,3 +586,59 @@ fn unknown_algorithm_does_not_create_output() {
         assert!(input.exists());
     }
 }
+
+#[test]
+fn force_refuses_output_that_is_the_input() {
+    // `-f -o X X` used to truncate X before reading it, "successfully"
+    // replacing the input with a compressed empty stream.
+    let s = Scratch::new("same_file");
+    let same = s.file("same.txt");
+    fs::write(&same, b"precious\n").unwrap();
+    // Same file through a different spelling of the path.
+    let respelled = s.path.join(".").join("same.txt");
+
+    for out in [&same, &respelled] {
+        let (_out, err, code) = run(&[
+            "-t",
+            "gzip",
+            "-f",
+            "-o",
+            out.to_str().unwrap(),
+            same.to_str().unwrap(),
+        ]);
+        assert_ne!(code, 0, "must refuse to overwrite the input with itself");
+        assert!(
+            String::from_utf8_lossy(&err).contains("same file"),
+            "{}",
+            String::from_utf8_lossy(&err)
+        );
+        assert_eq!(file_contents(&same), b"precious\n");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn force_refuses_output_hard_linked_to_the_input() {
+    // Two names, one inode: path comparison can't see it, dev/ino can.
+    let s = Scratch::new("same_inode");
+    let input = s.file("data.txt");
+    let link = s.file("alias.txt");
+    fs::write(&input, b"precious\n").unwrap();
+    fs::hard_link(&input, &link).unwrap();
+
+    let (_out, err, code) = run(&[
+        "-t",
+        "gzip",
+        "-f",
+        "-o",
+        link.to_str().unwrap(),
+        input.to_str().unwrap(),
+    ]);
+    assert_ne!(code, 0, "must refuse to overwrite the input with itself");
+    assert!(
+        String::from_utf8_lossy(&err).contains("same file"),
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+    assert_eq!(file_contents(&input), b"precious\n");
+}

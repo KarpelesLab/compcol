@@ -8,7 +8,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use compcol::factory;
@@ -356,6 +356,30 @@ fn derive_output(args: &Args, algo: &str) -> Result<Output, String> {
     }
 }
 
+/// Whether `input` and `output` name the same existing file.
+///
+/// On unix the device/inode pair is compared, which also catches hard links
+/// and bind mounts; everywhere, the canonicalized paths are compared, which
+/// catches different spellings and symlinks. A path that doesn't exist (the
+/// usual case for the output) can't be the input, so any lookup failure
+/// means "not the same".
+fn is_same_file(input: &Path, output: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(input), std::fs::metadata(output))
+            && a.dev() == b.dev()
+            && a.ino() == b.ino()
+        {
+            return true;
+        }
+    }
+    match (std::fs::canonicalize(input), std::fs::canonicalize(output)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 // ─── main ────────────────────────────────────────────────────────────────
 
 fn main() -> ExitCode {
@@ -511,6 +535,17 @@ fn run(args: &Args) -> Result<(), RunError> {
     let (mut writer, output_path): (Box<dyn Write>, Option<PathBuf>) = match &output {
         Output::Stdout => (Box::new(BufWriter::new(stdout.lock())), None),
         Output::File(p) => {
+            // Refuse to write over the file we are about to read: opening it
+            // for writing (--force truncates) would destroy the input before
+            // a single byte of it had been consumed.
+            if let Some(input) = &args.input
+                && is_same_file(input, p)
+            {
+                return Err(RunError::Usage(format!(
+                    "input and output are the same file: {}",
+                    p.display()
+                )));
+            }
             // Without --force, create the output atomically with O_EXCL
             // (create_new). This eliminates the TOCTOU between an existence
             // check and the open, and refuses to follow a pre-existing or
