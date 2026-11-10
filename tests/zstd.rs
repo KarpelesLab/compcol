@@ -1469,10 +1469,9 @@ fn frame_header_len(frame: &[u8]) -> usize {
     5 + usize::from(!single_segment) + dict + fcs
 }
 
-/// A frame starts with an empty window: its blocks cannot reach into the
-/// previous frame's data (nor reuse its entropy tables).
-#[test]
-fn frame_cannot_reference_the_previous_one() {
+/// `(half, lone)`: 5000 incompressible bytes, and a frame whose only block
+/// is a back-reference to exactly those bytes — which it does not hold.
+fn lone_back_reference_frame() -> (Vec<u8>, Vec<u8>) {
     // One frame of two blocks, the second a copy of the first — so it is
     // encoded as a reference to it.
     let half = lcg_bytes(77, 5_000);
@@ -1509,6 +1508,14 @@ fn frame_cannot_reference_the_previous_one() {
     let mut lone = two_blocks[..header_len].to_vec();
     lone.extend_from_slice(&two_blocks[second..second_end]);
     lone[header_len] |= 1; // Last_Block
+    (half, lone)
+}
+
+/// A frame starts with an empty window: its blocks cannot reach into the
+/// previous frame's data (nor reuse its entropy tables).
+#[test]
+fn frame_cannot_reference_the_previous_one() {
+    let (half, lone) = lone_back_reference_frame();
     assert!(drive(&mut Decoder::new(), &lone, 4096, 4096).is_err());
 
     // Behind a frame holding exactly the data it refers to, it must fail
@@ -1971,6 +1978,12 @@ fn decode_all_chunkings(frame: &[u8]) -> Result<Vec<u8>, Error> {
     for (i, o) in [(1, 1), (1, 4096), (4096, 1), (3, 2)] {
         assert_eq!(decode_chunked(frame, i, o), first, "chunking {i}/{o}");
     }
+    // And so must decoding into one contiguous buffer.
+    assert_eq!(
+        contiguous_agrees(frame, DecoderConfig::default()),
+        first,
+        "contiguous"
+    );
     first
 }
 
@@ -2405,4 +2418,832 @@ fn exact_bitstream_checks_accept_encoder_output() {
             decoded.map(|v| v.len())
         );
     }
+}
+
+// ─── decoder: contiguous output (the caller's buffer is the window) ─────
+
+use compcol::ContiguousDecoder as _;
+
+/// The caller's side of [`compcol::ContiguousDecoder`]: one buffer holding
+/// everything decoded so far, replaced by a longer one whenever the decoder
+/// asks for room.
+struct ContigBuf {
+    buf: Vec<u8>,
+    filled: usize,
+    step: usize,
+    grows: usize,
+}
+
+impl ContigBuf {
+    fn new(initial: usize, step: usize) -> Self {
+        Self {
+            buf: vec![0x55; initial],
+            filled: 0,
+            step: step.max(1),
+            grows: 0,
+        }
+    }
+
+    /// Move to a NEW, longer allocation: only `buf[..filled]` is carried
+    /// over, the rest is junk, and the old buffer is scribbled over before
+    /// it is freed. A decoder holding on to anything about the old slice
+    /// would show.
+    fn grow(&mut self) {
+        self.grows += 1;
+        // Keep tiny steps from turning a large output into millions of
+        // reallocations.
+        let step = if self.grows > 3000 {
+            self.step.max(1 << 16)
+        } else {
+            self.step
+        };
+        let mut longer = vec![0xAA; self.buf.len() + step];
+        longer[..self.filled].copy_from_slice(&self.buf[..self.filled]);
+        self.buf.fill(0xEE);
+        self.buf = longer;
+    }
+}
+
+/// [`drive`], through the contiguous calls: feed `encoded` in
+/// `in_chunk`-byte slices into a buffer that starts `initial` bytes long and
+/// grows by `step`. Returns what was decoded and how often the buffer grew.
+fn drive_contiguous(
+    dec: &mut Decoder,
+    encoded: &[u8],
+    in_chunk: usize,
+    initial: usize,
+    step: usize,
+) -> Result<(Decoded, usize), Error> {
+    let mut out = ContigBuf::new(initial, step);
+    let mut consumed = 0;
+    let mut ended_in_decode = false;
+    'feed: loop {
+        let end = in_chunk.saturating_add(consumed).min(encoded.len());
+        loop {
+            let (p, status) =
+                dec.decode_contiguous(&encoded[consumed..end], &mut out.buf, out.filled)?;
+            assert!(out.filled + p.written <= out.buf.len());
+            consumed += p.consumed;
+            out.filled += p.written;
+            match status {
+                Status::StreamEnd => {
+                    ended_in_decode = true;
+                    break 'feed;
+                }
+                Status::InputEmpty => break,
+                Status::OutputFull => out.grow(),
+            }
+        }
+        assert_eq!(consumed, end, "InputEmpty with input left over");
+        if end == encoded.len() {
+            break;
+        }
+    }
+    loop {
+        let (p, status) = dec.finish_contiguous(&mut out.buf, out.filled)?;
+        assert_eq!(p.consumed, 0);
+        out.filled += p.written;
+        if status == Status::StreamEnd {
+            break;
+        }
+        assert_eq!(status, Status::OutputFull);
+        out.grow();
+    }
+    // Contiguous mode never builds a history.
+    assert_eq!(dec._history_capacity(), 0, "a window was allocated");
+    out.buf.truncate(out.filled);
+    Ok((
+        Decoded {
+            out: out.buf,
+            consumed,
+            ended_in_decode,
+        },
+        out.grows,
+    ))
+}
+
+/// Decode `stream` the usual way and into a contiguous buffer under several
+/// feedings and buffer growth patterns — from nothing in small steps, one
+/// input byte at a time, exactly sized, oversized — and require the same
+/// outcome everywhere: output, bytes consumed and where the end was seen, or
+/// the same error. Returns that outcome.
+fn modes_agree(stream: &[u8], config: DecoderConfig) -> Result<Decoded, Error> {
+    let windowed = drive(&mut Decoder::with_config(config), stream, 1 << 20, 1 << 20);
+    let len = windowed.as_ref().map_or(0, |d| d.out.len());
+    // Small outputs grow a byte at a time; large ones in ~40 steps, far less
+    // than a block, so a block is refused many times before it fits.
+    let small = if len <= 3000 { 1 } else { len / 37 + 1 };
+    let contig = |in_chunk: usize, initial: usize, step: usize| {
+        let mut dec = Decoder::with_config(config);
+        let got = drive_contiguous(&mut dec, stream, in_chunk, initial, step);
+        let (got, grows) = match got {
+            Ok((d, grows)) => (Ok(d), grows),
+            Err(e) => (Err(e), 0),
+        };
+        assert!(
+            got == windowed,
+            "contiguous (in {in_chunk}, initial {initial}, step {step}): {:?}, windowed: {:?}",
+            got.as_ref().map(|d| (d.out.len(), d.consumed)),
+            windowed.as_ref().map(|d| (d.out.len(), d.consumed)),
+        );
+        grows
+    };
+    contig(usize::MAX, 0, small);
+    contig(1, 0, small * 3 + 1);
+    contig(7, 1, 2 * small + 5);
+    if windowed.is_ok() {
+        // A buffer of exactly the decoded size is never found too short.
+        assert_eq!(contig(usize::MAX, len, 1), 0, "exact-size buffer grew");
+        assert_eq!(contig(1, len, 1), 0, "exact-size buffer grew");
+        assert_eq!(contig(4096, len + (1 << 18), 1), 0);
+    }
+    windowed
+}
+
+/// [`modes_agree`], reduced to the decoded bytes.
+fn contiguous_agrees(stream: &[u8], config: DecoderConfig) -> Result<Vec<u8>, Error> {
+    modes_agree(stream, config).map(|d| d.out)
+}
+
+/// Encoder output at assorted levels, negative ones included, one-shot and
+/// streamed, over inputs of different shapes.
+#[test]
+fn contiguous_matches_windowed_on_encoder_output() {
+    let inputs: [Vec<u8>; 7] = [
+        Vec::new(),
+        b"a".to_vec(),
+        gen_words(1_000),
+        mixed_corpus(),
+        // Incompressible: Raw_Blocks.
+        lcg_bytes(5, 150_000),
+        // One byte repeated across several blocks: RLE_Blocks.
+        vec![b'r'; 300_000],
+        // Runs, noise and text side by side.
+        [
+            &vec![0u8; 140_000][..],
+            &lcg_bytes(8, 9_000)[..],
+            &gen_words(160_000)[..],
+            &vec![7u8; 70_000][..],
+        ]
+        .concat(),
+    ];
+    const LEVELS: [i32; 8] = [MIN_LEVEL, -50, -1, 1, 3, 9, 19, 22];
+    for (i, input) in inputs.iter().enumerate() {
+        // Every level on the small inputs; on the large ones a rotating
+        // pair of the quick levels (the slow ones would take the test's
+        // time without adding a block shape).
+        let levels: Vec<i32> = if input.len() <= 1_000 {
+            LEVELS.to_vec()
+        } else if input.len() <= 70_000 {
+            vec![-1, 9]
+        } else {
+            vec![LEVELS[i % 6], LEVELS[(i * 5 + 3) % 6]]
+        };
+        for level in levels {
+            let one_shot = encode_at_level(input, level);
+            let streamed = {
+                let mut enc = Encoder::with_config(EncoderConfig { level });
+                encode_chunked(&mut enc, input, 1000, 333)
+            };
+            for wire in [one_shot, streamed] {
+                let got = contiguous_agrees(&wire, DecoderConfig::default());
+                assert!(
+                    got.as_deref() == Ok(&input[..]),
+                    "input {i}, level {level}: {:?}",
+                    got.map(|v| v.len())
+                );
+            }
+        }
+    }
+}
+
+/// Many small frames of every shape the encoder produces (see
+/// `exact_bitstream_checks_accept_encoder_output`), some with flushes.
+#[test]
+fn contiguous_matches_windowed_on_many_small_frames() {
+    const LEVELS: [i32; 9] = [MIN_LEVEL, -50, -3, -1, 1, 3, 7, 15, 22];
+    for case in 0..60u32 {
+        let len = (case as usize * 523) % 6000;
+        let input: Vec<u8> = match case % 4 {
+            0 => gen_words(len),
+            1 => lcg_bytes(case, len)
+                .into_iter()
+                .map(|b| b"aaaabbbcdeefghij"[(b & 15) as usize])
+                .collect(),
+            2 => gen_words(len)
+                .into_iter()
+                .zip(lcg_bytes(case, len))
+                .map(|(w, n)| if n < 40 { n } else { w })
+                .collect(),
+            _ => lcg_bytes(case, len)
+                .into_iter()
+                .enumerate()
+                .map(|(i, n)| if n < 8 { n } else { (i % 7) as u8 })
+                .collect(),
+        };
+        let level = LEVELS[case as usize % LEVELS.len()];
+        let mut enc = Encoder::with_config(EncoderConfig { level });
+        let mut wire = Vec::new();
+        if case % 3 == 0 && len > 2 {
+            let (a, rest) = input.split_at(len / 3);
+            let (b, c) = rest.split_at(len / 3);
+            flush_test_encode(&mut enc, a, 4096, &mut wire);
+            flush_test_flush(&mut enc, Flush::Sync, 4096, &mut wire);
+            flush_test_encode(&mut enc, b, 4096, &mut wire);
+            flush_test_flush(&mut enc, Flush::Full, 4096, &mut wire);
+            flush_test_encode(&mut enc, c, 4096, &mut wire);
+            flush_test_finish(&mut enc, 4096, &mut wire);
+        } else {
+            wire = encode_chunked(&mut enc, &input, 4096, 4096);
+        }
+        let got = contiguous_agrees(&wire, DecoderConfig::default());
+        assert!(
+            got.as_deref() == Ok(&input[..]),
+            "case {case}: len {len}, level {level}: {:?}",
+            got.map(|v| v.len())
+        );
+    }
+}
+
+/// Sync- and Full-flushed streams: many blocks in one frame, back-references
+/// across blocks, and a block boundary wherever a flush fell.
+#[test]
+fn contiguous_matches_windowed_on_flushed_streams() {
+    for mode in [Flush::Sync, Flush::Full] {
+        let mut enc = Encoder::new();
+        let mut wire = Vec::new();
+        let mut given = Vec::new();
+        for seg in flush_segments() {
+            flush_test_encode(&mut enc, &seg, 4096, &mut wire);
+            given.extend_from_slice(&seg);
+            flush_test_flush(&mut enc, mode, 4096, &mut wire);
+        }
+        flush_test_finish(&mut enc, 4096, &mut wire);
+        let got = contiguous_agrees(&wire, DecoderConfig::default());
+        assert!(got.as_deref() == Ok(&given[..]), "{mode:?}");
+    }
+    // The reference encoder's blocks in a 1 KiB window: every match is
+    // within the window although the whole output is at hand.
+    let got = contiguous_agrees(WORDS300K_WLOG10, DecoderConfig::default());
+    assert!(got.as_deref() == Ok(&gen_words(300_000)[..]));
+    for (fixture, raw) in [(AB_19, AB_RAW), (DLAST_19, DLAST_RAW)] {
+        assert!(contiguous_agrees(fixture, DecoderConfig::default()).as_deref() == Ok(raw));
+    }
+}
+
+/// Concatenated frames, empty frames and skippable frames, in both
+/// `multi_frame` settings, with and without trailing bytes.
+#[test]
+fn contiguous_matches_windowed_on_multi_frame_streams() {
+    let a = gen_words(3_000);
+    let b = lcg_bytes(9, 2_000);
+    let fa = encode_at_level(&a, 1);
+    let fb = encode_at_level(&b, 19);
+    let empty = encode_at_level(b"", 3);
+    let hello = checksummed_raw_frame(b"hello", HELLO_XXH);
+    let rle = build_rle_frame(b'z', 300);
+    let big = {
+        // Streamed and larger than a block: no Frame_Content_Size.
+        let mut enc = Encoder::with_config(EncoderConfig { level: 3 });
+        encode_chunked(&mut enc, &gen_words(200_000), 1000, 4096)
+    };
+    let decoy = build_raw_frame(b"must not appear in the output");
+    let streams: Vec<(Vec<u8>, Vec<u8>)> = vec![
+        ([&fa[..], &fb[..]].concat(), [&a[..], &b[..]].concat()),
+        ([&empty[..], &empty[..]].concat(), Vec::new()),
+        (
+            [&empty[..], &fa[..], &empty[..], &rle[..], &empty[..]].concat(),
+            [&a[..], &[b'z'; 300][..]].concat(),
+        ),
+        (
+            [&fa[..], &big[..], &hello[..], &fb[..]].concat(),
+            [&a[..], &gen_words(200_000)[..], b"hello", &b[..]].concat(),
+        ),
+        (
+            [
+                &skippable_frame(1, b"")[..],
+                &skippable_frame(2, b"x")[..],
+                &fa[..],
+                &skippable_frame(3, &decoy)[..],
+                &hello[..],
+                &skippable_frame(4, b"")[..],
+                &fb[..],
+                &skippable_frame(5, &lcg_bytes(11, 70_000))[..],
+                &skippable_frame(6, b"")[..],
+            ]
+            .concat(),
+            [&a[..], b"hello", &b[..]].concat(),
+        ),
+        (
+            [
+                &skippable_frame(0, &decoy)[..],
+                &skippable_frame(1, b"")[..],
+            ]
+            .concat(),
+            Vec::new(),
+        ),
+    ];
+    let single = DecoderConfig::default().with_multi_frame(false);
+    for (n, (stream, expected)) in streams.iter().enumerate() {
+        let got = modes_agree(stream, DecoderConfig::default()).unwrap();
+        assert!(got.out == *expected, "stream {n}");
+        assert_eq!(got.consumed, stream.len(), "stream {n}");
+        assert!(!got.ended_in_decode, "stream {n}");
+        // Bytes that start no frame end the stream and stay unconsumed.
+        for garbage in [&b"trailing"[..], &[0xFF], &[0x27, 0xB5, 0x2F, 0xFD]] {
+            let got = modes_agree(&[stream, garbage].concat(), DecoderConfig::default()).unwrap();
+            assert!(got.out == *expected, "stream {n}");
+            assert_eq!(got.consumed, stream.len(), "stream {n}");
+            assert!(got.ended_in_decode, "stream {n}");
+        }
+        // Single-frame mode: whatever it makes of the stream (the last one
+        // holds no frame at all), both ways make the same of it.
+        let _ = modes_agree(stream, single);
+    }
+
+    // Single-frame mode stops exactly at the end of the first frame.
+    for (frame, content) in [(&fa, &a[..]), (&hello, &b"hello"[..]), (&empty, &b""[..])] {
+        for tail in [&b""[..], &hello, &[0x28], &[0u8; 16], b"container data"] {
+            let skip = skippable_frame(2, b"metadata");
+            let stream = [&skip[..], &frame[..], tail].concat();
+            let got = modes_agree(&stream, single).unwrap();
+            assert_eq!(got.out, content);
+            assert_eq!(got.consumed, skip.len() + frame.len());
+            assert!(got.ended_in_decode);
+        }
+    }
+}
+
+/// Every malformed or truncated stream the tests above use is refused with
+/// the same error by both modes (and the well-formed neighbours decode the
+/// same).
+#[test]
+fn contiguous_rejects_what_windowed_rejects() {
+    let default = DecoderConfig::default();
+    let check = |stream: &[u8], expected: Result<usize, Error>| {
+        assert_eq!(
+            modes_agree(stream, default).map(|d| d.out.len()),
+            expected,
+            "stream {:02x?}",
+            &stream[..stream.len().min(24)]
+        );
+    };
+
+    // Not a frame; reserved bits; reserved block type; nothing at all.
+    check(b"", Err(Error::UnexpectedEnd));
+    check(b"(not a frame", Err(Error::BadHeader));
+    let mut bad_magic = build_raw_frame(b"x");
+    bad_magic[0] = 0;
+    check(&bad_magic, Err(Error::BadHeader));
+    check(&[0x28, 0xB5, 0x2F, 0xFD, 0x08], Err(Error::Corrupt));
+    check(
+        &[0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x50, 0x07, 0x00, 0x00],
+        Err(Error::Corrupt),
+    );
+    check(&[0x28, 0xB5, 0x2F, 0xFD, 0x00], Err(Error::UnexpectedEnd));
+    // A dictionary is named.
+    check(
+        &[0x28, 0xB5, 0x2F, 0xFD, 0x01, 0x00, 0x07, 0x01, 0x00, 0x00],
+        Err(Error::Unsupported),
+    );
+    // RLE_Block of size 0; Compressed_Block of size 1.
+    check(
+        &[0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x03, 0x00, 0x00, b'z'],
+        Err(Error::Corrupt),
+    );
+    check(
+        &[0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x0D, 0x00, 0x00, 0x00],
+        Err(Error::Corrupt),
+    );
+
+    // Checksums.
+    check(&checksummed_raw_frame(b"hello", HELLO_XXH), Ok(5));
+    check(
+        &checksummed_raw_frame(b"hello", [0xA3, 0x6D, 0x9F, 0x00]),
+        Err(Error::ChecksumMismatch),
+    );
+    let fa = encode_at_level(&gen_words(500), 3);
+    check(
+        &[
+            &fa[..],
+            &checksummed_raw_frame(b"hello", HELLO_XXH)[..],
+            &checksummed_raw_frame(b"hello", [0xA3, 0x6D, 0x9F, 0x89])[..],
+        ]
+        .concat(),
+        Err(Error::ChecksumMismatch),
+    );
+
+    // After a frame: a wrong or partial magic.
+    let cases: [(&[u8], Error); 8] = [
+        (&[0x28, 0xB5, 0x2F, 0xFE], Error::BadHeader),
+        (&[0x28, 0, 0, 0, 0, 0], Error::BadHeader),
+        (b"Paddings", Error::BadHeader),
+        (&[0x50, 0x2A, 0x4D, 0x19, 0, 0, 0, 0], Error::BadHeader),
+        (&[0x28], Error::UnexpectedEnd),
+        (&[0x28, 0xB5, 0x2F], Error::UnexpectedEnd),
+        (&[0x5F, 0x2A], Error::UnexpectedEnd),
+        (&[0x50, 0x2A, 0x4D, 0x18, 1, 0], Error::UnexpectedEnd),
+    ];
+    for (tail, error) in cases {
+        check(&[&fa[..], tail].concat(), Err(error));
+    }
+    // A skippable frame whose payload is not all there.
+    let mut huge_skip = vec![0x5A, 0x2A, 0x4D, 0x18, 0xFF, 0xFF, 0xFF, 0xFF];
+    huge_skip.extend_from_slice(&[0u8; 1000]);
+    check(&huge_skip, Err(Error::UnexpectedEnd));
+
+    // Frame_Content_Size: short, long, and exceeded by each kind of block.
+    let raw_abc = [0x19, 0x00, 0x00, b'a', b'b', b'c'];
+    check(&frame_from_parts(&[0x20, 3], &raw_abc), Ok(3));
+    check(&frame_from_parts(&[0x20, 5], &raw_abc), Err(Error::Corrupt));
+    check(&frame_from_parts(&[0x20, 1], &raw_abc), Err(Error::Corrupt));
+    let blocks = [
+        0x18, 0x00, 0x00, b'a', b'b', b'c', // Raw, 3 bytes
+        0x22, 0x00, 0x00, b'x', // RLE, 4 bytes
+        0x11, 0x00, 0x00, b'd', b'e', // Raw, 2 bytes, last
+    ];
+    let comp = [
+        0x55, 0x00, 0x00, 0x20, b'a', b'b', b'c', b'd', 0x01, 0x00, 0x00, 0x8E, 0x08,
+    ];
+    for (blocks, size) in [(&blocks[..], 9u32), (&comp[..], 7)] {
+        for n in [0u32, 2, 5, 6, 7, 8, 9, 10, 1000] {
+            let mut h = vec![0x80, 0x00];
+            h.extend_from_slice(&n.to_le_bytes());
+            let expected = if n == size {
+                Ok(size as usize)
+            } else {
+                Err(Error::Corrupt)
+            };
+            check(&frame_from_parts(&h, blocks), expected);
+        }
+    }
+    check(
+        &frame_from_parts(
+            &[0x80, 0x00, 2, 0, 0, 0],
+            &[0x10, 0x00, 0x00, b'a', b'b', 0x43, 0x1F, 0x00, b'z'],
+        ),
+        Err(Error::Corrupt),
+    );
+
+    // Block_Maximum_Size, windowed and single-segment.
+    const KIB128: u32 = 128 * 1024;
+    check(&rle_frame_in_window(0x00, 0x1F_FFFF), Err(Error::Corrupt));
+    for (wd, max) in [(0x00, 1024), (0x38, KIB128), (0x40, KIB128)] {
+        check(&rle_frame_in_window(wd, max), Ok(max as usize));
+        check(&raw_frame_in_window(wd, max), Ok(max as usize));
+        check(&rle_frame_in_window(wd, max + 1), Err(Error::Corrupt));
+        check(&raw_frame_in_window(wd, max + 1), Err(Error::Corrupt));
+    }
+    let mut body = vec![0xDC, 0x3F, 0x00]; // Raw literals, 20-bit size 1021
+    body.extend((0..1021u32).map(|i| (i % 251) as u8));
+    body.push(0x00);
+    for (wd, expected) in [(0x08, Ok(1021)), (0x00, Err(Error::Corrupt))] {
+        let mut f = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, wd];
+        f.extend_from_slice(&block_header(true, 2, body.len() as u32));
+        f.extend_from_slice(&body);
+        check(&f, expected);
+    }
+    for (n, expected) in [(1024u32, Ok(1024)), (1025, Err(Error::Corrupt))] {
+        let mut f = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00];
+        f.extend_from_slice(&block_header(true, 2, 4));
+        f.extend_from_slice(&[0x05 | ((n & 0xF) << 4) as u8, (n >> 4) as u8, b'q', 0x00]);
+        check(&f, expected);
+    }
+    let ss = |fcs: u8, blocks: &[u8]| frame_from_parts(&[0x20, fcs], blocks);
+    let comp_rle = |n: u8| [0x1D, 0x00, 0x00, (n << 3) | 1, b'z', 0x00];
+    check(&ss(3, &comp_rle(3)), Ok(3));
+    check(&ss(2, &comp_rle(2)), Err(Error::Corrupt));
+    check(&ss(0, &[0x01, 0x00, 0x00]), Ok(0));
+    check(&ss(0, &[0x15, 0x00, 0x00, 0x00, 0x00]), Err(Error::Corrupt));
+
+    // Entropy bitstreams must be consumed exactly.
+    for body in [
+        &[
+            0x20, b'a', b'b', b'c', b'd', 0x01, 0x00, 0x00, 0x00, 0x8E, 0x08,
+        ][..],
+        &[0x52, 0xC0, 0x00, 0x80, 0x10, 0x5A, 0x00],
+        &[0x52, 0x00, 0x01, 0x80, 0x10, 0x00, 0x2D, 0x00],
+        &[0x52, 0xC0, 0x00, 0x80, 0x10, 0x16, 0x00],
+        // 4-stream literals regenerating 4 bytes.
+        &[
+            0x46, 0x00, 0x03, 0x80, 0x10, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x02, 0x03, 0x02,
+            0x03, 0x00,
+        ],
+        // 6 literals in 4 streams, the empty fourth not a bare marker.
+        &[
+            0x66, 0x00, 0x03, 0x80, 0x10, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x05, 0x06, 0x07,
+            0x04, 0x00,
+        ],
+    ] {
+        check(&compressed_block_frame(body), Err(Error::Corrupt));
+    }
+    check(
+        &compressed_block_frame(&[0x52, 0xC0, 0x00, 0x80, 0x10, 0x2D, 0x00]),
+        Ok(5),
+    );
+
+    // Offsets: beyond the window although the bytes exist, and before the
+    // start of the frame although an earlier frame's bytes are right there
+    // in the buffer.
+    check(&far_offset_frame(1 << 3), Ok(2003));
+    check(&far_offset_frame(0x00), Err(Error::Corrupt));
+    let (half, lone) = lone_back_reference_frame();
+    check(&lone, Err(Error::Corrupt));
+    check(
+        &[&encode_at_level(&half, 3)[..], &lone[..]].concat(),
+        Err(Error::Corrupt),
+    );
+    // An offset of 1 in the very first sequence of a frame, with no literal
+    // in front of it: nothing to copy from, in a second frame too.
+    let no_source = compressed_block_frame(&[0x00, 0x01, 0x00, 0x00, 0x8E, 0x08]);
+    check(&no_source, Err(Error::Corrupt));
+    check(
+        &[&build_raw_frame(b"abcd")[..], &no_source[..]].concat(),
+        Err(Error::Corrupt),
+    );
+}
+
+/// A multi-frame stream cut at every byte: both modes agree on every cut,
+/// and only cuts at a frame boundary decode.
+#[test]
+fn contiguous_truncation_matches_windowed() {
+    let a = gen_words(600);
+    let b = lcg_bytes(21, 300);
+    let fa = encode_at_level(&a, 3);
+    let fb = checksummed_raw_frame(b"hello", HELLO_XXH);
+    let fc = encode_at_level(&b, 5);
+    let skip = skippable_frame(3, b"padding");
+    let rle = build_rle_frame(b'q', 40);
+    let stream = [&fa[..], &fb[..], &skip[..], &fc[..], &rle[..]].concat();
+    let mut boundaries = vec![fa.len()];
+    for part in [&fb, &skip, &fc, &rle] {
+        boundaries.push(boundaries.last().unwrap() + part.len());
+    }
+    for cut in 0..=stream.len() {
+        for in_chunk in [1, usize::MAX] {
+            let windowed = drive(&mut Decoder::new(), &stream[..cut], 4096, 4096);
+            let contiguous = drive_contiguous(&mut Decoder::new(), &stream[..cut], in_chunk, 0, 1)
+                .map(|(d, _)| d);
+            assert_eq!(contiguous, windowed, "cut {cut}, input chunk {in_chunk}");
+            assert_eq!(
+                contiguous.is_ok(),
+                boundaries.contains(&cut),
+                "cut {cut} of {} (boundaries {boundaries:?})",
+                stream.len()
+            );
+            if let Err(e) = contiguous {
+                assert_eq!(e, Error::UnexpectedEnd, "cut {cut}");
+            }
+        }
+    }
+}
+
+/// `max_window_size` is a memory budget, and contiguous mode allocates no
+/// window: a frame declaring one far above the limit is refused by `decode`
+/// and decoded by `decode_contiguous`, without a history.
+#[test]
+fn contiguous_ignores_the_window_limit_and_allocates_no_window() {
+    // A multi-block frame with back-references across its blocks...
+    let mut enc = Encoder::new();
+    let mut wire = Vec::new();
+    let mut given = Vec::new();
+    for seg in flush_segments() {
+        flush_test_encode(&mut enc, &seg, 4096, &mut wire);
+        given.extend_from_slice(&seg);
+        flush_test_flush(&mut enc, Flush::Sync, 4096, &mut wire);
+    }
+    flush_test_finish(&mut enc, 4096, &mut wire);
+    assert_eq!(wire[4] & 0x20, 0, "windowed frame expected");
+    // ...re-labelled with the largest window the format can express:
+    // Exponent 31, Mantissa 7 = 3.75 TiB.
+    wire[5] = 0xFF;
+
+    assert_eq!(
+        drive(&mut Decoder::new(), &wire, 4096, 4096).map(|d| d.out.len()),
+        Err(Error::Unsupported)
+    );
+    for (in_chunk, initial, step) in [(usize::MAX, given.len(), 1), (1, 0, 10_007), (500, 77, 1)] {
+        let mut dec = Decoder::new();
+        let (got, _) = drive_contiguous(&mut dec, &wire, in_chunk, initial, step).unwrap();
+        assert!(got.out == given, "in {in_chunk}, initial {initial}");
+        assert_eq!(got.consumed, wire.len());
+        // (`drive_contiguous` checks it too.)
+        assert_eq!(dec._history_capacity(), 0);
+    }
+    // The window still bounds offsets: the limit is ignored, the format's
+    // rules are not.
+    for (wd, expected) in [(0xFF, Ok(2003)), (0x00, Err(Error::Corrupt))] {
+        let mut dec = Decoder::new();
+        assert_eq!(
+            drive_contiguous(&mut dec, &far_offset_frame(wd), usize::MAX, 0, 100)
+                .map(|(d, _)| d.out.len()),
+            expected
+        );
+    }
+
+    // Single-segment frames (Window_Size = Frame_Content_Size) and a
+    // configured limit: the same.
+    let tight = DecoderConfig::default().with_max_window_size(1024);
+    let words = gen_words(40_000);
+    let frame = encode_at_level(&words, 3);
+    assert_ne!(frame[4] & 0x20, 0, "single-segment frame expected");
+    assert_eq!(
+        drive(&mut Decoder::with_config(tight), &frame, 4096, 4096).map(|d| d.out.len()),
+        Err(Error::Unsupported)
+    );
+    let mut dec = Decoder::with_config(tight);
+    let (got, _) = drive_contiguous(&mut dec, &frame, 100, 0, 999).unwrap();
+    assert!(got.out == words);
+    // The windowed path, for contrast, does keep a history.
+    let mut dec = Decoder::new();
+    drive(&mut dec, &frame, 4096, 4096).unwrap();
+    assert!(dec._history_capacity() >= words.len());
+    // After a reset the limit applies again to `decode`.
+    let mut dec = Decoder::with_config(tight);
+    drive_contiguous(&mut dec, &frame, 100, 0, 999).unwrap();
+    dec.reset();
+    assert_eq!(
+        drive(&mut dec, &frame, 4096, 4096).map(|d| d.out.len()),
+        Err(Error::Unsupported)
+    );
+}
+
+/// A Compressed_Block is written whole or not at all: short of room, the
+/// call writes nothing of it and says `OutputFull`, and the block comes out
+/// once a long enough (and different) buffer is offered.
+#[test]
+fn contiguous_block_waits_for_room() {
+    let words = gen_words(5_000);
+    let frame = encode_at_level(&words, 3);
+    let mut dec = Decoder::new();
+    let mut short = vec![0u8; words.len() - 1];
+    let (p, status) = dec.decode_contiguous(&frame, &mut short, 0).unwrap();
+    assert_eq!(
+        (p.consumed, p.written, status),
+        (frame.len(), 0, Status::OutputFull)
+    );
+    // Asking again changes nothing, with or without input, in `finish` too.
+    for _ in 0..3 {
+        let (p, status) = dec.decode_contiguous(&[], &mut short, 0).unwrap();
+        assert_eq!((p.consumed, p.written, status), (0, 0, Status::OutputFull));
+        let (p, status) = dec.finish_contiguous(&mut short, 0).unwrap();
+        assert_eq!((p.consumed, p.written, status), (0, 0, Status::OutputFull));
+    }
+    drop(short);
+    let mut exact = vec![0u8; words.len()];
+    let (p, status) = dec.finish_contiguous(&mut exact, 0).unwrap();
+    assert_eq!((p.written, status), (words.len(), Status::StreamEnd));
+    assert!(exact == words);
+    // Terminal from here on.
+    let (p, status) = dec
+        .decode_contiguous(&frame, &mut exact, words.len())
+        .unwrap();
+    assert_eq!((p.consumed, p.written, status), (0, 0, Status::StreamEnd));
+
+    // RLE and Raw blocks are written as far as the room goes.
+    let rle = build_rle_frame(b'q', 500);
+    let mut dec = Decoder::new();
+    let mut buf = vec![0u8; 200];
+    let (p, status) = dec.decode_contiguous(&rle, &mut buf, 0).unwrap();
+    assert_eq!(
+        (p.consumed, p.written, status),
+        (rle.len(), 200, Status::OutputFull)
+    );
+    let mut buf = [&buf[..], &[0u8; 300]].concat();
+    let (p, status) = dec.decode_contiguous(&[], &mut buf, 200).unwrap();
+    assert_eq!((p.written, status), (300, Status::InputEmpty));
+    let (p, status) = dec.finish_contiguous(&mut buf, 500).unwrap();
+    assert_eq!((p.written, status), (0, Status::StreamEnd));
+    assert_eq!(buf, vec![b'q'; 500]);
+
+    let raw = build_raw_frame(b"hello world");
+    let mut dec = Decoder::new();
+    let mut buf = vec![0u8; 5];
+    let (p, status) = dec.decode_contiguous(&raw, &mut buf, 0).unwrap();
+    assert_eq!(
+        (p.consumed, p.written, status),
+        (raw.len() - 6, 5, Status::OutputFull)
+    );
+    let mut buf = [&buf[..], &[0u8; 6]].concat();
+    let (p, status) = dec
+        .decode_contiguous(&raw[raw.len() - 6..], &mut buf, 5)
+        .unwrap();
+    assert_eq!((p.consumed, p.written, status), (6, 6, Status::InputEmpty));
+    assert_eq!(buf, b"hello world");
+}
+
+/// One stream is decoded one way: mixing `decode` / `finish` with the
+/// contiguous calls is refused, as is a `filled` the decoder did not
+/// produce. The refusal leaves the stream where it was; `reset` clears the
+/// choice.
+#[test]
+fn contiguous_and_windowed_calls_do_not_mix() {
+    let words = gen_words(4_000);
+    let frame = encode_at_level(&words, 3);
+    let (head, tail) = frame.split_at(frame.len() / 2);
+    let mut small = [0u8; 64];
+
+    // Contiguous first.
+    let mut dec = Decoder::new();
+    let mut buf = vec![0u8; words.len() + 100];
+    let (p, status) = dec.decode_contiguous(head, &mut buf, 0).unwrap();
+    assert_eq!((p.consumed, status), (head.len(), Status::InputEmpty));
+    let filled = p.written;
+    assert_eq!(dec.decode(tail, &mut small), Err(Error::Unsupported));
+    assert_eq!(dec.finish(&mut small), Err(Error::Unsupported));
+    assert_eq!(dec.discard_output(tail, 10), Err(Error::Unsupported));
+    // A `filled` that is not what was written, or beyond the buffer.
+    for wrong in [filled + 1, filled.wrapping_sub(1), words.len() + 101] {
+        assert_eq!(
+            dec.decode_contiguous(tail, &mut buf, wrong),
+            Err(Error::Unsupported),
+            "filled {wrong}"
+        );
+        assert_eq!(
+            dec.finish_contiguous(&mut buf, wrong),
+            Err(Error::Unsupported),
+            "filled {wrong}"
+        );
+    }
+    assert_eq!(
+        dec.decode_contiguous(tail, &mut buf[..0], 1),
+        Err(Error::Unsupported)
+    );
+    // None of that disturbed the stream.
+    let (p, status) = dec.decode_contiguous(tail, &mut buf, filled).unwrap();
+    assert_eq!((p.consumed, status), (tail.len(), Status::InputEmpty));
+    let filled = filled + p.written;
+    let (p, status) = dec.finish_contiguous(&mut buf, filled).unwrap();
+    assert_eq!((p.written, status), (0, Status::StreamEnd));
+    assert!(buf[..filled] == words);
+    // Still contiguous after the end.
+    assert_eq!(dec.decode(tail, &mut small), Err(Error::Unsupported));
+
+    // `reset` allows the other mode, and the first again.
+    dec.reset();
+    assert!(drive(&mut dec, &frame, 4096, 4096).unwrap().out == words);
+    assert_eq!(
+        dec.decode_contiguous(&frame, &mut buf, 0),
+        Err(Error::Unsupported)
+    );
+    assert_eq!(dec.finish_contiguous(&mut buf, 0), Err(Error::Unsupported));
+    dec.reset();
+    let (got, _) = drive_contiguous(&mut dec, &frame, 100, 0, 1500).unwrap();
+    assert!(got.out == words);
+
+    // Windowed first, mid-stream.
+    let mut dec = Decoder::new();
+    let mut out = vec![0u8; words.len()];
+    let (p, _) = dec.decode(head, &mut out).unwrap();
+    assert_eq!(p.consumed, head.len());
+    let written = p.written;
+    assert_eq!(
+        dec.decode_contiguous(tail, &mut buf, 0),
+        Err(Error::Unsupported)
+    );
+    assert_eq!(
+        dec.decode_contiguous(tail, &mut buf, written),
+        Err(Error::Unsupported)
+    );
+    assert_eq!(dec.finish_contiguous(&mut buf, 0), Err(Error::Unsupported));
+    let (p, _) = dec.decode(tail, &mut out[written..]).unwrap();
+    assert_eq!(written + p.written, words.len());
+    assert!(out == words);
+    // `finish` alone settles the mode as well.
+    let mut dec = Decoder::new();
+    assert_eq!(dec.finish(&mut small), Err(Error::UnexpectedEnd));
+    dec.reset();
+    assert_eq!(
+        dec.finish_contiguous(&mut small, 0),
+        Err(Error::UnexpectedEnd)
+    );
+
+    // An error is sticky in contiguous mode as it is in the other.
+    let mut dec = Decoder::new();
+    assert_eq!(
+        dec.decode_contiguous(b"(not a frame", &mut buf, 0),
+        Err(Error::BadHeader)
+    );
+    assert_eq!(
+        dec.decode_contiguous(&frame, &mut buf, 0),
+        Err(Error::Corrupt)
+    );
+    assert_eq!(dec.finish_contiguous(&mut buf, 0), Err(Error::Corrupt));
+}
+
+/// The trait object the crate hands out behaves the same.
+#[test]
+fn contiguous_through_a_trait_object() {
+    let words = gen_words(20_000);
+    let frame = encode_at_level(&words, 5);
+    let mut dec: Box<dyn compcol::ContiguousDecoder> = Box::new(Decoder::new());
+    let mut buf = vec![0u8; words.len()];
+    let (p, status) = dec.decode_contiguous(&frame, &mut buf, 0).unwrap();
+    assert_eq!(
+        (p.consumed, p.written, status),
+        (frame.len(), words.len(), Status::InputEmpty)
+    );
+    let (p, status) = dec.finish_contiguous(&mut buf, words.len()).unwrap();
+    assert_eq!((p.written, status), (0, Status::StreamEnd));
+    assert!(buf == words);
 }

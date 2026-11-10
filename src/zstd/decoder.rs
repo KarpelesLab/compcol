@@ -10,13 +10,19 @@
 //!
 //! Concatenated frames decode as one stream and Skippable_Frames are
 //! skipped; [`DecoderConfig::multi_frame`] turns the former off.
+//!
+//! The decoder also implements [`ContiguousDecoder`]: given the whole output
+//! as one buffer it keeps no history of its own (see the impl's docs).
 
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::traits::{RawDecoder, RawProgress};
+use crate::traits::{ContiguousDecoder, Progress, RawDecoder, RawProgress, Status};
 use crate::zstd::literals::{LiteralsState, decode_literals};
-use crate::zstd::sequences::{SequencesState, decode_sequences, execute_sequences};
+use crate::zstd::sequences::{
+    Sequence, SequencesState, decode_sequences, execute_sequences, execute_sequences_into,
+    measure_sequences,
+};
 use crate::zstd::xxhash::Xxh64;
 
 const MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -49,6 +55,10 @@ const MAX_BLOCK_SIZE: u64 = 128 * 1024;
 /// frames) are rejected with [`Error::Unsupported`] before any data is
 /// decoded.
 ///
+/// The limit bounds memory, so it does not apply when the stream is decoded
+/// through [`ContiguousDecoder`]: no window is allocated there, whatever the
+/// frame declares.
+///
 /// `#[non_exhaustive]`: construct via [`DecoderConfig::default`] and the
 /// `with_*` builders rather than a struct literal, so new options can be
 /// added in future without breaking downstream code.
@@ -57,7 +67,8 @@ const MAX_BLOCK_SIZE: u64 = 128 * 1024;
 pub struct DecoderConfig {
     /// Largest `Window_Size` (in bytes) a frame may declare. Defaults to
     /// [`DEFAULT_MAX_WINDOW_SIZE`] (128 MiB). Values below 1 KiB are treated
-    /// as 1 KiB.
+    /// as 1 KiB. Not applied to [`ContiguousDecoder`] calls, which allocate
+    /// no window.
     pub max_window_size: u64,
     /// Decode concatenated frames (`cat a.zst b.zst`, `pzstd` output) as
     /// one output, like `zstd -d`. Default `true`.
@@ -151,10 +162,35 @@ enum DecPhase {
     Done,
 }
 
+/// Which of the two ways of delivering output a stream is being decoded
+/// with. Fixed by the first call after a reset.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// No call yet.
+    Unset,
+    /// [`Decoder::decode`](crate::Decoder::decode) /
+    /// [`finish`](crate::Decoder::finish): output drained through the
+    /// caller's buffers, back-references served from `history`.
+    Windowed,
+    /// [`ContiguousDecoder`]: the caller's one buffer is the history.
+    Contiguous,
+}
+
 /// Streaming Zstandard decoder. See module-level docs for the supported subset.
 pub struct Decoder {
     phase: DecPhase,
     poisoned: bool,
+    mode: Mode,
+    /// Bytes written through [`ContiguousDecoder`] calls since the last
+    /// reset: what the caller's `filled` must be.
+    contig_total: u64,
+    /// Contiguous mode: the literals, sequences and regenerated size of a
+    /// Compressed_Block that has been decoded and validated but not yet
+    /// executed into the caller's buffer (which may first have to grow).
+    /// Bounded by the block, never by the window.
+    pend_lits: Vec<u8>,
+    pend_seqs: Vec<Sequence>,
+    pend_regen: usize,
 
     /// Buffer used by every multi-byte fixed-length phase (Magic, FHD, WD,
     /// Dictionary_ID, Frame_Content_Size, Block_Header, RLE byte read,
@@ -233,6 +269,11 @@ impl Decoder {
         Self {
             phase: DecPhase::Magic,
             poisoned: false,
+            mode: Mode::Unset,
+            contig_total: 0,
+            pend_lits: Vec::new(),
+            pend_seqs: Vec::new(),
+            pend_regen: 0,
             scratch: [0u8; 8],
             scratch_idx: 0,
             scratch_need: 4,
@@ -258,6 +299,19 @@ impl Decoder {
             seq_state: SequencesState::new(),
             content_hash: Xxh64::new(),
         }
+    }
+
+    /// Capacity of the internal history buffer, for tests asserting that
+    /// contiguous decoding allocates no window. Not part of the public API.
+    #[doc(hidden)]
+    pub fn _history_capacity(&self) -> usize {
+        self.history.capacity()
+    }
+
+    /// Whether a frame declaring `window_size` is refused. The limit is a
+    /// memory budget, and contiguous mode allocates no window.
+    fn window_too_large(&self) -> bool {
+        self.window_size > self.max_window_size && self.mode != Mode::Contiguous
     }
 
     fn poison(&mut self, e: Error) -> Error {
@@ -300,6 +354,9 @@ impl Decoder {
         self.comp_buf.clear();
         self.history.clear();
         self.history_emitted = 0;
+        self.pend_lits.clear();
+        self.pend_seqs.clear();
+        self.pend_regen = 0;
         self.lit_state = LiteralsState::default();
         self.seq_state = SequencesState::new();
         self.content_hash = Xxh64::new();
@@ -383,7 +440,7 @@ impl Decoder {
         self.window_size = base + add;
         // RFC 8878 lets a decoder reject frames requesting more memory than it
         // is willing to commit; do so before decoding any block.
-        if self.window_size > self.max_window_size {
+        if self.window_too_large() {
             return Err(self.poison(Error::Unsupported));
         }
         Ok(())
@@ -422,7 +479,7 @@ impl Decoder {
         // Apply the same hard cap so a single-segment bomb is rejected too.
         if self.single_segment {
             self.window_size = v;
-            if self.window_size > self.max_window_size {
+            if self.window_too_large() {
                 return Err(self.poison(Error::Unsupported));
             }
         }
@@ -527,13 +584,18 @@ impl Default for Decoder {
     }
 }
 
-impl RawDecoder for Decoder {
-    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
-        if self.poisoned {
-            return Err(Error::Corrupt);
-        }
+impl Decoder {
+    /// The frame state machine, shared by both output modes.
+    ///
+    /// Output goes to `output[start..]`, and the returned
+    /// `RawProgress::written` is the position reached in `output`, i.e.
+    /// `start` plus the bytes written. The windowed path passes `start = 0`;
+    /// the contiguous path passes the caller's `filled`, with
+    /// `output[..start]` being everything decoded so far.
+    fn run(&mut self, input: &[u8], output: &mut [u8], start: usize) -> Result<RawProgress, Error> {
+        let contiguous = self.mode == Mode::Contiguous;
         let mut consumed = 0usize;
-        let mut written = 0usize;
+        let mut written = start;
 
         loop {
             let initial_consumed = consumed;
@@ -709,10 +771,13 @@ impl RawDecoder for Decoder {
                         self.content_hash.update(&output[written..written + n]);
                     }
                     // Mirror into history so subsequent Compressed_Blocks can
-                    // back-reference these bytes.
-                    self.history
-                        .extend_from_slice(&input[consumed..consumed + n]);
-                    self.history_emitted = self.history.len();
+                    // back-reference these bytes. (In contiguous mode they
+                    // will read them from `output`.)
+                    if !contiguous {
+                        self.history
+                            .extend_from_slice(&input[consumed..consumed + n]);
+                        self.history_emitted = self.history.len();
+                    }
                     consumed += n;
                     written += n;
                     self.raw_remaining -= n as u32;
@@ -748,10 +813,12 @@ impl RawDecoder for Decoder {
                         self.content_hash.update(&output[written..written + n]);
                     }
                     // Mirror into history.
-                    for _ in 0..n {
-                        self.history.push(self.rle_byte);
+                    if !contiguous {
+                        for _ in 0..n {
+                            self.history.push(self.rle_byte);
+                        }
+                        self.history_emitted = self.history.len();
                     }
-                    self.history_emitted = self.history.len();
                     written += n;
                     self.rle_remaining -= n as u32;
                     if self.rle_remaining == 0 {
@@ -769,8 +836,14 @@ impl RawDecoder for Decoder {
                         consumed += n;
                     }
                     if self.comp_buf.len() == self.comp_total as usize {
-                        // Decode the block into history.
-                        if let Err(e) = self.decode_compressed_block() {
+                        // Decode the block: into history, or in contiguous
+                        // mode as far as a validated sequence list.
+                        let decoded = if contiguous {
+                            self.prepare_compressed_block()
+                        } else {
+                            self.decode_compressed_block()
+                        };
+                        if let Err(e) = decoded {
                             return Err(self.poison(e));
                         }
                         self.phase = DecPhase::CompressedEmit;
@@ -781,6 +854,32 @@ impl RawDecoder for Decoder {
                             done: false,
                         });
                     }
+                }
+                DecPhase::CompressedEmit if contiguous => {
+                    // Execute the pending block straight into the caller's
+                    // buffer, all of it or none: with too little room left
+                    // nothing is written and the block stays pending until
+                    // the caller comes back with a longer buffer.
+                    let regen = self.pend_regen;
+                    if output.len() - written < regen {
+                        return Ok(RawProgress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                    let end =
+                        execute_sequences_into(&self.pend_seqs, &self.pend_lits, output, written);
+                    debug_assert_eq!(end, written + regen);
+                    if self.has_content_checksum {
+                        self.content_hash.update(&output[written..end]);
+                    }
+                    written = end;
+                    self.pend_lits = Vec::new();
+                    self.pend_seqs = Vec::new();
+                    self.pend_regen = 0;
+                    self.advance_after_block();
+                    continue;
                 }
                 DecPhase::CompressedEmit => {
                     // Drain freshly decoded bytes from history into output.
@@ -884,6 +983,23 @@ impl RawDecoder for Decoder {
             }
         }
     }
+}
+
+impl RawDecoder for Decoder {
+    fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
+        if self.poisoned {
+            return Err(Error::Corrupt);
+        }
+        if self.mode != Mode::Windowed {
+            if self.mode == Mode::Contiguous {
+                // The stream so far lives in the caller's contiguous buffer;
+                // there is no history here to continue from.
+                return Err(Error::Unsupported);
+            }
+            self.mode = Mode::Windowed;
+        }
+        self.run(input, output, 0)
+    }
 
     fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
         if self.poisoned {
@@ -967,6 +1083,41 @@ impl Decoder {
         Ok(())
     }
 
+    /// Contiguous-mode counterpart of [`Self::decode_compressed_block`]:
+    /// decode the literals and the sequence list of the block in `comp_buf`
+    /// and validate them exactly as execution into a history would — block
+    /// size, literal bounds, every offset against the frame's start and its
+    /// window, then Frame_Content_Size — leaving them pending for
+    /// `CompressedEmit` to execute into the caller's buffer once it has
+    /// `pend_regen` bytes of room. Nothing is written here, so a block that
+    /// does not fit yet costs no output and no second copy.
+    fn prepare_compressed_block(&mut self) -> Result<(), Error> {
+        let block = core::mem::take(&mut self.comp_buf);
+        let lit = decode_literals(&block, &mut self.lit_state)?;
+        let after_lit = lit.consumed;
+        if after_lit > block.len() {
+            return Err(Error::Corrupt);
+        }
+        let seqs = decode_sequences(&block[after_lit..], &mut self.seq_state)?;
+        // Every earlier block of this frame is already in the caller's
+        // buffer, so `decoded_size` is how far back a match may reach before
+        // it would leave the frame; `window_size` bounds it as well.
+        let regen = measure_sequences(
+            &seqs,
+            lit.literals.len(),
+            self.decoded_size,
+            self.block_max_size() as usize,
+            self.window_size,
+        )?;
+        self.account_block(regen as u64)?;
+        self.pend_lits = lit.literals;
+        self.pend_seqs = seqs;
+        self.pend_regen = regen;
+        self.comp_buf = block;
+        self.comp_buf.clear();
+        Ok(())
+    }
+
     /// Drop history older than `Window_Size` once every decoded byte has been
     /// delivered, so memory stays bounded by the window rather than the total
     /// decoded size. The prefix is only discarded once it exceeds a slack of
@@ -1000,5 +1151,116 @@ impl Decoder {
             self.phase = DecPhase::BlockHeader;
             self.begin_scratch(3);
         }
+    }
+}
+
+impl Decoder {
+    /// Checks common to both [`ContiguousDecoder`] calls; commits the
+    /// stream to contiguous mode.
+    fn enter_contiguous(&mut self, output_len: usize, filled: usize) -> Result<(), Error> {
+        if self.poisoned {
+            return Err(Error::Corrupt);
+        }
+        // Mixing the two modes, or a `filled` that is not what this decoder
+        // wrote: the caller's buffer is not the history we need.
+        if self.mode == Mode::Windowed || filled > output_len || filled as u64 != self.contig_total
+        {
+            return Err(Error::Unsupported);
+        }
+        self.mode = Mode::Contiguous;
+        Ok(())
+    }
+}
+
+/// Decoding with the caller's buffer as the window.
+///
+/// In this mode the decoder keeps **no history**: Raw and RLE blocks are
+/// written straight into `output[filled..]`, and a Compressed_Block's
+/// sequences are executed there too, literals copied in and matches copied
+/// from `output[..pos]`. What it still holds is one block's worth of state
+/// (the compressed block, at most 128 KiB, its decoded literals and its
+/// sequence list) plus the entropy tables — nothing that grows with
+/// `Window_Size`.
+///
+/// * **Same streams, same errors.** Frames, concatenated and skippable
+///   frames, [`DecoderConfig::multi_frame`], trailing bytes, checksums and
+///   every validity rule are those of [`Decoder::decode`](crate::Decoder):
+///   the frame state machine is shared and only the sink differs. In
+///   particular a match may reach neither before the first byte of its own
+///   frame nor further back than the frame's `Window_Size`, although the
+///   bytes are there in `output`.
+/// * **[`DecoderConfig::max_window_size`] is not applied.** It bounds the
+///   memory a frame can make the decoder allocate, and here that is nothing;
+///   a frame declaring a multi-gigabyte window decodes with the same small
+///   footprint. (The output itself is the caller's to bound.)
+/// * **A Compressed_Block is written whole or not at all.** If `output` has
+///   less room than the block regenerates (at most 128 KiB), the call
+///   returns [`Status::OutputFull`] having written nothing of it, even
+///   though some room is left; call again with a longer buffer. So with a
+///   buffer of exactly the decoded size `OutputFull` is never returned, and
+///   a buffer of unknown final size should grow by at least 128 KiB at a
+///   time to avoid repeated calls.
+/// * Calling `decode` / `finish` on a stream started here, or the reverse,
+///   or passing a `filled` that is not the total this decoder has written
+///   since the last reset, is [`Error::Unsupported`]; the decoder's state
+///   is left as it was. [`reset`](crate::Decoder::reset) allows either mode
+///   again.
+impl ContiguousDecoder for Decoder {
+    fn decode_contiguous(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        filled: usize,
+    ) -> Result<(Progress, Status), Error> {
+        self.enter_contiguous(output.len(), filled)?;
+        let p = self.run(input, output, filled)?;
+        let written = p.written - filled;
+        self.contig_total += written as u64;
+        let status = if p.done {
+            Status::StreamEnd
+        } else {
+            match self.phase {
+                // A decoded block, or the rest of an RLE run, is waiting
+                // for room.
+                DecPhase::CompressedEmit | DecPhase::RleEmit => Status::OutputFull,
+                // A Raw_Block stops on whichever side ran out first.
+                _ if p.consumed < input.len() => Status::OutputFull,
+                _ => Status::InputEmpty,
+            }
+        };
+        Ok((
+            Progress {
+                consumed: p.consumed,
+                written,
+            },
+            status,
+        ))
+    }
+
+    fn finish_contiguous(
+        &mut self,
+        output: &mut [u8],
+        filled: usize,
+    ) -> Result<(Progress, Status), Error> {
+        self.enter_contiguous(output.len(), filled)?;
+        let p = self.run(&[], output, filled)?;
+        let written = p.written - filled;
+        self.contig_total += written as u64;
+        let status = match self.phase {
+            DecPhase::Done | DecPhase::BetweenFrames => {
+                self.phase = DecPhase::Done;
+                Status::StreamEnd
+            }
+            // Output still owed: not done yet, no error.
+            DecPhase::RleEmit | DecPhase::CompressedEmit => Status::OutputFull,
+            _ => return Err(self.poison(Error::UnexpectedEnd)),
+        };
+        Ok((
+            Progress {
+                consumed: 0,
+                written,
+            },
+            status,
+        ))
     }
 }
