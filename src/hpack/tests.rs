@@ -270,3 +270,20 @@ fn header_list_size_cap_is_inclusive_and_configurable() {
     dec.set_max_header_list_size(usize::MAX);
     assert_eq!(dec.decode(&amplifying_block(100)).unwrap().len(), 101);
 }
+
+/// Regression: a continuation byte whose bits are shifted out of `usize` was
+/// silently truncated (`checked_shl` only rejects an over-wide shift *count*),
+/// so an integer far beyond `usize::MAX` decoded as a small wrapped value.
+#[test]
+fn decode_rejects_integer_overflow_in_string_length() {
+    // Literal without indexing, new name; the 7-bit-prefix name length
+    // continues with nine `80` and a `02` (2 << 63): the wrapped value was
+    // 127, i.e. a 127-byte name of 'a's.
+    let mut block = vec![0x00, 0x7f];
+    block.extend(core::iter::repeat_n(0x80, 9));
+    block.push(0x02);
+    block.extend(core::iter::repeat_n(b'a', 127));
+    block.push(0x00);
+    let mut dec = HpackDecoder::with_limits(4096, 65536);
+    assert!(matches!(dec.decode(&block), Err(Error::Corrupt)));
+}

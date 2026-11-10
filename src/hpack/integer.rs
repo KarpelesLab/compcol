@@ -53,12 +53,15 @@ pub fn decode_int(buf: &[u8], pos: usize, n: u32) -> Result<(usize, usize), Erro
     loop {
         let b = *buf.get(p).ok_or(Error::UnexpectedEnd)? as usize;
         p += 1;
-        // 7 fresh bits at `shift`; guard against usize overflow.
-        if shift >= usize::BITS {
+        // 7 fresh bits at `shift`; guard against usize overflow. Checking the
+        // shift count alone is not enough (`checked_shl` only rejects a count
+        // >= the type width): the group's own high bits must not be shifted
+        // out either, or the value would silently wrap.
+        let group = b & 0x7f;
+        if shift >= usize::BITS || group > (usize::MAX >> shift) {
             return Err(Error::Corrupt);
         }
-        let add = (b & 0x7f).checked_shl(shift).ok_or(Error::Corrupt)?;
-        value = value.checked_add(add).ok_or(Error::Corrupt)?;
+        value = value.checked_add(group << shift).ok_or(Error::Corrupt)?;
         if b & 0x80 == 0 {
             break;
         }
@@ -108,6 +111,42 @@ mod tests {
         buf.extend(core::iter::repeat_n(0x80, 64));
         buf.push(0x00);
         assert!(matches!(decode_int(&buf, 0, 5), Err(Error::Corrupt)));
+    }
+
+    #[test]
+    fn overflow_boundaries() {
+        for n in 1..=8u32 {
+            let max_prefix = (1usize << n) - 1;
+
+            // The largest representable value still round-trips…
+            let mut buf = Vec::new();
+            encode_int(&mut buf, usize::MAX, n, 0);
+            assert_eq!(decode_int(&buf, 0, n).unwrap(), (usize::MAX, buf.len()));
+
+            // …a continuation that is itself `usize::MAX` on top of the prefix
+            // overflows in the addition…
+            let mut buf = alloc::vec![max_prefix as u8];
+            let mut v = usize::MAX;
+            while v >= 128 {
+                buf.push((v & 0x7f) as u8 | 0x80);
+                v >>= 7;
+            }
+            buf.push(v as u8);
+            assert!(matches!(decode_int(&buf, 0, n), Err(Error::Corrupt)));
+
+            // …and a final group with bits shifted out of `usize` is rejected
+            // rather than truncated (shift 63 on 64-bit targets, 28 on 32-bit).
+            let groups = (usize::BITS / 7) as usize;
+            for last in [0x10u8, 0x40, 0x7f] {
+                let mut buf = alloc::vec![max_prefix as u8];
+                buf.extend(core::iter::repeat_n(0x80, groups));
+                buf.push(last);
+                assert!(
+                    matches!(decode_int(&buf, 0, n), Err(Error::Corrupt)),
+                    "n={n} last={last:#x}"
+                );
+            }
+        }
     }
 
     #[test]

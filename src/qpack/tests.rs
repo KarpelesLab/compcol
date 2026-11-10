@@ -631,3 +631,59 @@ fn field_section_size_cap_is_inclusive_and_configurable() {
         .unwrap();
     assert_eq!(out.len(), 100);
 }
+
+/// Regression: a continuation byte whose bits are shifted out of `usize` was
+/// silently truncated (`checked_shl` only rejects an over-wide shift *count*),
+/// so an integer far beyond `usize::MAX` decoded as a small wrapped value.
+#[test]
+fn integer_overflow_in_field_section_rejected() {
+    // Section prefix `00 00`, then a literal field line with literal name
+    // whose 3-bit-prefix name length continues with nine `80` and a `02`
+    // (2 << 63): the wrapped value was 7, i.e. a 7-byte name "aaaaaaa".
+    let mut block = vec![0x00, 0x00, 0x27];
+    block.extend(core::iter::repeat_n(0x80, 9));
+    block.push(0x02);
+    block.extend_from_slice(b"aaaaaaa");
+    block.push(0x00);
+    let mut dec = QpackDecoder::with_limits(4096, 65536);
+    assert!(matches!(
+        dec.decode_field_section(&block),
+        Err(Error::Corrupt)
+    ));
+}
+
+#[test]
+fn integer_decode_overflow_boundaries() {
+    for n in 1..=8u32 {
+        let max_prefix = (1usize << n) - 1;
+
+        // The largest representable value still round-trips…
+        let mut buf = Vec::new();
+        encode_int(&mut buf, usize::MAX, n, 0);
+        assert_eq!(decode_int(&buf, 0, n).unwrap(), (usize::MAX, buf.len()));
+
+        // …a continuation that is itself `usize::MAX` on top of the prefix
+        // overflows in the addition…
+        let mut buf = vec![max_prefix as u8];
+        let mut v = usize::MAX;
+        while v >= 128 {
+            buf.push((v & 0x7f) as u8 | 0x80);
+            v >>= 7;
+        }
+        buf.push(v as u8);
+        assert!(matches!(decode_int(&buf, 0, n), Err(Error::Corrupt)));
+
+        // …and a final group with bits shifted out of `usize` is rejected
+        // rather than truncated (shift 63 on 64-bit targets, 28 on 32-bit).
+        let groups = (usize::BITS / 7) as usize;
+        for last in [0x10u8, 0x40, 0x7f] {
+            let mut buf = vec![max_prefix as u8];
+            buf.extend(core::iter::repeat_n(0x80, groups));
+            buf.push(last);
+            assert!(
+                matches!(decode_int(&buf, 0, n), Err(Error::Corrupt)),
+                "n={n} last={last:#x}"
+            );
+        }
+    }
+}
