@@ -21,11 +21,13 @@ flag, and a `compcol` binary turns the library into a Unix-style filter.
 ## Design principles
 
 - **Pure Rust.** No `bindgen`, no FFI, no C dependencies. The crate has
-  **zero runtime dependencies** by default — the only entry in
-  `[dependencies]` is an optional `tokio` (trait definitions only),
-  pulled in solely by the opt-in `tokio` feature.
-- **100% safe.** `unsafe_code = "forbid"` is set crate-wide; the library
-  never opts out.
+  **zero runtime dependencies** by default — `[dependencies]` holds only
+  two optional entries: `tokio` (trait definitions only, for the opt-in
+  `tokio` feature) and `memmap2` (for the CLI's opt-in `mmap` feature).
+- **100% safe library.** The library is `#![forbid(unsafe_code)]` and
+  never opts out. The only `unsafe` in the package is one call in the
+  `compcol` binary, compiled only with the `mmap` feature, that maps the
+  output file.
 - **`no_std`.** The library is `#![no_std]`. `alloc` is used by
   everything except the bare-bones `rle` algorithm; algorithms that need
   large windows or work buffers pull in `alloc` automatically.
