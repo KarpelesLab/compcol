@@ -618,6 +618,46 @@ fn force_refuses_output_that_is_the_input() {
 
 #[cfg(unix)]
 #[test]
+fn in_place_decompress_keeps_non_utf8_name_bytes() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    // Stripping the extension went through a lossy UTF-8 conversion, so
+    // `f\xFF.gz` decompressed to `f` + U+FFFD (and distinct inputs could
+    // collide on that one mangled name) before the input was removed.
+    let (gz, _err, code) = run_with_stdin(&["-t", "gzip"], b"non-utf8 name payload");
+    assert_eq!(code, 0);
+
+    let s = Scratch::new("non_utf8");
+    let input = s.path.join(OsString::from_vec(b"f\xff.gz".to_vec()));
+    let expected = s.path.join(OsString::from_vec(b"f\xff".to_vec()));
+    if fs::write(&input, &gz).is_err() {
+        // Some filesystems (APFS, for one) reject names that aren't UTF-8.
+        println!("skipping: filesystem rejects non-UTF-8 file names");
+        return;
+    }
+
+    let out = Command::new(BIN)
+        .arg("-d")
+        .arg(&input)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn compcol");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!input.exists(), "input should have been removed");
+    assert!(
+        !s.file("f\u{FFFD}").exists(),
+        "output name was mangled to U+FFFD"
+    );
+    assert_eq!(file_contents(&expected), b"non-utf8 name payload");
+}
+
+#[cfg(unix)]
+#[test]
 fn force_refuses_output_hard_linked_to_the_input() {
     // Two names, one inode: path comparison can't see it, dev/ino can.
     let s = Scratch::new("same_inode");

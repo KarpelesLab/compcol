@@ -338,15 +338,13 @@ fn derive_output(args: &Args, algo: &str) -> Result<Output, String> {
     })?;
 
     if args.decompress {
-        let s = input.to_string_lossy();
-        let suffix = format!(".{ext}");
-        if !s.ends_with(&suffix) {
-            return Err(format!(
+        match strip_extension(input, ext)? {
+            Some(stripped) => Ok(Output::File(stripped)),
+            None => Err(format!(
                 "input {} doesn't end with '.{ext}'; use -o PATH",
                 input.display()
-            ));
+            )),
         }
-        Ok(Output::File(PathBuf::from(&s[..s.len() - suffix.len()])))
     } else {
         // Append `.<ext>` to the input path.
         let mut new_name = input.clone().into_os_string();
@@ -354,6 +352,39 @@ fn derive_output(args: &Args, algo: &str) -> Result<Output, String> {
         new_name.push(ext);
         Ok(Output::File(PathBuf::from(new_name)))
     }
+}
+
+/// Strip a trailing `.<ext>` from `input`, returning `Ok(None)` when the
+/// path doesn't end with it.
+///
+/// The path is never round-tripped through a lossy string conversion: a name
+/// that isn't valid Unicode must keep its exact bytes, or the output would
+/// land under a different (mangled, possibly colliding) name while the input
+/// is removed.
+#[cfg(unix)]
+fn strip_extension(input: &Path, ext: &str) -> Result<Option<PathBuf>, String> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let suffix = format!(".{ext}");
+    Ok(input
+        .as_os_str()
+        .as_bytes()
+        .strip_suffix(suffix.as_bytes())
+        .map(|stem| PathBuf::from(OsString::from_vec(stem.to_vec()))))
+}
+
+/// Non-unix fallback: without a safe way to slice the platform's native
+/// encoding, only valid-Unicode paths are handled; anything else is refused
+/// rather than written under a mangled name.
+#[cfg(not(unix))]
+fn strip_extension(input: &Path, ext: &str) -> Result<Option<PathBuf>, String> {
+    let Some(s) = input.to_str() else {
+        return Err(format!(
+            "input {} is not valid Unicode, so the output name can't be derived; use -o PATH",
+            input.display()
+        ));
+    };
+    let suffix = format!(".{ext}");
+    Ok(s.strip_suffix(&suffix).map(PathBuf::from))
 }
 
 /// Whether `input` and `output` name the same existing file.
