@@ -555,3 +555,28 @@ fn buffered_compressor() {
     assert_eq!(through, chunks);
     assert!(through * 3 < buffered(&text, Cut::Bytes, 0).len());
 }
+
+/// Two gzip members: the first stores "abcdefgh", the second is one fixed
+/// block holding a match of length 8 at distance 8, and a trailer for
+/// "abcdefgh". The match reaches into the first member's data, which is no
+/// part of the second member's history: zlib and gzip refuse it.
+const CROSS_MEMBER: [u8; 52] = [
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x01, 0x08, 0x00, 0xf7, 0xff, 0x61,
+    0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x50, 0x2a, 0xef, 0xae, 0x08, 0x00, 0x00, 0x00, 0x1f,
+    0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x83, 0xd1, 0x00, 0x50, 0x2a, 0xef, 0xae,
+    0x08, 0x00, 0x00, 0x00,
+];
+
+#[test]
+fn a_gzip_member_cannot_reference_the_previous_one() {
+    for cut in [Cut::Whole, Cut::Bytes, Cut::Random(7)] {
+        let (result, out, _) = push::<Gzip>(&CROSS_MEMBER[..31], cut, 64);
+        assert_eq!(result, Ok(8), "{cut:?}");
+        assert_eq!(out, b"abcdefgh");
+
+        let (result, _, _) = push::<Gzip>(&CROSS_MEMBER, cut, 64);
+        assert_eq!(result, Err(Error::InvalidDistance), "{cut:?}");
+        let (result, _, _) = push::<Detect>(&CROSS_MEMBER, cut, 64);
+        assert_eq!(result, Err(Error::InvalidDistance), "{cut:?}");
+    }
+}

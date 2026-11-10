@@ -231,9 +231,9 @@ impl Context {
                 State::Block
             }
             State::Member => {
-                // Each member has its own checksum and length.
+                // Each member has its own checksum, length and history.
                 *inflate.sink.format = F::INIT;
-                self.start = inflate.sink.window.written();
+                self.start = inflate.sink.window.member();
                 if inflate.bits(16) != 0x8b1f {
                     return Err(Error::BadHeader);
                 }

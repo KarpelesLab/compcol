@@ -31,6 +31,8 @@ pub(crate) trait Output: Out {
     const VERIFY: bool;
     /// Bytes produced so far.
     fn written(&self) -> usize;
+    /// Starts a gzip member: back-references reach no farther than here.
+    fn member(&mut self);
     /// The data produced from `start` on, if it is kept.
     fn data(&self, start: usize) -> &[u8];
     /// Appends `len` bytes copied from `dist` bytes back.
@@ -42,11 +44,17 @@ pub(crate) trait Output: Out {
 pub(crate) struct Buffer<'a> {
     buf: &'a mut [u8],
     pos: usize,
+    /// Where the current gzip member started.
+    floor: usize,
 }
 
 impl<'a> Buffer<'a> {
     pub(crate) fn new(buf: &'a mut [u8]) -> Self {
-        Buffer { buf, pos: 0 }
+        Buffer {
+            buf,
+            pos: 0,
+            floor: 0,
+        }
     }
 }
 
@@ -72,15 +80,19 @@ impl Output for Buffer<'_> {
         self.pos
     }
 
+    fn member(&mut self) {
+        self.floor = self.pos;
+    }
+
     fn data(&self, start: usize) -> &[u8] {
         self.buf.get(start..self.pos).unwrap_or(&[])
     }
 
     fn copy(&mut self, dist: u32, len: u32) -> Result<(), Error> {
-        let start = self
-            .pos
-            .checked_sub(dist as usize)
-            .ok_or(Error::InvalidDistance)?;
+        if dist as usize > self.pos - self.floor {
+            return Err(Error::InvalidDistance);
+        }
+        let start = self.pos - dist as usize;
         // Should this wrap around, the range is invalid and gets refused.
         let end = self.pos.wrapping_add(len as usize);
         let region = self.buf.get_mut(start..end).ok_or(Error::OutputTooSmall)?;
@@ -100,11 +112,17 @@ impl Output for Buffer<'_> {
 pub(crate) struct Counter {
     count: usize,
     max: usize,
+    /// The count when the current gzip member started.
+    floor: usize,
 }
 
 impl Counter {
     pub(crate) fn new(max: usize) -> Self {
-        Counter { count: 0, max }
+        Counter {
+            count: 0,
+            max,
+            floor: 0,
+        }
     }
 }
 
@@ -127,12 +145,16 @@ impl Output for Counter {
         self.count
     }
 
+    fn member(&mut self) {
+        self.floor = self.count;
+    }
+
     fn data(&self, _: usize) -> &[u8] {
         &[]
     }
 
     fn copy(&mut self, dist: u32, len: u32) -> Result<(), Error> {
-        if dist as usize > self.count {
+        if dist as usize > self.count - self.floor {
             return Err(Error::InvalidDistance);
         }
         // `count` never exceeds `max`, so this cannot overflow.
@@ -195,6 +217,7 @@ fn container<F: Format, O: Output>(inflate: &mut Inflate<'_, O>) -> Result<(), E
 
 /// Decodes one gzip member.
 fn member<F: Format, O: Output>(inflate: &mut Inflate<'_, O>) -> Result<(), Error> {
+    inflate.sink.member();
     let start = inflate.sink.written();
     if inflate.bits(16) != 0x8b1f {
         return Err(Error::BadHeader);

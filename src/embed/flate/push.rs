@@ -78,10 +78,12 @@ impl<F: Container> Checksum for Check<'_, F> {
 struct Context {
     bit_buf: u32,
     bit_cnt: u32,
-    /// Whether this is a gzip stream, and where the output was when its
-    /// current member started, modulo 2<sup>32</sup> as the length it records.
+    /// Whether this is a gzip stream, and where the output was when the
+    /// stream, or its current gzip member, started: the low word, then the
+    /// high one. Back-references reach no farther, and the low word is all
+    /// the length a gzip member records takes.
     gzip: bool,
-    start: u32,
+    start: [u32; 2],
     /// Whether the current block is the last.
     last: bool,
     /// How many literal/length symbols, symbols in all, and code length
@@ -144,7 +146,7 @@ impl<O: Output, F: Container> Decompressor<O, F> {
                 bit_buf: 0,
                 bit_cnt: 0,
                 gzip: false,
-                start: 0,
+                start: [0; 2],
                 last: false,
                 len_syms: 0,
                 syms: 0,
@@ -228,9 +230,11 @@ impl<O: Output, F: Container> Decompressor<O, F> {
             // measure the stream by. Taken here rather than in `new`, which
             // is `const` and cannot ask.
             self.set_begin(self.out.written());
+            self.context.start = self.begin;
         }
         let context = &mut self.context;
         let mut inflate = Inflate {
+            floor: (context.start[1] as u64) << 32 | context.start[0] as u64,
             input,
             out: &mut self.out,
             check: Check(&mut self.format),
@@ -302,7 +306,9 @@ impl Context {
                 *inflate.check.0 = F::new();
                 inflate.check.0.detect(0x1f);
                 self.gzip = true;
-                self.start = inflate.out.written() as u32;
+                // And its own history.
+                inflate.floor = inflate.out.written();
+                self.start = [inflate.floor as u32, (inflate.floor >> 32) as u32];
                 // ID2 and CM.
                 match inflate.bits(16) {
                     0x088b => {}
@@ -450,7 +456,7 @@ impl Context {
         check: u32,
         size: u32,
     ) -> Result<State, Error> {
-        let written = (inflate.out.written() as u32).wrapping_sub(self.start);
+        let written = (inflate.out.written() as u32).wrapping_sub(self.start[0]);
         let [expected, _] = inflate.check.0.trailer(written);
         if (O::VERIFY && check != expected) || (self.gzip && size != written) {
             return Err(Error::ChecksumMismatch);
