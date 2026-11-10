@@ -82,7 +82,10 @@ pub struct Decoder {
     input_buf: Vec<u8>,
     /// LZ window. Initialised to zero.
     window: Vec<u8>,
-    /// Next write offset into the window.
+    /// Next write offset into the window. Always a valid index
+    /// (`< window_size`): it is wrapped on every advance rather than
+    /// counting total output, which would overflow `usize` after 4 GiB on
+    /// 32-bit targets.
     window_posn: usize,
     /// True once we've allocated the window and models.
     initialised: bool,
@@ -346,9 +349,9 @@ impl Decoder {
                 )?,
             };
             let byte = (sym & 0xFF) as u8;
-            self.window[self.window_posn & self.window_mask] = byte;
-            let start = self.window_posn & self.window_mask;
-            self.window_posn += 1;
+            self.window[self.window_posn] = byte;
+            let start = self.window_posn;
+            self.window_posn = (self.window_posn + 1) & self.window_mask;
             self.frame_todo -= 1;
             self.enqueue_output(start, 1);
             return Ok(());
@@ -455,10 +458,10 @@ impl Decoder {
         };
         let match_offset = pm.match_offset;
         let mut remaining = pm.remaining;
-        let mut emit_start = self.window_posn & self.window_mask;
+        let mut emit_start = self.window_posn;
         let mut emit_count = 0usize;
         while remaining > 0 {
-            let dest = self.window_posn & self.window_mask;
+            let dest = self.window_posn;
             let src = (self.window_posn.wrapping_sub(match_offset)) & self.window_mask;
             // Fast path: try to copy a non-overlapping, non-wrapping run.
             let dst_room = self.window_size - dest;
@@ -466,10 +469,10 @@ impl Decoder {
             let max_chunk = remaining.min(dst_room).min(src_room);
             if max_chunk > 1 && match_offset >= max_chunk {
                 self.window.copy_within(src..src + max_chunk, dest);
-                self.window_posn += max_chunk;
+                self.window_posn = (self.window_posn + max_chunk) & self.window_mask;
                 remaining -= max_chunk;
                 emit_count += max_chunk;
-                let next = self.window_posn & self.window_mask;
+                let next = self.window_posn;
                 if next == 0 && remaining > 0 {
                     self.enqueue_output(emit_start, emit_count);
                     emit_start = 0;
@@ -478,12 +481,12 @@ impl Decoder {
                 continue;
             }
             self.window[dest] = self.window[src];
-            self.window_posn += 1;
+            self.window_posn = (self.window_posn + 1) & self.window_mask;
             remaining -= 1;
             emit_count += 1;
             // If we're about to wrap the window, flush this run as one
             // contiguous emit and start a new one at offset 0.
-            let next = self.window_posn & self.window_mask;
+            let next = self.window_posn;
             if next == 0 && remaining > 0 {
                 self.enqueue_output(emit_start, emit_count);
                 emit_start = 0;
@@ -694,5 +697,57 @@ impl RawDecoder for Decoder {
         self.model6 = Model::new(0, i);
         self.model6len = Model::new(0, 27);
         self.model7 = Model::new(0, 7);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    /// Decode `input` with an `out_chunk`-byte output buffer until at least
+    /// `want` bytes are out, checking after every call that the write
+    /// position is a window index.
+    fn decode_prefix(input: &[u8], window_bits: u32, out_chunk: usize, want: usize) -> Vec<u8> {
+        let mut dec = Decoder::with_window_bits(window_bits).unwrap();
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; out_chunk];
+        let mut pos = 0usize;
+        while out.len() < want {
+            let p = dec.raw_decode(&input[pos..], &mut buf).unwrap();
+            assert!(
+                dec.window_posn < dec.window_size,
+                "window_posn {} after {} bytes",
+                dec.window_posn,
+                out.len() + p.written
+            );
+            assert!(p.consumed > 0 || p.written > 0, "decoder stalled");
+            pos += p.consumed;
+            out.extend_from_slice(&buf[..p.written]);
+        }
+        out.truncate(want);
+        out
+    }
+
+    /// `window_posn` used to count every byte ever produced and was only
+    /// masked where it was used, so on a 32-bit target it overflowed after
+    /// 4 GiB of output (a panic with overflow checks on; an all-0xFF input
+    /// expands ~213x and never ends). It is now kept as a window index.
+    #[test]
+    fn window_posn_stays_inside_the_window() {
+        let input = vec![0xFFu8; 4096];
+        for window_bits in [10, 12, 15] {
+            // Many times around the window, through literals and matches
+            // that straddle its end.
+            let want = 40 << window_bits.min(12);
+            let whole = decode_prefix(&input, window_bits, 1 << 16, want);
+            assert_eq!(whole.len(), want);
+            for out_chunk in [1, 7, 1000] {
+                assert!(
+                    decode_prefix(&input, window_bits, out_chunk, want) == whole,
+                    "window_bits={window_bits} out_chunk={out_chunk}"
+                );
+            }
+        }
     }
 }
