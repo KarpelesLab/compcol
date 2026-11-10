@@ -32,6 +32,12 @@ Targets currently shipped (one binary each):
 | `decoder_lzma`       | Legacy `.lzma` decoder                                  |
 | `decoder_xz`         | `.xz` container decoder                                 |
 | `decoder_lz4`        | LZ4 block format decoder                                |
+| `limited_dispatch`   | `LimitedDecoder` over every factory decoder: cap holds, no stall |
+| `chunked_vs_oneshot` | Differential: chunked decode must match one-shot decode |
+| `hpack_qpack`        | HPACK / QPACK table logic and header-list size caps     |
+
+(The table is not exhaustive: `fuzz/Cargo.toml` is the list of targets,
+and the CI matrix mirrors it.)
 
 Every target drives the decoder over arbitrary input bytes and
 asserts no panic, abort, or undefined behavior. The decoder is
@@ -39,6 +45,13 @@ allowed to return any `compcol::Error`; the property is purely "does
 not crash". This catches index-out-of-bounds, integer overflow,
 denial-of-service infinite loops (via a `steps > 4096` guard), and
 stack overflows.
+
+The newer targets (`limited_dispatch`, `chunked_vs_oneshot`, and the
+`decoder_*` targets that `mod common;`) share the driver in
+`fuzz_targets/common/mod.rs`, which is stricter: a `decode` call that
+reports `OutputFull` without consuming or writing anything, twice in a
+row with the same arguments, is a stall and panics instead of quietly
+ending the run.
 
 ## CI
 
