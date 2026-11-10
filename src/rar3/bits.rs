@@ -31,6 +31,28 @@ impl BitReader {
         Self::default()
     }
 
+    /// A reader positioned at the start of `bytes`, taking ownership of them
+    /// (no copy).
+    pub fn from_vec(bytes: alloc::vec::Vec<u8>) -> Self {
+        Self {
+            buf: bytes,
+            ..Self::default()
+        }
+    }
+
+    /// Lend the underlying byte buffer out, leaving the reader empty. The
+    /// PPMd path reads the same bytes through the range decoder; the caller
+    /// hands them back with [`restore_buf`](Self::restore_buf) and then
+    /// repositions the reader with [`seek_byte`](Self::seek_byte).
+    pub fn take_buf(&mut self) -> alloc::vec::Vec<u8> {
+        core::mem::take(&mut self.buf)
+    }
+
+    /// Give back the buffer lent out by [`take_buf`](Self::take_buf).
+    pub fn restore_buf(&mut self, bytes: alloc::vec::Vec<u8>) {
+        self.buf = bytes;
+    }
+
     /// Append raw bytes to the input buffer.
     pub fn feed_slice(&mut self, bytes: &[u8]) {
         self.buf.extend_from_slice(bytes);

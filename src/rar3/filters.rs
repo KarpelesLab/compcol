@@ -156,10 +156,84 @@ pub fn apply_e8_filter(data: &mut [u8], data_start_offset: u64, translate_e9: bo
     }
 }
 
+/// Incremental form of [`apply_e8_filter`] for a stream whose bytes become
+/// available a piece at a time.
+///
+/// `data` is a slice of the stream whose first byte sits at stream offset
+/// `base`; the scan resumes at index `from` (where the previous call
+/// stopped) and handles every call site whose five bytes lie inside `data`.
+/// Returns the index it stopped at: everything before it is final, and the
+/// next call must resume there once more bytes have been appended. At the
+/// end of the stream the up-to-four bytes left over are final as they are
+/// (the one-shot filter never rewrites an opcode with fewer than four bytes
+/// after it).
+///
+/// Running this over any split of a stream produces exactly what one
+/// [`apply_e8_filter`] call over the whole stream at offset 0 does.
+pub(super) fn apply_e8_filter_from(
+    data: &mut [u8],
+    base: u64,
+    from: usize,
+    translate_e9: bool,
+) -> usize {
+    let mut i = from;
+    while i + 5 <= data.len() {
+        let b = data[i];
+        if b == 0xE8 || (translate_e9 && b == 0xE9) {
+            let cur_pos = (base + i as u64 + 1) as i32;
+            let rel = i32::from_le_bytes([data[i + 1], data[i + 2], data[i + 3], data[i + 4]]);
+            data[i + 1..i + 5].copy_from_slice(&rel.wrapping_sub(cur_pos).to_le_bytes());
+            i += 5;
+        } else {
+            i += 1;
+        }
+    }
+    i
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     extern crate std;
+
+    /// The incremental scan equals the one-shot filter however the stream
+    /// is cut up, including cuts inside a call site and with the consumed
+    /// prefix dropped between calls.
+    #[test]
+    fn incremental_e8_matches_one_shot() {
+        let mut seed = 0x1234_5678u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 24
+        };
+        let src: std::vec::Vec<u8> = (0..4000)
+            .map(|_| match next() % 5 {
+                0 => 0xE8,
+                1 => 0xE9,
+                _ => next() as u8,
+            })
+            .collect();
+        for translate_e9 in [false, true] {
+            let mut want = src.clone();
+            apply_e8_filter(&mut want, 0, translate_e9);
+            for step in [1usize, 2, 3, 4, 5, 6, 7, 64, 4000] {
+                let mut got = std::vec::Vec::new();
+                // `held` is the not-yet-final tail, starting at `base`.
+                let mut held = std::vec::Vec::new();
+                let mut base = 0u64;
+                let mut from = 0usize;
+                for piece in src.chunks(step) {
+                    held.extend_from_slice(piece);
+                    from = apply_e8_filter_from(&mut held, base, from, translate_e9);
+                    got.extend(held.drain(..from));
+                    base += from as u64;
+                    from = 0;
+                }
+                got.extend_from_slice(&held);
+                assert_eq!(got, want, "step {step}, e9 {translate_e9}");
+            }
+        }
+    }
 
     #[test]
     fn ignores_short_buffers() {
