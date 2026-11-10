@@ -665,6 +665,33 @@ fn missing_end_marker_is_unexpected_end() {
     assert_eq!((p.written, status), (0, Status::StreamEnd));
 }
 
+/// A `bvx2` block claiming close to `u32::MAX` raw bytes, decoded on top of
+/// existing history: the output-size checks added the history length to
+/// `n_raw_bytes`, which overflows `usize` on 32-bit targets (a panic with
+/// overflow checks on). It must be a plain `Corrupt` everywhere.
+#[test]
+fn bvx2_huge_n_raw_with_history_is_corrupt() {
+    use compcol::vec::{compress_to_vec, decompress_to_vec_capped};
+
+    let data: Vec<u8> = (0..8000).map(|i| b"abcdefgh"[i % 7]).collect();
+    let v2 = compress_to_vec::<Lzfse>(&data).unwrap();
+    assert_eq!(&v2[..4], b"bvx2");
+    for n_raw in [u32::MAX, u32::MAX - 1, u32::MAX - 8000, 1 << 31, 8001] {
+        let mut bad = v2.clone();
+        bad[4..8].copy_from_slice(&n_raw.to_le_bytes());
+        for history in [&b""[..], b"x", &data] {
+            let mut stream = make_uncompressed_block(history);
+            stream.extend_from_slice(&bad);
+            assert_eq!(
+                decompress_to_vec_capped::<Lzfse>(&stream, 1 << 20),
+                Err(Error::Corrupt),
+                "n_raw={n_raw} history={}",
+                history.len()
+            );
+        }
+    }
+}
+
 /// The encoder ends every stream with `bvx$`, whatever was flushed before.
 #[test]
 fn encoder_always_writes_end_marker() {
