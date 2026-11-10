@@ -1318,8 +1318,10 @@ pub struct Decoder {
     /// properties byte. Set when a Block Header is parsed.
     lzma2_dict_size: u32,
     /// Lazily-instantiated LZMA core, persists across chunks subject to
-    /// reset bits in each chunk's control byte. Allocated on first
-    /// compressed chunk and dropped when the block ends.
+    /// reset bits in each chunk's control byte. Allocated on the first
+    /// chunk and kept across Blocks (each Block's first chunk resets its
+    /// dictionary), so neither a dictionary-reset chunk nor a new Block
+    /// costs an allocation; dropped when the Streams are over.
     lzma_core: Option<Box<LzmaCore>>,
     /// True until the first chunk of a block is parsed. The LZMA2 spec
     /// requires the first chunk of any block to be a "full reset" chunk
@@ -1404,23 +1406,43 @@ impl Decoder {
         }
     }
 
-    /// Feed raw uncompressed-chunk bytes into the LZMA2 dictionary so a later
-    /// dictionary-continuing compressed chunk can reference them. Creates the
-    /// `lzma_core` on first use (canonical default props; the next compressed
-    /// chunk's reset bits replace them) sized to the block's dictionary.
-    fn feed_uncompressed_dict(&mut self, src: &[u8]) {
-        if self.lzma_core.is_none() {
-            // Props are irrelevant for plain dict population; use the canonical
-            // default (lc=3, lp=0, pb=2). `parse` cannot fail for this byte.
-            let props = Lzma2Props::parse(LZMA2_PROPS_BYTE).unwrap_or(Lzma2Props {
-                lc: 3,
-                lp: 0,
-                pb: 2,
-            });
-            let dict_size = (self.lzma2_dict_size as usize).clamp(4096, 128 * 1024 * 1024);
-            self.lzma_core = Some(Box::new(LzmaCore::new(props, dict_size)));
-            self.last_props = LZMA2_PROPS_BYTE;
+    /// The current Block's LZMA2 dictionary size, clamped to what we are
+    /// willing to allocate: at least 4 KiB (the format's minimum) and at
+    /// most 128 MiB, to bound memory (legitimate xz outputs almost never
+    /// need more than 64 MiB). The dictionary buffer itself grows only with
+    /// the bytes actually decoded.
+    fn block_dict_size(&self) -> usize {
+        (self.lzma2_dict_size as usize).clamp(4096, 128 * 1024 * 1024)
+    }
+
+    /// Apply the dictionary reset of an uncompressed `0x01` chunk. The core
+    /// (probability tables and dictionary allocation) is reused whenever it
+    /// was built for this Block's dictionary size: a 4-byte `0x01` chunk
+    /// must not cost an allocation, let alone one of the whole dictionary.
+    /// With no usable core yet, one is created with the canonical default
+    /// props, which are irrelevant for plain dictionary population.
+    fn reset_dict_for_uncompressed(&mut self) {
+        let dict_size = self.block_dict_size();
+        match self.lzma_core.as_mut() {
+            Some(core) if core.dict_capacity() == dict_size => core.reset_dict(),
+            _ => {
+                // `parse` cannot fail for this byte.
+                let props = Lzma2Props::parse(LZMA2_PROPS_BYTE).unwrap_or(Lzma2Props {
+                    lc: 3,
+                    lp: 0,
+                    pb: 2,
+                });
+                self.lzma_core = Some(Box::new(LzmaCore::new(props, dict_size)));
+                self.last_props = LZMA2_PROPS_BYTE;
+            }
         }
+    }
+
+    /// Feed raw uncompressed-chunk bytes into the LZMA2 dictionary so a later
+    /// dictionary-continuing compressed chunk can reference them. The core
+    /// exists by then: a Block's first chunk resets the dictionary, which
+    /// creates it.
+    fn feed_uncompressed_dict(&mut self, src: &[u8]) {
         if let Some(core) = self.lzma_core.as_mut() {
             core.append_literals(src);
         }
@@ -1669,7 +1691,6 @@ impl RawDecoder for Decoder {
                             self.block_compressed_seen = 0;
                             self.block_uncompressed_seen = 0;
                             self.check = BlockCheck::new(self.check_id);
-                            self.lzma_core = None;
                             self.expecting_block_first_chunk = true;
                             self.phase = DecPhase::BlockHeader;
                         }
@@ -1728,8 +1749,8 @@ impl RawDecoder for Decoder {
                             return Err(self.poison(e));
                         }
                         // Free the (potentially MiB-sized) compressed-chunk
-                        // working buffers now that the block has ended.
-                        self.lzma_core = None;
+                        // working buffers now that the block has ended. The
+                        // LZMA core stays for the next Block.
                         self.comp_buf = Vec::new();
                         self.comp_decoded = Vec::new();
                         self.phase = DecPhase::BlockPadding;
@@ -1741,9 +1762,11 @@ impl RawDecoder for Decoder {
                             return Err(self.poison(Error::Corrupt));
                         }
                         // 0x01 also resets the LZ dictionary in any
-                        // straddling compressed state.
+                        // straddling compressed state. (Re-running this
+                        // while the chunk header is still incomplete is
+                        // harmless: nothing is written in between.)
                         if control == 0x01 {
-                            self.lzma_core = None;
+                            self.reset_dict_for_uncompressed();
                         }
                         self.expecting_block_first_chunk = false;
                         self.scratch_want = 3;
@@ -1830,12 +1853,9 @@ impl RawDecoder for Decoder {
                             Ok(p) => p,
                             Err(e) => return Err(self.poison(e)),
                         };
-                        let dict_size = (self.lzma2_dict_size as usize).max(4096);
-                        // Cap at 128 MiB to bound memory; legitimate xz
-                        // outputs almost never need more than 64 MiB.
-                        let dict_size = dict_size.min(128 * 1024 * 1024);
+                        let dict_size = self.block_dict_size();
                         match self.lzma_core.as_mut() {
-                            Some(core) if core.dict_capacity() == dict_size.max(1) => {
+                            Some(core) if core.dict_capacity() == dict_size => {
                                 core.reset_full(props);
                             }
                             _ => {
@@ -2019,12 +2039,7 @@ impl RawDecoder for Decoder {
                         self.check.update(src);
                         // Feed the raw bytes into the LZ dictionary so a later
                         // dictionary-continuing compressed chunk (`0xC0`) can
-                        // back-reference them. Lazily create the core (with the
-                        // block's dict size and the canonical default props —
-                        // props don't affect plain dict population, and the
-                        // next compressed chunk resets them) when none exists
-                        // yet, e.g. when the block opens with an uncompressed
-                        // chunk.
+                        // back-reference them.
                         self.feed_uncompressed_dict(src);
                         self.block_compressed_seen += take as u64;
                         self.block_uncompressed_seen += take as u64;
@@ -2275,6 +2290,7 @@ impl RawDecoder for Decoder {
                         // Nothing (or a partial magic, which is not a
                         // Stream) follows: the Streams are over.
                         self.scratch.clear();
+                        self.lzma_core = None;
                         self.phase = DecPhase::Done;
                         continue;
                     }
@@ -2313,6 +2329,7 @@ impl RawDecoder for Decoder {
                         // earlier call's had already been buffered), so the
                         // caller sees where the xz data stops.
                         self.scratch.clear();
+                        self.lzma_core = None;
                         self.phase = DecPhase::Done;
                         continue;
                     }
@@ -2376,5 +2393,90 @@ impl RawDecoder for Decoder {
 
     fn raw_reset(&mut self) {
         *self = Self::new();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lzma2_internal::lzma2_decoder::test_stats;
+    use crate::traits::Decoder as _;
+    use alloc::vec;
+
+    /// Stream Header (no Check) + a Block Header declaring LZMA2 with the
+    /// given dictionary-size flag, ready for LZMA2 chunks to be appended.
+    fn stream_prefix(dict_flag: u8) -> Vec<u8> {
+        let mut s = vec![0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0x00, 0x00];
+        let c = crc32(&s[6..8]);
+        s.extend_from_slice(&c.to_le_bytes());
+        let mut bh = vec![0x02, 0x00, 0x21, 0x01, dict_flag, 0, 0, 0];
+        let c = crc32(&bh);
+        bh.extend_from_slice(&c.to_le_bytes());
+        s.extend_from_slice(&bh);
+        s
+    }
+
+    /// Feed all of `s`, returning the number of bytes decoded.
+    fn decode_counting(s: &[u8]) -> usize {
+        let mut dec = Decoder::new();
+        let mut out = vec![0u8; 1 << 12];
+        let (mut pos, mut total) = (0, 0);
+        while pos < s.len() {
+            let (p, _) = dec.decode(&s[pos..], &mut out).unwrap();
+            pos += p.consumed;
+            total += p.written;
+            assert!(p.consumed != 0 || p.written != 0, "no progress");
+        }
+        total
+    }
+
+    /// Every `0x01` chunk used to drop the LZMA core and build a new one,
+    /// allocating and zeroing the Block's whole declared dictionary (24 MiB
+    /// here) for each 4 bytes of input.
+    #[test]
+    fn dict_reset_chunks_do_not_reallocate_the_dictionary() {
+        let mut s = stream_prefix(25);
+        for i in 0..2500u32 {
+            s.extend_from_slice(&[0x01, 0x00, 0x00, i as u8]);
+        }
+        test_stats::reset();
+        assert_eq!(decode_counting(&s), 2500);
+        assert!(
+            test_stats::cores_built() <= 1,
+            "{}",
+            test_stats::cores_built()
+        );
+        // 2500 bytes of output need nowhere near the declared 24 MiB.
+        assert!(
+            test_stats::dict_bytes() <= 1 << 16,
+            "{}",
+            test_stats::dict_bytes()
+        );
+    }
+
+    /// The core (and its dictionary) used to be dropped at the end of every
+    /// Block and rebuilt for the next one.
+    #[test]
+    fn core_is_kept_across_blocks() {
+        let mut s = stream_prefix(25);
+        s.truncate(12);
+        for i in 0..200u32 {
+            // Block Header, one 1-byte chunk, end marker, 3 bytes of Block
+            // Padding (12 + 5 = 17), no Check.
+            s.extend_from_slice(&stream_prefix(25)[12..]);
+            s.extend_from_slice(&[0x01, 0x00, 0x00, i as u8, 0x00, 0, 0, 0]);
+        }
+        test_stats::reset();
+        assert_eq!(decode_counting(&s), 200);
+        assert!(
+            test_stats::cores_built() <= 1,
+            "{}",
+            test_stats::cores_built()
+        );
+        assert!(
+            test_stats::dict_bytes() <= 1 << 16,
+            "{}",
+            test_stats::dict_bytes()
+        );
     }
 }

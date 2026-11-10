@@ -679,19 +679,31 @@ impl Decoder {
         e
     }
 
+    /// Apply the dictionary reset of an uncompressed `0x01` chunk. An
+    /// existing core (probability tables and dictionary allocation) is
+    /// reused: a 4-byte `0x01` chunk must not cost an allocation, let alone
+    /// one of the whole dictionary. With no core yet (the stream opens with
+    /// an uncompressed chunk) one is created with the canonical default
+    /// props, which are irrelevant for plain dictionary population.
+    fn reset_dict_for_uncompressed(&mut self) {
+        match self.lzma_core.as_mut() {
+            Some(core) => core.reset_dict(),
+            None => {
+                let props = Lzma2Props::parse(LZMA2_PROPS_BYTE).unwrap_or(Lzma2Props {
+                    lc: 3,
+                    lp: 0,
+                    pb: 2,
+                });
+                self.lzma_core = Some(Box::new(LzmaCore::new(props, self.dict_size)));
+            }
+        }
+    }
+
     /// Feed raw uncompressed-chunk bytes into the LZMA2 dictionary so a later
     /// dictionary-continuing compressed chunk (`0xC0`) can reference them.
-    /// Lazily creates `lzma_core` (canonical default props, sized to the
-    /// configured dictionary) when the stream opens with an uncompressed chunk.
+    /// The core exists by then: the stream's first chunk resets the
+    /// dictionary, which creates it.
     fn feed_uncompressed_dict(&mut self, src: &[u8]) {
-        if self.lzma_core.is_none() {
-            let props = Lzma2Props::parse(LZMA2_PROPS_BYTE).unwrap_or(Lzma2Props {
-                lc: 3,
-                lp: 0,
-                pb: 2,
-            });
-            self.lzma_core = Some(Box::new(LzmaCore::new(props, self.dict_size)));
-        }
         if let Some(core) = self.lzma_core.as_mut() {
             core.append_literals(src);
         }
@@ -746,7 +758,7 @@ impl RawDecoder for Decoder {
                         }
                         if control == 0x01 {
                             // Dictionary reset clears any straddling LZ state.
-                            self.lzma_core = None;
+                            self.reset_dict_for_uncompressed();
                         }
                         self.expecting_first = false;
                         self.scratch_want = 2;
@@ -792,11 +804,7 @@ impl RawDecoder for Decoder {
                         output[written..written + take].copy_from_slice(src);
                         // Feed the bytes into the LZ window so a later
                         // dictionary-continuing compressed chunk (`0xC0`) can
-                        // back-reference them. Lazily create the core (canonical
-                        // default props — irrelevant for plain dict population,
-                        // and replaced by the next compressed chunk's reset
-                        // bits) when none exists yet, e.g. when the stream opens
-                        // with an uncompressed chunk.
+                        // back-reference them.
                         self.feed_uncompressed_dict(src);
                         self.chunk_remaining -= take;
                         consumed += take;
@@ -1363,5 +1371,43 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a, s1, "reset output diverged from a fresh encoder");
         assert_eq!(decode_all(&a, data.len()).unwrap(), data);
+    }
+
+    /// Every `0x01` chunk used to drop the LZMA core and build a new one,
+    /// allocating and zeroing the whole configured dictionary (24 MiB here)
+    /// for each 4 bytes of input.
+    #[test]
+    fn dict_reset_chunks_do_not_reallocate_the_dictionary() {
+        use crate::lzma2_internal::lzma2_decoder::test_stats;
+        let mut s = Vec::new();
+        for i in 0..2500u32 {
+            s.extend_from_slice(&[0x01, 0x00, 0x00, i as u8]);
+        }
+        s.push(0x00);
+        test_stats::reset();
+        let mut dec = Decoder::new(DecoderConfig::with_dict_prop(25));
+        let mut out = vec![0u8; 1 << 12];
+        let (mut pos, mut total) = (0, 0);
+        loop {
+            let (p, st) = dec.decode(&s[pos..], &mut out).unwrap();
+            pos += p.consumed;
+            total += p.written;
+            if st == Status::StreamEnd {
+                break;
+            }
+            assert!(p.consumed != 0 || p.written != 0, "no progress");
+        }
+        assert_eq!(total, 2500);
+        assert!(
+            test_stats::cores_built() <= 1,
+            "{}",
+            test_stats::cores_built()
+        );
+        // 2500 bytes of output need nowhere near the declared 24 MiB.
+        assert!(
+            test_stats::dict_bytes() <= 1 << 16,
+            "{}",
+            test_stats::dict_bytes()
+        );
     }
 }

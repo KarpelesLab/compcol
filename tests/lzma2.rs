@@ -584,3 +584,175 @@ fn flushes_interoperate_with_system_xz_raw() {
         assert!(out.status.success() && out.stdout == given, "{mode:?}");
     }
 }
+
+// ─── hand-built compressed chunks ───────────────────────────────────────
+
+/// A minimal LZMA range encoder for hand-built payloads. Every bit goes
+/// through a probability that is still at its initial value (1/2), which is
+/// all the short payloads below need.
+struct FreshBitEncoder {
+    low: u64,
+    range: u32,
+    cache: u8,
+    cache_size: u64,
+    out: Vec<u8>,
+}
+
+impl FreshBitEncoder {
+    fn new() -> Self {
+        Self {
+            low: 0,
+            range: 0xFFFF_FFFF,
+            cache: 0,
+            cache_size: 1,
+            out: Vec::new(),
+        }
+    }
+
+    fn shift_low(&mut self) {
+        if (self.low as u32) < 0xFF00_0000 || (self.low >> 32) != 0 {
+            let carry = (self.low >> 32) as u8;
+            let mut byte = self.cache;
+            loop {
+                self.out.push(byte.wrapping_add(carry));
+                byte = 0xFF;
+                self.cache_size -= 1;
+                if self.cache_size == 0 {
+                    break;
+                }
+            }
+            self.cache = (self.low >> 24) as u8;
+        }
+        self.cache_size += 1;
+        self.low = (self.low & 0x00FF_FFFF) << 8;
+    }
+
+    fn bits(&mut self, bits: &[u8]) {
+        for &bit in bits {
+            let bound = (self.range >> 11) * 1024;
+            if bit == 0 {
+                self.range = bound;
+            } else {
+                self.low += bound as u64;
+                self.range -= bound;
+            }
+            while self.range < 1 << 24 {
+                self.range <<= 8;
+                self.shift_low();
+            }
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        for _ in 0..5 {
+            self.shift_low();
+        }
+        self.out
+    }
+}
+
+/// The LZMA payload of a chunk that is one match of length 2 at distance 9
+/// (the bytes 9 and 8 back), decoded from a freshly reset state at a
+/// position that is a multiple of 4.
+fn match_len2_dist9_payload() -> Vec<u8> {
+    let mut rc = FreshBitEncoder::new();
+    rc.bits(&[1]); // is_match: a match
+    rc.bits(&[0]); // is_rep: a new distance
+    rc.bits(&[0, 0, 0, 0]); // length: "low" choice, symbol 0 → 2
+    rc.bits(&[0, 0, 0, 1, 1, 0]); // distance slot 6 → base 8, 2 more bits
+    rc.bits(&[0, 0]); // the 2 reverse-coded bits → distance 8 (9 back)
+    rc.finish()
+}
+
+/// `control` + sizes + properties (lc=3, lp=0, pb=2) + `payload`, for a
+/// compressed chunk of `uncomp` bytes carrying a properties byte.
+fn compressed_chunk(control: u8, uncomp: usize, payload: &[u8]) -> Vec<u8> {
+    assert!(control >= 0xC0 && uncomp - 1 < 1 << 16);
+    let mut c = vec![control, ((uncomp - 1) >> 8) as u8, (uncomp - 1) as u8];
+    c.extend_from_slice(&[((payload.len() - 1) >> 8) as u8, (payload.len() - 1) as u8]);
+    c.push(0x5D);
+    c.extend_from_slice(payload);
+    c
+}
+
+fn stored_chunk(control: u8, data: &[u8]) -> Vec<u8> {
+    let mut c = vec![
+        control,
+        ((data.len() - 1) >> 8) as u8,
+        (data.len() - 1) as u8,
+    ];
+    c.extend_from_slice(data);
+    c
+}
+
+/// A dictionary reset keeps the decoder's dictionary buffer (re-allocating
+/// it per `0x01` chunk was a CPU DoS), so the bytes from before the reset
+/// are still in memory: no match may reach them.
+#[test]
+fn match_cannot_reach_bytes_from_before_a_dictionary_reset() {
+    let first: &[u8] = b"0123456789abcdef";
+    let second: &[u8] = b"ABCDEFGH";
+    let tail = compressed_chunk(0xC0, 2, &match_len2_dist9_payload());
+
+    // The hand-built match works: straight after `first` it copies the
+    // bytes 9 and 8 back.
+    let mut s = stored_chunk(0x01, first);
+    s.extend_from_slice(&tail);
+    s.push(0x00);
+    let got = decode_all(&s, DecoderConfig::default(), 64).unwrap();
+    assert_eq!(got, b"0123456789abcdef78");
+
+    // With `second` appended to the same dictionary (0x02: no reset) the
+    // match reaches back into `first`.
+    let mut s = stored_chunk(0x01, first);
+    s.extend_from_slice(&stored_chunk(0x02, second));
+    s.extend_from_slice(&tail);
+    s.push(0x00);
+    let got = decode_all(&s, DecoderConfig::default(), 64).unwrap();
+    assert_eq!(got, b"0123456789abcdefABCDEFGHfA");
+
+    // After a dictionary reset (0x01) only `second`'s 8 bytes exist: a
+    // match 9 back is corrupt, not a read of what the buffer still holds.
+    let mut s = stored_chunk(0x01, first);
+    s.extend_from_slice(&stored_chunk(0x01, second));
+    s.extend_from_slice(&tail);
+    s.push(0x00);
+    let r = decode_all(&s, DecoderConfig::default(), 64);
+    assert_eq!(r, Err(Error::Corrupt));
+
+    // The same through a full-reset compressed chunk: 0xE0 resets the
+    // dictionary itself, so nothing at all can be referenced.
+    let mut s = stored_chunk(0x01, first);
+    s.extend_from_slice(&compressed_chunk(0xE0, 2, &match_len2_dist9_payload()));
+    s.push(0x00);
+    let r = decode_all(&s, DecoderConfig::default(), 64);
+    assert_eq!(r, Err(Error::Corrupt));
+}
+
+/// The dictionary buffer grows with the output instead of being allocated
+/// up front, and wraps only at the configured size: decode data several
+/// times larger than a small dictionary, through stored and compressed
+/// chunks, with matches all along (so also across the wrap).
+#[test]
+fn lazily_grown_dictionary_wraps_at_its_size() {
+    let mut s = stored_chunk(0x01, b"0123456789abcdef");
+    let mut want: Vec<u8> = b"0123456789abcdef".to_vec();
+    let payload = match_len2_dist9_payload();
+    let mut i = 0u32;
+    while want.len() < 20_000 {
+        // Sized to keep the position a multiple of 4 for the hand-built
+        // payload: 4k + 2 stored bytes, then the 2 matched ones.
+        let stored: Vec<u8> = (0..(10 + 4 * (i % 300)))
+            .map(|j| j.wrapping_mul(i + 7) as u8)
+            .collect();
+        s.extend_from_slice(&stored_chunk(0x02, &stored));
+        want.extend_from_slice(&stored);
+        s.extend_from_slice(&compressed_chunk(0xC0, 2, &payload));
+        let n = want.len();
+        want.extend_from_within(n - 9..n - 7);
+        i += 1;
+    }
+    s.push(0x00);
+    let got = decode_all(&s, DecoderConfig::with_dict_size(4096), want.len()).unwrap();
+    assert!(got == want);
+}
