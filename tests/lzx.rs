@@ -957,6 +957,57 @@ fn total_reached_mid_match_ignores_what_follows() {
     assert_eq!(try_decode_all_ways(&s), Ok(vec![0u8; k as usize + 1]));
 }
 
+/// Every chunking of input and output gives the same result, and no proper
+/// prefix of a small stream decodes to anything but the full output.
+#[test]
+fn chunking_and_truncation_differential() {
+    let mut cases: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for n in [0usize, 1, 2, 3, 100, 101, 4096, 40_001, 70_000] {
+        let data = lorem(n);
+        let enc = encode_chunked(&data, data.len().max(1), 4096);
+        cases.push((enc, data));
+    }
+    // Verbatim blocks, alone and followed by an (odd) uncompressed block;
+    // the larger ones cross a 32 KiB frame boundary.
+    let mut lens = [0u8; 256];
+    for (k, l) in lens.iter_mut().enumerate().take(16) {
+        *l = k as u8 + 1;
+    }
+    lens[16] = 16;
+    for n in [5usize, 64, 333, 33_000] {
+        let data: Vec<u8> = (0..n).map(|i| (i % 5) as u8).collect();
+        let tail: Vec<u8> = (0..37u32).map(|i| (i * 3) as u8).collect();
+        for with_tail in [false, true] {
+            let mut w = BitW::new();
+            w.put(1, 0);
+            if n > 32_768 {
+                put_verbatim_literals(&mut w, 16, &data, true);
+            } else {
+                put_verbatim_with_lens(&mut w, 16, &lens, &data);
+            }
+            let mut want = data.clone();
+            if with_tail {
+                put_uncompressed_block(&mut w, &tail);
+                want.extend_from_slice(&tail);
+            } else if w.n != 0 {
+                w.put(16 - w.n, 0);
+            }
+            cases.push((w.framed(16, want.len()), want));
+        }
+    }
+    for (stream, want) in &cases {
+        assert_eq!(
+            try_decode_all_ways(stream).as_deref(),
+            Ok(&want[..]),
+            "{} bytes",
+            want.len()
+        );
+        if stream.len() <= 400 {
+            check_prefixes(stream, want);
+        }
+    }
+}
+
 /// `finish` with no room for output is not an error while bytes are still
 /// owed: it used to report `UnexpectedEnd` and poison a healthy decoder.
 /// On a stream that really is truncated it must still fail, not stall.
