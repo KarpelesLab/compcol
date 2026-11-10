@@ -107,7 +107,8 @@ struct RunCtx {
     frame_ready: bool,
     /// `finish` has appended one zero word past the end of the input. A
     /// Huffman decode looks ahead by the tree's longest code, which can run
-    /// past the last real bit; libmspack pads the input the same way.
+    /// past the last real bit; libmspack pads the input the same way. The
+    /// pad may only be looked at: consuming any of it is `UnexpectedEnd`.
     eof_padded: bool,
 }
 
@@ -391,12 +392,18 @@ impl RawDecoder for Decoder {
         let mut written = 0usize;
         if let DecState::Running(ctx) = &mut self.state {
             drain_frame(ctx, output, &mut written);
-            if !ctx.eof_padded && ctx.bit_reader.can_accept_word() {
-                ctx.bit_reader.feed(0);
-                ctx.bit_reader.feed(0);
+            if !ctx.eof_padded && ctx.bit_reader.can_pad_eof() {
+                ctx.bit_reader.pad_eof();
                 ctx.eof_padded = true;
             }
-            if let Err(e) = step(ctx) {
+            let res = step(ctx);
+            // The pad is lookahead only. If any of it was consumed, the
+            // stream ended before its data did — whatever those bits then
+            // decoded to (output bytes, or some other error) is meaningless.
+            if ctx.bit_reader.eof_pad_consumed() {
+                return Err(self.poison(Error::UnexpectedEnd));
+            }
+            if let Err(e) = res {
                 return Err(self.poison(e));
             }
             drain_frame(ctx, output, &mut written);
@@ -687,12 +694,24 @@ fn step(ctx: &mut RunCtx) -> Result<(), Error> {
                             if ctx.bit_reader.bits_available() < 16 {
                                 break;
                             }
-                            let word = ctx.bit_reader.peek(16);
-                            ctx.bit_reader.drop_bits(16);
-                            if remaining > 1 {
-                                carry = Some((word >> 8) as u8);
+                            // The block's last byte may be the last byte of
+                            // the stream, its pad byte left off.
+                            let half = if remaining == 1 {
+                                ctx.bit_reader.take_eof_half_byte()
+                            } else {
+                                None
+                            };
+                            match half {
+                                Some(b) => b,
+                                None => {
+                                    let word = ctx.bit_reader.peek(16);
+                                    ctx.bit_reader.drop_bits(16);
+                                    if remaining > 1 {
+                                        carry = Some((word >> 8) as u8);
+                                    }
+                                    (word & 0xFF) as u8
+                                }
                             }
-                            (word & 0xFF) as u8
                         }
                     };
                     emit_window(ctx, b);
