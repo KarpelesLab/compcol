@@ -1229,3 +1229,91 @@ fn flushed_compressible_stream_round_trips() {
         assert!(out.status.success() && out.stdout == given);
     }
 }
+
+// ─── more than 4 GiB of input ────────────────────────────────────────────
+//
+// The encoders' absolute input offsets used to be `usize`, so on 32-bit
+// targets they wrapped at 4 GiB: `.lzma` silently dropped data, xz and
+// lzma2 buffered without bound and then panicked. These stream a little
+// over 4 GiB through an encoder straight into a decoder and compare the
+// byte counts. They take minutes, so they are ignored by default; run on a
+// 32-bit target with
+// `cargo test --release --target i686-unknown-linux-gnu --features all
+//  --test lzma -- --ignored four_gib`.
+// The quick always-on equivalents are the `stream_encoder_crosses_4gib`
+// unit tests next to each encoder.
+
+fn four_gib_pipe<E: compcol::Encoder, D: compcol::Decoder>(mut enc: E, mut dec: D) {
+    let total: u64 = (1u64 << 32) + (64 << 20);
+    let inbuf = vec![0u8; 1 << 20];
+    let mut comp = vec![0u8; 1 << 20];
+    let mut plain = vec![0u8; 1 << 22];
+    let (mut fed, mut decoded) = (0u64, 0u64);
+    let mut feed = |b: &[u8], dec: &mut D, decoded: &mut u64| {
+        let mut c = 0;
+        loop {
+            let (p, _) = dec.decode(&b[c..], &mut plain).unwrap();
+            c += p.consumed;
+            *decoded += p.written as u64;
+            assert!(plain[..p.written].iter().all(|&x| x == 0));
+            if p.consumed == 0 && p.written == 0 {
+                break;
+            }
+        }
+    };
+    while fed < total {
+        let n = (total - fed).min(inbuf.len() as u64) as usize;
+        let mut c = 0;
+        while c < n {
+            let (p, _) = enc.encode(&inbuf[c..n], &mut comp).unwrap();
+            c += p.consumed;
+            feed(&comp[..p.written], &mut dec, &mut decoded);
+        }
+        fed += n as u64;
+    }
+    loop {
+        let (p, st) = enc.finish(&mut comp).unwrap();
+        feed(&comp[..p.written], &mut dec, &mut decoded);
+        if st == Status::StreamEnd {
+            break;
+        }
+    }
+    let mut plain = vec![0u8; 1 << 22];
+    loop {
+        let (p, st) = dec.finish(&mut plain).unwrap();
+        decoded += p.written as u64;
+        if st == Status::StreamEnd || p.written == 0 {
+            break;
+        }
+    }
+    assert_eq!(decoded, fed);
+}
+
+#[test]
+#[ignore = "streams 4 GiB; takes minutes"]
+fn four_gib_lzma() {
+    four_gib_pipe(
+        Encoder::with_config(EncoderConfig { level: 0 }),
+        Decoder::new(),
+    );
+}
+
+#[cfg(feature = "xz")]
+#[test]
+#[ignore = "streams 4 GiB; takes minutes"]
+fn four_gib_xz() {
+    four_gib_pipe(
+        compcol::xz::Encoder::with_config(compcol::xz::EncoderConfig { level: 0 }),
+        compcol::xz::Decoder::new(),
+    );
+}
+
+#[cfg(feature = "lzma2")]
+#[test]
+#[ignore = "streams 4 GiB; takes minutes"]
+fn four_gib_lzma2() {
+    four_gib_pipe(
+        compcol::lzma2::Encoder::new(),
+        compcol::lzma2::Decoder::default(),
+    );
+}
