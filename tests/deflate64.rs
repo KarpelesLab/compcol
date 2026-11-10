@@ -721,3 +721,58 @@ fn consumption_stops_at_the_end_of_the_stream() {
         }
     }
 }
+
+/// `finish` with no room while a match or a literal is waiting for output
+/// is not an error: the stream is whole, the decoder just cannot hand its
+/// data out. It reports `OutputFull` and goes on when given room. (It used
+/// to fail with `UnexpectedEnd` and poison the decoder.)
+#[test]
+fn finish_with_no_room_keeps_pending_output() {
+    let plain = [b'x'; 1000];
+    let mut enc = Encoder::new();
+    let mut encoded = vec![0u8; 1024];
+    let (p, _) = enc.encode(&plain, &mut encoded).unwrap();
+    let mut len = p.written;
+    loop {
+        let (p, status) = enc.finish(&mut encoded[len..]).unwrap();
+        len += p.written;
+        if status == Status::StreamEnd {
+            break;
+        }
+    }
+    encoded.truncate(len);
+
+    let mut dec = Decoder::new();
+    let mut buf = [0u8; 10];
+    let mut out = Vec::new();
+    let (p, status) = dec.decode(&encoded, &mut buf).unwrap();
+    out.extend_from_slice(&buf[..p.written]);
+    assert_eq!(status, Status::OutputFull);
+    let rest = &encoded[p.consumed..];
+
+    for _ in 0..3 {
+        let (p, status) = dec.finish(&mut []).unwrap();
+        assert_eq!((p.written, status), (0, Status::OutputFull));
+    }
+    // The decoder goes on from there: the rest of the input, then `finish`
+    // until the stream ends, with a call that has no room before each.
+    let mut fed = 0;
+    let mut ended = false;
+    while fed < rest.len() && !ended {
+        let (p, status) = dec.decode(&rest[fed..], &mut buf).unwrap();
+        out.extend_from_slice(&buf[..p.written]);
+        fed += p.consumed;
+        ended = status == Status::StreamEnd;
+    }
+    while !ended {
+        if out.len() < plain.len() {
+            let (p, status) = dec.finish(&mut []).unwrap();
+            assert_eq!((p.written, status), (0, Status::OutputFull));
+        }
+        let (p, status) = dec.finish(&mut buf).unwrap();
+        out.extend_from_slice(&buf[..p.written]);
+        ended = status == Status::StreamEnd;
+        assert!(ended || p.written > 0, "finish stalled");
+    }
+    assert_eq!(out, plain);
+}
