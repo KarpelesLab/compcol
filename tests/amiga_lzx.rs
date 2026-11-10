@@ -743,6 +743,171 @@ fn total_reached_mid_block_ignores_what_follows() {
     assert_eq!(try_decode_all_ways(&s), Ok(vec![0u8; k as usize + 1]));
 }
 
+/// No proper prefix of `stream` may decode successfully to anything but
+/// `want` (a prefix that only loses tolerated trailing padding may still
+/// decode in full). Returns how many prefixes decoded.
+fn check_prefixes(stream: &[u8], want: &[u8]) -> usize {
+    let mut ok = 0;
+    // From 1: zero bytes of input is, by design, the empty stream.
+    for cut in 1..stream.len() {
+        if let Ok(got) = try_decode_all_ways(&stream[..cut]) {
+            assert_eq!(got, want, "prefix of {cut}/{} bytes", stream.len());
+            ok += 1;
+        }
+    }
+    ok
+}
+
+/// A Huffman decode looks ahead by the tree's longest code. Here the last
+/// symbols are 1-bit codes but the tree's longest code is 16 bits, so near
+/// the end of the stream fewer bits remain than the lookahead wants. The
+/// decoder used to wait for bits that never come and `finish` failed with
+/// `UnexpectedEnd` (two extra zero bytes made the stream decode). `finish`
+/// now pads the input, like the CAB decoder and libmspack.
+#[test]
+fn long_max_code_near_end_of_stream() {
+    for n in 1..=40u32 {
+        let mut w = BitPacker::default();
+        put_verbatim_header(&mut w, n, &[(0, 1), (1, 2), (2, 16)]);
+        for _ in 0..n {
+            w.push(0, 1);
+        }
+        let s = framed(n as usize, &w.finish());
+        assert_eq!(try_decode_all_ways(&s), Ok(vec![0u8; n as usize]), "n={n}");
+    }
+}
+
+/// The end-of-input padding is lookahead only: a stream that really is
+/// missing its tail must not decode the padding as data.
+#[test]
+fn truncated_streams_are_still_rejected() {
+    // Zero literals coded as "0" look exactly like the padding.
+    for n in [1u32, 7, 16, 17, 33, 40] {
+        let mut w = BitPacker::default();
+        put_verbatim_header(&mut w, n, &[(0, 1), (1, 2), (2, 16)]);
+        for _ in 0..n {
+            w.push(0, 1);
+        }
+        let s = framed(n as usize, &w.finish());
+        assert_eq!(
+            try_decode_all_ways(&s[..s.len() - 2]),
+            Err(Error::UnexpectedEnd),
+            "n={n}"
+        );
+        assert_eq!(check_prefixes(&s, &vec![0u8; n as usize]), 0, "n={n}");
+    }
+
+    // Literals 0 ("10") and 1 ("0"), mixed.
+    let data: Vec<u8> = (0..29u32).map(|i| (i % 3 == 0) as u8).collect();
+    let mut w = BitPacker::default();
+    put_verbatim_header(&mut w, data.len() as u32, &[(0, 2), (1, 1), (2, 16)]);
+    for &b in &data {
+        if b == 1 {
+            w.push(0, 1);
+        } else {
+            w.push(0b10, 2);
+        }
+    }
+    let s = framed(data.len(), &w.finish());
+    assert_eq!(try_decode_all_ways(&s).as_deref(), Ok(&data[..]));
+    assert_eq!(check_prefixes(&s, &data), 0);
+
+    // Uncompressed blocks, from the encoder.
+    let data = b"hello world, this is the LZX tail!";
+    let enc = encode_chunked(data, data.len(), 256);
+    assert_eq!(try_decode_all_ways(&enc).as_deref(), Ok(&data[..]));
+    assert_eq!(
+        try_decode_all_ways(&enc[..enc.len() - 2]),
+        Err(Error::UnexpectedEnd)
+    );
+    assert_eq!(check_prefixes(&enc, data), 0);
+}
+
+/// An odd-sized final uncompressed block does not need its pad byte: there
+/// is nothing after it to align. Same rule as the CAB decoder. Dropping a
+/// data byte is still an error.
+#[test]
+fn odd_final_uncompressed_block_without_pad_byte() {
+    let data: Vec<u8> = (0..41u32).map(|i| (i * 11 + 3) as u8).collect();
+    let mut w = BitPacker::default();
+    w.push(3, 3);
+    w.push(data.len() as u32, 24);
+    let mut s = framed(data.len(), &w.finish());
+    for _ in 0..3 {
+        s.extend_from_slice(&1u32.to_le_bytes());
+    }
+    s.extend_from_slice(&data);
+    let mut padded = s.clone();
+    padded.push(0);
+    assert_eq!(try_decode_all_ways(&padded).as_deref(), Ok(&data[..]));
+    assert_eq!(try_decode_all_ways(&s).as_deref(), Ok(&data[..]));
+    assert_eq!(
+        try_decode_all_ways(&s[..s.len() - 1]),
+        Err(Error::UnexpectedEnd)
+    );
+    assert_eq!(check_prefixes(&padded, &data), 1);
+}
+
+/// Every chunking of input and output gives the same result, and no proper
+/// prefix of a small stream decodes to anything but the full output.
+#[test]
+fn chunking_and_truncation_differential() {
+    let mut cases: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for n in [0usize, 1, 2, 3, 100, 101, 4096, 40_001, 70_000] {
+        let data = lorem(n);
+        let enc = encode_chunked(&data, data.len().max(1), 4096);
+        cases.push((enc, data));
+    }
+    // Verbatim blocks: 1- and 2-bit literals under a 16-bit longest code,
+    // then an uncompressed block.
+    for n in [5usize, 64, 333] {
+        let data: Vec<u8> = (0..n).map(|i| (i % 5 == 1) as u8).collect();
+        let mut w = BitPacker::default();
+        put_verbatim_header(&mut w, n as u32, &[(0, 1), (1, 2), (2, 16)]);
+        for &b in &data {
+            if b == 0 {
+                w.push(0, 1);
+            } else {
+                w.push(0b10, 2);
+            }
+        }
+        cases.push((framed(n, &w.finish()), data.clone()));
+
+        let tail: Vec<u8> = (0..37u32).map(|i| (i * 3) as u8).collect();
+        let mut w = BitPacker::default();
+        put_verbatim_header(&mut w, n as u32, &[(0, 1), (1, 2), (2, 16)]);
+        for &b in &data {
+            if b == 0 {
+                w.push(0, 1);
+            } else {
+                w.push(0b10, 2);
+            }
+        }
+        w.push(3, 3);
+        w.push(tail.len() as u32, 24);
+        let mut bits = w.finish();
+        for _ in 0..3 {
+            bits.extend_from_slice(&1u32.to_le_bytes());
+        }
+        bits.extend_from_slice(&tail);
+        bits.push(0);
+        let mut want = data;
+        want.extend_from_slice(&tail);
+        cases.push((framed(want.len(), &bits), want));
+    }
+    for (stream, want) in &cases {
+        assert_eq!(
+            try_decode_all_ways(stream).as_deref(),
+            Ok(&want[..]),
+            "{} bytes",
+            want.len()
+        );
+        if stream.len() <= 400 {
+            check_prefixes(stream, want);
+        }
+    }
+}
+
 /// `finish` with no room for output is not an error while bytes are still
 /// owed: it used to report `UnexpectedEnd` and poison a healthy decoder.
 /// On a stream that really is truncated it must still fail, not stall.

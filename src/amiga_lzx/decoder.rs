@@ -88,6 +88,12 @@ struct RunCtx {
     stage: Vec<u8>,
     /// Cursor into `stage` for bytes already forwarded to the caller.
     stage_emitted: usize,
+    /// `finish` has appended one zero word past the end of the input. A
+    /// Huffman decode looks ahead by the tree's longest code, which can run
+    /// past the last real bit; the CAB decoder and libmspack pad the input
+    /// the same way. The pad may only be looked at: consuming any of it is
+    /// `UnexpectedEnd`.
+    eof_padded: bool,
 }
 
 enum BlockState {
@@ -261,6 +267,7 @@ impl RawDecoder for Decoder {
                         aligned_tree: None,
                         stage: Vec::with_capacity(STAGE_BYTES),
                         stage_emitted: 0,
+                        eof_padded: false,
                     };
                     // Trivially-empty streams (total == 0) skip straight to
                     // Done without parsing a single block.
@@ -398,9 +405,24 @@ fn finish_running(ctx: &mut RunCtx, output: &mut [u8], written: &mut usize) -> R
             return Ok(false);
         }
         // Nothing staged. `decode` may have stopped on a full `output` with
-        // bits still buffered, so decode on before giving up.
-        step(ctx)?;
-        if ctx.stage.is_empty() {
+        // bits still buffered, and the last Huffman codes need the pad for
+        // their lookahead, so decode on before giving up.
+        if !ctx.eof_padded && ctx.bit_reader.can_pad_eof() {
+            ctx.bit_reader.pad_eof();
+            ctx.eof_padded = true;
+        }
+        let res = step(ctx);
+        // The pad is lookahead only. If any of it was consumed, the stream
+        // ended before its data did — whatever those bits then decoded to
+        // (output bytes, or some other error) is meaningless.
+        if ctx.bit_reader.eof_pad_consumed() {
+            return Err(Error::UnexpectedEnd);
+        }
+        res?;
+        // `step` returns with bytes staged or for want of input. Out of
+        // input with the pad in place is the end; without it (the reader
+        // was too full to pad) go round again, now that bits were used.
+        if ctx.stage.is_empty() && (ctx.eof_padded || !ctx.bit_reader.can_pad_eof()) {
             return Err(Error::UnexpectedEnd);
         }
     }
@@ -572,6 +594,15 @@ fn step(ctx: &mut RunCtx) -> Result<(), Error> {
                 // An odd-sized block's pad byte is the high half of its last
                 // word, dropped by the `remaining == 0` break below.
                 while remaining > 0 && ctx.bit_reader.bits_available() >= 16 {
+                    // The block's last byte may be the last byte of the
+                    // stream, its pad byte left off.
+                    if remaining == 1
+                        && let Some(b) = ctx.bit_reader.take_eof_half_byte()
+                    {
+                        emit_window(ctx, b);
+                        remaining = 0;
+                        break;
+                    }
                     let word = ctx.bit_reader.peek(16);
                     ctx.bit_reader.drop_bits(16);
                     let lo = (word & 0xFF) as u8;
