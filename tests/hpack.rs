@@ -126,3 +126,35 @@ fn raw_mode_matches_decoder() {
     let block = enc.encode(&fields);
     assert_eq!(dec.decode(&block).unwrap(), fields);
 }
+
+/// Regression: the Huffman decode table used to be rebuilt for every
+/// Huffman-coded string (~1.5 MB allocated and filled per string, whatever
+/// its length), so a block of thousands of *empty* Huffman strings cost
+/// seconds of CPU for a few KiB of input. The table is now a compile-time
+/// `static`, making the per-string cost proportional to the string. The old
+/// code needed many seconds here; the fixed code needs a few milliseconds, so
+/// the bound below is extremely generous.
+#[test]
+fn many_empty_huffman_strings_are_cheap() {
+    // 2047 × "literal without indexing, new name": name and value are both
+    // Huffman-flagged strings of length 0. 2047 fields × 32 bytes of
+    // per-field overhead stays just inside the default 64 KiB list limit.
+    let mut block = Vec::new();
+    for _ in 0..2047 {
+        block.extend_from_slice(&[0x00, 0x80, 0x80]);
+    }
+    let mut dec = HpackDecoder::with_limits(4096, 65536);
+    let start = std::time::Instant::now();
+    let fields = dec.decode(&block).unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(fields.len(), 2047);
+    assert!(
+        fields
+            .iter()
+            .all(|f| f.name.is_empty() && f.value.is_empty())
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "4094 empty Huffman strings took {elapsed:?}"
+    );
+}

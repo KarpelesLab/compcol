@@ -95,156 +95,165 @@ pub(crate) const CODES: [(u32, u8); 257] = [
 #[cfg(test)]
 const MAX_LEN: usize = 30;
 
-// ─── byte FSA fast decoder ───────────────────────────────────────────────
+// ─── nibble FSA fast decoder ─────────────────────────────────────────────
 //
 // Bit-at-a-time canonical decoding is correct but slow (one table probe per
-// input bit). For throughput we precompute a byte-wide finite-state machine
-// over the canonical code's binary trie: each transition consumes a whole
-// input byte and emits 0..=8 complete symbols. A Huffman string then costs
-// exactly one table lookup per input byte instead of ~8 bit probes. The FSA
-// is rebuilt per `decode` call; its construction is a fixed sweep over the
-// trie (≈ states × 256 steps), negligible against any non-trivial input.
+// input bit). Instead we precompute a finite-state machine over the code's
+// binary trie whose transitions each consume four input bits: a Huffman
+// string then costs two table lookups per input byte.
+//
+// The states are the trie's 256 internal nodes (257 leaves ⇒ 256 internal
+// nodes), so a state fits a `u8`, and because the shortest codeword is five
+// bits a nibble completes at most one symbol. The whole machine is therefore
+// 256 × 16 three-byte entries (12 KiB) and is built by a `const fn` into a
+// `static`: decoding a string allocates and initialises nothing but its own
+// output. (An earlier byte-wide machine was ~1.5 MB and was rebuilt on every
+// `decode` call, which made each string — however short — cost the better
+// part of a millisecond; a header block of thousands of empty Huffman strings
+// was a cheap CPU-exhaustion vector.)
 //
 // The byte-for-byte output and every RFC 7541 §5.2 rejection (EOS symbol,
 // over-long padding, non-`1` padding) are identical to the bit-at-a-time
 // path — the FSA is just a faster way to walk the same trie.
 
-/// One byte transition: where to go and what to emit.
+/// Number of FSA states = internal nodes of the code trie.
+const N_STATES: usize = 256;
+/// Total trie nodes: 257 leaves + 256 internal nodes.
+const N_NODES: usize = 2 * CODES.len() - 1;
+
+/// [`Nib::flags`] bit: this transition completes the symbol in [`Nib::sym`].
+const NIB_EMIT: u8 = 1;
+/// [`Nib::flags`] bit: this transition completes the EOS symbol (→ Corrupt).
+const NIB_EOS: u8 = 2;
+
+/// One nibble transition: where to go and what (if anything) to emit.
 #[derive(Clone, Copy)]
-struct Trans {
-    /// Trie node reached after consuming this byte's 8 bits.
-    next: u16,
-    /// Number of complete symbols emitted while consuming the byte (0..=8).
-    n: u8,
-    /// Set if any consumed bit completed the EOS symbol (→ Corrupt).
-    eos: bool,
-    /// The emitted symbol bytes (only the first `n` are meaningful).
-    out: [u8; 8],
+struct Nib {
+    /// State reached after consuming this nibble's 4 bits.
+    next: u8,
+    /// `NIB_EMIT` / `NIB_EOS`.
+    flags: u8,
+    /// The emitted byte (meaningful only with `NIB_EMIT`).
+    sym: u8,
 }
 
-/// Byte FSA: `trans[state * 256 + byte]` gives the transition. State 0 is the
-/// trie root, the only valid end-of-string boundary.
-struct FastTable {
-    trans: Vec<Trans>,
-    /// Per-state padding metadata: `(depth, all_ones)` for the partial path
-    /// from the root to this node. A valid end state has `depth < 8` and
-    /// `all_ones` (the RFC 7541 §5.2 EOS-prefix padding rule).
-    pad: Vec<(u8, bool)>,
+/// Nibble FSA. State 0 is the trie root, the only clean symbol boundary.
+struct Fsa {
+    /// `trans[state][nibble]`.
+    trans: [[Nib; 16]; N_STATES],
+    /// Whether the input may end in this state: the partial path from the
+    /// root is fewer than 8 bits and all `1`s (the RFC 7541 §5.2 EOS-prefix
+    /// padding rule; the root itself is the zero-padding case).
+    accept: [bool; N_STATES],
 }
 
-impl FastTable {
-    fn build() -> Self {
-        // Canonical binary trie. Node 0 is the root. `child[node][bit]` is the
-        // next node index (0 = unset, since the root is never a child).
-        // `leaf_sym[node]` is the symbol for a leaf, or -1.
-        let mut child: Vec<[u16; 2]> = Vec::new();
-        child.push([0, 0]); // root
-        let mut leaf_sym: Vec<i32> = Vec::new();
-        leaf_sym.push(-1);
+/// The decode machine, evaluated at compile time.
+static FSA: Fsa = build_fsa();
 
-        for (sym, &(code, len)) in CODES.iter().enumerate() {
-            let len = len as u32;
-            let mut node = 0usize;
-            for i in (0..len).rev() {
-                let bit = ((code >> i) & 1) as usize;
-                let nxt = child[node][bit];
-                if nxt == 0 {
-                    let new = child.len() as u16;
-                    child.push([0, 0]);
-                    leaf_sym.push(-1);
-                    child[node][bit] = new;
-                    node = new as usize;
-                } else {
-                    node = nxt as usize;
-                }
+const fn build_fsa() -> Fsa {
+    /// `leaf[node]` value for a node that is not a leaf.
+    const INTERNAL: u16 = u16::MAX;
+
+    // Binary trie of the code. Node 0 is the root; `child[node][bit]` is the
+    // next node index (0 = unset, since the root is never a child) and
+    // `leaf[node]` the symbol of a leaf.
+    let mut child = [[0u16; 2]; N_NODES];
+    let mut leaf = [INTERNAL; N_NODES];
+    let mut n_nodes = 1usize;
+    let mut sym = 0usize;
+    while sym < CODES.len() {
+        let (code, len) = CODES[sym];
+        let mut node = 0usize;
+        let mut i = len as u32;
+        while i > 0 {
+            i -= 1;
+            let bit = ((code >> i) & 1) as usize;
+            // A codeword may not extend another one (prefix-free code).
+            assert!(leaf[node] == INTERNAL);
+            if child[node][bit] == 0 {
+                child[node][bit] = n_nodes as u16;
+                n_nodes += 1;
             }
-            leaf_sym[node] = sym as i32;
+            node = child[node][bit] as usize;
         }
+        // … nor be a prefix of (or equal to) an earlier one.
+        assert!(leaf[node] == INTERNAL && child[node][0] == 0 && child[node][1] == 0);
+        leaf[node] = sym as u16;
+        sym += 1;
+    }
+    assert!(n_nodes == N_NODES);
 
-        let n_states = child.len();
-
-        // Per-node padding metadata: depth from root and whether the path is
-        // all `1`-bits. Leaves reset to the root after emitting, so only
-        // non-leaf nodes are ever a resting state, but we fill every node.
-        let mut pad = alloc::vec![(0u8, true); n_states];
-        // Iterative DFS from the root; children are always added after their
-        // parent, so a single forward pass over node indices in creation
-        // order would also work, but we walk explicitly for clarity.
-        let mut stack = alloc::vec![0usize];
-        while let Some(node) = stack.pop() {
-            let (d, ones) = pad[node];
-            let kids = child[node];
-            for (bit, &c) in kids.iter().enumerate() {
-                if c != 0 {
-                    let c = c as usize;
-                    pad[c] = (d + 1, ones && bit == 1);
-                    stack.push(c);
-                }
+    // Number the internal nodes densely (root → state 0) and record, for each
+    // node, its depth and whether its path from the root is all `1` bits.
+    // Children are always created after their parent, so one forward pass in
+    // creation order sees every parent before its children.
+    let mut state_of = [0u8; N_NODES];
+    let mut depth = [0u8; N_NODES];
+    let mut ones = [true; N_NODES];
+    let mut accept = [false; N_STATES];
+    let mut n_states = 0usize;
+    let mut node = 0usize;
+    while node < N_NODES {
+        if leaf[node] == INTERNAL {
+            // The code is complete: every internal node has both children.
+            assert!(child[node][0] != 0 && child[node][1] != 0);
+            assert!(n_states < N_STATES);
+            state_of[node] = n_states as u8;
+            accept[n_states] = depth[node] < 8 && ones[node];
+            n_states += 1;
+            let mut bit = 0usize;
+            while bit < 2 {
+                let c = child[node][bit] as usize;
+                depth[c] = depth[node] + 1;
+                ones[c] = ones[node] && bit == 1;
+                bit += 1;
             }
         }
+        node += 1;
+    }
+    assert!(n_states == N_STATES);
 
-        // Build a per-nibble transition first (n_states × 16, four bit-steps
-        // each), then compose each byte transition from its two nibble halves.
-        // This costs ≈ n_states·(16·4 + 256·2) build steps instead of
-        // n_states·256·8 — roughly a 4× cheaper construction, which matters
-        // because the table is rebuilt on every `decode` call.
-        struct Nib {
-            next: u16,
-            n: u8,
-            eos: bool,
-            out: [u8; 4],
-        }
-        let mut nib = Vec::with_capacity(n_states * 16);
-        for state in 0..n_states {
-            for half in 0..16u32 {
-                let mut node = state;
-                let mut out = [0u8; 4];
-                let mut n = 0u8;
-                let mut eos = false;
-                for i in (0..4).rev() {
-                    let bit = ((half >> i) & 1) as usize;
-                    node = child[node][bit] as usize;
-                    if leaf_sym[node] >= 0 {
-                        let sym = leaf_sym[node] as u16;
-                        if sym == EOS {
-                            eos = true;
+    let mut trans = [[Nib {
+        next: 0,
+        flags: 0,
+        sym: 0,
+    }; 16]; N_STATES];
+    let mut start = 0usize;
+    while start < N_NODES {
+        if leaf[start] == INTERNAL {
+            let mut nibble = 0usize;
+            while nibble < 16 {
+                let mut node = start;
+                let mut flags = 0u8;
+                let mut out = 0u8;
+                let mut i = 4u32;
+                while i > 0 {
+                    i -= 1;
+                    node = child[node][(nibble >> i) & 1] as usize;
+                    if leaf[node] != INTERNAL {
+                        if leaf[node] == EOS {
+                            flags |= NIB_EOS;
                         } else {
-                            out[n as usize] = sym as u8;
-                            n += 1;
+                            // Shortest codeword is 5 bits: one symbol at most.
+                            assert!(flags & NIB_EMIT == 0);
+                            flags |= NIB_EMIT;
+                            out = leaf[node] as u8;
                         }
                         node = 0;
                     }
                 }
-                nib.push(Nib {
-                    next: node as u16,
-                    n,
-                    eos,
-                    out,
-                });
+                trans[state_of[start] as usize][nibble] = Nib {
+                    next: state_of[node],
+                    flags,
+                    sym: out,
+                };
+                nibble += 1;
             }
         }
-
-        let mut trans = Vec::with_capacity(n_states * 256);
-        for state in 0..n_states {
-            for byte in 0..256usize {
-                let hi = &nib[state * 16 + (byte >> 4)];
-                let lo = &nib[hi.next as usize * 16 + (byte & 0x0f)];
-                let mut out = [0u8; 8];
-                let hn = hi.n as usize;
-                out[..hn].copy_from_slice(&hi.out[..hn]);
-                let ln = lo.n as usize;
-                out[hn..hn + ln].copy_from_slice(&lo.out[..ln]);
-                trans.push(Trans {
-                    next: lo.next,
-                    n: (hn + ln) as u8,
-                    eos: hi.eos || lo.eos,
-                    out,
-                });
-            }
-        }
-
-        FastTable { trans, pad }
+        start += 1;
     }
+
+    Fsa { trans, accept }
 }
 
 /// Canonical decode tables reconstructed from [`CODES`], retained only for
@@ -323,24 +332,27 @@ pub fn encoded_len(data: &[u8]) -> usize {
 /// bits, padding not consisting of EOS-prefix `1`s, and any appearance of
 /// the EOS symbol — all as [`Error::Corrupt`].
 pub fn decode(data: &[u8]) -> Result<Vec<u8>, Error> {
-    let table = FastTable::build();
+    let fsa = &FSA;
     let mut out = Vec::with_capacity(data.len() * 2);
-    // Current trie node (state). State 0 = root = clean symbol boundary.
-    let mut state = 0usize;
-    let trans = &table.trans[..];
+    // Current state (internal trie node). State 0 = root = symbol boundary.
+    let mut state = 0u8;
     for &byte in data {
-        let t = &trans[state * 256 + byte as usize];
-        if t.eos {
+        let hi = fsa.trans[state as usize][(byte >> 4) as usize];
+        if hi.flags & NIB_EMIT != 0 {
+            out.push(hi.sym);
+        }
+        let lo = fsa.trans[hi.next as usize][(byte & 0x0f) as usize];
+        if lo.flags & NIB_EMIT != 0 {
+            out.push(lo.sym);
+        }
+        if (hi.flags | lo.flags) & NIB_EOS != 0 {
             return Err(Error::Corrupt);
         }
-        // Emit the symbols completed in this byte (0..=8).
-        out.extend_from_slice(&t.out[..t.n as usize]);
-        state = t.next as usize;
+        state = lo.next;
     }
     // Trailing bits are padding: must be < 8 bits, all 1s. A prefix-free code
     // guarantees these EOS-prefix 1s cannot complete a real symbol above.
-    let (depth, all_ones) = table.pad[state];
-    if depth >= 8 || !all_ones {
+    if !fsa.accept[state as usize] {
         return Err(Error::Corrupt);
     }
     Ok(out)
@@ -533,5 +545,151 @@ mod tests {
         // ones → invalid padding.
         let bad = [0b0000_0000u8]; // 5-bit code 00000 then 000 padding
         assert!(matches!(decode(&bad), Err(Error::Corrupt)));
+    }
+
+    /// Slow reference decoder: canonical bit-at-a-time decoding straight from
+    /// the RFC 7541 §5.2 rules, sharing nothing with the table-driven
+    /// [`decode`] but the code table itself.
+    fn decode_reference(table: &DecodeTable, data: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut count = [0u32; MAX_LEN + 1];
+        for &(_, len) in CODES.iter() {
+            count[len as usize] += 1;
+        }
+        let mut offset = [0u32; MAX_LEN + 1];
+        for len in 1..=MAX_LEN {
+            offset[len] = offset[len - 1] + count[len - 1];
+        }
+
+        let mut out = Vec::new();
+        // The bits of the codeword in progress.
+        let mut code = 0u32;
+        let mut len = 0usize;
+        let mut all_ones = true;
+        for &byte in data {
+            for i in (0..8).rev() {
+                let bit = ((byte >> i) & 1) as u32;
+                code = (code << 1) | bit;
+                len += 1;
+                all_ones &= bit == 1;
+                assert!(len <= MAX_LEN, "prefix code must resolve within 30 bits");
+                let rel = code.wrapping_sub(table.first_code[len]);
+                if code >= table.first_code[len] && rel < count[len] {
+                    let sym = table.symbols[(offset[len] + rel) as usize];
+                    if sym == EOS {
+                        return Err(Error::Corrupt);
+                    }
+                    out.push(sym as u8);
+                    code = 0;
+                    len = 0;
+                    all_ones = true;
+                }
+            }
+        }
+        // Whatever is left is padding: fewer than 8 bits, all of them `1`.
+        if len >= 8 || !all_ones {
+            return Err(Error::Corrupt);
+        }
+        Ok(out)
+    }
+
+    /// Outcome of a decode, comparable across implementations.
+    fn outcome(r: Result<Vec<u8>, Error>) -> Option<Vec<u8>> {
+        match r {
+            Ok(v) => Some(v),
+            Err(Error::Corrupt) => None,
+            Err(e) => panic!("unexpected error kind {e:?}"),
+        }
+    }
+
+    #[test]
+    fn table_decoder_matches_bitwise_reference() {
+        let table = DecodeTable::build();
+        let check = |data: &[u8]| {
+            assert_eq!(
+                outcome(decode(data)),
+                outcome(decode_reference(&table, data)),
+                "decoders disagree on {data:02x?}"
+            );
+        };
+
+        // Every 0-, 1- and 2-byte input.
+        check(&[]);
+        for a in 0..=255u8 {
+            check(&[a]);
+            for b in 0..=255u8 {
+                check(&[a, b]);
+            }
+        }
+
+        // Runs of `1` bits around the padding limit and the 30-bit EOS code,
+        // each with every possible final byte: valid 1..=7-bit padding,
+        // over-long (>= 8 bit) padding, EOS in the stream, non-`1` padding.
+        for ones in 0..=6usize {
+            for last in 0..=255u8 {
+                let mut v = alloc::vec![0xffu8; ones];
+                v.push(last);
+                check(&v);
+                // The same tail after a real symbol.
+                let mut w = encode(b"a-Z\x00\xff");
+                w.pop();
+                w.extend_from_slice(&v);
+                check(&w);
+            }
+        }
+
+        // Valid encodings of random strings, then the same with every value of
+        // the final byte (flips padding bits / truncates the last symbol), a
+        // dropped final byte, and an appended byte.
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..300 {
+            let n = (next() % 24) as usize;
+            let plain: Vec<u8> = (0..n)
+                .map(|_| {
+                    let r = next();
+                    // Mix common (short-code) and rare (long-code) symbols.
+                    if round % 2 == 0 {
+                        b"0123456789abcdefghij -/.:%=_"[(r % 28) as usize]
+                    } else {
+                        (r >> 8) as u8
+                    }
+                })
+                .collect();
+            let enc = encode(&plain);
+            assert_eq!(decode(&enc).unwrap(), plain);
+            assert_eq!(decode_reference(&table, &enc).unwrap(), plain);
+            if let Some((&last, head)) = enc.split_last() {
+                check(head);
+                let mut v = enc.clone();
+                for b in 0..=255u8 {
+                    *v.last_mut().unwrap() = b;
+                    check(&v);
+                }
+                *v.last_mut().unwrap() = last;
+                for b in [0x00, 0x7f, 0x80, 0xfe, 0xff] {
+                    v.push(b);
+                    check(&v);
+                    v.pop();
+                }
+            }
+        }
+
+        // Arbitrary bytes, biased towards 0xff so the long codes, EOS and the
+        // all-ones padding paths are exercised.
+        for _ in 0..20_000 {
+            let n = (next() % 40) as usize;
+            let data: Vec<u8> = (0..n)
+                .map(|_| {
+                    let r = next();
+                    if r % 3 == 0 { 0xff } else { (r >> 8) as u8 }
+                })
+                .collect();
+            check(&data);
+        }
     }
 }
