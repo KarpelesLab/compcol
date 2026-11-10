@@ -1288,6 +1288,42 @@ fn reset_mid_stream_starts_clean() {
     assert!(out[..p.written] == want[..]);
 }
 
+// ─── decoder without a declared size ──────────────────────────────────────
+
+/// Regression: `Rar2::decoder()` / `Decoder::new()` used to treat *any*
+/// input as a complete zero-length stream (garbage in → `StreamEnd`, zero
+/// bytes). RAR 2.x has no end marker, so without a size the decoder cannot
+/// decode at all; it must say so instead of reporting success.
+#[test]
+fn decoder_without_unpack_size_rejects_input() {
+    let stream = build_literals_only_block(b'A', 7);
+    for mut dec in [Decoder::new(), <Rar2 as Algorithm>::decoder()] {
+        let mut out = [0u8; 16];
+        // No input at all is still an empty stream.
+        let (p, status) = dec.decode(&[], &mut out).unwrap();
+        assert_eq!((p.consumed, p.written), (0, 0));
+        assert!(matches!(status, Status::InputEmpty));
+
+        assert_eq!(
+            dec.decode(&stream, &mut out).unwrap_err(),
+            Error::Unsupported
+        );
+        assert_eq!(dec.decode(b"x", &mut out).unwrap_err(), Error::Unsupported);
+        assert_eq!(dec.finish(&mut out).unwrap_err(), Error::Unsupported);
+
+        // `reset` clears the refusal; a size makes the decoder usable.
+        dec.reset();
+        let (p, status) = dec.finish(&mut out).unwrap();
+        assert_eq!(p.written, 0);
+        assert!(matches!(status, Status::StreamEnd));
+        dec.reset();
+        dec.set_unpack_size(7);
+        let (p, status) = dec.decode(&stream, &mut out).unwrap();
+        assert_eq!(&out[..p.written], b"AAAAAAA");
+        assert!(matches!(status, Status::StreamEnd));
+    }
+}
+
 // ─── factory (only if the feature is enabled) ─────────────────────────────
 
 #[cfg(feature = "factory")]

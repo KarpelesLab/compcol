@@ -23,6 +23,12 @@
 //! bits than are buffered is retried from its saved bit position once more
 //! input arrives; in `finish` it is a truncation error instead.
 //!
+//! A decoder built without a size ([`Decoder::new`], which is what
+//! [`Algorithm::decoder`](crate::Algorithm::decoder) and the factory give)
+//! cannot decode: with no end marker there is no sound place to stop (the
+//! padding bits of the last byte would decode as extra symbols). It accepts
+//! an empty stream and fails with [`Error::Unsupported`] on any input.
+//!
 //! ## Format summary (re-implementation, not copied)
 //!
 //! Each block begins with two flag bits:
@@ -90,10 +96,11 @@ const INPUT_COMPACT_MIN: usize = 4096;
 
 /// Streaming RAR 2.x decoder. See module docs for the streaming model.
 pub struct Decoder {
-    /// Configured unpacked output size in bytes.
+    /// Configured unpacked output size in bytes; meaningful only when
+    /// `have_unpack_size` is set.
     unpack_size: u64,
-    /// Have we been given an unpack size? `new()` defaults to 0, which is
-    /// treated as a zero-output stream (trivially-empty).
+    /// Have we been given an unpack size? Without one the decoder accepts
+    /// only an empty stream (see the module docs).
     have_unpack_size: bool,
     /// Compressed input not yet moved past by the bit reader.
     input_buf: Vec<u8>,
@@ -103,6 +110,8 @@ pub struct Decoder {
     /// `finish` has been called: no more input is coming, so running out of
     /// bits is an error rather than a reason to wait.
     finishing: bool,
+    /// Input was offered to a decoder that has no unpack size.
+    rejected_input: bool,
     /// A decode error raised while bytes decoded before it were still
     /// waiting; reported once those bytes have been handed out.
     pending_err: Option<Error>,
@@ -111,10 +120,13 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    /// Construct a decoder. Without [`Self::with_unpack_size`] the decoder
-    /// treats the stream as zero-length — useful for the trait-default
-    /// factory path. Call [`Self::set_unpack_size`] before `decode` to
-    /// actually decompress data.
+    /// Construct a decoder with no decompressed size.
+    ///
+    /// RAR 2.x data has no end marker, so such a decoder cannot tell where
+    /// a member stops: it treats an empty stream as empty and returns
+    /// [`Error::Unsupported`] as soon as it is given input. Use
+    /// [`Self::with_unpack_size`], or call [`Self::set_unpack_size`] before
+    /// the first `decode`, to actually decompress data.
     pub const fn new() -> Self {
         Self {
             unpack_size: 0,
@@ -122,6 +134,7 @@ impl Decoder {
             input_buf: Vec::new(),
             ctx: None,
             finishing: false,
+            rejected_input: false,
             pending_err: None,
             poisoned: false,
         }
@@ -168,6 +181,13 @@ impl RawDecoder for Decoder {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
+        if !self.have_unpack_size {
+            if input.is_empty() {
+                return Ok(RawProgress::default());
+            }
+            self.rejected_input = true;
+            return Err(Error::Unsupported);
+        }
         if self.finishing && !input.is_empty() {
             // `finish` declared the input complete; more of it is illegal.
             return Err(self.poison(Error::Corrupt));
@@ -197,6 +217,17 @@ impl RawDecoder for Decoder {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
+        if !self.have_unpack_size {
+            if self.rejected_input {
+                return Err(Error::Unsupported);
+            }
+            // No size and no input: an empty stream.
+            return Ok(RawProgress {
+                consumed: 0,
+                written: 0,
+                done: true,
+            });
+        }
         self.finishing = true;
         let (written, done) = self.pump(output)?;
         Ok(RawProgress {
@@ -212,6 +243,7 @@ impl RawDecoder for Decoder {
         // it; the next stream allocates a fresh one.
         self.ctx = None;
         self.finishing = false;
+        self.rejected_input = false;
         self.pending_err = None;
         self.poisoned = false;
         // unpack_size and have_unpack_size persist; callers re-set them if
