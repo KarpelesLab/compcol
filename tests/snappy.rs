@@ -433,6 +433,43 @@ fn decoder_rejects_literal_longer_than_declared_output() {
     assert_eq!(decode_result(&block), Err(compcol::Error::Corrupt));
 }
 
+#[test]
+fn decoder_rejects_implausible_length_without_huge_allocation() {
+    // The header varint claims 0x9000_0000 (2.25 GiB) of output for ~9 MiB
+    // of input. Snappy cannot expand by more than 64 bytes per 3-byte copy
+    // tag (~21.3x), so this is impossible; the decoder used to accept
+    // anything up to 256x and `reserve` the whole claimed length before
+    // looking at a single tag (a `capacity overflow` panic on 32-bit).
+    let mut block = vec![0x80, 0x80, 0x80, 0x80, 0x09];
+    block.resize(9 * 1024 * 1024 + 16, 0xFF);
+    assert!(decode_result(&block).is_err());
+}
+
+#[test]
+fn decoder_accepts_maximum_ratio_block() {
+    // The densest legal block: one literal byte, then nothing but 3-byte
+    // copy tags (2-byte offset form) each replicating 64 bytes. The
+    // plausibility cap on the declared length must not reject it.
+    for copies in [1usize, 2, 3, 1000] {
+        let n = 1 + 64 * copies;
+        let mut block = Vec::new();
+        let mut v = n as u32;
+        while v >= 0x80 {
+            block.push((v as u8 & 0x7F) | 0x80);
+            v >>= 7;
+        }
+        block.push(v as u8);
+        block.extend_from_slice(&[0x00, b'z']);
+        for _ in 0..copies {
+            block.extend_from_slice(&[(63 << 2) | 0b10, 0x01, 0x00]);
+        }
+        assert_eq!(decode_result(&block).unwrap(), vec![b'z'; n]);
+    }
+    // A 2-byte copy tag (1-byte offset form) yields up to 11 bytes.
+    let block = [12, 0x00, b'q', (7 << 2) | 0b01, 0x01];
+    assert_eq!(decode_result(&block).unwrap(), vec![b'q'; 12]);
+}
+
 #[cfg(feature = "factory")]
 mod factory {
     use compcol::Status;

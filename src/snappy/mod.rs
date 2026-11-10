@@ -452,6 +452,56 @@ impl RawDecoder for Decoder {
     }
 }
 
+/// Upper bound on the output `payload_len` bytes of Snappy tags can
+/// produce.
+///
+/// The densest element of the format is a copy with a 2-byte offset: 3
+/// bytes of input for up to 64 bytes of output (64/3 ≈ 21.3×). Every other
+/// element is worse — a 2-byte copy with a 1-byte offset yields at most 11
+/// bytes (5.5×), a 5-byte copy with a 4-byte offset at most 64 (12.8×), and
+/// a literal never expands at all — so no block can exceed
+/// `ceil(payload_len * 64 / 3)`. Computed in `u64` so it cannot overflow a
+/// 32-bit `usize`.
+fn max_uncompressed_len(payload_len: usize) -> u64 {
+    (payload_len as u64).saturating_mul(64).div_ceil(3)
+}
+
+/// First allocation made for a block's output, however large the header
+/// claims it is.
+const INITIAL_OUTPUT_CAPACITY: usize = 64 * 1024;
+
+/// Make room for `additional` more bytes in `out`.
+///
+/// The caller has already checked `out.len() + additional <=
+/// uncompressed_len`. The buffer is grown geometrically, only as real
+/// output is produced, and never past `uncompressed_len`; an allocation
+/// the platform cannot satisfy (e.g. more than `isize::MAX` bytes on a
+/// 32-bit target) is reported as an error rather than a panic.
+#[inline]
+fn reserve_output(
+    out: &mut Vec<u8>,
+    additional: usize,
+    uncompressed_len: usize,
+) -> Result<(), Error> {
+    let needed = out.len() + additional;
+    if needed <= out.capacity() {
+        return Ok(());
+    }
+    grow_output(out, needed, uncompressed_len)
+}
+
+#[cold]
+fn grow_output(out: &mut Vec<u8>, needed: usize, uncompressed_len: usize) -> Result<(), Error> {
+    let target = out
+        .capacity()
+        .saturating_mul(2)
+        .max(INITIAL_OUTPUT_CAPACITY)
+        .max(needed)
+        .min(uncompressed_len);
+    out.try_reserve_exact(target - out.len())
+        .map_err(|_| Error::Corrupt)
+}
+
 /// Decompress one Snappy raw block into `out`.
 fn decompress_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
     out.clear();
@@ -461,18 +511,17 @@ fn decompress_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
     }
 
     let (uncompressed_len, vi_len) = read_varint_u32(input)?;
-    let uncompressed_len = uncompressed_len as usize;
-    // The varint sits in `input` (max u32 = 4 GiB). A truly hostile
-    // header can ask us to reserve gigabytes before we've read a single
-    // byte of payload. Cap at a sane multiple of the compressed input
-    // size — snappy's max ratio is somewhere around 60×, so 256× is
-    // safely above anything legitimate without letting malicious
-    // headers deplete the heap.
-    let max_plausible = input.len().saturating_mul(256).max(64 * 1024);
-    if uncompressed_len > max_plausible {
+    // The varint is attacker-controlled (up to 4 GiB) and is read before a
+    // single tag has been validated, so reject any length the remaining
+    // input could not possibly expand to. This is the format's exact
+    // ceiling, so it never rejects a valid block.
+    if u64::from(uncompressed_len) > max_uncompressed_len(input.len() - vi_len) {
         return Err(Error::Corrupt);
     }
-    out.reserve(uncompressed_len);
+    let uncompressed_len = usize::try_from(uncompressed_len).map_err(|_| Error::Corrupt)?;
+    // Deliberately no `reserve(uncompressed_len)` here: even a plausible
+    // claim is ~21× the input, so the buffer is grown by `reserve_output`
+    // as output is actually produced.
 
     let mut ip = vi_len;
     let input_end = input.len();
@@ -512,6 +561,7 @@ fn decompress_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
                 if length > uncompressed_len - out.len() {
                     return Err(Error::Corrupt);
                 }
+                reserve_output(out, length, uncompressed_len)?;
                 out.extend_from_slice(&input[ip..ip + length]);
                 ip += length;
             }
@@ -576,6 +626,7 @@ fn copy_from_back(
     if length > uncompressed_len - out.len() {
         return Err(Error::Corrupt);
     }
+    reserve_output(out, length, uncompressed_len)?;
     let start = out.len() - offset;
     if offset >= length {
         // Non-overlapping: collapses to memcpy.
@@ -597,4 +648,46 @@ fn copy_from_back(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_uncompressed_len_is_the_format_ceiling() {
+        assert_eq!(max_uncompressed_len(0), 0);
+        // One 3-byte copy tag: 64 bytes.
+        assert_eq!(max_uncompressed_len(3), 64);
+        // A 2-byte copy tag can emit 11 bytes; the bound must allow it.
+        assert!(max_uncompressed_len(2) >= 11);
+        assert_eq!(max_uncompressed_len(3_000_000), 64_000_000);
+        // No overflow at the top of the range, on any pointer width.
+        assert!(max_uncompressed_len(usize::MAX) >= u64::from(u32::MAX));
+    }
+
+    #[test]
+    fn output_buffer_is_not_reserved_from_the_header() {
+        // A header that plausibly claims 16 MiB (the input is large enough
+        // for that) followed by an invalid tag. The decoder must fail
+        // without ever having sized its output buffer from the claim.
+        let claimed: u32 = 16 * 1024 * 1024;
+        let mut block = Vec::new();
+        write_varint_u32(claimed, &mut block);
+        block.extend_from_slice(&[0x00, b'a']);
+        // Copy tags with offset 0: invalid as soon as the first is parsed.
+        for _ in 0..512 * 1024 {
+            block.extend_from_slice(&[0x01, 0x00]);
+        }
+        let mut out = Vec::new();
+        assert_eq!(
+            decompress_block(&block, &mut out),
+            Err(Error::InvalidDistance)
+        );
+        assert!(
+            out.capacity() < 1024 * 1024,
+            "output capacity {} was sized from the header",
+            out.capacity()
+        );
+    }
 }
