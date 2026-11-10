@@ -531,6 +531,11 @@ fn truncation_never_fabricates_output() {
                     rejected += 1;
                 }
             }
+            // Same verdict when the truncated stream arrives in small pieces.
+            match decode_chunked(&enc[..cut], 5, 7) {
+                Ok(got) => assert!(got == *plain, "cut {cut} (chunked) wrong output"),
+                Err(e) => assert_eq!(e, Error::UnexpectedEnd, "cut {cut} (chunked)"),
+            }
         }
         // Only the trailing lookahead padding may be dropped harmlessly.
         assert!(rejected + 8 >= enc.len(), "only {rejected} cuts rejected");
@@ -592,6 +597,206 @@ fn encoder_streams_decode_at_block_edge_sizes() {
             "len {len}"
         );
     }
+}
+
+// ─── resumable decoding ────────────────────────────────────────────────
+
+/// Deterministic test inputs covering literals-only, match-heavy and mixed
+/// data, at sizes from sub-block to several 64 KiB blocks.
+fn differential_corpus() -> Vec<(&'static str, Vec<u8>)> {
+    let mut state = 0x9E37_79B9u32;
+    let mut next = move || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (state >> 24) as u8
+    };
+    let phrase = b"the quick brown fox jumps over the lazy dog. ";
+    let text = |n: usize| -> Vec<u8> { (0..n).map(|i| phrase[i % phrase.len()]).collect() };
+    let random_small: Vec<u8> = (0..5000).map(|_| next()).collect();
+    let random_blocks: Vec<u8> = (0..65536 + 9000).map(|_| next()).collect();
+    // Long runs with occasional breaks: exercises the one- and three-byte
+    // length escapes and matches straddling block ends.
+    let mut runs = Vec::new();
+    while runs.len() < 2 * 65536 + 500 {
+        let b = next();
+        let n = 1 + (next() as usize) * 9;
+        runs.extend(core::iter::repeat_n(b, n));
+    }
+    // Text with random bytes sprinkled in: literals and short matches mixed.
+    let mut mixed = text(65536 + 3000);
+    for i in (0..mixed.len()).step_by(37) {
+        mixed[i] = next();
+    }
+    vec![
+        ("empty", Vec::new()),
+        ("one", vec![b'x']),
+        ("text-small", text(300)),
+        ("text-blocks", text(3 * 65536 + 123)),
+        ("random-small", random_small),
+        ("random-blocks", random_blocks),
+        ("zeros-block", vec![0u8; 65536]),
+        ("zeros-blocks", vec![0u8; 2 * 65536 + 77]),
+        ("runs", runs),
+        ("mixed", mixed),
+    ]
+}
+
+/// Drive a decoder with caller-chosen input and output chunk sizes (an
+/// output size of 0 is a legal "no room right now" call), then `finish`.
+fn decode_with_schedule(
+    encoded: &[u8],
+    mut next_in: impl FnMut() -> usize,
+    mut next_out: impl FnMut() -> usize,
+) -> Vec<u8> {
+    let mut dec = Decoder::new();
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 1 << 17];
+    let mut pos = 0;
+    let mut ended = false;
+    let mut idle = 0;
+    while pos < encoded.len() && !ended {
+        let end = (pos + next_in().max(1)).min(encoded.len());
+        let room = next_out().min(buf.len());
+        let (p, status) = dec.decode(&encoded[pos..end], &mut buf[..room]).unwrap();
+        out.extend_from_slice(&buf[..p.written]);
+        pos += p.consumed;
+        ended = status == Status::StreamEnd;
+        idle = if p.consumed == 0 && p.written == 0 {
+            idle + 1
+        } else {
+            0
+        };
+        assert!(idle < 10_000, "decode made no progress");
+    }
+    idle = 0;
+    while !ended {
+        let room = next_out().min(buf.len());
+        let (p, status) = dec.finish(&mut buf[..room]).unwrap();
+        out.extend_from_slice(&buf[..p.written]);
+        ended = status == Status::StreamEnd;
+        idle = if p.written == 0 { idle + 1 } else { 0 };
+        assert!(idle < 10_000, "finish made no progress");
+    }
+    out
+}
+
+/// However the stream is sliced on the way in and however the output room
+/// is sliced on the way out, the decoder must produce the same bytes as a
+/// one-shot decode.
+#[test]
+fn chunking_never_changes_the_output() {
+    for (name, plain) in differential_corpus() {
+        let enc = encode_all(&plain);
+        let one_shot = decode_with_schedule(&enc, || usize::MAX, || usize::MAX);
+        assert!(one_shot == plain, "{name}: one-shot mismatch");
+
+        let got = decode_with_schedule(&enc, || 1, || usize::MAX);
+        assert!(got == plain, "{name}: 1-byte input mismatch");
+
+        let mut seed = 0x2545_F491u32 ^ plain.len() as u32;
+        let mut rnd = move |limit: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as usize % limit
+        };
+        let mut rnd_out = rnd;
+        let got = decode_with_schedule(&enc, || 1 + rnd(700), || rnd_out(3000));
+        assert!(got == plain, "{name}: random chunk mismatch");
+
+        // Tiny output buffers are per-byte work; keep those to inputs that
+        // stay quick in a debug build.
+        if plain.len() <= 70_000 {
+            let got = decode_with_schedule(&enc, || usize::MAX, || 1);
+            assert!(got == plain, "{name}: 1-byte output mismatch");
+            let got = decode_with_schedule(&enc, || 1, || 1);
+            assert!(got == plain, "{name}: 1-byte in/out mismatch");
+            // Alternate "no room" and "one byte of room" calls.
+            let mut flip = false;
+            let got = decode_with_schedule(
+                &enc,
+                || 3,
+                || {
+                    flip = !flip;
+                    flip as usize
+                },
+            );
+            assert!(got == plain, "{name}: 0/1-byte output mismatch");
+        }
+    }
+}
+
+/// A complete encoder stream reaches `StreamEnd` through `decode` alone, even
+/// one byte at a time: waiting for "enough input for the next symbol" must
+/// use the symbol's real needs, not a worst-case bound that the tail of the
+/// stream can never satisfy.
+#[test]
+fn trickled_complete_stream_ends_without_finish() {
+    for (name, plain) in differential_corpus() {
+        if plain.len() > 70_000 {
+            continue;
+        }
+        let enc = encode_all(&plain);
+        let mut dec = Decoder::new();
+        let mut buf = vec![0u8; 1 << 17];
+        let mut got = Vec::new();
+        let mut ended = false;
+        for b in &enc {
+            let (p, status) = dec.decode(core::slice::from_ref(b), &mut buf).unwrap();
+            got.extend_from_slice(&buf[..p.written]);
+            ended = status == Status::StreamEnd;
+            if ended {
+                break;
+            }
+        }
+        assert!(ended, "{name}: decode never reported StreamEnd");
+        assert!(got == plain, "{name}: mismatch");
+    }
+}
+
+/// Output must be committed as symbols become decodable, not held back until
+/// a whole 64 KiB-output block is buffered. The decoder used to re-decode
+/// the block from its start on every call and roll everything back when the
+/// input ran out mid-symbol, so trickled input produced nothing until the
+/// block was complete (and cost quadratic time getting there).
+#[test]
+fn trickled_input_commits_output_incrementally() {
+    let mut state = 0x00C0_FFEEu32;
+    let plain: Vec<u8> = (0..8192)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8 & 0x1f
+        })
+        .collect();
+    let enc = encode_all(&plain);
+    let half = enc.len() / 2;
+    let mut dec = Decoder::new();
+    let mut buf = vec![0u8; 16384];
+    let mut got = Vec::new();
+    for b in &enc[..half] {
+        let (p, _) = dec.decode(core::slice::from_ref(b), &mut buf).unwrap();
+        assert_eq!(p.consumed, 1);
+        got.extend_from_slice(&buf[..p.written]);
+    }
+    // Half of the compressed block is in; a good share of its output must
+    // already be out, and it must be a prefix of the real data.
+    assert!(
+        got.len() > plain.len() / 4,
+        "only {} of {} bytes committed after half the input",
+        got.len(),
+        plain.len()
+    );
+    assert_eq!(got, plain[..got.len()]);
+    // The rest of the stream completes it.
+    let (p, _) = dec.decode(&enc[half..], &mut buf).unwrap();
+    got.extend_from_slice(&buf[..p.written]);
+    loop {
+        let (p, status) = dec.finish(&mut buf).unwrap();
+        got.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            break;
+        }
+    }
+    assert_eq!(got, plain);
 }
 
 // ─── ms-xca spec fixtures ──────────────────────────────────────────────
