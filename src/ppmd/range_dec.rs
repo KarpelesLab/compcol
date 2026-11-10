@@ -30,6 +30,21 @@ pub(crate) enum Mode {
     Rar,
 }
 
+/// A suspended [`RangeDec`]: everything the decoder carries from one symbol
+/// to the next, without the borrow of the input. [`RangeDec::save`] takes
+/// one between two symbols and [`RangeDec::resume`] rebuilds the decoder
+/// over the same input, so a caller that owns the input can stop decoding,
+/// return to its own caller, and pick up at the next symbol later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RangeDecState {
+    range: u32,
+    code: u32,
+    low: u32,
+    /// Input offset of the next byte normalisation will read.
+    pos: usize,
+}
+
 pub(crate) struct RangeDec<'a> {
     range: u32,
     code: u32,
@@ -83,6 +98,43 @@ impl<'a> RangeDec<'a> {
             }
         };
         Ok((d, consumed))
+    }
+
+    /// Capture the decoder's state between two symbols. Meaningful only
+    /// while the decoder is healthy — neither [`err`](Self::err) nor
+    /// [`overran`](Self::overran) — since the error flag is not part of the
+    /// state; callers check both after every symbol and stop for good when
+    /// either is set.
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn save(&self) -> RangeDecState {
+        RangeDecState {
+            range: self.range,
+            code: self.code,
+            low: self.low,
+            pos: self.pos,
+        }
+    }
+
+    /// Rebuild a decoder from a state [`save`](Self::save) returned.
+    /// `mode` and `input` must be the ones the saved decoder was working
+    /// with; decoding then continues exactly as if it had never stopped.
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resume(mode: Mode, input: &'a [u8], state: RangeDecState) -> Self {
+        RangeDec {
+            range: state.range,
+            code: state.code,
+            low: state.low,
+            bottom: match mode {
+                Mode::SevenZip => 0,
+                Mode::Rar => 0x8000,
+            },
+            mode,
+            input,
+            pos: state.pos,
+            err: false,
+        }
     }
 
     #[inline]
