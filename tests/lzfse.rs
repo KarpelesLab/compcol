@@ -612,6 +612,92 @@ fn decode_is_chunking_independent() {
     );
 }
 
+/// A stream must end with the `bvx$` marker. One cut on a block boundary
+/// used to finish cleanly, silently dropping the blocks after the cut;
+/// Apple's `lzfse_decode_buffer` rejects it too.
+#[test]
+fn missing_end_marker_is_unexpected_end() {
+    use compcol::vec::{compress_to_vec, decompress_to_vec};
+
+    let stream = make_uncompressed_block(b"abc");
+    assert_eq!(
+        decompress_to_vec::<Lzfse>(&stream),
+        Err(Error::UnexpectedEnd)
+    );
+
+    // Streaming: the block's bytes are delivered, then `finish` fails.
+    let mut dec = Decoder::new();
+    let mut buf = [0u8; 16];
+    let (p, status) = dec.decode(&stream, &mut buf).unwrap();
+    assert_eq!((p.consumed, &buf[..p.written]), (stream.len(), &b"abc"[..]));
+    assert_eq!(status, Status::InputEmpty);
+    assert_eq!(dec.finish(&mut buf), Err(Error::UnexpectedEnd));
+
+    // Every block boundary of a multi-block stream, all three block kinds.
+    let mut blocks = vec![make_uncompressed_block(HELLO_WORLD)];
+    blocks.push(make_lzvn_block(100, &lzvn_payload_literals(b'A', 100)));
+    let v2 = compress_to_vec::<Lzfse>(&lzfse_sample(8000)).unwrap();
+    assert_eq!(&v2[..4], b"bvx2");
+    assert_eq!(&v2[v2.len() - 4..], b"bvx$");
+    blocks.push(v2[..v2.len() - 4].to_vec());
+    blocks.push(make_uncompressed_block(b""));
+    let mut stream = Vec::new();
+    for block in &blocks {
+        stream.extend_from_slice(block);
+        assert_eq!(
+            decompress_to_vec::<Lzfse>(&stream),
+            Err(Error::UnexpectedEnd),
+            "cut after {} bytes",
+            stream.len()
+        );
+    }
+    stream.extend_from_slice(&eos());
+    assert_eq!(
+        decompress_to_vec::<Lzfse>(&stream).unwrap().len(),
+        HELLO_WORLD.len() + 100 + 8000
+    );
+
+    // Only a decoder that was never fed anything may finish without one
+    // (empty input decodes to empty output), also after a reset.
+    assert_eq!(decompress_to_vec::<Lzfse>(b"").unwrap(), b"");
+    dec.reset();
+    let (p, status) = dec.finish(&mut buf).unwrap();
+    assert_eq!((p.written, status), (0, Status::StreamEnd));
+}
+
+/// The encoder ends every stream with `bvx$`, whatever was flushed before.
+#[test]
+fn encoder_always_writes_end_marker() {
+    use compcol::vec::compress_to_vec;
+    use compcol::{Encoder as _, Flush};
+
+    for n in [0usize, 1, 100, 4095, 4096, 100_000] {
+        let packed = compress_to_vec::<Lzfse>(&lzfse_sample(n)).unwrap();
+        assert_eq!(&packed[packed.len() - 4..], b"bvx$", "n={n}");
+    }
+    for mode in [Flush::Sync, Flush::Full] {
+        for n in [0usize, 10, 5000] {
+            let data = lzfse_sample(n);
+            let mut enc = Lzfse::encoder();
+            let mut out = vec![0u8; 2 * n + 256];
+            let mut len = 0;
+            let (p, _) = enc.encode(&data, &mut out[len..]).unwrap();
+            assert_eq!(p.consumed, n);
+            len += p.written;
+            let (p, _) = enc.flush(&mut out[len..], mode).unwrap();
+            len += p.written;
+            let (p, status) = enc.finish(&mut out[len..]).unwrap();
+            len += p.written;
+            assert_eq!(status, Status::StreamEnd);
+            assert_eq!(&out[len - 4..len], b"bvx$", "n={n}");
+            assert_eq!(
+                compcol::vec::decompress_to_vec::<Lzfse>(&out[..len]).unwrap(),
+                data
+            );
+        }
+    }
+}
+
 /// A highly expanding `bvxn` block under an output cap is refused without
 /// decoding the block whole (it is produced ~64 KiB at a time).
 #[test]

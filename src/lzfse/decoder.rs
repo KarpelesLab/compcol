@@ -37,6 +37,10 @@ pub struct Decoder {
     eos: bool,
     /// Set on any decode error so callers don't accidentally resume.
     poisoned: bool,
+    /// Set once any input byte has been taken. From then on the stream
+    /// must end with the `bvx$` marker; only a decoder that was never fed
+    /// may `finish` without one.
+    started: bool,
     /// Tail of the decoded stream (at least [`HISTORY_WINDOW`] bytes once
     /// that much has been produced). `bvx2` match distances may reach back
     /// into earlier blocks, so each v2 block is decoded on top of this.
@@ -98,6 +102,7 @@ impl Decoder {
             state: State::AwaitMagic,
             eos: false,
             poisoned: false,
+            started: false,
             history: Vec::new(),
             lzvn: lzvn::BlockState::default(),
         }
@@ -172,6 +177,7 @@ impl Decoder {
             let need = self.bytes_needed().saturating_sub(self.input_buf.len());
             let take = need.min(input.len() - consumed);
             if take > 0 {
+                self.started = true;
                 self.input_buf
                     .extend_from_slice(&input[consumed..consumed + take]);
                 consumed += take;
@@ -457,16 +463,14 @@ impl RawDecoder for Decoder {
         if p.done {
             return Ok(p);
         }
-        // No more input is coming. If we haven't seen the EOS marker but
-        // we have nothing buffered and nothing pending, treat as
-        // unexpected-end. If we still have decoded bytes to drain, signal
-        // OutputFull-style (done=false, written>0).
+        // No more input is coming and we haven't seen the EOS marker. If we
+        // still have decoded bytes to drain, signal OutputFull-style
+        // (done=false, written>0); the verdict comes once they are out.
         if p.written > 0 || !self.output_buf.is_empty() {
             return Ok(p);
         }
-        if self.state == State::AwaitMagic && self.input_buf.is_empty() {
-            // No partial block in flight. Empty input followed by finish on
-            // a fresh decoder is fine — return StreamEnd.
+        if !self.started {
+            // Nothing was ever fed: empty input decodes to empty output.
             self.eos = true;
             return Ok(RawProgress {
                 consumed: 0,
@@ -474,7 +478,9 @@ impl RawDecoder for Decoder {
                 done: true,
             });
         }
-        // Mid-block at EOI — truncated.
+        // Input ended before the `bvx$` marker: mid-block, or on a block
+        // boundary with the rest of the stream (at least the marker)
+        // missing. Either way the output so far is not the whole stream.
         self.poisoned = true;
         Err(Error::UnexpectedEnd)
     }
@@ -486,6 +492,7 @@ impl RawDecoder for Decoder {
         self.state = State::AwaitMagic;
         self.eos = false;
         self.poisoned = false;
+        self.started = false;
         self.history.clear();
         self.lzvn = lzvn::BlockState::default();
     }
