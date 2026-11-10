@@ -394,7 +394,14 @@ fn emit_copy(offset: u32, length: u32, out: &mut Vec<u8>) {
 ///
 /// Buffers the entire compressed stream on `decode`, then emits the
 /// decompressed bytes across one or more `finish` calls.
-#[derive(Debug, Default)]
+///
+/// With an output limit set
+/// ([`Decoder::set_output_limit`](crate::Decoder::set_output_limit), which
+/// [`LimitedDecoder`](crate::limit::LimitedDecoder) calls), a block whose
+/// leading length varint declares more than the limit is refused with
+/// [`Error::OutputLimitExceeded`] by the `decode` call that completes the
+/// varint, before the block is buffered or any output is built.
+#[derive(Debug)]
 pub struct Decoder {
     /// Raw compressed bytes buffered across `decode` calls.
     input: Vec<u8>,
@@ -404,6 +411,21 @@ pub struct Decoder {
     out_pos: usize,
     /// Set the first time `finish` actually decompresses the buffered input.
     decompressed: bool,
+    /// Most bytes the caller will take; `u64::MAX` means no limit.
+    /// Configuration: survives `reset`.
+    output_limit: u64,
+    /// The length varint has been looked at against `output_limit` (or is
+    /// malformed, which `finish` reports).
+    header_checked: bool,
+    /// The block declares more than `output_limit`; every call fails until
+    /// `reset`.
+    over_limit: bool,
+}
+
+impl Default for Decoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Decoder {
@@ -413,12 +435,51 @@ impl Decoder {
             output: Vec::new(),
             out_pos: 0,
             decompressed: false,
+            output_limit: u64::MAX,
+            header_checked: false,
+            over_limit: false,
         }
+    }
+
+    /// Check the block's declared length against the output limit as soon
+    /// as the varint is complete, looking at the bytes already buffered
+    /// followed by `incoming` (which is not buffered yet).
+    fn check_header(&mut self, incoming: &[u8]) -> Result<(), Error> {
+        if self.over_limit {
+            return Err(Error::OutputLimitExceeded);
+        }
+        if self.header_checked || self.output_limit == u64::MAX {
+            return Ok(());
+        }
+        // A u32 varint is at most 5 bytes; a 6th lets `read_varint_u32`
+        // tell an overlong one from an incomplete one.
+        let mut head = [0u8; 6];
+        let mut n = 0;
+        for &b in self.input.iter().chain(incoming).take(head.len()) {
+            head[n] = b;
+            n += 1;
+        }
+        match read_varint_u32(&head[..n]) {
+            Ok((declared, _)) => {
+                if u64::from(declared) > self.output_limit {
+                    self.over_limit = true;
+                    return Err(Error::OutputLimitExceeded);
+                }
+                self.header_checked = true;
+            }
+            // Varint not complete yet: look again when more input arrives.
+            Err(Error::UnexpectedEnd) => {}
+            // Malformed: `finish` reports it, as it does without a limit.
+            Err(_) => self.header_checked = true,
+        }
+        Ok(())
     }
 }
 
 impl RawDecoder for Decoder {
     fn raw_decode(&mut self, input: &[u8], _output: &mut [u8]) -> Result<RawProgress, Error> {
+        // Before buffering: a block over the limit is not worth keeping.
+        self.check_header(input)?;
         self.input.extend_from_slice(input);
         Ok(RawProgress {
             consumed: input.len(),
@@ -428,8 +489,11 @@ impl RawDecoder for Decoder {
     }
 
     fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
+        if self.over_limit {
+            return Err(Error::OutputLimitExceeded);
+        }
         if !self.decompressed {
-            decompress_block(&self.input, &mut self.output)?;
+            decompress_block(&self.input, &mut self.output, self.output_limit)?;
             self.decompressed = true;
         }
         let remaining = self.output.len() - self.out_pos;
@@ -449,6 +513,15 @@ impl RawDecoder for Decoder {
         self.output.clear();
         self.out_pos = 0;
         self.decompressed = false;
+        // `output_limit` is configuration and is kept.
+        self.header_checked = false;
+        self.over_limit = false;
+    }
+
+    fn raw_set_output_limit(&mut self, max_output_bytes: u64) {
+        self.output_limit = max_output_bytes;
+        // Look at the header again under the new limit.
+        self.header_checked = false;
     }
 }
 
@@ -502,8 +575,9 @@ fn grow_output(out: &mut Vec<u8>, needed: usize, uncompressed_len: usize) -> Res
         .map_err(|_| Error::Corrupt)
 }
 
-/// Decompress one Snappy raw block into `out`.
-fn decompress_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+/// Decompress one Snappy raw block into `out`, refusing a block that
+/// declares more than `output_limit` bytes before producing any of them.
+fn decompress_block(input: &[u8], out: &mut Vec<u8>, output_limit: u64) -> Result<(), Error> {
     out.clear();
 
     if input.is_empty() {
@@ -511,6 +585,9 @@ fn decompress_block(input: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
     }
 
     let (uncompressed_len, vi_len) = read_varint_u32(input)?;
+    if u64::from(uncompressed_len) > output_limit {
+        return Err(Error::OutputLimitExceeded);
+    }
     // The varint is attacker-controlled (up to 4 GiB) and is read before a
     // single tag has been validated, so reject any length the remaining
     // input could not possibly expand to. This is the format's exact
@@ -667,6 +744,43 @@ mod tests {
     }
 
     #[test]
+    fn over_limit_block_is_neither_buffered_nor_decompressed() {
+        // Header claims 1 MiB; the tags behind it never get looked at.
+        let mut block = Vec::new();
+        write_varint_u32(1 << 20, &mut block);
+        block.resize(64 * 1024, 0);
+
+        let mut dec = Decoder::new();
+        dec.raw_set_output_limit(4096);
+        assert_eq!(
+            dec.raw_decode(&block, &mut []),
+            Err(Error::OutputLimitExceeded)
+        );
+        assert_eq!(dec.input.capacity(), 0, "refused input was buffered");
+        assert_eq!(dec.output.capacity(), 0);
+
+        // Same when the varint straddles two calls: only the bytes before
+        // the one that completes it are kept.
+        dec.raw_reset();
+        assert!(dec.raw_decode(&block[..2], &mut []).is_ok());
+        assert_eq!(
+            dec.raw_decode(&block[2..], &mut []),
+            Err(Error::OutputLimitExceeded)
+        );
+        assert_eq!(dec.input.len(), 2);
+        assert_eq!(dec.raw_finish(&mut []), Err(Error::OutputLimitExceeded));
+        assert_eq!(dec.output.capacity(), 0);
+
+        // The `finish` path refuses before allocating too.
+        let mut out = Vec::new();
+        assert_eq!(
+            decompress_block(&block, &mut out, 4096),
+            Err(Error::OutputLimitExceeded)
+        );
+        assert_eq!(out.capacity(), 0);
+    }
+
+    #[test]
     fn output_buffer_is_not_reserved_from_the_header() {
         // A header that plausibly claims 16 MiB (the input is large enough
         // for that) followed by an invalid tag. The decoder must fail
@@ -681,7 +795,7 @@ mod tests {
         }
         let mut out = Vec::new();
         assert_eq!(
-            decompress_block(&block, &mut out),
+            decompress_block(&block, &mut out, u64::MAX),
             Err(Error::InvalidDistance)
         );
         assert!(

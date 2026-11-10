@@ -534,3 +534,182 @@ mod factory {
         assert_eq!(&decoded, input);
     }
 }
+
+// ─── output limit (`Decoder::set_output_limit`) ───────────────────────────
+//
+// The decoder buffers the whole block and builds the whole result in
+// `finish`, so a limit that only watches the bytes handed out fires after
+// the memory is committed. With the limit passed down, the declared length
+// (the varint that opens the block) is enough to refuse.
+
+mod output_limit {
+    use super::encode_chunked;
+    use compcol::limit::LimitedDecoder;
+    use compcol::snappy::{Decoder, Snappy};
+    use compcol::vec::decompress_to_vec_capped;
+    use compcol::{Decoder as _, Error, Status};
+
+    const BOMB_LEN: usize = 256 * 1024;
+    const CAP: u64 = 4096;
+
+    /// A valid block that decodes to `BOMB_LEN` zero bytes. Its length
+    /// varint is 3 bytes long.
+    fn bomb() -> Vec<u8> {
+        let encoded = encode_chunked(&vec![0u8; BOMB_LEN], 64 * 1024, 64 * 1024);
+        assert!(encoded.len() < BOMB_LEN / 8, "not much of a bomb");
+        encoded
+    }
+
+    /// Feed everything in one `decode` call, then `finish` to the end.
+    fn drain<D: compcol::Decoder>(dec: &mut D, encoded: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut buf = vec![0u8; 1024];
+        let mut out = Vec::new();
+        let mut consumed = 0;
+        while consumed < encoded.len() {
+            let (p, status) = dec.decode(&encoded[consumed..], &mut buf)?;
+            out.extend_from_slice(&buf[..p.written]);
+            consumed += p.consumed;
+            if matches!(status, Status::StreamEnd) {
+                return Ok(out);
+            }
+        }
+        loop {
+            let (p, status) = dec.finish(&mut buf)?;
+            out.extend_from_slice(&buf[..p.written]);
+            if matches!(status, Status::StreamEnd) {
+                return Ok(out);
+            }
+        }
+    }
+
+    #[test]
+    fn first_decode_call_refuses_an_oversized_block() {
+        let bomb = bomb();
+        let mut dec = LimitedDecoder::new(Decoder::new(), CAP);
+        let mut buf = [0u8; 64];
+        // The whole block is offered at once; the varint at its start is
+        // all the decoder needs, so nothing is buffered or decompressed.
+        assert_eq!(
+            dec.decode(&bomb, &mut buf).unwrap_err(),
+            Error::OutputLimitExceeded
+        );
+        // The refusal sticks until `reset`.
+        assert_eq!(
+            dec.decode(&bomb[..1], &mut buf).unwrap_err(),
+            Error::OutputLimitExceeded
+        );
+        assert_eq!(
+            dec.finish(&mut buf).unwrap_err(),
+            Error::OutputLimitExceeded
+        );
+    }
+
+    #[test]
+    fn refused_as_soon_as_the_varint_is_complete() {
+        let bomb = bomb();
+        let mut dec = LimitedDecoder::new(Decoder::new(), CAP);
+        let mut buf = [0u8; 64];
+        let mut fed = 0;
+        let err = loop {
+            match dec.decode(&bomb[fed..fed + 1], &mut buf) {
+                Ok((p, _)) => {
+                    assert_eq!(p.consumed, 1);
+                    fed += 1;
+                }
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(err, Error::OutputLimitExceeded);
+        // 256 KiB is a 3-byte varint: two bytes accepted, the third refused.
+        assert_eq!(fed, 2);
+    }
+
+    #[test]
+    fn exact_limit_succeeds_one_less_fails() {
+        let payload: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        let encoded = encode_chunked(&payload, 4096, 4096);
+        let len = payload.len() as u64;
+
+        assert_eq!(
+            decompress_to_vec_capped::<Snappy>(&encoded, len).unwrap(),
+            payload
+        );
+        assert_eq!(
+            decompress_to_vec_capped::<Snappy>(&encoded, u64::MAX).unwrap(),
+            payload
+        );
+        assert_eq!(
+            decompress_to_vec_capped::<Snappy>(&encoded, len - 1).unwrap_err(),
+            Error::OutputLimitExceeded
+        );
+        assert_eq!(
+            decompress_to_vec_capped::<Snappy>(&bomb(), CAP).unwrap_err(),
+            Error::OutputLimitExceeded
+        );
+
+        let mut dec = LimitedDecoder::new(Decoder::new(), len);
+        assert_eq!(drain(&mut dec, &encoded).unwrap(), payload);
+    }
+
+    #[test]
+    fn limit_survives_reset() {
+        let bomb = bomb();
+        let small = encode_chunked(b"hello", 32, 32);
+        let mut dec = LimitedDecoder::new(Decoder::new(), CAP);
+        let mut buf = [0u8; 64];
+
+        assert_eq!(
+            dec.decode(&bomb, &mut buf).unwrap_err(),
+            Error::OutputLimitExceeded
+        );
+        dec.reset();
+        // The error state is gone, the limit is not.
+        assert_eq!(drain(&mut dec, &small).unwrap(), b"hello");
+        dec.reset();
+        assert_eq!(
+            dec.decode(&bomb, &mut buf).unwrap_err(),
+            Error::OutputLimitExceeded
+        );
+    }
+
+    #[test]
+    fn limit_set_after_buffering_is_enforced_by_finish() {
+        let bomb = bomb();
+        let mut dec = Decoder::new();
+        let mut buf = [0u8; 64];
+        dec.decode(&bomb, &mut buf).unwrap();
+        dec.set_output_limit(CAP);
+        assert_eq!(
+            dec.finish(&mut buf).unwrap_err(),
+            Error::OutputLimitExceeded
+        );
+    }
+
+    #[test]
+    fn malformed_varint_is_still_reported_as_corrupt() {
+        // Six continuation bytes: not a u32 varint. The limit must not
+        // turn that into a different error (or hide it).
+        let block = [0xFFu8; 8];
+        let mut dec = LimitedDecoder::new(Decoder::new(), CAP);
+        assert_eq!(drain(&mut dec, &block).unwrap_err(), Error::Corrupt);
+    }
+
+    #[cfg(feature = "factory")]
+    #[test]
+    fn boxed_factory_decoder_refuses_from_first_decode() {
+        let bomb = bomb();
+        let boxed = compcol::factory::decoder_by_name("snappy").unwrap();
+        let mut dec = LimitedDecoder::new(boxed, CAP);
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            dec.decode(&bomb, &mut buf).unwrap_err(),
+            Error::OutputLimitExceeded
+        );
+
+        // And a block within the limit still decodes through the box.
+        let small = encode_chunked(b"hello", 32, 32);
+        let boxed = compcol::factory::decoder_by_name("snappy").unwrap();
+        let mut dec = LimitedDecoder::new(boxed, CAP);
+        assert_eq!(drain(&mut dec, &small).unwrap(), b"hello");
+    }
+}
