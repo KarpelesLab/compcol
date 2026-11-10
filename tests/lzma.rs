@@ -11,7 +11,9 @@
 
 #![cfg(feature = "lzma")]
 
-use compcol::lzma::{Decoder, Encoder, EncoderConfig, Lzma};
+use compcol::lzma::{
+    DEFAULT_MAX_DICT_SIZE, Decoder, DecoderConfig, Encoder, EncoderConfig, Lzma, MAX_DICT_SIZE,
+};
 use compcol::{Algorithm, Decoder as _, Encoder as _, Error, Flush, Status};
 
 fn hex(s: &str) -> Vec<u8> {
@@ -339,6 +341,256 @@ fn name_is_lzma() {
 #[test]
 fn default_config_is_level_6() {
     assert_eq!(EncoderConfig::default().level, 6);
+}
+
+// ─── dictionary size limit (DecoderConfig::max_dict_size) ────────────────
+
+const MIB: u64 = 1024 * 1024;
+
+/// `stream` with the dictionary size field of its `.lzma` header replaced.
+fn with_header_dict(stream: &[u8], dict: u32) -> Vec<u8> {
+    let mut s = stream.to_vec();
+    s[1..5].copy_from_slice(&dict.to_le_bytes());
+    s
+}
+
+fn decode_limited(max_dict_size: u64, stream: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut dec = Decoder::with_config(DecoderConfig::with_max_dict_size(max_dict_size));
+    decode_chunked_with(&mut dec, stream, stream.len(), 65536)
+}
+
+/// The default limit is the 64 MiB the decoder has always had (what
+/// `xz --format=lzma -9` writes), through every default constructor.
+#[test]
+fn default_max_dict_size_is_64_mib() {
+    assert_eq!(DEFAULT_MAX_DICT_SIZE, 64 * MIB);
+    assert_eq!(DecoderConfig::default().max_dict_size, 64 * MIB);
+    assert_eq!(DecoderConfig::new(), DecoderConfig::default());
+    assert_eq!(Decoder::new().max_dict_size(), 64 * MIB);
+    assert_eq!(Decoder::default().max_dict_size(), 64 * MIB);
+    assert_eq!(Lzma::decoder().max_dict_size(), 64 * MIB);
+
+    let hello = hex(FIX_HELLO);
+    let at = with_header_dict(&hello, 64 << 20);
+    let over = with_header_dict(&hello, (64 << 20) + 1);
+    type Make = fn() -> Decoder;
+    let makers: [Make; 4] = [Decoder::new, Decoder::default, Lzma::decoder, || {
+        Lzma::decoder_with(DecoderConfig::default())
+    }];
+    for make in makers {
+        let mut dec = make();
+        assert_eq!(
+            decode_chunked_with(&mut dec, &at, at.len(), 64).unwrap(),
+            b"hello world"
+        );
+        let mut dec = make();
+        assert_eq!(
+            decode_chunked_with(&mut dec, &over, over.len(), 64),
+            Err(Error::Unsupported)
+        );
+    }
+}
+
+/// A header declaring exactly the configured maximum is accepted, one byte
+/// more is `Unsupported`, for limits below and above the default.
+#[test]
+fn header_dict_size_checked_against_max_dict_size() {
+    let hello = hex(FIX_HELLO);
+    for max in [4096u32, 65536, 1 << 20, 64 << 20, 100 << 20, 1 << 30] {
+        for (dict, ok) in [(max - 1, true), (max, true), (max + 1, false)] {
+            let got = decode_limited(max as u64, &with_header_dict(&hello, dict));
+            if ok {
+                assert_eq!(got.unwrap(), b"hello world", "max {max} dict {dict}");
+            } else {
+                assert_eq!(got, Err(Error::Unsupported), "max {max} dict {dict}");
+            }
+        }
+        // Whatever the limit, the fixture's own 8 MiB header only passes
+        // when the limit allows 8 MiB.
+        assert_eq!(
+            decode_limited(max as u64, &hello).is_ok(),
+            max >= 8 << 20,
+            "max {max}"
+        );
+    }
+
+    // Both a header and a limit below the format's 4 KiB minimum mean 4 KiB.
+    for dict in [0u32, 1, 4095, 4096] {
+        for max in [0u64, 1, 4096] {
+            assert_eq!(
+                decode_limited(max, &with_header_dict(&hello, dict)).unwrap(),
+                b"hello world"
+            );
+        }
+    }
+    assert_eq!(
+        decode_limited(0, &with_header_dict(&hello, 4097)),
+        Err(Error::Unsupported)
+    );
+    assert_eq!(DecoderConfig::with_max_dict_size(0).max_dict_size, 0);
+    assert_eq!(
+        Decoder::with_config(DecoderConfig::with_max_dict_size(0)).max_dict_size(),
+        4096
+    );
+}
+
+/// The limit can be raised to everything the 32-bit header field can say
+/// (as far as the address space allows), and no further.
+#[test]
+fn max_dict_size_tops_out_at_the_format_limit() {
+    assert!(MAX_DICT_SIZE <= u32::MAX as u64);
+    assert_eq!(
+        Decoder::with_config(DecoderConfig::with_max_dict_size(u64::MAX)).max_dict_size(),
+        MAX_DICT_SIZE
+    );
+    assert_eq!(
+        Decoder::new().with_max_dict_size(u64::MAX).max_dict_size(),
+        MAX_DICT_SIZE
+    );
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert_eq!(MAX_DICT_SIZE, u32::MAX as u64);
+        let stream = with_header_dict(&hex(FIX_HELLO), u32::MAX);
+        assert_eq!(decode_limited(u64::MAX, &stream).unwrap(), b"hello world");
+        assert_eq!(
+            decode_limited(u32::MAX as u64 - 1, &stream),
+            Err(Error::Unsupported)
+        );
+    }
+}
+
+/// A stream that declares a 1 GiB dictionary but produces a few bytes
+/// decodes under a 1 GiB limit without allocating the gigabyte: the
+/// dictionary grows with the output actually produced.
+#[test]
+fn huge_declared_dictionary_is_not_allocated() {
+    let stream = with_header_dict(&hex(FIX_HELLO), 1 << 30);
+
+    let mut dec = Decoder::new();
+    assert_eq!(
+        decode_chunked_with(&mut dec, &stream, stream.len(), 64),
+        Err(Error::Unsupported)
+    );
+    assert_eq!(dec.dict_allocated(), 0);
+
+    let mut dec = Decoder::new().with_max_dict_size(1 << 30);
+    assert_eq!(dec.dict_allocated(), 0);
+    // Header and range-coder init alone allocate nothing.
+    let mut out = [0u8; 64];
+    let (p, _) = dec.decode(&stream[..18], &mut out).unwrap();
+    assert_eq!((p.consumed, p.written), (18, 0));
+    assert_eq!(dec.dict_allocated(), 0);
+    let mut dec = Decoder::new().with_max_dict_size(1 << 30);
+    assert_eq!(
+        decode_chunked_with(&mut dec, &stream, 7, 5).unwrap(),
+        b"hello world"
+    );
+    assert!(dec.dict_allocated() > 0);
+    assert!(
+        dec.dict_allocated() <= 64 * 1024,
+        "{}",
+        dec.dict_allocated()
+    );
+}
+
+/// The dictionary allocation follows the output, up to the declared size.
+#[test]
+fn dictionary_grows_with_the_output() {
+    let plain = lorem_corpus(300 * 1024);
+    let stream = with_header_dict(&encode_at_level(&plain, 1), 64 << 20);
+    let mut dec = Decoder::new();
+    let mut out = vec![0u8; 4096];
+    let mut got = Vec::new();
+    let mut pos = 0;
+    loop {
+        let (p, st) = if pos < stream.len() {
+            dec.decode(&stream[pos..], &mut out).unwrap()
+        } else {
+            dec.finish(&mut out).unwrap()
+        };
+        pos += p.consumed;
+        got.extend_from_slice(&out[..p.written]);
+        // Never more than double what has been produced (plus the floor).
+        assert!(
+            dec.dict_allocated() <= 2 * got.len() + 8192,
+            "{} allocated for {} bytes",
+            dec.dict_allocated(),
+            got.len()
+        );
+        if st == Status::StreamEnd {
+            break;
+        }
+        assert!(p.consumed + p.written > 0, "stalled");
+    }
+    assert!(got == plain);
+    assert!(dec.dict_allocated() >= plain.len());
+    assert!(dec.dict_allocated() < 1 << 20);
+}
+
+/// A dictionary smaller than the data still wraps around correctly now
+/// that it is grown lazily, and is never grown past its declared size.
+/// (`plain` only repeats at distances below 4 KiB, so the 4 KiB header is
+/// truthful.)
+#[test]
+fn small_dictionary_wraps_and_is_not_overgrown() {
+    let mut x = 0x2545_f491u32;
+    let period: Vec<u8> = (0..1500)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x >> 24) as u8
+        })
+        .collect();
+    let plain = period.repeat(200);
+    for (dict, in_chunk, out_chunk) in [
+        (4096u32, 1 << 20, 65536),
+        (4096, 13, 7),
+        (4097, 1000, 4096),
+        (6000, 999, 4095),
+        (65536, 1 << 20, 1),
+    ] {
+        let stream = with_header_dict(&encode_at_level(&plain, 1), dict);
+        let mut dec = Decoder::new();
+        let got = decode_chunked_with(&mut dec, &stream, in_chunk, out_chunk).unwrap();
+        assert!(got == plain, "dict {dict}");
+        assert_eq!(dec.dict_allocated(), dict as usize, "dict {dict}");
+    }
+}
+
+/// Exceeding the limit is reported as soon as the 13-byte header is in, is
+/// repeated by later calls, and `reset` keeps the configured limit.
+#[test]
+fn over_limit_header_is_reported_early_and_reset_keeps_the_limit() {
+    let hello = hex(FIX_HELLO);
+    let over = with_header_dict(&hello, (1 << 20) + 1);
+    let mut dec = Decoder::with_config(DecoderConfig::with_max_dict_size(MIB));
+    let mut out = [0u8; 64];
+    for (i, b) in over[..12].iter().enumerate() {
+        let (p, st) = dec.decode(std::slice::from_ref(b), &mut out).unwrap();
+        assert_eq!(
+            (p.consumed, p.written, st),
+            (1, 0, Status::InputEmpty),
+            "{i}"
+        );
+    }
+    assert_eq!(dec.decode(&over[12..13], &mut out), Err(Error::Unsupported));
+    assert_eq!(dec.decode(&over[13..], &mut out), Err(Error::Unsupported));
+    assert_eq!(dec.finish(&mut out), Err(Error::Unsupported));
+    assert_eq!(dec.dict_allocated(), 0);
+
+    dec.reset();
+    assert_eq!(dec.max_dict_size(), MIB);
+    let ok = with_header_dict(&hello, 1 << 20);
+    assert_eq!(
+        decode_chunked_with(&mut dec, &ok, 3, 64).unwrap(),
+        b"hello world"
+    );
+    dec.reset();
+    assert_eq!(
+        decode_chunked_with(&mut dec, &over, over.len(), 64),
+        Err(Error::Unsupported)
+    );
 }
 
 // ─── encoder round-trip tests ────────────────────────────────────────────

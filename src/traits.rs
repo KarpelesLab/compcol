@@ -120,6 +120,16 @@ pub trait RawDecoder {
     fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error>;
     fn raw_reset(&mut self);
 
+    /// See [`Decoder::set_output_limit`]. The default ignores the limit,
+    /// which is right for every decoder that hands its output out as it
+    /// produces it. A decoder that builds a block or the whole result
+    /// internally before the caller sees it overrides this and fails with
+    /// [`Error::OutputLimitExceeded`] instead of building more than
+    /// `max_output_bytes` in total.
+    fn raw_set_output_limit(&mut self, max_output_bytes: u64) {
+        let _ = max_output_bytes;
+    }
+
     /// Optional accelerated skip. Default impl drains through a scratch
     /// buffer via `raw_decode`. Override when the format allows fast-
     /// forwarding (e.g. seeking past deflate stored blocks).
@@ -288,6 +298,27 @@ pub trait Decoder {
     /// short-circuit (e.g. through stored / uncompressed blocks) are
     /// encouraged to override.
     fn discard_output(&mut self, input: &[u8], n: usize) -> Result<(Progress, Status), Error>;
+
+    /// Tell the decoder that the caller will take at most
+    /// `max_output_bytes` decoded bytes from a stream, counted from the
+    /// start of the stream.
+    ///
+    /// This is advice for decoders that cannot hand their output out as
+    /// they produce it and build a block, or the whole result, in memory
+    /// first: with a limit set, such a decoder fails with
+    /// [`Error::OutputLimitExceeded`] as soon as it can tell the stream
+    /// decodes to more, instead of committing the memory and letting the
+    /// caller find out afterwards. Decoders that stream ignore it, so it
+    /// does not by itself stop a stream from producing more than the
+    /// limit: [`LimitedDecoder`](crate::limit::LimitedDecoder) does that,
+    /// and calls this for you.
+    ///
+    /// Call it before the first `decode`. The limit is configuration: it
+    /// survives [`reset`](Decoder::reset). `u64::MAX` means no limit, and
+    /// is the default.
+    fn set_output_limit(&mut self, max_output_bytes: u64) {
+        let _ = max_output_bytes;
+    }
 }
 
 // ─── bridge: RawEncoder/RawDecoder → Encoder/Decoder ────────────────────
@@ -413,6 +444,9 @@ impl<T: RawDecoder> Decoder for T {
         self.raw_reset()
     }
 
+    fn set_output_limit(&mut self, max_output_bytes: u64) {
+        self.raw_set_output_limit(max_output_bytes)
+    }
     fn discard_output(&mut self, input: &[u8], n: usize) -> Result<(Progress, Status), Error> {
         let p = self.raw_skip(input, n)?;
         let status = if p.done {
@@ -479,6 +513,9 @@ impl Decoder for alloc::boxed::Box<dyn Decoder + '_> {
     }
     fn discard_output(&mut self, input: &[u8], n: usize) -> Result<(Progress, Status), Error> {
         (**self).discard_output(input, n)
+    }
+    fn set_output_limit(&mut self, max_output_bytes: u64) {
+        (**self).set_output_limit(max_output_bytes)
     }
 }
 

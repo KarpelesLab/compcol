@@ -65,6 +65,14 @@
 //! a stream whose last bytes arrive without anything following them ends in
 //! `finish` rather than in `decode`.
 //!
+//! Memory: the decoder's one large allocation is the dictionary, whose size
+//! the stream's header declares (up to 4 GiB − 1). [`DecoderConfig`] bounds
+//! it: a header declaring more than
+//! [`max_dict_size`](DecoderConfig::max_dict_size) (64 MiB by default, what
+//! `xz --format=lzma -9` writes) is [`Error::Unsupported`]. The dictionary
+//! is grown as output is produced, so a stream costs at most the smaller of
+//! its declared dictionary and its decoded length.
+//!
 //! The encoder lives in the private `encoder` submodule. It accumulates input into a buffer and
 //! emits the entire compressed stream on `finish` — LZMA's range coder
 //! prevents a true byte-streaming output, and full-buffer encoding is by far
@@ -92,12 +100,98 @@ impl Algorithm for Lzma {
     type Encoder = Encoder;
     type Decoder = Decoder;
     type EncoderConfig = EncoderConfig;
-    type DecoderConfig = ();
+    type DecoderConfig = DecoderConfig;
     fn encoder_with(c: Self::EncoderConfig) -> Encoder {
         Encoder::with_config(c)
     }
-    fn decoder_with(_: ()) -> Decoder {
-        Decoder::new()
+    fn decoder_with(c: DecoderConfig) -> Decoder {
+        Decoder::with_config(c)
+    }
+}
+
+// ─── decoder configuration ───────────────────────────────────────────────
+
+/// Default [`DecoderConfig::max_dict_size`]: 64 MiB, the dictionary
+/// `xz --format=lzma -9` writes.
+pub const DEFAULT_MAX_DICT_SIZE: u64 = 64 * 1024 * 1024;
+
+/// Largest dictionary a [`DecoderConfig`] can allow: what the header's
+/// 32-bit dictionary size field can express (4 GiB − 1), or the largest
+/// allocation the target supports if that is smaller (2 GiB − 1 on 32-bit
+/// targets). Higher [`DecoderConfig::max_dict_size`] values mean this.
+pub const MAX_DICT_SIZE: u64 = if (isize::MAX as u64) < u32::MAX as u64 {
+    isize::MAX as u64
+} else {
+    u32::MAX as u64
+};
+
+/// Smallest dictionary the decoder works with; a header (or a limit) asking
+/// for less is treated as asking for this, as in the LZMA SDK.
+const MIN_DICT_SIZE: u64 = 4096;
+
+/// Decoder tunables, for `.lzma` streams and ZIP method-14 entries alike.
+///
+/// The dictionary (the sliding window of decoded history) is the decoder's
+/// only large allocation, and its size comes from the stream's header, so
+/// this limit is the decoder's memory budget. A header declaring a larger
+/// dictionary is rejected with [`Error::Unsupported`] as soon as it has been
+/// read, before any data is decoded.
+///
+/// The dictionary is allocated as output is produced, not when the header is
+/// read: a stream costs the smaller of its declared dictionary size and the
+/// bytes it has decoded to so far, so raising the limit does not by itself
+/// make small streams expensive.
+///
+/// ```
+/// use compcol::lzma::{Decoder, DecoderConfig};
+///
+/// // Accept the 1 GiB dictionaries of `xz --format=lzma --lzma1=dict=1GiB`.
+/// let dec = Decoder::with_config(DecoderConfig::with_max_dict_size(1 << 30));
+/// assert_eq!(dec.max_dict_size(), 1 << 30);
+/// // Or keep a memory-constrained ZIP reader to 8 MiB per entry.
+/// let dec = Decoder::zip(false, Some(1234)).with_max_dict_size(8 << 20);
+/// assert_eq!(dec.max_dict_size(), 8 << 20);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecoderConfig {
+    /// Largest dictionary size (in bytes) a stream's header may declare.
+    /// Defaults to [`DEFAULT_MAX_DICT_SIZE`] (64 MiB). Values below 4 KiB
+    /// are treated as 4 KiB and values above [`MAX_DICT_SIZE`] as
+    /// [`MAX_DICT_SIZE`].
+    pub max_dict_size: u64,
+}
+
+impl DecoderConfig {
+    /// The default configuration: a [`DEFAULT_MAX_DICT_SIZE`] limit.
+    pub const fn new() -> Self {
+        Self {
+            max_dict_size: DEFAULT_MAX_DICT_SIZE,
+        }
+    }
+
+    /// Configuration accepting dictionaries of up to `bytes` bytes.
+    pub const fn with_max_dict_size(bytes: u64) -> Self {
+        Self {
+            max_dict_size: bytes,
+        }
+    }
+
+    /// The limit actually applied: `max_dict_size` brought into
+    /// `4 KiB..=MAX_DICT_SIZE`.
+    const fn effective_max_dict_size(self) -> u64 {
+        if self.max_dict_size < MIN_DICT_SIZE {
+            MIN_DICT_SIZE
+        } else if self.max_dict_size > MAX_DICT_SIZE {
+            MAX_DICT_SIZE
+        } else {
+            self.max_dict_size
+        }
+    }
+}
+
+impl Default for DecoderConfig {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -146,7 +240,8 @@ const RC_MOVE_BITS: u32 = 5;
 const RC_TOP_VALUE: u32 = 0x0100_0000;
 const PROB_INIT: u16 = (RC_BIT_MODEL_TOTAL / 2) as u16;
 
-const DIC_SIZE_MAX: u64 = 1 << 26; // 64 MiB cap on dict allocation
+/// Smallest step the lazily grown dictionary buffer is extended by.
+const DICT_GROW_MIN: usize = 4096;
 
 // State transitions per LZMA spec: each "packet" advances the state machine
 // according to whether the packet was a literal, a new match, a long-rep,
@@ -436,7 +531,21 @@ struct LzmaCore {
     expected_len: Option<u64>,
 
     // Dictionary / sliding window (decoded output buffer).
+    //
+    // The buffer is grown lazily, as output is produced, up to the declared
+    // window size `dict_size` (see `reserve_dict`), so a stream that merely
+    // *declares* a large dictionary commits no memory for it. Invariants
+    // (the same as the LZMA2 core's):
+    //   * `dict_pos < dict.len()` whenever a byte is about to be written
+    //     (`reserve_dict` runs before every write);
+    //   * `dict_pos` reaches `dict.len()` — the wrap-around — only once
+    //     `dict.len() == dict_size`, so `dict_full` implies a fully grown
+    //     buffer and every wrapped read is modulo `dict_size`;
+    //   * every read is guarded by `dict_has`, which without `dict_full`
+    //     admits only distances below `dict_pos`, i.e. bytes already
+    //     written.
     dict: Vec<u8>,
+    dict_size: usize,
     dict_pos: usize,
     dict_full: bool,
     /// Total bytes already produced and successfully delivered to the caller.
@@ -483,7 +592,8 @@ impl LzmaCore {
             lit_pos_mask,
             uncompressed_size,
             expected_len: None,
-            dict: vec![0u8; dict_size.max(1)],
+            dict: Vec::new(),
+            dict_size: dict_size.max(1),
             dict_pos: 0,
             dict_full: false,
             output_pos: 0,
@@ -520,7 +630,43 @@ impl LzmaCore {
         self.dict[pos]
     }
 
+    /// Make room for the next `n` dictionary writes. Must be called before
+    /// writing; afterwards up to `n` bytes can be put without `dict_pos`
+    /// running into the end of a not yet fully grown buffer.
+    #[inline]
+    fn reserve_dict(&mut self, n: usize) {
+        if self.dict.len() < self.dict_size {
+            self.grow_dict(n);
+        }
+    }
+
+    /// Slow path of [`Self::reserve_dict`]: grow the buffer geometrically
+    /// (so the zero-fill and copying stay proportional to the bytes
+    /// produced), never past `dict_size`.
+    #[cold]
+    fn grow_dict(&mut self, n: usize) {
+        // One spare byte keeps `dict_pos` strictly below `dict.len()` after
+        // the `n` writes, so the wrap-around test (`dict_pos >= dict.len()`)
+        // can only fire once the buffer has reached `dict_size`.
+        let need = self
+            .dict_pos
+            .saturating_add(n)
+            .saturating_add(1)
+            .min(self.dict_size);
+        let have = self.dict.len();
+        if need <= have {
+            return;
+        }
+        let new_len = need
+            .max(have.saturating_mul(2))
+            .max(DICT_GROW_MIN)
+            .min(self.dict_size);
+        self.dict.reserve_exact(new_len - have);
+        self.dict.resize(new_len, 0);
+    }
+
     fn dict_put(&mut self, b: u8) {
+        self.reserve_dict(1);
         self.dict[self.dict_pos] = b;
         self.dict_pos += 1;
         if self.dict_pos >= self.dict.len() {
@@ -543,6 +689,7 @@ impl LzmaCore {
         output: &mut [u8],
         written: &mut usize,
     ) -> usize {
+        self.reserve_dict(n);
         let dist1 = distance as usize + 1;
         let src = if self.dict_pos >= dist1 {
             self.dict_pos - dist1
@@ -587,6 +734,7 @@ impl LzmaCore {
         if self.dict_pos < dist1 {
             return 0;
         }
+        self.reserve_dict(n);
         let dst = self.dict_pos;
         let src = dst - dist1;
         let dst_room = self.dict.len() - dst;
@@ -941,6 +1089,15 @@ pub struct Decoder {
     zip: Option<ZipParams>,
     /// Buffered bytes the range decoder had not read when the stream ended.
     leftover: usize,
+    /// Largest dictionary size a header may declare (already brought into
+    /// `MIN_DICT_SIZE..=MAX_DICT_SIZE`).
+    max_dict_size: u64,
+    /// The header declared a dictionary over `max_dict_size`: every call
+    /// returns [`Error::Unsupported`] until `reset`.
+    over_limit: bool,
+    /// What the dictionary had grown to when the stream ended (it is freed
+    /// then); only read by [`Decoder::dict_allocated`].
+    dict_at_end: usize,
 }
 
 /// Out-of-band parameters of a ZIP method-14 entry.
@@ -972,8 +1129,17 @@ impl Default for Decoder {
 }
 
 impl Decoder {
-    /// Decoder for a legacy `.lzma` (alone) stream with its 13-byte header.
+    /// Decoder for a legacy `.lzma` (alone) stream with its 13-byte header,
+    /// with the default [`DecoderConfig`]: streams declaring a dictionary
+    /// larger than [`DEFAULT_MAX_DICT_SIZE`] (64 MiB) are rejected with
+    /// [`Error::Unsupported`].
     pub const fn new() -> Self {
+        Self::with_config(DecoderConfig::new())
+    }
+
+    /// Decoder for a legacy `.lzma` (alone) stream with an explicit
+    /// [`DecoderConfig`] (the dictionary size limit).
+    pub const fn with_config(config: DecoderConfig) -> Self {
         Self {
             buf: Vec::new(),
             pending_match: None,
@@ -981,6 +1147,41 @@ impl Decoder {
             header_state: HeaderState::Empty,
             zip: None,
             leftover: 0,
+            max_dict_size: config.effective_max_dict_size(),
+            over_limit: false,
+            dict_at_end: 0,
+        }
+    }
+
+    /// Set the largest dictionary size a stream's header may declare, as
+    /// [`DecoderConfig::max_dict_size`] does; chainable after any
+    /// constructor, e.g. `Decoder::zip(false, len).with_max_dict_size(n)`.
+    /// A header declaring more is rejected with [`Error::Unsupported`].
+    /// `reset` keeps the limit.
+    ///
+    /// Meant for a decoder that has not been fed yet: it does not
+    /// reconsider a header that has already been read.
+    pub const fn with_max_dict_size(mut self, bytes: u64) -> Self {
+        self.max_dict_size = DecoderConfig::with_max_dict_size(bytes).effective_max_dict_size();
+        self
+    }
+
+    /// The dictionary size limit in effect, in bytes: the configured
+    /// [`DecoderConfig::max_dict_size`] brought into
+    /// `4 KiB..=`[`MAX_DICT_SIZE`].
+    pub const fn max_dict_size(&self) -> u64 {
+        self.max_dict_size
+    }
+
+    /// Bytes allocated for the dictionary of the current stream so far (it
+    /// only grows; once the stream has ended, what it had grown to). For
+    /// tests of the allocation behaviour; not part of the stable API.
+    #[doc(hidden)]
+    pub fn dict_allocated(&self) -> usize {
+        match &self.header_state {
+            HeaderState::Active(core) => core.dict.capacity(),
+            HeaderState::Done => self.dict_at_end,
+            _ => 0,
         }
     }
 
@@ -1005,8 +1206,23 @@ impl Decoder {
     /// `StreamEnd` and leaves the bytes after the entry unconsumed (except
     /// for up to 20 bytes taken by earlier calls when the input arrives in
     /// very small pieces). `reset` keeps these settings.
+    ///
+    /// The dictionary size in the entry's properties is checked against the
+    /// default [`DecoderConfig`] limit ([`DEFAULT_MAX_DICT_SIZE`]); use
+    /// [`zip_with_config`](Self::zip_with_config) or chain
+    /// [`with_max_dict_size`](Self::with_max_dict_size) to change it.
     pub const fn zip(eos_marker: bool, uncompressed_len: Option<u64>) -> Self {
-        let mut d = Self::new();
+        Self::zip_with_config(eos_marker, uncompressed_len, DecoderConfig::new())
+    }
+
+    /// Same as [`Decoder::zip`], with an explicit [`DecoderConfig`] (the
+    /// dictionary size limit).
+    pub const fn zip_with_config(
+        eos_marker: bool,
+        uncompressed_len: Option<u64>,
+        config: DecoderConfig,
+    ) -> Self {
+        let mut d = Self::with_config(config);
         d.zip = Some(ZipParams {
             eos_marker,
             uncompressed_len,
@@ -1091,6 +1307,15 @@ impl Decoder {
                     self.buf[12],
                 ])
             };
+            // The dictionary is this decoder's memory budget: refuse a
+            // stream that asks for more than the caller allowed, rather
+            // than decode it with a smaller window and fail on the first
+            // match that reaches further back.
+            if dict_size as u64 > self.max_dict_size {
+                self.over_limit = true;
+                self.buf = Vec::new();
+                return Err(Error::Unsupported);
+            }
             self.buf.drain(0..header_len);
             self.header_state = HeaderState::HeaderParsed {
                 lc,
@@ -1118,7 +1343,10 @@ impl Decoder {
                 Some(z) if z.eos_marker => (None, z.uncompressed_len),
                 Some(z) => (z.uncompressed_len, z.uncompressed_len),
             };
-            let dict_size_eff = (dict_size as u64).clamp(4096, DIC_SIZE_MAX) as usize;
+            // At most `max_dict_size` (checked when the header was parsed),
+            // which fits `usize`. Nothing is allocated for it here: the
+            // buffer grows with the output.
+            let dict_size_eff = (dict_size as u64).max(MIN_DICT_SIZE) as usize;
             let mut core = Box::new(LzmaCore::new(lc, lp, pb, dict_size_eff, unc));
             core.expected_len = expected;
             // Try to initialise; if not enough bytes yet, stay in HeaderParsed.
@@ -1136,6 +1364,9 @@ impl Decoder {
     /// for a full output buffer or at the end of the stream. Once the
     /// stream has ended nothing more is consumed.
     fn absorb_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
+        if self.over_limit {
+            return Err(Error::Unsupported);
+        }
         if matches!(self.header_state, HeaderState::Done) {
             return Ok(RawProgress {
                 consumed: 0,
@@ -1186,6 +1417,9 @@ impl RawDecoder for Decoder {
     }
 
     fn raw_finish(&mut self, output: &mut [u8]) -> Result<RawProgress, Error> {
+        if self.over_limit {
+            return Err(Error::Unsupported);
+        }
         let mut written = 0usize;
         // Drain whatever we can with at_eof=true so the streaming gate is
         // disabled and any genuine short read errors with UnexpectedEnd.
@@ -1200,6 +1434,7 @@ impl RawDecoder for Decoder {
                     None => core.finished,
                 };
                 if target_met && no_pending {
+                    self.dict_at_end = core.dict.capacity();
                     self.header_state = HeaderState::Done;
                     true
                 } else if no_pending && written == 0 && !output.is_empty() {
@@ -1227,6 +1462,8 @@ impl RawDecoder for Decoder {
         self.pending_literal = None;
         self.header_state = HeaderState::Empty;
         self.leftover = 0;
+        self.over_limit = false;
+        self.dict_at_end = 0;
     }
 }
 
@@ -1351,6 +1588,7 @@ impl Decoder {
                     Some(false) => return Err(Error::Corrupt),
                 }
                 self.leftover = self.buf.len() - core.range.pos;
+                self.dict_at_end = core.dict.capacity();
                 self.header_state = HeaderState::Done;
                 return Ok(());
             }

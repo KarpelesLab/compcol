@@ -12,6 +12,32 @@
 //! decodes up to `u64::MAX` bytes (suitable for tests where the caller
 //! independently tracks output length).
 //!
+//! ## Streaming and memory
+//!
+//! The compressed stream is still buffered in full by `decode`, and
+//! decoding starts on the first `finish` call: a PPMd block's range coder
+//! reads ahead of the symbols it has decoded, and neither path retries a
+//! symbol cut short by a chunk boundary. From there the output is produced
+//! incrementally, as the caller drains it: `finish` returns as soon as it
+//! has bytes to hand out, and decoding resumes at the next symbol on the
+//! next call — in LZ and PPMd blocks alike (a PPMd block's range coder is
+//! saved between calls; an escape sequence counts as one symbol).
+//!
+//! Decoded bytes are released one dictionary behind the decoding position
+//! — the lag the reference decoder has between unpacking into its 4 MiB
+//! window and writing it out, which is also when in-band filters run — and
+//! never past the start of a filter window that is not complete yet. The
+//! output held inside the decoder is therefore bounded by the dictionary
+//! plus one filter window (about 4.3 MiB), whatever the unpacked size.
+//! Members smaller than the dictionary are released when they end, so an
+//! error in such a member is reported before any of its output.
+//!
+//! Set an output limit ([`set_output_limit`](crate::Decoder::set_output_limit),
+//! or wrap the decoder in a [`LimitedDecoder`](crate::limit::LimitedDecoder))
+//! when the input is untrusted: with a limit the decoder — in LZ and PPMd
+//! blocks alike — fails with `Error::OutputLimitExceeded` instead of
+//! producing more than the limit.
+//!
 //! ## What's supported
 //!
 //! - The **LZ77 + Huffman path** used by the vast majority of RAR3
@@ -66,7 +92,7 @@ use crate::traits::{RawDecoder, RawProgress};
 
 use super::bits::BitReader;
 use super::filters::{
-    PendingFilter, StdProgram, apply_e8_filter, apply_pending, recognize_program,
+    PendingFilter, StdProgram, apply_e8_filter_from, apply_pending, recognize_program,
 };
 use super::huffman::Huffman;
 use super::tables::{
@@ -74,22 +100,16 @@ use super::tables::{
     LOW_OFFSET_SIZE, MAIN_SIZE, OFFSET_BASE, OFFSET_EXTRA_BITS, OFFSET_SIZE, PRECODE_SIZE,
     SHORT_BASE, SHORT_EXTRA_BITS,
 };
-use crate::ppmd::{Ppmd7, RangeDec, RangeMode};
+use crate::ppmd::{Ppmd7, RangeDec, RangeDecState, RangeMode};
 
 /// Streaming RAR 3.x decoder. See module docs for the calling convention.
 pub struct Decoder {
-    /// Pending compressed bytes the caller has supplied but we haven't yet
-    /// consumed.
     state: State,
-    /// Sink we hand decoded output to before the caller drains it.
-    out_buf: Vec<u8>,
-    out_drained: usize,
     /// Caller-declared maximum unpacked size. The decoder stops emitting
     /// once this is reached. The default is `u64::MAX`.
     unpack_size: u64,
-    /// Apply the E8/E9 filter once decompression finishes? When `true`, the
-    /// filter is applied as a single post-pass over the full output buffer
-    /// after the unpack_size is reached.
+    /// Apply the standalone E8/E9 filter over the member's output (after
+    /// any in-band filters)?
     e8_enabled: bool,
     e8_translate_e9: bool,
     /// Set on any irrecoverable error.
@@ -98,18 +118,25 @@ pub struct Decoder {
     /// PPMd model where applicable) and the decode context persists across
     /// [`Decoder::begin_solid_member`] calls.
     solid: bool,
-    /// The persistent decode context (window, code tables, offset history,
-    /// filter programs, PPMd model). Created on the first `finish`; dropped
-    /// after each stream unless `solid`.
+    /// The decode context: window, code tables, offset history, filter
+    /// programs, PPMd model, and the current member's input and undelivered
+    /// output. Created on the first `finish`; dropped once a stream has
+    /// drained unless `solid`.
     ctx: Option<Box<RunCtx>>,
+    /// Advisory output limit (see `raw_set_output_limit`); `u64::MAX` when
+    /// unset. Configuration: survives `reset`.
+    output_limit: u64,
+    /// Output produced by the members completed since the last reset, so
+    /// the limit covers a solid group as a whole.
+    produced_before: u64,
 }
 
 enum State {
     /// Buffering input until [`finish`] is called.
     Buffering { input: Vec<u8> },
-    /// Decoding is finished; bytes are in `out_buf`. After all `out_buf`
-    /// bytes are drained to the caller, transitions to `Done`.
-    Draining,
+    /// `finish` has been called: the member is being decoded and its output
+    /// drained, a piece per call.
+    Decoding,
     /// Stream is fully decoded and output drained.
     Done,
 }
@@ -124,14 +151,14 @@ impl Decoder {
     pub fn new() -> Self {
         Self {
             state: State::Buffering { input: Vec::new() },
-            out_buf: Vec::new(),
-            out_drained: 0,
             unpack_size: u64::MAX,
             e8_enabled: false,
             e8_translate_e9: false,
             poisoned: false,
             solid: false,
             ctx: None,
+            output_limit: u64::MAX,
+            produced_before: 0,
         }
     }
 
@@ -183,28 +210,51 @@ impl Decoder {
         Ok(())
     }
 
+    /// Decoded bytes currently held inside the decoder: output that is
+    /// waiting to be drained, or that cannot be released yet (it is less
+    /// than a dictionary behind the decoding position, or inside a filter
+    /// window that is still incomplete). Exposed so tests can check that
+    /// this stays bounded while a large stream is drained through a small
+    /// buffer.
+    #[doc(hidden)]
+    pub fn buffered_output(&self) -> usize {
+        self.ctx.as_deref().map_or(0, |ctx| ctx.out.len())
+    }
+
     fn poison<T>(&mut self, e: Error) -> Result<T, Error> {
         self.poisoned = true;
         Err(e)
     }
 
-    /// Drain `out_buf` into the caller's `output`. Returns bytes written.
-    fn drain_into(&mut self, output: &mut [u8]) -> usize {
-        let mut written = 0usize;
-        while self.out_drained < self.out_buf.len() && written < output.len() {
-            let n = (self.out_buf.len() - self.out_drained).min(output.len() - written);
-            output[written..written + n]
-                .copy_from_slice(&self.out_buf[self.out_drained..self.out_drained + n]);
-            written += n;
-            self.out_drained += n;
+    /// Hand out decoded bytes, decoding more of the member when none are
+    /// waiting. Returns the bytes written to `output`; moves to `Done` once
+    /// the member is finished and fully drained.
+    ///
+    /// Decoding only ever runs with nothing waiting and nothing yet copied
+    /// to `output` in this call: if it were to fail after bytes had been
+    /// copied out, the error would swallow them, and how many would depend
+    /// on the size of `output`.
+    fn advance(&mut self, output: &mut [u8]) -> Result<usize, Error> {
+        if !matches!(self.state, State::Decoding) {
+            return Ok(0);
         }
-        if self.out_drained == self.out_buf.len() {
-            // Once everything is drained, free the buffer.
-            self.out_buf.clear();
-            self.out_drained = 0;
+        let solid = self.solid;
+        let ctx = self.ctx.as_deref_mut().ok_or(Error::Corrupt)?;
+        if !ctx.has_ready() && !ctx.member_finished() {
+            ctx.pump(solid)?;
+        }
+        let written = ctx.drain_into(output);
+        if !ctx.has_ready() && ctx.member_finished() {
+            self.produced_before = self.produced_before.saturating_add(ctx.produced());
+            if solid {
+                ctx.end_member();
+            } else {
+                // A one-shot stream has no further use for the 4 MiB window.
+                self.ctx = None;
+            }
             self.state = State::Done;
         }
-        written
+        Ok(written)
     }
 }
 
@@ -221,19 +271,18 @@ impl RawDecoder for Decoder {
         }
         let mut consumed = 0usize;
         let mut written = 0usize;
-        // RAR3 needs the entire compressed stream before it can decode —
-        // we don't snapshot the inner state to handle mid-symbol stalls,
-        // so the streaming model is buffer-then-drain. The caller may
-        // however interleave `decode` calls (to push input) with periodic
-        // drains, which we honour here.
+        // RAR3 needs the entire compressed stream before it can decode (see
+        // the module docs), so input is buffered until `finish`. Once
+        // decoding has started, `decode` drains output just like `finish`.
         match &mut self.state {
             State::Buffering { input: buf } => {
                 buf.extend_from_slice(input);
                 consumed = input.len();
             }
-            State::Draining => {
-                written = self.drain_into(output);
-            }
+            State::Decoding => match self.advance(output) {
+                Ok(n) => written = n,
+                Err(e) => return self.poison(e),
+            },
             State::Done => {}
         }
         Ok(RawProgress {
@@ -247,141 +296,87 @@ impl RawDecoder for Decoder {
         if self.poisoned {
             return Err(Error::Corrupt);
         }
-        // If we still need to decode, do it now.
+        // First call: start decoding the buffered member.
         if let State::Buffering { input } = &mut self.state {
             let input = core::mem::take(input);
-            let ctx = self
-                .ctx
-                .get_or_insert_with(|| Box::new(RunCtx::new(self.unpack_size)));
-            ctx.unpack_size = self.unpack_size;
-            let result = if self.unpack_size == 0 {
-                Ok(Vec::new())
+            if self.unpack_size == 0 {
+                self.state = State::Done;
             } else {
-                run_member(ctx, &input, self.solid)
-            };
-            match result {
-                Ok(mut out) => {
-                    if self.e8_enabled {
-                        apply_e8_filter(&mut out, 0, self.e8_translate_e9);
-                    }
-                    if !self.solid {
-                        // Match the pre-solid memory profile: a one-shot
-                        // stream has no further use for the 4 MiB window.
-                        self.ctx = None;
-                    }
-                    self.out_buf = out;
-                    self.out_drained = 0;
-                    self.state = State::Draining;
-                }
-                Err(e) => return self.poison(e),
+                let limit = self.output_limit.saturating_sub(self.produced_before);
+                let e8 = self.e8_enabled.then_some(self.e8_translate_e9);
+                let ctx = self.ctx.get_or_insert_with(|| Box::new(RunCtx::new()));
+                ctx.begin_member(input, self.unpack_size, limit, e8);
+                self.state = State::Decoding;
             }
         }
-        let written = self.drain_into(output);
-        let done = matches!(self.state, State::Done);
+        let written = match self.advance(output) {
+            Ok(n) => n,
+            Err(e) => return self.poison(e),
+        };
         Ok(RawProgress {
             consumed: 0,
             written,
-            done,
+            done: matches!(self.state, State::Done),
         })
     }
 
     fn raw_reset(&mut self) {
         self.state = State::Buffering { input: Vec::new() };
-        self.out_buf.clear();
-        self.out_drained = 0;
         self.poisoned = false;
         // A reset starts a fresh stream: any solid history is gone.
         self.ctx = None;
-        // unpack_size, solid and filter flags are configuration; preserved
-        // across reset to match the LZX/Quantum conventions.
+        self.produced_before = 0;
+        // unpack_size, solid, the filter flags and the output limit are
+        // configuration; preserved across reset to match the LZX/Quantum
+        // conventions.
+    }
+
+    /// With a limit set, a stream that decodes to more than
+    /// `max_output_bytes` (in total — across the members of a solid group)
+    /// fails with [`Error::OutputLimitExceeded`] at the symbol that would
+    /// cross it, before those bytes are produced.
+    fn raw_set_output_limit(&mut self, max_output_bytes: u64) {
+        self.output_limit = max_output_bytes;
     }
 }
 
 // ─── Internal decode pipeline ─────────────────────────────────────────────
 
-/// Decode one member's compressed payload against the (possibly carried-
-/// over) context. In solid mode the end-of-member marker is consumed so the
-/// persistent state is exactly what the next member's stream expects.
-/// Cap on speculative preallocation of the output buffer, so a hostile
-/// `unpack_size` can't drive a huge up-front allocation. Real members past
-/// this still decode; `out` just grows the rest of the way.
-const OUT_PREALLOC_CAP: u64 = 64 << 20;
+/// How far output release lags behind decoding: decoded bytes are handed
+/// out (and the filters over them run) once this many are held. It is the
+/// reference decoder's own lag — unrar unpacks into its 4 MiB window and
+/// writes it out when the window is within 260 bytes of lapping the write
+/// position — and keeping it preserves the reference's answer to "which
+/// filters has a mid-stream reset declaration come too late to cancel?"
+/// for every member that fits in one dictionary.
+const RELEASE_LAG: u64 = DICT_DEFAULT_SIZE as u64 - 260;
 
-/// Bytes to reserve up front for a member's output, from its declared
-/// `unpack_size`. Avoids ~log2(size) grow-and-copy reallocations while a
-/// large member decodes. The `u64::MAX` sentinel means "unknown length"
-/// (no declared size) — reserve nothing rather than speculate.
-fn out_prealloc(unpack_size: u64) -> usize {
-    if unpack_size == u64::MAX {
-        0
-    } else {
-        unpack_size.min(OUT_PREALLOC_CAP) as usize
-    }
-}
+/// When a release pass leaves bytes held behind an incomplete filter
+/// window, look again after this much more output rather than a whole
+/// [`RELEASE_LAG`] later.
+const RELEASE_RETRY_STRIDE: u64 = 64 << 10;
 
-fn run_member(ctx: &mut RunCtx, input: &[u8], solid: bool) -> Result<Vec<u8>, Error> {
-    // Each member's payload is its own byte-aligned stream (the container
-    // resets the bit input at every member boundary), so the reader is
-    // rebuilt even when the rest of the context carries over.
-    ctx.bits = BitReader::new();
-    ctx.bits.feed_slice(input);
-    ctx.out = Vec::with_capacity(out_prealloc(ctx.unpack_size));
-    // Filter *programs* persist across solid members, but scheduled filter
-    // instances never span a member boundary.
-    ctx.pending_filters.clear();
+/// Upper bound on the decoded bytes still held right after a release pass
+/// (asserted in debug builds). Every pending filter was declared less than
+/// `DICT_DEFAULT_SIZE + FILTER_MAX_BLOCK` bytes ago — an older one has a
+/// complete window, as has everything declared before it, so the pass
+/// applied it — and a window never starts before its declaration.
+const HELD_AFTER_RELEASE_MAX: u64 = DICT_DEFAULT_SIZE as u64 + FILTER_MAX_BLOCK as u64;
 
-    // A fresh stream — or a previous member that announced new tables —
-    // starts with a block header; otherwise symbol decoding continues
-    // directly under the carried-over tables (or PPMd model).
-    if !ctx.tables_read {
-        parse_block_header(ctx)?;
-    }
-    loop {
-        let seg = match ctx.block {
-            BlockKind::Lz => expand(ctx, solid)?,
-            BlockKind::Ppm => run_ppmd(ctx, input, solid)?,
-        };
-        match seg {
-            Segment::MemberEnd => break,
-            Segment::NewTable => parse_block_header(ctx)?,
-            Segment::NewTableThenEnd => {
-                parse_block_header(ctx)?;
-                if matches!(ctx.block, BlockKind::Ppm) {
-                    // A PPMd block starting exactly at the member boundary
-                    // would prime its range coder from this member's tail
-                    // bytes and keep pulling from the next member's payload
-                    // — cross-member coder state we don't support (rar 6.24
-                    // starts such blocks with a header in the next member
-                    // instead).
-                    return Err(Error::Unsupported);
-                }
-                break;
-            }
-        }
-    }
-
-    if solid && (ctx.out.len() as u64) < ctx.unpack_size {
-        // A short member desyncs the shared history for every member after
-        // it; fail the group rather than hand back silently-short output.
-        return Err(Error::UnexpectedEnd);
-    }
-
-    // Run any in-band filters whose windows the stream completed. A filter
-    // still pending here declared a window the stream never finished
-    // producing — a truncated or malformed stream. unrar in that situation
-    // writes the raw bytes and relies on the container CRC to flag the
-    // file; this crate's policy is to surface the error instead of
-    // returning pre-filter bytes as a success.
-    ctx.flush_completed_filters()?;
-    if !ctx.pending_filters.is_empty() {
-        return Err(Error::Corrupt);
-    }
-
-    Ok(core::mem::take(&mut ctx.out))
-}
+/// Total bytes in-band filters may process, as a multiple of the output
+/// decoded so far. A real encoder filters each region of a file once (the
+/// reference decoder can chain filters, but only over an identical block),
+/// and of the standard programs only three run here, so honest streams
+/// stay at or below 1x; a stream that stacks thousands of windows on the
+/// same bytes to buy a full-window pass per few input bytes is refused as
+/// corrupt once it crosses this.
+const FILTER_WORK_FACTOR: u64 = 4;
 
 /// How a run of symbol decoding ended.
 enum Segment {
+    /// Decoded output is waiting for the caller; decoding resumes at the
+    /// next symbol once it has been drained.
+    Paused,
     /// The member is complete (declared size produced and, in solid mode,
     /// the end-of-member marker consumed).
     MemberEnd,
@@ -396,9 +391,21 @@ enum Segment {
 
 /// Which decoding mode the current block uses. Persists across solid
 /// members: a member may continue a block the previous member started.
+#[derive(Clone, Copy)]
 enum BlockKind {
     Lz,
     Ppm,
+}
+
+/// Where decoding of the current member stands between `pump` calls.
+#[derive(Clone, Copy)]
+enum Phase {
+    /// A block header is next in the bit stream.
+    Header,
+    /// Symbols of the current block (LZ or PPMd) are next.
+    Symbols,
+    /// The member is complete; only draining remains.
+    Finished,
 }
 
 struct RunCtx {
@@ -417,8 +424,27 @@ struct RunCtx {
     /// "16" symbol.
     last_low_offset: u32,
     num_low_offset_repeats: u32,
-    /// The decoded output stream.
+    /// Decoded output of the current member not yet handed to the caller:
+    /// `out[0]` is the byte at member offset `out_base`. The first
+    /// `ready_len` bytes are final (of which `drained` are already
+    /// delivered and await compaction); the first `final_len` have had
+    /// their in-band filters applied; the rest is still held back.
     out: Vec<u8>,
+    out_base: u64,
+    final_len: usize,
+    ready_len: usize,
+    drained: usize,
+    /// Member offset at which the next release pass runs.
+    next_release_at: u64,
+    /// Member offset the output may not grow past (the caller's output
+    /// limit, less what earlier members produced).
+    out_limit: u64,
+    /// Bytes in-band filters have processed in this member.
+    filter_work: u64,
+    /// The standalone E8 pass: `Some(translate_e9)` when enabled.
+    e8: Option<bool>,
+    /// Decoding progress of the current member.
+    phase: Phase,
     /// Sliding window — kept in sync with `out` for back-reference lookups.
     /// We use a plain Vec sized to DICT_DEFAULT_SIZE so wrap-around at the
     /// end is cheap; reads use bitwise masking.
@@ -443,6 +469,12 @@ struct RunCtx {
     /// blocks and solid members: a later PPMd block header without the
     /// reset flag reuses it (with a freshly initialised range coder).
     ppmd: Option<Box<PpmdBlock>>,
+    /// The range coder of the PPMd block being decoded, saved when
+    /// [`run_ppmd`] paused to let the caller drain. `None` when the block's
+    /// coder has yet to be primed from the bytes after its header. Never
+    /// outlives its block or its member: the coder reads this member's
+    /// payload only.
+    ppmd_coder: Option<RangeDecState>,
     /// Decoding mode of the current block (LZ+Huffman or PPMd).
     block: BlockKind,
     /// Whether valid LZ code tables are in effect, i.e. whether the next
@@ -470,7 +502,7 @@ struct ProgramSlot {
 }
 
 impl RunCtx {
-    fn new(unpack_size: u64) -> Self {
+    fn new() -> Self {
         RunCtx {
             bits: BitReader::new(),
             // The length table survives across blocks (and solid members):
@@ -487,27 +519,243 @@ impl RunCtx {
             last_length: 0,
             last_low_offset: 0,
             num_low_offset_repeats: 0,
-            out: Vec::with_capacity(out_prealloc(unpack_size)),
+            out: Vec::new(),
+            out_base: 0,
+            final_len: 0,
+            ready_len: 0,
+            drained: 0,
+            next_release_at: RELEASE_LAG,
+            out_limit: u64::MAX,
+            filter_work: 0,
+            e8: None,
+            phase: Phase::Finished,
             window: vec![0u8; DICT_DEFAULT_SIZE],
             wmask: {
                 debug_assert!(DICT_DEFAULT_SIZE.is_power_of_two());
                 DICT_DEFAULT_SIZE - 1
             },
             window_pos: 0,
-            unpack_size,
+            unpack_size: 0,
             programs: Vec::new(),
             last_filter_slot: 0,
             pending_filters: VecDeque::new(),
             ppmd: None,
+            ppmd_coder: None,
             block: BlockKind::Lz,
             tables_read: false,
         }
     }
 
-    fn emit_literal(&mut self, b: u8) {
+    /// Set up for one member's compressed payload against the (possibly
+    /// carried-over) context.
+    fn begin_member(&mut self, input: Vec<u8>, unpack_size: u64, out_limit: u64, e8: Option<bool>) {
+        // Each member's payload is its own byte-aligned stream (the
+        // container resets the bit input at every member boundary), so the
+        // reader is rebuilt even when the rest of the context carries over.
+        self.bits = BitReader::from_vec(input);
+        self.out.clear();
+        // Avoid grow-and-copy reallocations up to what the decoder holds in
+        // steady state; a smaller member reserves just its declared size
+        // (`u64::MAX` means unknown — reserve nothing rather than
+        // speculate).
+        if unpack_size != u64::MAX {
+            self.out
+                .reserve(unpack_size.min(RELEASE_LAG + RELEASE_RETRY_STRIDE) as usize);
+        }
+        self.out_base = 0;
+        self.final_len = 0;
+        self.ready_len = 0;
+        self.drained = 0;
+        self.next_release_at = RELEASE_LAG;
+        self.out_limit = out_limit;
+        self.filter_work = 0;
+        self.e8 = e8;
+        self.unpack_size = unpack_size;
+        // Filter *programs* persist across solid members, but scheduled
+        // filter instances never span a member boundary.
+        self.pending_filters.clear();
+        // Nor does a range coder: it read the previous member's payload.
+        self.ppmd_coder = None;
+        // A fresh stream — or a previous member that announced new tables —
+        // starts with a block header; otherwise symbol decoding continues
+        // directly under the carried-over tables.
+        self.phase = if self.tables_read {
+            Phase::Symbols
+        } else {
+            Phase::Header
+        };
+    }
+
+    /// Drop the finished member's buffers; the shared history stays.
+    fn end_member(&mut self) {
+        self.bits = BitReader::new();
+        self.out = Vec::new();
+        self.out_base = 0;
+        self.final_len = 0;
+        self.ready_len = 0;
+        self.drained = 0;
+    }
+
+    /// Member offset of the next byte to be decoded.
+    #[inline]
+    fn produced(&self) -> u64 {
+        self.out_base + self.out.len() as u64
+    }
+
+    /// Final bytes are waiting for the caller.
+    fn has_ready(&self) -> bool {
+        self.drained < self.ready_len
+    }
+
+    fn member_finished(&self) -> bool {
+        matches!(self.phase, Phase::Finished)
+    }
+
+    /// Copy final bytes into the caller's `output`. Returns bytes written.
+    fn drain_into(&mut self, output: &mut [u8]) -> usize {
+        let n = (self.ready_len - self.drained).min(output.len());
+        output[..n].copy_from_slice(&self.out[self.drained..self.drained + n]);
+        self.drained += n;
+        n
+    }
+
+    /// Drop the delivered prefix of `out`.
+    fn compact(&mut self) {
+        if self.drained > 0 {
+            self.out.drain(..self.drained);
+            self.out_base += self.drained as u64;
+            self.final_len -= self.drained;
+            self.ready_len -= self.drained;
+            self.drained = 0;
+        }
+    }
+
+    /// Decode until final bytes are waiting for the caller or the member is
+    /// finished. Only called with nothing waiting, so the delivered prefix
+    /// can be dropped first.
+    ///
+    /// LZ and PPMd blocks alike stop at the release pass that made bytes
+    /// final, which is what keeps `out` bounded (see
+    /// [`HELD_AFTER_RELEASE_MAX`]).
+    fn pump(&mut self, solid: bool) -> Result<(), Error> {
+        self.compact();
+        loop {
+            if self.has_ready() {
+                return Ok(());
+            }
+            match self.phase {
+                Phase::Finished => return Ok(()),
+                Phase::Header => {
+                    parse_block_header(self)?;
+                    self.phase = Phase::Symbols;
+                }
+                Phase::Symbols => {
+                    let seg = match self.block {
+                        BlockKind::Lz => expand(self, solid)?,
+                        BlockKind::Ppm => run_ppmd(self, solid)?,
+                    };
+                    match seg {
+                        Segment::Paused => return Ok(()),
+                        Segment::MemberEnd => self.finish_member(solid)?,
+                        Segment::NewTable => self.phase = Phase::Header,
+                        Segment::NewTableThenEnd => {
+                            parse_block_header(self)?;
+                            if matches!(self.block, BlockKind::Ppm) {
+                                // A PPMd block starting exactly at the
+                                // member boundary would prime its range
+                                // coder from this member's tail bytes and
+                                // keep pulling from the next member's
+                                // payload — cross-member coder state we
+                                // don't support (rar 6.24 starts such
+                                // blocks with a header in the next member
+                                // instead).
+                                return Err(Error::Unsupported);
+                            }
+                            self.finish_member(solid)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The member's symbols are exhausted: make the rest of its output
+    /// final.
+    fn finish_member(&mut self, solid: bool) -> Result<(), Error> {
+        if solid && self.produced() < self.unpack_size {
+            // A short member desyncs the shared history for every member
+            // after it; fail the group rather than hand back silently-short
+            // output.
+            return Err(Error::UnexpectedEnd);
+        }
+        self.release(true)?;
+        self.phase = Phase::Finished;
+        // The compressed payload is no longer needed.
+        self.bits = BitReader::new();
+        Ok(())
+    }
+
+    /// A release pass: run the filters whose windows are complete, then
+    /// make final every byte in front of the earliest window still pending
+    /// (all of them at the end of the member).
+    ///
+    /// Passes happen at stream positions that depend only on the stream —
+    /// never on how the caller sizes its buffers — so the output, and the
+    /// point at which a malformed stream fails, are the same for every
+    /// chunking.
+    fn release(&mut self, at_end: bool) -> Result<(), Error> {
+        self.flush_completed_filters()?;
+        let produced = self.produced();
+        let bound = if at_end {
+            // A filter still pending here declared a window the stream
+            // never finished producing — a truncated or malformed stream.
+            // unrar in that situation writes the raw bytes and relies on
+            // the container CRC to flag the file; this crate's policy is to
+            // surface the error instead of returning pre-filter bytes as a
+            // success.
+            if !self.pending_filters.is_empty() {
+                return Err(Error::Corrupt);
+            }
+            produced
+        } else {
+            self.pending_filters
+                .iter()
+                .map(|f| f.start)
+                .min()
+                .map_or(produced, |start| start.min(produced))
+        };
+        // A window never starts before the position it was declared at, so
+        // the bound only moves forward.
+        debug_assert!(bound >= self.out_base + self.final_len as u64);
+        debug_assert!(at_end || produced - bound <= HELD_AFTER_RELEASE_MAX);
+        self.final_len = self.final_len.max((bound - self.out_base) as usize);
+        self.ready_len = match self.e8 {
+            None => self.final_len,
+            Some(translate_e9) => {
+                let scanned = apply_e8_filter_from(
+                    &mut self.out[..self.final_len],
+                    self.out_base,
+                    self.ready_len,
+                    translate_e9,
+                );
+                // The trailing bytes of the member have too little after
+                // them to be a call site.
+                if at_end { self.final_len } else { scanned }
+            }
+        };
+        self.next_release_at = (self.out_base + self.final_len as u64 + RELEASE_LAG)
+            .max(produced + RELEASE_RETRY_STRIDE);
+        Ok(())
+    }
+
+    fn emit_literal(&mut self, b: u8) -> Result<(), Error> {
+        if self.produced() >= self.out_limit {
+            return Err(Error::OutputLimitExceeded);
+        }
         self.out.push(b);
         self.window[self.window_pos] = b;
         self.window_pos = (self.window_pos + 1) & self.wmask;
+        Ok(())
     }
 
     fn emit_match(&mut self, offset: u32, length: u32) -> Result<(), Error> {
@@ -523,8 +771,14 @@ impl RunCtx {
         }
         // Clamp the run to the declared unpack size (the old loop broke per
         // byte once `out` reached it — produce exactly the same byte count).
-        let remaining_out = self.unpack_size.saturating_sub(self.out.len() as u64);
-        let length = (length as u64).min(remaining_out) as usize;
+        let produced = self.produced();
+        let length = (length as u64).min(self.unpack_size.saturating_sub(produced));
+        if length > self.out_limit.saturating_sub(produced) {
+            // Refuse before copying: the match would cross the caller's
+            // output limit.
+            return Err(Error::OutputLimitExceeded);
+        }
+        let length = length as usize;
         let mut src = (self.window_pos + wlen - off) & wmask;
         self.out.reserve(length);
 
@@ -573,7 +827,7 @@ impl RunCtx {
     }
 
     fn done(&self) -> bool {
-        (self.out.len() as u64) >= self.unpack_size
+        self.produced() >= self.unpack_size
     }
 
     /// Apply and drop every filter at the *front* of the pending queue
@@ -582,17 +836,27 @@ impl RunCtx {
     /// Only a prefix is flushed: a filter behind one whose window is still
     /// incomplete stays queued even if its own window is complete, so
     /// overlapping windows (filter chains) always apply in declaration
-    /// order — the same order unrar's stack executes them. `out` is
-    /// append-only and LZ back-references read the (unfiltered) window,
-    /// not `out`, so applying a filter as soon as its window completes is
-    /// equivalent to applying it at the end of the stream.
+    /// order — the same order unrar's stack executes them. LZ
+    /// back-references read the (unfiltered) window, not `out`, and bytes
+    /// at or past a pending window's start are never released, so applying
+    /// a filter any time after its window completes gives the same bytes.
+    ///
+    /// The bytes filtered are charged against the member's filter-work
+    /// budget ([`FILTER_WORK_FACTOR`]).
     fn flush_completed_filters(&mut self) -> Result<(), Error> {
+        let produced = self.produced();
         while let Some(&f) = self.pending_filters.front() {
             let end = f.start + f.length as u64;
-            if end > self.out.len() as u64 {
+            if end > produced {
                 break;
             }
-            apply_pending(&f, &mut self.out[f.start as usize..end as usize])?;
+            self.filter_work += f.length as u64;
+            if self.filter_work > produced.saturating_mul(FILTER_WORK_FACTOR) {
+                return Err(Error::Corrupt);
+            }
+            let lo = (f.start - self.out_base) as usize;
+            let hi = (end - self.out_base) as usize;
+            apply_pending(&f, &mut self.out[lo..hi])?;
             self.pending_filters.pop_front();
         }
         Ok(())
@@ -660,6 +924,9 @@ fn parse_block_header(ctx: &mut RunCtx) -> Result<(), Error> {
         }
         ctx.bits.byte_align();
         ctx.block = BlockKind::Ppm;
+        // Every PPMd block header starts a fresh range coder, primed from
+        // the bytes that follow it.
+        ctx.ppmd_coder = None;
         // A PPMd block never leaves LZ tables in effect: after a PPMd
         // member, the next member always starts with its own header.
         ctx.tables_read = false;
@@ -801,6 +1068,15 @@ fn expand(ctx: &mut RunCtx, solid: bool) -> Result<Segment, Error> {
             }
             return Ok(Segment::MemberEnd);
         }
+        if ctx.produced() >= ctx.next_release_at {
+            ctx.release(false)?;
+            if ctx.has_ready() {
+                // Let the caller drain before decoding further; every
+                // symbol is decoded whole, so the bit reader, tables and
+                // offset history are exactly where the next call resumes.
+                return Ok(Segment::Paused);
+            }
+        }
 
         // Decode the next main-tree symbol.
         let main_tree = ctx.main.as_ref().ok_or(Error::InvalidHuffmanTree)?;
@@ -808,8 +1084,8 @@ fn expand(ctx: &mut RunCtx, solid: bool) -> Result<Segment, Error> {
             Ok(s) => s,
             Err(Error::UnexpectedEnd) => {
                 if solid {
-                    // A short member desyncs the group; `run_member` turns
-                    // this into a hard error rather than short output.
+                    // A short member desyncs the group: a hard error
+                    // rather than short output.
                     return Err(Error::UnexpectedEnd);
                 }
                 // Stream ran out before we've reached unpack_size. The
@@ -820,7 +1096,7 @@ fn expand(ctx: &mut RunCtx, solid: bool) -> Result<Segment, Error> {
         };
 
         if sym < 256 {
-            ctx.emit_literal(sym as u8);
+            ctx.emit_literal(sym as u8)?;
             continue;
         }
 
@@ -1009,21 +1285,53 @@ fn read_member_end_lz(ctx: &mut RunCtx) -> Result<Segment, Error> {
 /// equal the escape byte, which introduces a control code (end-of-data, an
 /// LZ match, a filter declaration, a new table, or a literal-escape).
 /// Matches copy through the same sliding window as the LZ path so they
-/// interleave seamlessly. On return the bit reader is repositioned to the
-/// byte where the range-coded data ended.
-fn run_ppmd(ctx: &mut RunCtx, input: &[u8], solid: bool) -> Result<Segment, Error> {
-    ctx.bits.byte_align();
-    let payload_start = ctx.bits.consumed_bytes();
-    if payload_start > input.len() {
-        return Err(Error::UnexpectedEnd);
+/// interleave seamlessly.
+///
+/// Like [`expand`], this returns [`Segment::Paused`] as soon as a release
+/// pass has made bytes final. The model lives in the context; the range
+/// coder borrows the input, so it is rebuilt on every call — primed from
+/// the payload on the block's first call, restored from
+/// `RunCtx::ppmd_coder` after a pause. On any other return the block is
+/// over and the bit reader is repositioned to the byte where the
+/// range-coded data ended.
+fn run_ppmd(ctx: &mut RunCtx, solid: bool) -> Result<Segment, Error> {
+    let saved = ctx.ppmd_coder.take();
+    if saved.is_none() {
+        ctx.bits.byte_align();
     }
-    // Take the model out of the context so the emit helpers can borrow the
-    // context mutably alongside it; it is put back on every path.
-    let mut pb = ctx.ppmd.take().ok_or(Error::Corrupt)?;
-    let result = run_ppmd_inner(ctx, input, payload_start, &mut pb, solid);
-    ctx.ppmd = Some(pb);
-    let (seg, end_pos) = result?;
-    ctx.bits.seek_byte(end_pos);
+    let payload_start = ctx.bits.consumed_bytes();
+    // The range decoder reads the same bytes the bit reader owns: borrow
+    // them (and the model) out of the context so the emit helpers can take
+    // the context mutably alongside; both are put back on every path.
+    let input = ctx.bits.take_buf();
+    let result = if saved.is_none() && payload_start > input.len() {
+        Err(Error::UnexpectedEnd)
+    } else {
+        match ctx.ppmd.take() {
+            None => Err(Error::Corrupt),
+            Some(mut pb) => {
+                let coder = match saved {
+                    Some(state) => Ok(RangeDec::resume(RangeMode::Rar, &input, state)),
+                    None => RangeDec::init(RangeMode::Rar, &input, payload_start).map(|r| r.0),
+                };
+                let r = coder.and_then(|mut rc| {
+                    let seg = run_ppmd_inner(ctx, &mut rc, &mut pb, solid)?;
+                    Ok((seg, rc.save(), rc.pos()))
+                });
+                ctx.ppmd = Some(pb);
+                r
+            }
+        }
+    };
+    ctx.bits.restore_buf(input);
+    let (seg, coder, end_pos) = result?;
+    if matches!(seg, Segment::Paused) {
+        // The bit reader stays where the block's header left it; nothing
+        // reads it until the block ends.
+        ctx.ppmd_coder = Some(coder);
+    } else {
+        ctx.bits.seek_byte(end_pos);
+    }
     Ok(seg)
 }
 
@@ -1041,19 +1349,19 @@ fn ppmd_symbol(m: &mut Ppmd7, rc: &mut RangeDec) -> Result<u8, Error> {
     Ok(s)
 }
 
+/// The symbol loop of a PPMd block. Every return leaves `rc` between two
+/// symbols of the escape layer — a literal or one whole escape sequence,
+/// its match or filter declaration included — so the caller can save it.
 fn run_ppmd_inner(
     ctx: &mut RunCtx,
-    input: &[u8],
-    payload_start: usize,
+    rc: &mut RangeDec,
     pb: &mut PpmdBlock,
     solid: bool,
-) -> Result<(Segment, usize), Error> {
-    let (mut rc, _) = RangeDec::init(RangeMode::Rar, input, payload_start)?;
-
+) -> Result<Segment, Error> {
     loop {
         if ctx.done() {
             if !solid {
-                return Ok((Segment::MemberEnd, rc.pos()));
+                return Ok(Segment::MemberEnd);
             }
             // The encoder coded this member's end marker through the model;
             // decode it the same way or the shared statistics desync from
@@ -1062,64 +1370,75 @@ fn run_ppmd_inner(
             // still-running range coder across payloads — cross-member
             // coder state we don't support (rar 6.24 ends PPMd members
             // with an explicit marker).
-            let s = ppmd_symbol(&mut pb.model, &mut rc).map_err(|e| match e {
+            let s = ppmd_symbol(&mut pb.model, rc).map_err(|e| match e {
                 Error::UnexpectedEnd => Error::Unsupported,
                 other => other,
             })?;
             if s != pb.escape {
                 return Err(Error::Corrupt);
             }
-            let code = ppmd_symbol(&mut pb.model, &mut rc)?;
+            let code = ppmd_symbol(&mut pb.model, rc)?;
             return match code {
-                2 => Ok((Segment::MemberEnd, rc.pos())),
-                0 => Ok((Segment::NewTableThenEnd, rc.pos())),
+                2 => Ok(Segment::MemberEnd),
+                0 => Ok(Segment::NewTableThenEnd),
                 _ => Err(Error::Corrupt),
             };
         }
-        let s = ppmd_symbol(&mut pb.model, &mut rc)?;
+        if ctx.produced() >= ctx.next_release_at {
+            // Same release points as the LZ path, so filters run (and the
+            // pending queue drains) at the same stream positions.
+            ctx.release(false)?;
+            if ctx.has_ready() {
+                // Let the caller drain before decoding further. The coder
+                // sits between two symbols; the caller saves it, and the
+                // model and escape byte stay in the context.
+                return Ok(Segment::Paused);
+            }
+        }
+        let s = ppmd_symbol(&mut pb.model, rc)?;
         if s != pb.escape {
-            ctx.emit_literal(s);
+            ctx.emit_literal(s)?;
             continue;
         }
-        let code = ppmd_symbol(&mut pb.model, &mut rc)?;
+        let code = ppmd_symbol(&mut pb.model, rc)?;
         match code {
             0 => {
                 // start-new-table: a fresh block header follows in the bit
                 // domain at the coder's byte position (it may keep PPMd
                 // with or without a model reset, or switch back to LZ).
-                return Ok((Segment::NewTable, rc.pos()));
+                return Ok(Segment::NewTable);
             }
             2 => {
                 // End of PPMd data before the declared size: short member.
-                // Solid mode turns this into an error in `run_member`.
-                return Ok((Segment::MemberEnd, rc.pos()));
+                // Solid mode turns this into an error in `finish_member`.
+                return Ok(Segment::MemberEnd);
             }
             3 => {
                 // A filter declaration carried in the PPMd stream: the same
                 // wire layout as main symbol 257, with every byte decoded
                 // through the model.
-                read_filter_declaration_ppmd(ctx, &mut pb.model, &mut rc)?;
+                read_filter_declaration_ppmd(ctx, &mut pb.model, rc)?;
             }
             4 => {
                 // 24-bit distance from three symbols (big-endian), then a
                 // length symbol. Distance +2, length +32.
                 let mut dist = 0u32;
                 for i in (0..3).rev() {
-                    let b = ppmd_symbol(&mut pb.model, &mut rc)? as u32;
+                    let b = ppmd_symbol(&mut pb.model, rc)? as u32;
                     dist |= b << (i * 8);
                 }
-                let len = ppmd_symbol(&mut pb.model, &mut rc)? as u32;
+                let len = ppmd_symbol(&mut pb.model, rc)? as u32;
                 ctx.emit_match(dist + 2, len + 32)?;
             }
             5 => {
                 // Distance-1 run: length symbol, length +4.
-                let len = ppmd_symbol(&mut pb.model, &mut rc)? as u32;
+                let len = ppmd_symbol(&mut pb.model, rc)? as u32;
                 ctx.emit_match(1, len + 4)?;
             }
             _ => {
                 // Any other control code encodes a literal equal to the
                 // escape byte (the control symbol is consumed and dropped).
-                ctx.emit_literal(pb.escape);
+                ctx.emit_literal(pb.escape)?;
             }
         }
     }
@@ -1273,7 +1592,16 @@ fn parse_declaration_payload(
     if flags & 0x40 != 0 {
         start += 258;
     }
-    let start = ctx.out.len() as u64 + start;
+    if start >= DICT_DEFAULT_SIZE as u64 {
+        // The reference decoder addresses a filter block inside its window
+        // (`(start + position) & window_mask`), so a block a whole
+        // dictionary or more ahead cannot be expressed and no encoder
+        // declares one. Taking the offset at face value would let a single
+        // declaration pin every later filter — and all the output behind
+        // them — for up to 4 GiB.
+        return Err(Error::Corrupt);
+    }
+    let start = ctx.produced() + start;
 
     let explicit_length = if flags & 0x20 != 0 {
         Some(read_vm_number(db)?)
@@ -1369,6 +1697,7 @@ fn promote_offset(ctx: &mut RunCtx, idx: usize, offs: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rar3::filters::apply_e8_filter;
     use crate::traits::Decoder as _;
     extern crate std;
     use std::vec;
@@ -1428,6 +1757,15 @@ mod tests {
             last_low_offset: 0,
             num_low_offset_repeats: 0,
             out: vec![],
+            out_base: 0,
+            final_len: 0,
+            ready_len: 0,
+            drained: 0,
+            next_release_at: RELEASE_LAG,
+            out_limit: u64::MAX,
+            filter_work: 0,
+            e8: None,
+            phase: Phase::Symbols,
             window: vec![0u8; 16],
             wmask: 15,
             window_pos: 0,
@@ -1436,6 +1774,7 @@ mod tests {
             last_filter_slot: 0,
             pending_filters: VecDeque::new(),
             ppmd: None,
+            ppmd_coder: None,
             block: BlockKind::Lz,
             tables_read: false,
         }
@@ -1701,6 +2040,264 @@ mod tests {
         let (p, status) = dec.finish(&mut out).unwrap();
         assert_eq!(p.written, 0);
         assert!(matches!(status, crate::Status::StreamEnd));
+    }
+
+    /// A window starting a whole dictionary ahead (or more) is refused at
+    /// the declaration; one byte less is scheduled.
+    #[test]
+    fn filter_start_a_dictionary_ahead_is_corrupt() {
+        for (offset, ok) in [
+            (DICT_DEFAULT_SIZE as u32 - 1, true),
+            (DICT_DEFAULT_SIZE as u32, false),
+            (u32::MAX, false),
+        ] {
+            let mut ctx = test_ctx();
+            ctx.programs.push(ProgramSlot {
+                program: StdProgram::Delta,
+                last_block_length: 8,
+            });
+            let mut w = BitWriter::new();
+            w.push_vm_number(offset);
+            let mut db = BitReader::new();
+            db.feed_slice(&w.bytes);
+            let got = parse_declaration_payload(&mut ctx, 0x00, &mut db);
+            if ok {
+                got.unwrap();
+                assert_eq!(ctx.pending_filters[0].start, offset as u64);
+            } else {
+                assert_eq!(got, Err(Error::Corrupt));
+                assert!(ctx.pending_filters.is_empty());
+            }
+        }
+        // The +258 flag counts towards the offset.
+        let mut ctx = test_ctx();
+        ctx.programs.push(ProgramSlot {
+            program: StdProgram::Delta,
+            last_block_length: 8,
+        });
+        let mut w = BitWriter::new();
+        w.push_vm_number(DICT_DEFAULT_SIZE as u32 - 258);
+        let mut db = BitReader::new();
+        db.feed_slice(&w.bytes);
+        assert_eq!(
+            parse_declaration_payload(&mut ctx, 0x40, &mut db),
+            Err(Error::Corrupt)
+        );
+    }
+
+    /// Filter work is budgeted against the output produced: the window can
+    /// be filtered `FILTER_WORK_FACTOR` times over, and the next pass is
+    /// refused before it runs.
+    #[test]
+    fn filter_work_is_bounded_by_output() {
+        let mut ctx = test_ctx();
+        ctx.out = vec![1; 100];
+        let stacked = PendingFilter {
+            start: 0,
+            length: 100,
+            program: StdProgram::Delta,
+            channels: 1,
+        };
+        for _ in 0..FILTER_WORK_FACTOR {
+            ctx.pending_filters.push_back(stacked);
+        }
+        ctx.flush_completed_filters().unwrap();
+        assert!(ctx.pending_filters.is_empty());
+        let before = ctx.out.clone();
+        ctx.pending_filters.push_back(stacked);
+        assert_eq!(ctx.flush_completed_filters(), Err(Error::Corrupt));
+        assert_eq!(ctx.out, before, "the refused pass must not run");
+    }
+
+    /// A release pass makes final only the bytes in front of the earliest
+    /// pending window — even when that window belongs to a filter queued
+    /// behind an incomplete one — and draining plus compaction keep the
+    /// member offsets of what is left.
+    #[test]
+    fn release_stops_at_earliest_pending_window() {
+        let mut ctx = test_ctx();
+        ctx.out = (0..200u8).collect();
+        // Front of the queue: incomplete, starting at 150. Behind it: a
+        // complete window at 60..70 that must wait its turn.
+        ctx.pending_filters.push_back(incomplete_filter(150));
+        ctx.pending_filters.push_back(PendingFilter {
+            start: 60,
+            length: 10,
+            program: StdProgram::Delta,
+            channels: 1,
+        });
+        ctx.release(false).unwrap();
+        assert_eq!(ctx.pending_filters.len(), 2);
+        assert_eq!((ctx.final_len, ctx.ready_len), (60, 60));
+
+        let mut buf = [0u8; 40];
+        assert_eq!(ctx.drain_into(&mut buf), 40);
+        assert_eq!(buf[39], 39);
+        ctx.compact();
+        assert_eq!((ctx.out_base, ctx.out.len(), ctx.ready_len), (40, 160, 20));
+        assert_eq!(ctx.produced(), 200);
+
+        // The front window completes: both filters run, in order, over the
+        // right bytes of the compacted buffer, and everything is released.
+        ctx.out.extend(core::iter::repeat_n(0u8, 50));
+        let mut want = ctx.out.clone();
+        crate::rar_filters::delta_decode(1, &mut want[110..210]);
+        crate::rar_filters::delta_decode(1, &mut want[20..30]);
+        ctx.release(false).unwrap();
+        assert!(ctx.pending_filters.is_empty());
+        assert_eq!(ctx.out, want);
+        assert_eq!(ctx.ready_len, 210);
+
+        // At the end of the member an unfinished window is an error.
+        ctx.pending_filters.push_back(incomplete_filter(300));
+        assert_eq!(ctx.release(true), Err(Error::Corrupt));
+    }
+
+    /// The standalone E8 pass keeps back the bytes that may still turn out
+    /// to be part of a call site until more output (or the member's end)
+    /// settles them.
+    #[test]
+    fn release_holds_back_unsettled_e8_tail() {
+        let mut ctx = test_ctx();
+        ctx.e8 = Some(false);
+        ctx.out = vec![0x90, 0x90, 0xE8, 0x40, 0x00];
+        ctx.release(false).unwrap();
+        // Nothing from four bytes before the end on is settled yet: the
+        // opcode at index 2 has only two bytes after it so far.
+        assert_eq!((ctx.final_len, ctx.ready_len), (5, 1));
+        ctx.out.extend_from_slice(&[0x00, 0x00, 0x90]);
+        ctx.release(true).unwrap();
+        assert_eq!(ctx.ready_len, 8);
+        let mut want = [0x90, 0x90, 0xE8, 0x40, 0x00, 0x00, 0x00, 0x90];
+        apply_e8_filter(&mut want, 0, false);
+        assert_eq!(ctx.out, want);
+    }
+
+    // ─── Pausing inside PPMd blocks ──────────────────────────────────────
+
+    const PPMD_NOTES: &[u8] = include_bytes!("../../tests/fixtures/rar3/ppmd_notes.bin");
+    const PPMD_PROSE: &[u8] = include_bytes!("../../tests/fixtures/rar3/solid_ppmd_prose.bin");
+
+    /// What [`decode_group_pausing`] saw.
+    struct Paused {
+        /// Each member's delivered bytes.
+        members: Vec<Vec<u8>>,
+        err: Option<Error>,
+        /// `pump` calls that returned with a PPMd block suspended.
+        ppmd_pauses: usize,
+    }
+
+    /// Decode a solid group through the context, bringing the next release
+    /// pass — and with it the next pause — forward to `every` bytes after
+    /// each resumption. The real fixtures are far smaller than the
+    /// dictionary and would otherwise never pause.
+    fn decode_group_pausing(group: &[(&[u8], u64)], every: u64) -> Paused {
+        let mut ctx = RunCtx::new();
+        let mut seen = Paused {
+            members: Vec::new(),
+            err: None,
+            ppmd_pauses: 0,
+        };
+        let mut buf = [0u8; 61];
+        for &(payload, unpack_size) in group {
+            ctx.begin_member(payload.to_vec(), unpack_size, u64::MAX, None);
+            let mut out = Vec::new();
+            loop {
+                if !ctx.has_ready() && !ctx.member_finished() {
+                    ctx.next_release_at = ctx
+                        .next_release_at
+                        .min(ctx.produced().saturating_add(every));
+                    if let Err(e) = ctx.pump(true) {
+                        seen.members.push(out);
+                        seen.err = Some(e);
+                        return seen;
+                    }
+                    if ctx.ppmd_coder.is_some() {
+                        assert!(matches!(ctx.phase, Phase::Symbols));
+                        assert!(matches!(ctx.block, BlockKind::Ppm));
+                        seen.ppmd_pauses += 1;
+                    }
+                }
+                let n = ctx.drain_into(&mut buf);
+                out.extend_from_slice(&buf[..n]);
+                if !ctx.has_ready() && ctx.member_finished() {
+                    break;
+                }
+            }
+            assert!(ctx.ppmd_coder.is_none(), "a coder outlived its member");
+            ctx.end_member();
+            seen.members.push(out);
+        }
+        seen
+    }
+
+    /// A PPMd block suspended and resumed at every symbol of the escape
+    /// layer — between literals, around the match escapes rar codes
+    /// notes.txt with, and in a block that continues the previous member's
+    /// model — decodes exactly what an uninterrupted run does. (`tests/rar3.rs`
+    /// checks the uninterrupted run against the archives' CRCs.)
+    #[test]
+    fn ppmd_block_resumes_at_every_symbol() {
+        let group: &[(&[u8], u64)] = &[(PPMD_NOTES, 20001), (PPMD_PROSE, 236737)];
+        let straight = decode_group_pausing(group, u64::MAX);
+        assert_eq!(straight.err, None);
+        assert_eq!(straight.ppmd_pauses, 0);
+        assert_eq!(straight.members[0].len(), 20001);
+        assert_eq!(straight.members[1].len(), 236737);
+        for every in [1, 7, 4099] {
+            let paused = decode_group_pausing(group, every);
+            assert_eq!(paused.err, None, "every {every}");
+            assert!(
+                paused.members == straight.members,
+                "output differs when pausing every {every} bytes"
+            );
+            // Pauses come at symbol boundaries, so a match can overshoot
+            // `every`; they are still at least this frequent.
+            let total = 20001 + 236737;
+            assert!(
+                paused.ppmd_pauses as u64 >= total / (every + 300),
+                "every {every}: only {} pauses",
+                paused.ppmd_pauses
+            );
+        }
+    }
+
+    /// Damaged and truncated PPMd members (a flipped bit in the first, or
+    /// in the cut-short second) fail the same way whether or not the block
+    /// is suspended along the way, and nothing panics.
+    #[test]
+    fn damaged_ppmd_block_resumes_consistently() {
+        let mut seed = 0x2545_F491u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for round in 0..8 {
+            let mut notes = PPMD_NOTES.to_vec();
+            let mut prose = PPMD_PROSE[..2048].to_vec();
+            if round % 2 == 0 {
+                let at = next() as usize % notes.len();
+                notes[at] ^= 1 << (next() % 8);
+            } else {
+                let at = next() as usize % prose.len();
+                prose[at] ^= 1 << (next() % 8);
+            }
+            let group: &[(&[u8], u64)] = &[(&notes, 20001), (&prose, 236737)];
+            let straight = decode_group_pausing(group, u64::MAX);
+            for every in [1, 300] {
+                let paused = decode_group_pausing(group, every);
+                // Both runs decode the same symbols (no filters are in
+                // play), so they stop at the same one; the paused run has
+                // merely delivered more of the output by then.
+                assert_eq!(paused.err, straight.err, "round {round} every {every}");
+                assert_eq!(paused.members.len(), straight.members.len());
+                for (p, s) in paused.members.iter().zip(&straight.members) {
+                    assert!(p.len() >= s.len() && p[..s.len()] == s[..]);
+                }
+            }
+        }
     }
 
     #[test]

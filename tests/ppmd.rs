@@ -393,3 +393,117 @@ mod factory {
         assert_eq!(factory::extension("ppmd"), Some("ppmd"));
     }
 }
+
+// ─── output limit ────────────────────────────────────────────────────────
+
+/// The decoder buffers its whole output, so the caller's limit has to be
+/// applied to the declared length, before the model and the output exist,
+/// rather than after 20 KiB (or 64 MiB) has been decoded.
+#[test]
+fn output_limit_is_checked_against_the_declared_length() {
+    let (stream, expected) = fixture!("mixed");
+    let n = expected.len() as u64;
+    assert!(n > 4096);
+
+    // Refused by the call that completes the header, with no output.
+    let mut dec = Decoder::new();
+    dec.set_output_limit(1024);
+    let mut buf = [0u8; 64];
+    assert_eq!(
+        dec.decode(&stream[..11], &mut buf),
+        Err(Error::OutputLimitExceeded)
+    );
+    assert_eq!(dec.finish(&mut buf), Err(Error::OutputLimitExceeded));
+
+    // The limit is configuration: it survives a reset.
+    dec.reset();
+    assert_eq!(
+        drive_to_end(&mut dec, stream),
+        Err(Error::OutputLimitExceeded)
+    );
+
+    // One byte short is refused; exactly the declared length decodes.
+    let mut dec = Decoder::new();
+    dec.set_output_limit(n - 1);
+    assert_eq!(
+        drive_to_end(&mut dec, stream),
+        Err(Error::OutputLimitExceeded)
+    );
+    let mut dec = Decoder::new();
+    dec.set_output_limit(n);
+    assert_eq!(drive_to_end(&mut dec, stream).unwrap(), expected);
+}
+
+#[test]
+fn limited_decoder_passes_its_budget_down() {
+    use compcol::limit::LimitedDecoder;
+    use compcol::vec::decompress_to_vec_capped;
+
+    let (stream, expected) = fixture!("mixed");
+    let n = expected.len() as u64;
+
+    let mut dec = LimitedDecoder::new(Decoder::new(), 1024);
+    let mut buf = [0u8; 64];
+    assert_eq!(
+        dec.decode(&stream[..11], &mut buf),
+        Err(Error::OutputLimitExceeded)
+    );
+    assert_eq!(dec.bytes_written(), 0);
+
+    assert_eq!(
+        decompress_to_vec_capped::<Ppmd>(stream, 1024),
+        Err(Error::OutputLimitExceeded)
+    );
+    assert_eq!(
+        decompress_to_vec_capped::<Ppmd>(stream, n - 1),
+        Err(Error::OutputLimitExceeded)
+    );
+    assert_eq!(
+        decompress_to_vec_capped::<Ppmd>(stream, n).unwrap(),
+        expected
+    );
+}
+
+// ─── memory cap ──────────────────────────────────────────────────────────
+
+/// The header's memory byte sizes the model arena, which is allocated
+/// whole. A configured cap must refuse a larger request as soon as the
+/// header is in, before the arena exists.
+#[test]
+fn max_memory_rejects_a_larger_model_at_the_header() {
+    use compcol::ppmd::DecoderConfig;
+
+    // Order 6, 255 MiB, five bytes: all a hostile header needs.
+    let hostile = make_header(6, 255, 0, 5);
+    let mut dec = Ppmd::decoder_with(DecoderConfig::default().with_max_memory(16 << 20));
+    let mut buf = [0u8; 16];
+    assert_eq!(dec.decode(&hostile, &mut buf), Err(Error::Unsupported));
+    assert_eq!(dec.finish(&mut buf), Err(Error::Unsupported));
+
+    // The cap is configuration: it survives a reset.
+    dec.reset();
+    assert_eq!(dec.decode(&hostile, &mut buf), Err(Error::Unsupported));
+
+    // A real stream (order 6, 16 MiB) decodes with a cap of exactly its
+    // size and is refused one byte below it.
+    let (stream, expected) = fixture!("mixed");
+    assert_eq!(stream[1], 16);
+    dec.reset();
+    assert_eq!(drive_to_end(&mut dec, stream).unwrap(), expected);
+    let mut dec = Decoder::with_config(DecoderConfig::default().with_max_memory((16 << 20) - 1));
+    assert_eq!(drive_to_end(&mut dec, stream), Err(Error::Unsupported));
+}
+
+#[test]
+fn default_config_accepts_every_header_size() {
+    use compcol::ppmd::{DecoderConfig, MAX_MEMORY};
+
+    assert_eq!(DecoderConfig::default().max_memory, MAX_MEMORY);
+    assert_eq!(MAX_MEMORY, 256 << 20);
+    // Header validation only (no `finish`, so no arena): the largest size
+    // the framing can name passes with the default configuration.
+    let mut dec = Ppmd::decoder();
+    let mut buf = [0u8; 16];
+    let (p, _) = dec.decode(&make_header(6, 255, 0, 5), &mut buf).unwrap();
+    assert_eq!(p.consumed, 11);
+}

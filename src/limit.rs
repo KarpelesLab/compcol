@@ -58,7 +58,11 @@ impl<D: Decoder> LimitedDecoder<D> {
     /// A budget of `u64::MAX` is effectively unlimited (the inner
     /// decoder runs unbounded); use `Decoder` directly in that case
     /// rather than paying for the comparison.
-    pub fn new(inner: D, max_output_bytes: u64) -> Self {
+    pub fn new(mut inner: D, max_output_bytes: u64) -> Self {
+        // Decoders that build their output internally before handing it
+        // out need to know the budget to refuse early; see
+        // `Decoder::set_output_limit`.
+        inner.set_output_limit(max_output_bytes);
         Self {
             inner,
             limit: max_output_bytes,
@@ -170,5 +174,12 @@ impl<D: Decoder> Decoder for LimitedDecoder<D> {
         // discard_output emits no bytes to a caller slice, so it doesn't
         // consume budget. We forward to the inner directly.
         self.inner.discard_output(input, n)
+    }
+
+    /// Tightens the wrapped decoder's advisory limit; this wrapper's own
+    /// budget stays the one it was built with.
+    fn set_output_limit(&mut self, max_output_bytes: u64) {
+        self.inner
+            .set_output_limit(max_output_bytes.min(self.limit));
     }
 }

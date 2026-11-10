@@ -104,6 +104,17 @@ fn file_contents(p: &Path) -> Vec<u8> {
     fs::read(p).expect("read")
 }
 
+/// Sorted names of the entries in `dir` — to check nothing extra (such as a
+/// temporary file) was left behind.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .expect("read_dir")
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
 // ─── help / list / version ───────────────────────────────────────────────
 
 #[test]
@@ -378,7 +389,9 @@ fn force_target_not_deleted_when_codec_errors_midstream() {
     // Regression for L12: a mid-stream codec error on an existing
     // --force target must not delete the user's pre-existing file. We
     // feed corrupt gzip so stream_decode fails after the output was
-    // opened (and truncated). The file must still exist afterwards.
+    // opened. The file must still exist afterwards — and, since --force
+    // writes to a temporary file that only replaces the target on success,
+    // with its content intact (it used to be left truncated).
     let s = Scratch::new("force_no_delete");
     let bad = s.file("bad.gz");
     // Valid gzip magic + method/flags + zeroed mtime, then garbage that
@@ -402,13 +415,18 @@ fn force_target_not_deleted_when_codec_errors_midstream() {
         bad.to_str().unwrap(),
     ]);
     assert_ne!(code, 0, "expected the corrupt input to fail");
-    // The pre-existing target must survive the error (truncated, but
-    // present — not removed). Before the fix it was unconditionally
-    // deleted.
+    // The pre-existing target must survive the error. Before the first fix
+    // it was unconditionally deleted; before the second, truncated.
     assert!(
         out.exists(),
         "pre-existing --force target was deleted on codec error"
     );
+    assert_eq!(
+        file_contents(&out),
+        b"precious user data",
+        "pre-existing --force target was modified by a failed run"
+    );
+    assert_eq!(names_in(&s.path), ["bad.gz", "preexisting.out"]);
 }
 
 #[test]
@@ -750,4 +768,556 @@ fn force_refuses_output_hard_linked_to_the_input() {
         String::from_utf8_lossy(&err)
     );
     assert_eq!(file_contents(&input), b"precious\n");
+}
+
+// ─── --max-output ───────────────────────────────────────────────────────
+
+/// A small compressed stream that expands to `len` zero bytes.
+fn bomb(codec: &str, len: usize) -> Vec<u8> {
+    let (encoded, err, code) = run_with_stdin(&["-t", codec], &vec![0u8; len]);
+    assert_eq!(code, 0, "{codec}: {}", String::from_utf8_lossy(&err));
+    encoded
+}
+
+#[test]
+fn max_output_aborts_a_decompression_bomb() {
+    // Without --max-output the CLI had no way to bound what a tiny hostile
+    // stream expands to; the library's LimitedDecoder was unreachable.
+    const LEN: usize = 4 * 1024 * 1024;
+    let mut codecs = vec!["gzip"];
+    if cfg!(feature = "zstd") {
+        codecs.push("zstd");
+    }
+    if cfg!(feature = "xz") {
+        codecs.push("xz");
+    }
+    if cfg!(feature = "bzip2") {
+        codecs.push("bzip2");
+    }
+    for codec in codecs {
+        let encoded = bomb(codec, LEN);
+        for limit in ["1048576", "1M", "1024k", "64K", "0"] {
+            let (out, err, code) =
+                run_with_stdin(&["-d", "-t", codec, "--max-output", limit], &encoded);
+            let err = String::from_utf8_lossy(&err);
+            assert_eq!(code, 1, "{codec} limit {limit}: {err}");
+            assert!(err.contains("--max-output"), "{codec} limit {limit}: {err}");
+            assert!(
+                out.len() <= 1024 * 1024,
+                "{codec} limit {limit}: {} bytes got out",
+                out.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn max_output_allows_output_up_to_the_limit() {
+    const LEN: usize = 300 * 1024;
+    let encoded = bomb("gzip", LEN);
+    // Exactly the limit, the `=` spelling, and each suffix.
+    for limit in [
+        "--max-output=307200",
+        "--max-output=300K",
+        "--max-output=300KiB",
+        "--max-output=1M",
+    ] {
+        let (out, err, code) = run_with_stdin(&["-d", "-t", "gzip", limit], &encoded);
+        assert_eq!(code, 0, "{limit}: {}", String::from_utf8_lossy(&err));
+        assert_eq!(out.len(), LEN, "{limit}");
+    }
+    let (out, err, code) = run_with_stdin(&["-d", "--max-output", "1G"], &encoded);
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+    assert_eq!(out.len(), LEN);
+    // One byte short is over the limit.
+    let (_out, _err, code) = run_with_stdin(&["-d", "--max-output=307199"], &encoded);
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn max_output_failure_removes_output_and_keeps_input() {
+    let s = Scratch::new("max_output_file");
+    let input = s.file("bomb.gz");
+    let encoded = bomb("gzip", 1024 * 1024);
+    fs::write(&input, &encoded).unwrap();
+
+    let (_out, err, code) = run(&["-d", "--max-output", "64K", input.to_str().unwrap()]);
+    let err = String::from_utf8_lossy(&err);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("--max-output"), "{err}");
+    assert!(err.contains("65536"), "limit not named in: {err}");
+    assert!(!s.file("bomb").exists(), "partial output left behind");
+    assert_eq!(file_contents(&input), encoded, "input must be kept");
+}
+
+#[test]
+fn max_output_is_rejected_when_compressing() {
+    let (_out, err, code) = run_with_stdin(&["-t", "gzip", "--max-output", "1M"], b"data");
+    assert_eq!(code, 2);
+    assert!(
+        String::from_utf8_lossy(&err).contains("--max-output"),
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+}
+
+#[test]
+fn max_output_rejects_malformed_values() {
+    for bad in [
+        "",
+        "abc",
+        "-1",
+        "+1",
+        "1X",
+        "K",
+        "1.5M",
+        "1 M",
+        "1KB",
+        "99999999999999999999",
+        "17179869184G",
+    ] {
+        let arg = format!("--max-output={bad}");
+        let (_out, err, code) = run_with_stdin(&["-d", "-t", "gzip", &arg], b"");
+        assert_eq!(code, 2, "'{bad}' was accepted");
+        assert!(
+            String::from_utf8_lossy(&err).contains("--max-output"),
+            "'{bad}': {}",
+            String::from_utf8_lossy(&err)
+        );
+    }
+    let (_out, err, code) = run_with_stdin(&["-d", "--max-output"], b"");
+    assert_eq!(code, 2);
+    assert!(String::from_utf8_lossy(&err).contains("requires an argument"));
+}
+
+// ─── trailing data after the stream ─────────────────────────────────────
+
+const TRAILING_MSG: &str = "trailing data after the end of the compressed stream";
+
+#[test]
+fn trailing_data_fails_in_place_decompress_and_keeps_input() {
+    // `cp a.gz g.gz; echo garbage >> g.gz; compcol -d g.gz` used to exit 0,
+    // silently drop the extra bytes and delete g.gz.
+    let (gz, _err, code) = run_with_stdin(&["-t", "gzip"], b"payload before the garbage\n");
+    assert_eq!(code, 0);
+    // A short tail, and one far larger than any buffer the CLI reads with.
+    for tail in [b"garbage\n".to_vec(), vec![0x55u8; 300 * 1024]] {
+        let s = Scratch::new("trailing");
+        let input = s.file("g.gz");
+        let mut bytes = gz.clone();
+        bytes.extend_from_slice(&tail);
+        fs::write(&input, &bytes).unwrap();
+
+        let (_out, err, code) = run(&["-d", input.to_str().unwrap()]);
+        let err = String::from_utf8_lossy(&err);
+        assert_eq!(code, 1, "{err}");
+        assert!(err.contains(TRAILING_MSG), "{err}");
+        assert!(!s.file("g").exists(), "output must be removed");
+        assert_eq!(file_contents(&input), bytes, "input must be kept");
+    }
+}
+
+#[test]
+fn trailing_data_fails_in_stdout_and_pipe_modes_too() {
+    let (gz, _err, code) = run_with_stdin(&["-t", "gzip"], b"payload before the garbage\n");
+    assert_eq!(code, 0);
+    let mut bytes = gz.clone();
+    bytes.extend_from_slice(b"garbage\n");
+
+    // stdin → stdout.
+    let (_out, err, code) = run_with_stdin(&["-d"], &bytes);
+    assert_eq!(code, 1);
+    assert!(String::from_utf8_lossy(&err).contains(TRAILING_MSG));
+
+    // file → stdout (-c) and file → -o: the input is kept either way.
+    let s = Scratch::new("trailing_c");
+    let input = s.file("g.gz");
+    fs::write(&input, &bytes).unwrap();
+    let (_out, err, code) = run(&["-d", "-c", input.to_str().unwrap()]);
+    assert_eq!(code, 1);
+    assert!(String::from_utf8_lossy(&err).contains(TRAILING_MSG));
+    let out = s.file("out");
+    let (_out, err, code) = run(&["-d", "-o", out.to_str().unwrap(), input.to_str().unwrap()]);
+    assert_eq!(code, 1);
+    assert!(String::from_utf8_lossy(&err).contains(TRAILING_MSG));
+    assert!(!out.exists(), "output must be removed");
+    assert_eq!(file_contents(&input), bytes);
+}
+
+#[test]
+fn ignore_trailing_restores_the_lenient_behaviour_with_a_warning() {
+    let payload = b"payload before the garbage\n";
+    let (gz, _err, code) = run_with_stdin(&["-t", "gzip"], payload);
+    assert_eq!(code, 0);
+    for tail in [b"garbage\n".to_vec(), vec![0x55u8; 300 * 1024]] {
+        let mut bytes = gz.clone();
+        bytes.extend_from_slice(&tail);
+
+        let (out, err, code) = run_with_stdin(&["-d", "--ignore-trailing"], &bytes);
+        let err = String::from_utf8_lossy(&err);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out, payload);
+        assert!(err.contains("warning"), "{err}");
+        assert!(err.contains("trailing data"), "{err}");
+
+        let s = Scratch::new("ignore_trailing");
+        let input = s.file("g.gz");
+        fs::write(&input, &bytes).unwrap();
+        let (_out, err, code) = run(&["-d", "--ignore-trailing", input.to_str().unwrap()]);
+        let err = String::from_utf8_lossy(&err);
+        assert_eq!(code, 0, "{err}");
+        assert!(err.contains("warning"), "{err}");
+        assert_eq!(file_contents(&s.file("g")), payload);
+        assert!(!input.exists(), "input is removed as on any success");
+    }
+}
+
+#[test]
+fn ignore_trailing_is_silent_without_trailing_data() {
+    let (gz, _err, code) = run_with_stdin(&["-t", "gzip"], b"clean");
+    assert_eq!(code, 0);
+    let (out, err, code) = run_with_stdin(&["-d", "--ignore-trailing"], &gz);
+    assert_eq!(code, 0);
+    assert_eq!(out, b"clean");
+    assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+}
+
+#[test]
+fn ignore_trailing_is_rejected_when_compressing() {
+    let (_out, err, code) = run_with_stdin(&["-t", "gzip", "--ignore-trailing"], b"data");
+    assert_eq!(code, 2);
+    assert!(
+        String::from_utf8_lossy(&err).contains("only meaningful on decompression"),
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+}
+
+#[test]
+fn concatenated_members_are_not_trailing_data() {
+    // Formats whose decoder continues into a following member/stream must
+    // keep doing so: that is more stream, not trailing data.
+    let a = b"first member\n".repeat(50);
+    let b = b"second member, different text\n".repeat(5000);
+    let mut codecs = vec!["gzip"];
+    if cfg!(feature = "xz") {
+        codecs.push("xz");
+    }
+    if cfg!(feature = "bzip2") {
+        codecs.push("bzip2");
+    }
+    for codec in codecs {
+        let (mut joined, _err, code) = run_with_stdin(&["-t", codec], &a);
+        assert_eq!(code, 0);
+        let (second, _err, code) = run_with_stdin(&["-t", codec], &b);
+        assert_eq!(code, 0);
+        joined.extend_from_slice(&second);
+
+        let (out, err, code) = run_with_stdin(&["-d", "-t", codec], &joined);
+        assert_eq!(code, 0, "{codec}: {}", String::from_utf8_lossy(&err));
+        assert_eq!(out, [&a[..], &b[..]].concat(), "{codec}");
+    }
+}
+
+#[test]
+fn round_trips_never_report_trailing_data() {
+    // Every codec that can both encode and decode through the CLI must come
+    // back clean: an end-of-stream that leaves the encoder's own padding or
+    // trailer unconsumed would now be an error.
+    let (list, _err, code) = run(&["--list"]);
+    assert_eq!(code, 0);
+    let list = String::from_utf8(list).unwrap();
+    let payloads: [Vec<u8>; 3] = [
+        b"x".to_vec(),
+        b"The quick brown fox jumps over the lazy dog. ".repeat(40),
+        (0..200_000usize)
+            .map(|i| (i.wrapping_mul(2654435761) >> 11) as u8)
+            .collect(),
+    ];
+    for codec in list.lines() {
+        for payload in &payloads {
+            let (encoded, _err, code) = run_with_stdin(&["-t", codec], payload);
+            if code != 0 {
+                continue; // decode-only codec
+            }
+            let (_out, err, _code) = run_with_stdin(&["-d", "-t", codec], &encoded);
+            let err = String::from_utf8_lossy(&err);
+            assert!(
+                !err.contains("trailing data"),
+                "{codec} ({} bytes): {err}",
+                payload.len()
+            );
+        }
+    }
+}
+
+// ─── --force writes through a temporary file ────────────────────────────
+
+#[test]
+fn force_leaves_no_temporary_files() {
+    let s = Scratch::new("force_tmp");
+    let input = s.file("in.txt");
+    let out = s.file("out.gz");
+    fs::write(&input, b"new data").unwrap();
+
+    // Onto a path that doesn't exist yet, then onto the file just written.
+    for _ in 0..2 {
+        let (_out, err, code) = run(&[
+            "-t",
+            "gzip",
+            "-f",
+            "-o",
+            out.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+        assert_eq!(names_in(&s.path), ["in.txt", "out.gz"]);
+        let (back, _err, code) = run(&["-d", "-c", out.to_str().unwrap()]);
+        assert_eq!(code, 0);
+        assert_eq!(back, b"new data");
+    }
+
+    // A failing run onto a path that doesn't exist creates nothing.
+    let bad = s.file("bad.gz");
+    fs::write(
+        &bad,
+        b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xff\xff\xff\xff",
+    )
+    .unwrap();
+    let fresh = s.file("fresh");
+    let (_out, _err, code) = run(&[
+        "-d",
+        "-f",
+        "-o",
+        fresh.to_str().unwrap(),
+        bad.to_str().unwrap(),
+    ]);
+    assert_ne!(code, 0);
+    assert_eq!(names_in(&s.path), ["bad.gz", "in.txt", "out.gz"]);
+}
+
+#[test]
+fn force_in_a_relative_directory() {
+    // The temporary file goes next to the output; a bare file name has an
+    // empty parent, which must mean the current directory.
+    let s = Scratch::new("force_rel");
+    fs::write(s.file("in.txt"), b"relative").unwrap();
+    fs::write(s.file("in.txt.gz"), b"old").unwrap();
+    let out = Command::new(BIN)
+        .args(["-t", "gzip", "-f", "in.txt"])
+        .current_dir(&s.path)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn compcol");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(names_in(&s.path), ["in.txt.gz"]);
+    assert_eq!(&file_contents(&s.file("in.txt.gz"))[..2], &[0x1F, 0x8B]);
+}
+
+#[test]
+fn force_onto_a_directory_fails_cleanly() {
+    let s = Scratch::new("force_dir");
+    let input = s.file("in.txt");
+    let dir = s.file("dir");
+    fs::write(&input, b"data").unwrap();
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("inside"), b"kept").unwrap();
+
+    let (_out, err, code) = run(&[
+        "-t",
+        "gzip",
+        "-f",
+        "-o",
+        dir.to_str().unwrap(),
+        input.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 1, "stderr: {}", String::from_utf8_lossy(&err));
+    assert_eq!(names_in(&s.path), ["dir", "in.txt"]);
+    assert_eq!(names_in(&dir), ["inside"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn force_replaces_a_symlink_instead_of_writing_through_it() {
+    // `ln -s tgt link.gz; compcol -t gzip -f link` used to follow the
+    // symlink and overwrite `tgt`. Like gzip -f, replace the link itself.
+    let s = Scratch::new("force_symlink");
+    let tgt = s.file("tgt");
+    let link = s.file("link.gz");
+    let input = s.file("link");
+    fs::write(&tgt, b"the symlink's target").unwrap();
+    std::os::unix::fs::symlink(&tgt, &link).unwrap();
+    fs::write(&input, b"input data").unwrap();
+
+    let (_out, err, code) = run(&["-t", "gzip", "-f", input.to_str().unwrap()]);
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+    assert_eq!(file_contents(&tgt), b"the symlink's target");
+    assert!(
+        fs::symlink_metadata(&link).unwrap().file_type().is_file(),
+        "the symlink should have been replaced by the output file"
+    );
+    assert_eq!(&file_contents(&link)[..2], &[0x1F, 0x8B]);
+    assert_eq!(names_in(&s.path), ["link.gz", "tgt"]);
+
+    // The same for a dangling symlink: nothing is created at its target.
+    let dangling = s.file("dangling.gz");
+    std::os::unix::fs::symlink(s.file("nowhere"), &dangling).unwrap();
+    let (_out, err, code) = run(&[
+        "-d",
+        "-k",
+        "-f",
+        "-o",
+        dangling.to_str().unwrap(),
+        link.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+    assert!(!s.file("nowhere").exists());
+    assert_eq!(file_contents(&dangling), b"input data");
+}
+
+#[cfg(unix)]
+#[test]
+fn force_replaces_the_file_rather_than_rewriting_it() {
+    // The destination is swapped by rename: another hard link to the old
+    // file keeps the old content instead of seeing a truncate-and-rewrite.
+    let s = Scratch::new("force_inode");
+    let input = s.file("in.txt");
+    let out = s.file("out.gz");
+    let other = s.file("other-name");
+    fs::write(&input, b"new").unwrap();
+    fs::write(&out, b"old content").unwrap();
+    fs::hard_link(&out, &other).unwrap();
+
+    let (_out, err, code) = run(&[
+        "-t",
+        "gzip",
+        "-f",
+        "-o",
+        out.to_str().unwrap(),
+        input.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+    assert_eq!(file_contents(&other), b"old content");
+    assert_eq!(&file_contents(&out)[..2], &[0x1F, 0x8B]);
+}
+
+#[cfg(unix)]
+#[test]
+fn force_writes_straight_to_a_device() {
+    use std::os::unix::fs::FileTypeExt;
+
+    // A device (or FIFO, socket) can't be replaced by rename and holds
+    // nothing to protect: `-f -o /dev/null` must keep writing into it —
+    // also when it is reached through a symlink.
+    let s = Scratch::new("force_dev");
+    let input = s.file("in.txt");
+    let sink = s.file("sink");
+    fs::write(&input, b"discard me").unwrap();
+    std::os::unix::fs::symlink("/dev/null", &sink).unwrap();
+
+    for out in [Path::new("/dev/null"), &sink] {
+        let (_out, err, code) = run(&[
+            "-t",
+            "gzip",
+            "-f",
+            "-o",
+            out.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+    }
+    assert!(
+        fs::metadata("/dev/null")
+            .unwrap()
+            .file_type()
+            .is_char_device()
+    );
+    assert!(
+        fs::symlink_metadata(&sink)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(names_in(&s.path), ["in.txt", "sink"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn force_from_stdin_keeps_the_replaced_files_permissions() {
+    // With no input file there is no mode to copy. Overwriting in place
+    // used to leave the existing file's mode alone; replacing it must not
+    // quietly widen a private file to the umask default.
+    let s = Scratch::new("force_stdin_mode");
+    let out = s.file("out.gz");
+    fs::write(&out, b"old").unwrap();
+    set_mode(&out, 0o600);
+
+    let (_out, err, code) =
+        run_with_stdin(&["-t", "gzip", "-f", "-o", out.to_str().unwrap()], b"data");
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+    assert_eq!(mode_of(&out), 0o600);
+    assert_eq!(&file_contents(&out)[..2], &[0x1F, 0x8B]);
+
+    // And a new file gets the plain default, as without --force.
+    let reference = s.file("reference");
+    fs::write(&reference, b"x").unwrap();
+    let fresh = s.file("fresh.gz");
+    let (_out, err, code) = run_with_stdin(
+        &["-t", "gzip", "-f", "-o", fresh.to_str().unwrap()],
+        b"data",
+    );
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+    assert_eq!(mode_of(&fresh), mode_of(&reference));
+}
+
+// ─── auto-detection vs. archive containers ──────────────────────────────
+
+#[test]
+fn auto_detect_refuses_archive_containers() {
+    // `factory::detect` answers RAR and StuffIt magics with the name of a
+    // member codec, as a hint. The CLI used to take the hint literally and
+    // feed the whole archive — headers, directory and all — to that codec.
+    let mut sit_classic = b"SIT!\x00\x01\x00\x00\x10\x00rLau\x01\x00".to_vec();
+    sit_classic.extend_from_slice(&[0u8; 64]);
+    let cases: [(&[u8], &str); 4] = [
+        (b"Rar!\x1a\x07\x01\x00 rar5 archive body ...", "RAR"),
+        (b"Rar!\x1a\x07\x00 rar4 archive body .......", "RAR"),
+        (&sit_classic, "StuffIt"),
+        (b"StuffIt (c)1997-2002 Aladdin Systems, Inc.", "StuffIt"),
+    ];
+    for (bytes, kind) in cases {
+        let (out, err, code) = run_with_stdin(&["-d"], bytes);
+        let err = String::from_utf8_lossy(&err);
+        assert_eq!(code, 2, "{kind}: {err}");
+        assert!(
+            err.contains(&format!("looks like a {kind} archive")),
+            "{kind}: {err}"
+        );
+        assert!(err.contains("pass -t to force"), "{kind}: {err}");
+        assert!(out.is_empty());
+
+        // An explicit -t is taken at its word: the codec runs (and gets to
+        // report whatever it makes of the bytes), without the archive hint.
+        let (_out, err, _code) = run_with_stdin(&["-d", "-t", "gzip"], bytes);
+        let err = String::from_utf8_lossy(&err);
+        assert!(!err.contains("archive"), "{kind} with -t: {err}");
+    }
+}
+
+#[test]
+fn auto_detect_archive_refusal_touches_no_files() {
+    let s = Scratch::new("archive_detect");
+    let input = s.file("stuff.rar");
+    let bytes = b"Rar!\x1a\x07\x01\x00 not really an archive, but it claims to be";
+    fs::write(&input, bytes).unwrap();
+
+    let (_out, err, code) = run(&["-d", input.to_str().unwrap()]);
+    assert_eq!(code, 2, "{}", String::from_utf8_lossy(&err));
+    assert!(String::from_utf8_lossy(&err).contains("RAR archive"));
+    assert_eq!(names_in(&s.path), ["stuff.rar"]);
+    assert_eq!(file_contents(&input), bytes);
 }

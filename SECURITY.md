@@ -23,22 +23,26 @@ decoders are written to that bar:
     use `decompress_to_vec_capped` / `decompress_to_vec_capped_with`,
     which take an explicit output cap.
 
-  An output limit bounds the bytes a decoder **hands out**, not the memory
-  it works in. Most decoders stream and keep only their window, but a few
-  build a block or the whole result internally before the caller sees a
-  byte, so the limit fires only after that memory is committed:
+  The limit is also passed down to the decoder
+  ([`Decoder::set_output_limit`]), so the decoders that build a block or
+  the whole result in memory before handing it out (`snappy`, `huffman`,
+  `bwt`, `arsenic`, the 7z-style `ppmd`, `lz5`) refuse a stream that
+  decodes to more than the limit instead of building it first.
 
-  | Codec | What is held regardless of the output limit |
-  |---|---|
-  | `rar2`, `rar3` | the whole declared output of a member |
-  | `snappy`, `huffman`, `bwt` | the whole decoded block (snappy: at most ~21× the input) |
-  | `sit13`, `arsenic` | the whole fork, up to 256 MiB |
-  | `ppmd` (7z-style) | the whole output, up to 64 MiB |
-  | `lz5` | one decoded block, up to 256 MiB for the largest block code |
-  | `ppmd`, `ppmd-zip`, `rar3` | a model arena sized by the stream header, up to 256 MiB |
+  What an output limit does **not** bound is memory that is not output:
 
-  For these, also bound the **input** size and the number of concurrent
-  decodes, or do not expose them to untrusted data.
+  | Codec | What a stream can still make the decoder hold | How to bound it |
+  |---|---|---|
+  | `ppmd`, `ppmd-zip` | a model arena sized by the stream header, up to 256 MiB | `DecoderConfig::max_memory` / `ZipDecoder::with_max_memory` |
+  | `rar3` | a PPMd model arena sized by the stream, up to 256 MiB; the whole compressed member | bound the input size |
+  | `lz5` | 16 MiB of history in a block-dependent frame; one compressed block | `DecoderConfig::max_block_size` |
+  | `lzma`, `zstd` | a dictionary / window as large as the stream declares (`lzma`: grown as output is produced) | `DecoderConfig::max_dict_size` (default 64 MiB), `DecoderConfig::max_window_size` |
+  | `xz`, `lzma2` | a dictionary as large as the stream declares, up to 128 MiB, grown as output is produced | bound the output |
+  | `snappy`, `huffman`, `bwt`, `range`, `rar2`, `arsenic`, `sit13` | the whole compressed input, until `finish` | bound the input size |
+  | `bwt` | about 5× one block while inverting it | bound the input size |
+
+  For untrusted data, bound the **input** size and the number of
+  concurrent decodes as well as the output.
 
 These are the only guarantees claimed: no panic, no undefined behavior,
 and bomb-bounded decode when the caller supplies a limit. The crate does

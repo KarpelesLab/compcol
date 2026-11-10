@@ -476,12 +476,12 @@ fn output_beyond_initial_reservation_round_trips() {
     let n = MAX_PREALLOC * 2 + 123;
     let text: Vec<u8> = (0..n).map(|i| b"abcdefgh"[(i * 7 + i / 5) % 8]).collect();
     let enc = encode_stream(&text);
-    assert_eq!(decode_stream(&enc).unwrap(), text);
+    assert_eq!(decode_stream(&enc, u64::MAX).unwrap(), text);
 
     let run = vec![b'z'; n];
     let enc = encode_stream(&run);
     assert_eq!(enc.len(), 3 + 5 + n.div_ceil(8));
-    assert_eq!(decode_stream(&enc).unwrap(), run);
+    assert_eq!(decode_stream(&enc, u64::MAX).unwrap(), run);
 }
 
 // ─── frequency scaling (inputs with ≥ 2^32 occurrences of a byte) ─────────

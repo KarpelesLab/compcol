@@ -651,3 +651,867 @@ fn lowdist_repeat_state_resets_when_fed_bytewise() {
     assert_eq!(crc32(&out), LOWDIST_RESET_CRC);
     assert_eq!(out, LOWDIST_RESET_EXPECTED);
 }
+
+// ─── Streaming output, output limit, filter-work bound ───────────────────
+//
+// The fixtures above are all far smaller than the 4 MiB dictionary, so the
+// properties below need streams this file builds itself: a minimal RAR3 LZ
+// block (hand-assembled code tables over a tiny alphabet) that expands to
+// many MiB from a few KiB.
+
+/// MSB-first bit writer.
+struct BitW {
+    bytes: Vec<u8>,
+    nbits: u32,
+}
+
+impl BitW {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            nbits: 0,
+        }
+    }
+    fn push(&mut self, value: u32, n: u32) {
+        for i in (0..n).rev() {
+            if self.nbits.is_multiple_of(8) {
+                self.bytes.push(0);
+            }
+            let last = self.bytes.len() - 1;
+            self.bytes[last] |= (((value >> i) & 1) as u8) << (7 - (self.nbits % 8));
+            self.nbits += 1;
+        }
+    }
+    /// RarVM variable-length number, shortest form.
+    fn push_vm(&mut self, v: u32) {
+        if v < 16 {
+            self.push(0, 2);
+            self.push(v, 4);
+        } else if v < 256 {
+            self.push(1, 2);
+            self.push(v, 8);
+        } else if v < 0x1_0000 {
+            self.push(2, 2);
+            self.push(v, 16);
+        } else {
+            self.push(3, 2);
+            self.push(v, 32);
+        }
+    }
+}
+
+/// The 29-byte standard Delta program as rar 6.24 emits it (lifted from
+/// `filter_delta_gradient_bmp.bin`; byte 0 is the XOR checksum).
+const DELTA_PROG: [u8; 29] = [
+    0x2F, 0x01, 0x9A, 0x41, 0x80, 0xEC, 0x27, 0x48, 0x2F, 0x09, 0x76, 0x6D, 0xD3, 0xEA, 0x41, 0x5B,
+    0x59, 0x44, 0xE8, 0x17, 0x5C, 0xE1, 0x6C, 0x91, 0x4C, 0x4E, 0x3F, 0x77, 0x00,
+];
+
+/// One step of a synthetic LZ stream.
+#[derive(Clone, Copy)]
+enum Op {
+    /// A literal; must be one of [`SYN_LITERALS`].
+    Lit(u8),
+    /// A 258-byte match at distance 1 (repeats the previous byte).
+    Run,
+    /// Main symbol 258: repeat the last match (needs a prior `Run`).
+    Rep,
+    /// A Delta filter declaration over `[pos + start, pos + start + len)`.
+    Delta { start: u32, len: u32, channels: u32 },
+}
+
+const SYN_LITERALS: [u8; 4] = [0x00, 0x01, 0x41, 0xE8];
+
+/// What a synthetic stream decodes to.
+struct Synthetic {
+    stream: Vec<u8>,
+    /// Output before any filter runs.
+    raw: Vec<u8>,
+    /// Declared filter windows `(start, len, channels)`, in order.
+    filters: Vec<(usize, usize, usize)>,
+}
+
+impl Synthetic {
+    /// Expected output: the declared Delta filters applied in order.
+    fn filtered(&self) -> Vec<u8> {
+        let mut out = self.raw.clone();
+        for &(start, len, channels) in &self.filters {
+            let src = out[start..start + len].to_vec();
+            let mut sp = 0;
+            for ch in 0..channels {
+                let mut prev = 0u8;
+                let mut i = ch;
+                while i < len {
+                    prev = prev.wrapping_sub(src[sp]);
+                    out[start + i] = prev;
+                    sp += 1;
+                    i += channels;
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Assemble a single-block RAR3 LZ stream running `ops`, ending with the
+/// end-of-data marker.
+fn build_lz_stream(ops: &[Op]) -> Synthetic {
+    build_lz_block(ops, false)
+}
+
+/// Assemble a RAR3 LZ block running `ops`. It ends with the end-of-data
+/// marker, or — with `then_new_table` — with the "new tables follow"
+/// marker, after which the caller appends the next block's header.
+///
+/// Main code: eight 3-bit symbols — the four literals, 256 (end), 257
+/// (filter), 258 (repeat match), 298 (longest length slot); canonical codes
+/// are assigned in symbol order. Offset code: symbols 0 and 1, one bit each.
+fn build_lz_block(ops: &[Op], then_new_table: bool) -> Synthetic {
+    const MAIN: [usize; 8] = [0x00, 0x01, 0x41, 0xE8, 256, 257, 258, 298];
+    let main_code = |sym: usize| MAIN.iter().position(|&s| s == sym).unwrap() as u32;
+
+    let mut lengths = [0u8; 299 + 60 + 17 + 28];
+    for &s in &MAIN {
+        lengths[s] = 3;
+    }
+    lengths[299] = 1;
+    lengths[300] = 1;
+
+    let mut w = BitW::new();
+    w.push(0, 1); // LZ block
+    w.push(0, 1); // fresh tables
+    // Precode: symbols 0, 1, 3 and 19 with 2-bit codes (00, 01, 10, 11).
+    for sym in 0..20 {
+        w.push(if matches!(sym, 0 | 1 | 3 | 19) { 2 } else { 0 }, 4);
+    }
+    let mut i = 0;
+    while i < lengths.len() {
+        match lengths[i] {
+            0 => {
+                let run = lengths[i..].iter().take_while(|&&l| l == 0).count();
+                if run >= 11 {
+                    let n = run.min(138);
+                    w.push(0b11, 2);
+                    w.push(n as u32 - 11, 7);
+                    i += n;
+                } else {
+                    w.push(0b00, 2);
+                    i += 1;
+                }
+            }
+            1 => {
+                w.push(0b01, 2);
+                i += 1;
+            }
+            _ => {
+                w.push(0b10, 2);
+                i += 1;
+            }
+        }
+    }
+
+    let mut raw: Vec<u8> = Vec::new();
+    let mut filters = Vec::new();
+    let mut program_declared = false;
+    for &op in ops {
+        match op {
+            Op::Lit(b) => {
+                assert!(SYN_LITERALS.contains(&b));
+                w.push(main_code(b as usize), 3);
+                raw.push(b);
+            }
+            Op::Run => {
+                w.push(main_code(298), 3);
+                w.push(31, 5); // length slot 27: 224 + 3 + 31 = 258
+                w.push(0, 1); // offset symbol 0: distance 1
+                let b = raw.last().copied().unwrap_or(0);
+                raw.resize(raw.len() + 258, b);
+            }
+            Op::Rep => {
+                w.push(main_code(258), 3);
+                let b = raw.last().copied().unwrap_or(0);
+                raw.resize(raw.len() + 258, b);
+            }
+            Op::Delta {
+                start,
+                len,
+                channels,
+            } => {
+                let mut p = BitW::new();
+                let mut flags = 0x30; // explicit length + registers
+                if !program_declared {
+                    flags |= 0x80;
+                    p.push_vm(0); // reset, slot 0
+                }
+                p.push_vm(start);
+                p.push_vm(len);
+                p.push(0x01, 7); // register mask: r0
+                p.push_vm(channels);
+                if !program_declared {
+                    p.push_vm(DELTA_PROG.len() as u32);
+                    for &b in &DELTA_PROG {
+                        p.push(b as u32, 8);
+                    }
+                    program_declared = true;
+                }
+                w.push(main_code(257), 3);
+                let n = p.bytes.len() as u32;
+                if n <= 6 {
+                    w.push(flags | (n - 1), 8);
+                } else {
+                    w.push(flags | 6, 8);
+                    w.push(n - 7, 8);
+                }
+                for &b in &p.bytes {
+                    w.push(b as u32, 8);
+                }
+                filters.push((raw.len() + start as usize, len as usize, channels as usize));
+            }
+        }
+    }
+    w.push(main_code(256), 3);
+    if then_new_table {
+        w.push(1, 1); // the next block's header follows, byte-aligned
+    } else {
+        w.push(0, 2); // no new table; next member starts with its own header
+    }
+    Synthetic {
+        stream: w.bytes,
+        raw,
+        filters,
+    }
+}
+
+/// `blocks` repetitions of "a literal, then `reps + 1` 258-byte runs of it".
+fn run_ops(blocks: usize, reps: usize) -> Vec<Op> {
+    let mut ops = Vec::new();
+    for b in 0..blocks {
+        ops.push(Op::Lit(SYN_LITERALS[(b * 7 + b / 3) % 4]));
+        ops.push(Op::Run);
+        ops.extend(std::iter::repeat_n(Op::Rep, reps));
+    }
+    ops
+}
+
+/// Feed `input` in `in_chunk`-byte pieces, then drain through an
+/// `out_chunk`-byte buffer. Returns the bytes delivered, the terminal error
+/// if any, and the largest [`Decoder::buffered_output`] seen between calls.
+fn decode_chunked(
+    mut dec: Decoder,
+    input: &[u8],
+    in_chunk: usize,
+    out_chunk: usize,
+) -> (Vec<u8>, Option<Error>, usize) {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; out_chunk];
+    let mut peak = 0;
+    for chunk in input.chunks(in_chunk.clamp(1, input.len().max(1))) {
+        let mut off = 0;
+        while off < chunk.len() {
+            match dec.decode(&chunk[off..], &mut buf) {
+                Ok((p, _)) => {
+                    off += p.consumed;
+                    out.extend_from_slice(&buf[..p.written]);
+                    assert!(p.consumed + p.written > 0, "decode made no progress");
+                }
+                Err(e) => return (out, Some(e), peak),
+            }
+            peak = peak.max(dec.buffered_output());
+        }
+    }
+    loop {
+        match dec.finish(&mut buf) {
+            Ok((p, status)) => {
+                out.extend_from_slice(&buf[..p.written]);
+                peak = peak.max(dec.buffered_output());
+                if matches!(status, Status::StreamEnd) {
+                    return (out, None, peak);
+                }
+                assert!(p.written > 0, "finish made no progress");
+            }
+            Err(e) => return (out, Some(e), peak),
+        }
+    }
+}
+
+/// Every non-solid fixture with its declared size and FILE_CRC.
+fn single_fixtures() -> Vec<(&'static [u8], u64, u32)> {
+    vec![
+        (
+            TESTDIR_TEST_TXT_BLOCK,
+            TESTDIR_TEST_TXT_EXPECTED.len() as u64,
+            crc32(TESTDIR_TEST_TXT_EXPECTED),
+        ),
+        (FILTER_DELTA_BMP, 49206, 0x2347_E5ED),
+        (FILTER_DELTA_WAV, 16428, 0x0E8F_2810),
+        (FILTER_DELTA12_CALLS, 6146, 0x6C08_D7DF),
+        (FILTER_X86_SLICE, 32768, 0x6188_0029),
+        (PPMD_NOTES, 20001, 0x0E1A_EC07),
+        (LOWDIST_RESET, LOWDIST_RESET_UNPACK, LOWDIST_RESET_CRC),
+    ]
+}
+
+/// One-shot, 1-byte input and 1-byte output decodes of every fixture are
+/// byte-identical (and match the archive's FILE_CRC).
+#[test]
+fn chunking_differential_on_every_fixture() {
+    for (i, (block, unp, crc)) in single_fixtures().into_iter().enumerate() {
+        let shapes = [(usize::MAX, 1 << 16), (1, 1 << 16), (usize::MAX, 1), (1, 1)];
+        for (in_chunk, out_chunk) in shapes {
+            let (out, err, _) =
+                decode_chunked(Decoder::with_unpack_size(unp), block, in_chunk, out_chunk);
+            assert_eq!(err, None, "fixture {i} ({in_chunk}/{out_chunk})");
+            assert_eq!(
+                out.len() as u64,
+                unp,
+                "fixture {i} ({in_chunk}/{out_chunk})"
+            );
+            assert_eq!(crc32(&out), crc, "fixture {i} ({in_chunk}/{out_chunk})");
+        }
+    }
+}
+
+/// The same differential over the solid groups, member by member.
+#[test]
+fn chunking_differential_on_solid_groups() {
+    let ppmd_group: &[(&[u8], u64, u32)] = &[
+        (PPMD_NOTES, 20001, 0x0E1A_EC07),
+        (SOLID_PPMD_PROSE, 236737, 0x028E_1AC1),
+    ];
+    for group in [SOLID_M3_GROUP, ppmd_group] {
+        for (in_chunk, out_chunk) in [(1usize, 1usize << 16), (usize::MAX, 1), (3, 5)] {
+            let mut dec = Decoder::with_unpack_size(group[0].1).with_solid();
+            for (i, &(payload, unp, want_crc)) in group.iter().enumerate() {
+                if i > 0 {
+                    dec.begin_solid_member(unp).unwrap();
+                }
+                let mut out = Vec::new();
+                let mut buf = vec![0u8; out_chunk];
+                for chunk in payload.chunks(in_chunk.min(payload.len())) {
+                    let (p, _) = dec.decode(chunk, &mut buf).unwrap();
+                    assert_eq!(p.consumed, chunk.len());
+                    out.extend_from_slice(&buf[..p.written]);
+                }
+                loop {
+                    let (p, status) = dec.finish(&mut buf).unwrap();
+                    out.extend_from_slice(&buf[..p.written]);
+                    if matches!(status, Status::StreamEnd) {
+                        break;
+                    }
+                    assert!(p.written > 0);
+                }
+                assert_eq!(out.len() as u64, unp, "member {i}");
+                assert_eq!(crc32(&out), want_crc, "member {i}");
+            }
+        }
+    }
+}
+
+/// Truncated non-solid streams keep their behaviour whatever the chunking:
+/// the same bytes come out and the same verdict (short output or an error)
+/// is reached with 1-byte buffers as with a one-shot decode.
+#[test]
+fn chunking_differential_on_truncated_fixtures() {
+    for (i, (block, unp, _)) in single_fixtures().into_iter().enumerate() {
+        for cut in [block.len() / 4, block.len() / 2, block.len() - 3] {
+            let cut = &block[..cut];
+            let one = decode_chunked(Decoder::with_unpack_size(unp), cut, usize::MAX, 4096);
+            let byte = decode_chunked(Decoder::with_unpack_size(unp), cut, 1, 1);
+            assert_eq!(one.0, byte.0, "fixture {i} cut {}", cut.len());
+            assert_eq!(one.1, byte.1, "fixture {i} cut {}", cut.len());
+            assert!(one.0.len() as u64 <= unp);
+        }
+    }
+}
+
+/// Corrupted streams reach the same verdict, with the same bytes delivered
+/// first, whatever the chunking (and never panic).
+#[test]
+fn chunking_differential_on_corrupted_fixtures() {
+    let mut seed = 0x9E37_79B9u32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    for (i, (block, unp, _)) in single_fixtures().into_iter().enumerate() {
+        for round in 0..12 {
+            let mut bad = block.to_vec();
+            for _ in 0..1 + round % 3 {
+                let at = next() as usize % bad.len();
+                bad[at] ^= 1 << (next() % 8);
+            }
+            let one = decode_chunked(Decoder::with_unpack_size(unp), &bad, usize::MAX, 4096);
+            let small = decode_chunked(Decoder::with_unpack_size(unp), &bad, 5, 3);
+            assert!(one.0 == small.0, "fixture {i} round {round}: bytes differ");
+            assert_eq!(one.1, small.1, "fixture {i} round {round}");
+        }
+    }
+}
+
+/// A truncated LZ stream (non-solid) still hands back the bytes decoded
+/// before the input ran out, as a short success.
+#[test]
+fn truncated_lz_stream_returns_short_output() {
+    let syn = build_lz_stream(&run_ops(40, 3));
+    let cut = &syn.stream[..syn.stream.len() - 20];
+    let (out, err, _) = decode_chunked(Decoder::new(), cut, usize::MAX, 4096);
+    assert_eq!(err, None);
+    assert!(!out.is_empty() && out.len() < syn.raw.len());
+    assert_eq!(out, syn.raw[..out.len()]);
+}
+
+/// The synthetic builder agrees with the decoder on a small stream,
+/// filters included.
+#[test]
+fn synthetic_stream_decodes() {
+    let mut ops = vec![Op::Delta {
+        start: 0,
+        len: 3000,
+        channels: 3,
+    }];
+    ops.extend(run_ops(20, 2));
+    let syn = build_lz_stream(&ops);
+    assert_eq!(
+        decode_full(&syn.stream, syn.raw.len() as u64),
+        syn.filtered()
+    );
+    // Without a declared size the end marker stops the decode.
+    let (out, err, _) = decode_chunked(Decoder::new(), &syn.stream, 7, 13);
+    assert_eq!(err, None);
+    assert_eq!(out, syn.filtered());
+}
+
+/// Largest amount of output the decoder may hold: the 4 MiB dictionary's
+/// worth it lags behind by, plus a filter window's worth of slack.
+const BUFFERED_OUTPUT_BOUND: usize = (4 << 20) + (512 << 10);
+
+/// Output buffering is bounded by the dictionary, not by the unpacked
+/// size: a ~13 MiB stream never has more than ~4.5 MiB waiting inside the
+/// decoder, whatever buffer it is drained through.
+#[test]
+fn streaming_output_buffering_is_bounded() {
+    let syn = build_lz_stream(&run_ops(500, 99));
+    assert!(syn.raw.len() > 12 << 20);
+    for out_chunk in [1 << 16, 4099] {
+        let (out, err, peak) = decode_chunked(
+            Decoder::with_unpack_size(syn.raw.len() as u64),
+            &syn.stream,
+            usize::MAX,
+            out_chunk,
+        );
+        assert_eq!(err, None);
+        assert!(out == syn.raw, "output differs (drained by {out_chunk})");
+        assert!(
+            peak <= BUFFERED_OUTPUT_BOUND,
+            "{peak} bytes buffered for a {} byte stream",
+            syn.raw.len()
+        );
+    }
+}
+
+/// Filters whose windows sit anywhere relative to the points where the
+/// decoder releases output — including straddling them — are applied
+/// exactly once, in a stream several dictionaries long, with the standalone
+/// E8 pass on top.
+#[test]
+fn streaming_applies_filters_across_release_points() {
+    let mut ops = Vec::new();
+    let mut produced = 0usize;
+    let mut block = 0usize;
+    while produced < 9 << 20 {
+        // A filter every ~77 KiB over windows of 1..121 KiB, some starting
+        // a little ahead of the current position: neighbours overlap (and
+        // must then apply in declaration order), and whichever windows are
+        // open when the decoder releases output hold part of it back.
+        let ahead = (block * 977) % 5000;
+        let len = 1000 + (block * 7919) % 120_000;
+        ops.push(Op::Delta {
+            start: ahead as u32,
+            len: len as u32,
+            channels: 1 + (block % 5) as u32,
+        });
+        ops.extend(run_ops(6, 49));
+        produced += 6 * (1 + 50 * 258);
+        block += 1;
+    }
+    // Enough tail for the last window to complete.
+    ops.extend(run_ops(12, 49));
+    let syn = build_lz_stream(&ops);
+    let want = syn.filtered();
+    for out_chunk in [1 << 16, 7919] {
+        let (out, err, peak) = decode_chunked(
+            Decoder::with_unpack_size(syn.raw.len() as u64),
+            &syn.stream,
+            usize::MAX,
+            out_chunk,
+        );
+        assert_eq!(err, None);
+        assert!(
+            out == want,
+            "filtered output differs (drained by {out_chunk})"
+        );
+        assert!(peak <= BUFFERED_OUTPUT_BOUND, "{peak} bytes buffered");
+    }
+
+    let mut want_e8 = want.clone();
+    apply_e8_filter(&mut want_e8, 0, true);
+    assert!(want_e8 != want, "the stream should contain E8 call sites");
+    let (out, err, _) = decode_chunked(
+        Decoder::with_unpack_size(syn.raw.len() as u64).with_e8_filter(true),
+        &syn.stream,
+        usize::MAX,
+        50_001,
+    );
+    assert_eq!(err, None);
+    assert!(
+        out == want_e8,
+        "E8 post-pass differs from the one-shot filter"
+    );
+}
+
+/// With an output limit the decoder refuses a stream that decodes to more,
+/// before building the excess: a ~13 MiB bomb under a 1 KiB cap fails with
+/// at most 1 KiB ever buffered.
+#[test]
+fn output_limit_refuses_lz_bomb_before_building_it() {
+    use compcol::limit::LimitedDecoder;
+    let syn = build_lz_stream(&run_ops(500, 99));
+    for declared in [u64::MAX, syn.raw.len() as u64] {
+        let mut dec = LimitedDecoder::new(Decoder::with_unpack_size(declared), 1024);
+        dec.decode(&syn.stream, &mut []).unwrap();
+        let mut buf = [0u8; 4096];
+        let mut delivered = 0usize;
+        let err = loop {
+            match dec.finish(&mut buf) {
+                Ok((p, status)) => {
+                    delivered += p.written;
+                    assert!(dec.get_ref().buffered_output() <= 1024);
+                    assert!(!matches!(status, Status::StreamEnd), "bomb decoded");
+                    assert!(p.written > 0);
+                }
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(err, Error::OutputLimitExceeded);
+        assert!(delivered <= 1024);
+        assert!(dec.get_ref().buffered_output() <= 1024);
+    }
+}
+
+/// The limit is exact — a stream of exactly the limit decodes, one byte
+/// less refuses it — covers PPMd blocks, and survives a reset.
+#[test]
+fn output_limit_is_exact_and_covers_ppmd() {
+    let mut buf = [0u8; 4096];
+
+    // No declared size: the stream's own end marker lands on the limit.
+    let syn = build_lz_stream(&run_ops(30, 2));
+    let mut dec = Decoder::new();
+    dec.set_output_limit(syn.raw.len() as u64);
+    let (out, err, _) = decode_chunked(dec, &syn.stream, usize::MAX, 4096);
+    assert_eq!(err, None);
+    assert_eq!(out, syn.raw);
+    let mut dec = Decoder::new();
+    dec.set_output_limit(syn.raw.len() as u64 - 1);
+    let (_, err, _) = decode_chunked(dec, &syn.stream, usize::MAX, 4096);
+    assert_eq!(err, Some(Error::OutputLimitExceeded));
+
+    for (block, unp, crc) in [
+        (PPMD_NOTES, 20001u64, 0x0E1A_EC07u32),
+        (FILTER_X86_SLICE, 32768, 0x6188_0029),
+    ] {
+        let mut dec = Decoder::with_unpack_size(unp);
+        dec.set_output_limit(unp - 1);
+        dec.decode(block, &mut []).unwrap();
+        assert_eq!(
+            dec.finish(&mut buf).unwrap_err(),
+            Error::OutputLimitExceeded
+        );
+        assert!((dec.buffered_output() as u64) < unp);
+
+        // A declared size within the limit is never refused, and the limit
+        // is configuration: it survives a reset.
+        let mut dec = Decoder::with_unpack_size(unp);
+        dec.set_output_limit(unp);
+        for _ in 0..2 {
+            dec.decode(block, &mut []).unwrap();
+            let mut out = Vec::new();
+            drain(&mut dec, &mut out);
+            assert_eq!(crc32(&out), crc);
+            dec.reset();
+        }
+        dec.set_output_limit(10);
+        dec.reset();
+        dec.decode(block, &mut []).unwrap();
+        assert_eq!(
+            dec.finish(&mut buf).unwrap_err(),
+            Error::OutputLimitExceeded
+        );
+    }
+}
+
+/// In a solid group the limit covers the group as a whole: the members
+/// together may produce exactly the limit, and one byte less refuses the
+/// member that would cross it.
+#[test]
+fn output_limit_spans_solid_members() {
+    let total: u64 = SOLID_M3_GROUP.iter().map(|m| m.1).sum();
+    for (limit, fits) in [(total, true), (total - 1, false)] {
+        let mut dec = Decoder::with_unpack_size(SOLID_M3_GROUP[0].1).with_solid();
+        dec.set_output_limit(limit);
+        let mut refused_at = None;
+        let mut buf = vec![0u8; 1 << 16];
+        'group: for (i, &(payload, unp, _)) in SOLID_M3_GROUP.iter().enumerate() {
+            if i > 0 {
+                dec.begin_solid_member(unp).unwrap();
+            }
+            dec.decode(payload, &mut []).unwrap();
+            loop {
+                match dec.finish(&mut buf) {
+                    Ok((_, Status::StreamEnd)) => break,
+                    Ok((p, _)) => assert!(p.written > 0),
+                    Err(e) => {
+                        assert_eq!(e, Error::OutputLimitExceeded);
+                        refused_at = Some(i);
+                        break 'group;
+                    }
+                }
+            }
+        }
+        let want = (!fits).then_some(SOLID_M3_GROUP.len() - 1);
+        assert_eq!(refused_at, want, "limit {limit}");
+    }
+}
+
+/// Filter work is bounded by the output produced: thousands of Delta
+/// declarations stacked on one window (each a 128 KiB pass for a few bytes
+/// of input) are refused instead of run.
+#[test]
+fn stacked_delta_filters_are_refused() {
+    const WINDOW: u32 = 0x20000;
+    let mut ops: Vec<Op> = std::iter::repeat_n(
+        Op::Delta {
+            start: 0,
+            len: WINDOW,
+            channels: 1024,
+        },
+        4000,
+    )
+    .collect();
+    ops.extend(run_ops(1, 520));
+    let syn = build_lz_stream(&ops);
+    assert!(syn.raw.len() > WINDOW as usize);
+    let (out, err, _) = decode_chunked(
+        Decoder::with_unpack_size(syn.raw.len() as u64),
+        &syn.stream,
+        usize::MAX,
+        4096,
+    );
+    assert_eq!(err, Some(Error::Corrupt));
+    assert!(out.is_empty());
+
+    // A few passes over the same window (what a real encoder's filter
+    // stacking amounts to) still decode.
+    let mut ops: Vec<Op> = std::iter::repeat_n(
+        Op::Delta {
+            start: 0,
+            len: WINDOW,
+            channels: 3,
+        },
+        4,
+    )
+    .collect();
+    ops.extend(run_ops(1, 520));
+    let syn = build_lz_stream(&ops);
+    assert!(decode_full(&syn.stream, syn.raw.len() as u64) == syn.filtered());
+}
+
+/// A filter window cannot start a whole dictionary (4 MiB) or more ahead:
+/// the reference decoder addresses filter blocks inside its window, so no
+/// encoder can declare one, and accepting it would let a declaration pin
+/// output far behind it.
+#[test]
+fn filter_start_beyond_dictionary_is_corrupt() {
+    let mut ops = vec![Op::Delta {
+        start: 4 << 20,
+        len: 16,
+        channels: 1,
+    }];
+    ops.extend(run_ops(2, 1));
+    let syn = build_lz_stream(&ops);
+    let (_, err, _) = decode_chunked(Decoder::new(), &syn.stream, usize::MAX, 4096);
+    assert_eq!(err, Some(Error::Corrupt));
+}
+
+// ─── Streaming through PPMd blocks ───────────────────────────────────────
+//
+// The PPMd fixtures are far smaller than the dictionary, so they are
+// released in one piece when they end and never make the decoder suspend a
+// PPMd block. (The unit tests in `src/rar3/decoder.rs` force a pause at
+// every symbol of those fixtures.) A PPMd stream of several MiB is needed
+// here, and this crate has no PPMd encoder to make one with: arbitrary
+// bytes are not a valid range-coded payload — sooner or later they run into
+// an escape sequence or leave the coder's interval. One payload is valid
+// at any length, though: all zero bytes. The coder then always lands in the
+// first interval, which the model gives to byte 0 from the first symbol on,
+// so the block decodes to zeros — it is what an encoder writes for a run of
+// zeros, less its final flush — at about 2700 output bytes per payload
+// byte.
+
+/// Output bytes a zero-payload PPMd block yields per payload byte, rounded
+/// down (2720 measured; the block ends in `UnexpectedEnd` when its payload
+/// runs out).
+const PPMD_ZEROS_PER_BYTE: usize = 2600;
+
+/// A PPMd block header (fresh model, order 3, 1 MiB, escape byte 0xC8)
+/// followed by `payload` zero bytes. Decodes to at least
+/// `payload * PPMD_ZEROS_PER_BYTE` zero bytes.
+fn ppmd_zero_block(payload: usize) -> Vec<u8> {
+    // PPMd flag, model reset (0x20), explicit escape byte (0x40), order - 1.
+    let mut block = vec![0x80 | 0x60 | 2, 0, 0xC8];
+    block.resize(block.len() + payload, 0);
+    block
+}
+
+/// A PPMd member is streamed like an LZ one: a 6 MiB PPMd block never has
+/// more than the dictionary's worth (plus slack) waiting inside the
+/// decoder, whatever buffer it is drained through.
+#[test]
+fn ppmd_output_buffering_is_bounded() {
+    let unp = (6usize << 20) + 12_345;
+    let stream = ppmd_zero_block(unp / PPMD_ZEROS_PER_BYTE + 16);
+    for out_chunk in [1 << 16, 4099] {
+        let (out, err, peak) = decode_chunked(
+            Decoder::with_unpack_size(unp as u64),
+            &stream,
+            usize::MAX,
+            out_chunk,
+        );
+        assert_eq!(err, None);
+        assert_eq!(out.len(), unp, "drained by {out_chunk}");
+        assert!(out.iter().all(|&b| b == 0), "drained by {out_chunk}");
+        assert!(
+            peak <= BUFFERED_OUTPUT_BOUND,
+            "{peak} bytes buffered for a {unp} byte PPMd block"
+        );
+    }
+}
+
+/// Decode a failing zero-payload stream through two differently sized
+/// output buffers and check that the same bytes come out before the same
+/// error. Returns how many, and the error.
+fn same_failure_for_every_chunking(make: impl Fn() -> Decoder, stream: &[u8]) -> (usize, Error) {
+    let (out_a, err_a, peak_a) = decode_chunked(make(), stream, usize::MAX, 1 << 16);
+    let (out_b, err_b, peak_b) = decode_chunked(make(), stream, 4096, 4099);
+    assert!(out_a == out_b, "delivered bytes differ");
+    assert_eq!(err_a, err_b);
+    assert!(peak_a.max(peak_b) <= BUFFERED_OUTPUT_BOUND);
+    assert!(out_a.iter().all(|&b| b == 0));
+    (out_a.len(), err_a.expect("the stream should fail"))
+}
+
+/// A PPMd payload that runs out several MiB in fails at the same symbol
+/// whatever the chunking: the same bytes are delivered first — everything
+/// released before the failure, which for a block longer than the
+/// dictionary is no longer nothing — and then the same error.
+#[test]
+fn truncated_ppmd_block_fails_at_the_same_position() {
+    // Runs dry somewhere past 5 MiB, well short of the declared size.
+    let stream = ppmd_zero_block((5 << 20) / PPMD_ZEROS_PER_BYTE);
+    let (delivered, err) =
+        same_failure_for_every_chunking(|| Decoder::with_unpack_size(64 << 20), &stream);
+    assert_eq!(err, Error::UnexpectedEnd);
+    assert!(delivered > 3 << 20, "only {delivered} bytes delivered");
+    assert!(delivered < 6 << 20);
+}
+
+/// The output limit is checked symbol by symbol in a PPMd block that has
+/// already been suspended and resumed: the bytes released before the limit
+/// come out, then `OutputLimitExceeded`, for every chunking.
+#[test]
+fn output_limit_holds_in_a_resumed_ppmd_block() {
+    let limit = (5u64 << 20) + 77;
+    let stream = ppmd_zero_block((6 << 20) / PPMD_ZEROS_PER_BYTE);
+    let make = || {
+        let mut dec = Decoder::new();
+        dec.set_output_limit(limit);
+        dec
+    };
+    let (delivered, err) = same_failure_for_every_chunking(make, &stream);
+    assert_eq!(err, Error::OutputLimitExceeded);
+    assert!(delivered > 3 << 20, "only {delivered} bytes delivered");
+    assert!(delivered as u64 <= limit);
+}
+
+/// Solid mode keeps its end-of-member policy across pauses: a PPMd member
+/// that reaches its declared size after being suspended must still code
+/// its end marker through the model, and one that does not is refused.
+#[test]
+fn solid_ppmd_member_without_end_marker_fails_after_pauses() {
+    let unp = (4u64 << 20) + (300 << 10);
+    let stream = ppmd_zero_block((5 << 20) / PPMD_ZEROS_PER_BYTE);
+    let (delivered, err) =
+        same_failure_for_every_chunking(|| Decoder::with_unpack_size(unp).with_solid(), &stream);
+    // The symbol after the last byte is another zero, not the escape byte.
+    assert_eq!(err, Error::Corrupt);
+    assert!(delivered > 3 << 20, "only {delivered} bytes delivered");
+    assert!((delivered as u64) < unp);
+}
+
+/// An LZ block handing over to a PPMd block mid-member, with a Delta
+/// filter window that starts in the LZ block's output, ends in the PPMd
+/// block's, and is still incomplete when the decoder first releases output
+/// — which it now does from inside the PPMd block. The window is held back
+/// across that pause, filtered once it completes, and the rest of the
+/// PPMd block streams on.
+#[test]
+fn lz_block_switching_to_ppmd_streams_across_the_switch() {
+    // The first release pass comes once this much has been decoded.
+    const FIRST_RELEASE: usize = (4 << 20) - 260;
+    const WINDOW: usize = 0x1E000;
+    let mut ops = Vec::new();
+    let mut produced = 0usize;
+    let mut block = 0usize;
+    let mut declared = false;
+    while produced < FIRST_RELEASE - 50_000 {
+        if !declared && produced >= FIRST_RELEASE - 80_000 {
+            ops.push(Op::Delta {
+                start: 0,
+                len: WINDOW as u32,
+                channels: 3,
+            });
+            declared = true;
+        }
+        ops.push(Op::Lit(SYN_LITERALS[(block * 5 + block / 7) % 4]));
+        ops.push(Op::Run);
+        produced += 259;
+        block += 1;
+    }
+    let mut syn = build_lz_block(&ops, true);
+    let lz_len = syn.raw.len();
+    let (window_start, _, _) = syn.filters[0];
+    assert!(window_start < lz_len && lz_len < FIRST_RELEASE);
+    assert!(FIRST_RELEASE < window_start + WINDOW);
+
+    let ppmd_len = (4 << 20) + (400 << 10);
+    syn.stream
+        .extend_from_slice(&ppmd_zero_block(ppmd_len / PPMD_ZEROS_PER_BYTE + 16));
+    syn.raw.resize(lz_len + ppmd_len, 0);
+    let want = syn.filtered();
+    // The filter carries the LZ block's bytes into the PPMd block's zeros.
+    assert!(want[lz_len..window_start + WINDOW].iter().any(|&b| b != 0));
+
+    for out_chunk in [1 << 16, 4099] {
+        let (out, err, peak) = decode_chunked(
+            Decoder::with_unpack_size(want.len() as u64),
+            &syn.stream,
+            usize::MAX,
+            out_chunk,
+        );
+        assert_eq!(err, None);
+        assert!(out == want, "output differs (drained by {out_chunk})");
+        assert!(peak <= BUFFERED_OUTPUT_BOUND, "{peak} bytes buffered");
+    }
+}

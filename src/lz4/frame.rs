@@ -43,6 +43,31 @@
 //!
 //! When `block_independence = true`, the window is never populated and each
 //! block is compressed in isolation, decoding correctly on its own.
+//!
+//! ## Concatenated and skippable frames
+//!
+//! An `.lz4` file is any number of frames back to back (`cat a.lz4 b.lz4`),
+//! and the decoder decodes them as one, like `lz4 -d`: the output continues
+//! seamlessly, while each frame has its own descriptor, window, content
+//! size and checksums. Skippable frames (magic `0x184D2A50..=0x184D2A5F`,
+//! then a 4-byte little-endian length and that many bytes) are skipped
+//! wherever a frame may start; their payload is discarded as it arrives.
+//!
+//! After a frame, the next byte tells: the first byte of a frame magic
+//! (`0x04`, or `0x50..=0x5F` for a skippable one) starts another frame,
+//! which must then be valid — a wrong magic is `BadHeader`, an input that
+//! stops inside it is `UnexpectedEnd`. Any other byte ends the stream
+//! (`StreamEnd`), leaving the trailing bytes unconsumed, as the gzip decoder
+//! does (`lz4 -d` rejects such input instead). Since only the next byte
+//! tells, `decode` cannot report `StreamEnd` right at the end of the input;
+//! `finish` does.
+//!
+//! [`DecoderConfig::with_multi_frame(false)`](DecoderConfig::with_multi_frame)
+//! stops after the first frame instead — for a container that embeds one
+//! frame followed by other data: `decode` reports `StreamEnd` right after
+//! the frame's last byte and consumes nothing past it.
+//!
+//! The legacy frame format (magic `0x184C2102`) is not supported.
 
 use alloc::vec::Vec;
 
@@ -53,6 +78,17 @@ use super::block;
 
 /// Frame magic number, little-endian: `0x184D2204`.
 const MAGIC: u32 = 0x184D_2204;
+
+/// Skippable-frame magic numbers are `0x184D2A50..=0x184D2A5F`: this value
+/// once the low four bits are masked off.
+const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
+const SKIPPABLE_MAGIC_MASK: u32 = 0xFFFF_FFF0;
+
+/// Whether `b` can be the first byte of a frame: of an LZ4 frame's magic or
+/// of a skippable frame's (both are stored little-endian).
+fn starts_frame(b: u8) -> bool {
+    b == MAGIC.to_le_bytes()[0] || b & 0xF0 == 0x50
+}
 
 /// High two bits of `FLG`: version (must be `01`).
 const FLG_VERSION_MASK: u8 = 0b1100_0000;
@@ -172,10 +208,43 @@ impl Default for EncoderConfig {
     }
 }
 
-/// Decoder configuration (no tunables yet — every flag is read from the
-/// stream).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DecoderConfig;
+/// Decoder configuration. Everything about a frame is read from the
+/// stream; this only says how many frames to read.
+///
+/// `#[non_exhaustive]`: construct via [`DecoderConfig::default`] and the
+/// `with_*` builders rather than a struct literal, so new options can be
+/// added in future without breaking downstream code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DecoderConfig {
+    /// Decode concatenated frames (`cat a.lz4 b.lz4`) as one output, like
+    /// `lz4 -d`. Default `true`.
+    ///
+    /// With `false` the decoder stops at the end of the first frame:
+    /// `decode` returns `StreamEnd` as soon as the frame's EndMark (and
+    /// its content checksum, if any) is read and leaves every byte after
+    /// it unconsumed, so the caller can tell exactly where the frame
+    /// ended. With `true` the end is only known once the byte after a
+    /// frame turns out not to start another one (or `finish` says there is
+    /// none).
+    ///
+    /// Skippable frames ahead of the frame are skipped either way.
+    pub multi_frame: bool,
+}
+
+impl Default for DecoderConfig {
+    fn default() -> Self {
+        Self { multi_frame: true }
+    }
+}
+
+impl DecoderConfig {
+    /// Set [`multi_frame`](Self::multi_frame).
+    pub fn with_multi_frame(mut self, multi_frame: bool) -> Self {
+        self.multi_frame = multi_frame;
+        self
+    }
+}
 
 impl Algorithm for LZ4Frame {
     const NAME: &'static str = "lz4-frame";
@@ -187,8 +256,8 @@ impl Algorithm for LZ4Frame {
     fn encoder_with(c: EncoderConfig) -> Encoder {
         Encoder::with_config(c)
     }
-    fn decoder_with(_: DecoderConfig) -> Decoder {
-        Decoder::new()
+    fn decoder_with(c: DecoderConfig) -> Decoder {
+        Decoder::with_config(c)
     }
 }
 
@@ -704,6 +773,10 @@ fn max_compressed_block(raw_max: usize) -> usize {
 enum DecPhase {
     /// Reading the 4-byte magic.
     Magic,
+    /// Reading the 4-byte length of a skippable frame.
+    SkippableSize,
+    /// Discarding the `skip_remaining` payload bytes of a skippable frame.
+    SkippableData,
     /// Reading FLG + BD.
     FlgBd,
     /// Reading optional ContentSize (8 bytes) and DictID (4 bytes), in
@@ -724,7 +797,13 @@ enum DecPhase {
     Draining,
     /// Reading the 4-byte content xxHash32 (if FLG.C.Checksum=1).
     ContentChecksum,
-    /// Stream fully consumed.
+    /// A frame (or a skippable frame) has ended and another may follow.
+    /// The next input byte decides: the first byte of a frame magic
+    /// restarts at `Magic`, anything else settles into `Done`. With no
+    /// input available we stay here so `raw_finish` can declare success.
+    /// Only reached with [`DecoderConfig::multi_frame`].
+    BetweenFrames,
+    /// Stream fully decoded; subsequent input is left unconsumed.
     Done,
 }
 
@@ -769,15 +848,28 @@ pub struct Decoder {
     content_size: Option<u64>,
     /// Bytes decoded in this frame so far, checked against `content_size`.
     content_count: u64,
+    /// Decode concatenated frames as one stream
+    /// ([`DecoderConfig::multi_frame`]).
+    multi_frame: bool,
+    /// Payload bytes of the current skippable frame still to discard.
+    skip_remaining: u32,
     /// `true` once a malformed input was seen; further calls error.
     poisoned: bool,
 }
 
 impl Decoder {
-    /// Construct a fresh decoder. All decode-time options are read from
-    /// the stream.
+    /// Construct a decoder with the default [`DecoderConfig`]. All
+    /// per-frame options are read from the stream.
     pub fn new() -> Self {
+        Self::with_config(DecoderConfig::default())
+    }
+
+    /// Construct a decoder with explicit configuration (e.g. to stop after
+    /// one frame).
+    pub fn with_config(config: DecoderConfig) -> Self {
         Self {
+            multi_frame: config.multi_frame,
+            skip_remaining: 0,
             phase: DecPhase::Magic,
             accum: [0; 12],
             accum_len: 0,
@@ -806,6 +898,45 @@ impl Decoder {
     fn poison<T>(&mut self, e: Error) -> Result<T, Error> {
         self.poisoned = true;
         Err(e)
+    }
+
+    /// Forget everything the previous frame left behind. Frames are
+    /// independent: each has its own descriptor, starts with an empty
+    /// window, and counts and hashes its own content. Buffers keep their
+    /// allocations.
+    fn begin_frame(&mut self) {
+        self.flg = 0;
+        self.bd = 0;
+        self.desc_remaining = 0;
+        self.descriptor.clear();
+        self.block_max = BlockMaxSize::Max64KB;
+        self.block_independent = false;
+        self.block_checksum = false;
+        self.content_checksum = false;
+        self.cur_block_len = 0;
+        self.cur_block_uncompressed = false;
+        self.compressed.clear();
+        self.decoded.clear();
+        self.decoded_idx = 0;
+        self.window.clear();
+        self.content_hash = XxHash32::new();
+        self.content_size = None;
+        self.content_count = 0;
+    }
+
+    /// Where to go once a frame (or a skippable frame) has been read to
+    /// its last byte.
+    fn end_frame(&mut self, skippable: bool) {
+        if self.multi_frame {
+            self.phase = DecPhase::BetweenFrames;
+        } else if skippable {
+            // A single-frame decoder still wants its one frame.
+            self.phase = DecPhase::Magic;
+            self.accum_len = 0;
+            self.accum_need = 4;
+        } else {
+            self.phase = DecPhase::Done;
+        }
     }
 
     /// Read up to `accum_need` bytes from `input` into `accum`. Returns
@@ -943,12 +1074,49 @@ impl RawDecoder for Decoder {
                         self.accum[2],
                         self.accum[3],
                     ]);
-                    if m != MAGIC {
+                    if m == MAGIC {
+                        self.begin_frame();
+                        self.phase = DecPhase::FlgBd;
+                        self.accum_len = 0;
+                        self.accum_need = 2;
+                    } else if m & SKIPPABLE_MAGIC_MASK == SKIPPABLE_MAGIC {
+                        self.phase = DecPhase::SkippableSize;
+                        self.accum_len = 0;
+                        self.accum_need = 4;
+                    } else {
                         return self.poison(Error::BadHeader);
                     }
-                    self.phase = DecPhase::FlgBd;
-                    self.accum_len = 0;
-                    self.accum_need = 2;
+                }
+                DecPhase::SkippableSize => {
+                    if !self.fill_accum(input, &mut consumed) {
+                        return Ok(RawProgress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                    self.skip_remaining = u32::from_le_bytes([
+                        self.accum[0],
+                        self.accum[1],
+                        self.accum[2],
+                        self.accum[3],
+                    ]);
+                    self.phase = DecPhase::SkippableData;
+                }
+                DecPhase::SkippableData => {
+                    // The payload is dropped as it arrives; only the count
+                    // of bytes still owed is kept.
+                    let take = (input.len() - consumed).min(self.skip_remaining as usize);
+                    consumed += take;
+                    self.skip_remaining -= take as u32;
+                    if self.skip_remaining != 0 {
+                        return Ok(RawProgress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                    self.end_frame(true);
                 }
                 DecPhase::FlgBd => {
                     if !self.fill_accum(input, &mut consumed) {
@@ -1032,12 +1200,7 @@ impl RawDecoder for Decoder {
                             self.accum_len = 0;
                             self.accum_need = 4;
                         } else {
-                            self.phase = DecPhase::Done;
-                            return Ok(RawProgress {
-                                consumed,
-                                written,
-                                done: true,
-                            });
+                            self.end_frame(false);
                         }
                         continue;
                     }
@@ -1194,18 +1357,40 @@ impl RawDecoder for Decoder {
                     if actual != expected {
                         return self.poison(Error::ChecksumMismatch);
                     }
-                    self.phase = DecPhase::Done;
-                    return Ok(RawProgress {
-                        consumed,
-                        written,
-                        done: true,
-                    });
+                    self.end_frame(false);
+                }
+                DecPhase::BetweenFrames => {
+                    if consumed >= input.len() {
+                        // No byte to inspect. The caller may hand us
+                        // another frame in a later call, or call
+                        // `raw_finish` to settle into `Done`.
+                        return Ok(RawProgress {
+                            consumed,
+                            written,
+                            done: false,
+                        });
+                    }
+                    if starts_frame(input[consumed]) {
+                        // Another frame (or skippable frame) follows. The
+                        // byte stays in `input` for the `Magic` phase,
+                        // which holds it to the full 4-byte magic: from
+                        // here on anything else is an error.
+                        self.phase = DecPhase::Magic;
+                        self.accum_len = 0;
+                        self.accum_need = 4;
+                    } else {
+                        // Not ours: the stream ended with the previous
+                        // frame and these are trailing bytes, left
+                        // unconsumed.
+                        self.phase = DecPhase::Done;
+                    }
                 }
                 DecPhase::Done => {
-                    // Only reachable if the caller keeps calling after the
-                    // StreamEnd reported when the frame completed above, but
-                    // the state is terminal either way — report it as such
-                    // rather than as "call me again with no progress".
+                    // The stream is complete, and stays so if the caller
+                    // keeps calling: report it as terminal rather than as
+                    // "call me again with no progress". Trailing bytes
+                    // stay unconsumed so the caller can see where the LZ4
+                    // data stops.
                     return Ok(RawProgress {
                         consumed,
                         written,
@@ -1240,11 +1425,17 @@ impl RawDecoder for Decoder {
         }
 
         match self.phase {
-            DecPhase::Done => Ok(RawProgress {
-                consumed: 0,
-                written,
-                done: true,
-            }),
+            DecPhase::Done | DecPhase::BetweenFrames => {
+                // BetweenFrames with no more input: the stream ended
+                // cleanly at a frame boundary. Promote to Done so later
+                // calls are idempotent.
+                self.phase = DecPhase::Done;
+                Ok(RawProgress {
+                    consumed: 0,
+                    written,
+                    done: true,
+                })
+            }
             // Caller signalled "no more input" before we ever saw any —
             // legal, just no-op.
             DecPhase::Magic if self.accum_len == 0 => Ok(RawProgress {
@@ -1257,26 +1448,12 @@ impl RawDecoder for Decoder {
     }
 
     fn raw_reset(&mut self) {
+        // Configuration (`multi_frame`) survives a reset.
         self.phase = DecPhase::Magic;
         self.accum_len = 0;
         self.accum_need = 4;
-        self.flg = 0;
-        self.bd = 0;
-        self.desc_remaining = 0;
-        self.descriptor.clear();
-        self.block_max = BlockMaxSize::Max64KB;
-        self.block_independent = false;
-        self.block_checksum = false;
-        self.content_checksum = false;
-        self.cur_block_len = 0;
-        self.cur_block_uncompressed = false;
-        self.compressed.clear();
-        self.decoded.clear();
-        self.decoded_idx = 0;
-        self.window.clear();
-        self.content_hash = XxHash32::new();
-        self.content_size = None;
-        self.content_count = 0;
+        self.skip_remaining = 0;
+        self.begin_frame();
         self.poisoned = false;
     }
 }

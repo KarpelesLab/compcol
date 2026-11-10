@@ -1345,4 +1345,46 @@ mod tests {
         assert_eq!(model.decode_symbol(&mut rc).unwrap(), plain[640]);
         assert_eq!(model.run_length, i32::MIN);
     }
+
+    /// A range decoder rebuilt from its saved state before every symbol
+    /// decodes the same bytes, and ends in the same state, as one that
+    /// runs straight through — in both flavours.
+    #[test]
+    fn range_decoder_resumes_from_saved_state() {
+        use crate::ppmd::range_dec::Mode;
+
+        let stream: &[u8] = include_bytes!("../../tests/fixtures/ppmd/repeat.ppmd");
+        let plain: &[u8] = include_bytes!("../../tests/fixtures/ppmd/repeat.bin");
+        // The RAR flavour reads the same bytes as some other symbol
+        // sequence; all that matters there is that both runs agree on it.
+        for (mode, start) in [(Mode::SevenZip, 11), (Mode::Rar, 12)] {
+            let mut straight = Ppmd7::new(16 << 20).unwrap();
+            straight.init(6);
+            let (mut rc, _) = RangeDec::init(mode, stream, start).unwrap();
+            let mut resumed = Ppmd7::new(16 << 20).unwrap();
+            resumed.init(6);
+            let mut state = RangeDec::init(mode, stream, start).unwrap().0.save();
+            let mut decoded = 0;
+            for (i, &plain_byte) in plain.iter().enumerate() {
+                let want = straight.decode_symbol(&mut rc);
+                let mut rc2 = RangeDec::resume(mode, stream, state);
+                let got = resumed.decode_symbol(&mut rc2);
+                assert_eq!(got, want, "symbol {i}");
+                if want.is_err() || rc.err() || rc.overran() {
+                    break;
+                }
+                if mode == Mode::SevenZip {
+                    assert_eq!(got, Ok(plain_byte));
+                }
+                state = rc2.save();
+                assert_eq!(state, rc.save(), "state after symbol {i}");
+                decoded += 1;
+            }
+            // Read as a RAR stream the fixture runs out of bytes early.
+            match mode {
+                Mode::SevenZip => assert_eq!(decoded, plain.len()),
+                Mode::Rar => assert!(decoded >= 16, "only {decoded} symbols decoded"),
+            }
+        }
+    }
 }

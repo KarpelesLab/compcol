@@ -449,6 +449,8 @@ Required:
     -t, --type ALGO         Algorithm (use --list to see what's compiled in).
                             Optional on -d: if omitted, the format is
                             auto-detected from the input's magic bytes.
+                            Archives (RAR, StuffIt) are recognised but not
+                            unpacked: -t is needed to run a codec on one.
 
 Mode:
     -d, --decompress        Decompress instead of compress
@@ -470,9 +472,25 @@ Compression tuning:
                               brotli quality:    0..=11, default 6
                             Out-of-range values are clamped per algorithm.
 
+Decompression safety:
+        --max-output SIZE   Fail (and remove the partial output) rather than
+                            write more than SIZE decompressed bytes — the
+                            defence against decompression bombs. SIZE is a
+                            byte count, optionally with a K, M, G or T
+                            suffix (powers of 1024: 64M, 2G). Default: no
+                            limit. Only valid with -d.
+        --ignore-trailing   Input left over after the end of the compressed
+                            stream is an error by default (the output is
+                            removed, the input kept). With this flag it is
+                            ignored with a warning. Only valid with -d.
+
 Misc:
     -k, --keep              Keep input file even in in-place mode
-    -f, --force             Overwrite an existing output file
+    -f, --force             Replace an existing output file. The output is
+                            written to a temporary file next to it and
+                            renamed over it once complete, so a failed run
+                            leaves the old file as it was, and a symlink
+                            is replaced rather than followed.
     -L, --list              List available algorithms and exit
     -V, --version           Print version and exit
     -h, --help              Print this help and exit
@@ -495,6 +513,9 @@ compcol -t gzip -d README.md.gz      # → README.md, removes README.md.gz
 
 # Decompress with format auto-detection (no -t needed)
 cat README.md.gz | compcol -d > README.md
+
+# Decompress untrusted input: refuse to write more than 1 GiB
+compcol -d --max-output 1G upload.zst
 
 # Force overwrite of an existing output file
 compcol -t gzip -f README.md

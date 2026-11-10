@@ -54,6 +54,25 @@
 //! }
 //! ```
 //!
+//! ## Streaming and memory
+//!
+//! `decode` buffers the compressed stream; decoding starts on the first
+//! `finish` call and then proceeds as the caller drains: each `finish`
+//! returns as soon as it has bytes to hand out. Output is released one
+//! dictionary (4 MiB) behind the decoding position and never past the
+//! start of an in-band filter window that is still incomplete, so the
+//! decoder holds about 4.3 MiB of output at most, whatever the unpacked
+//! size and whether the blocks are LZ or PPMd — plus the compressed input,
+//! the 4 MiB dictionary and, for PPMd blocks, the model the block header
+//! sizes.
+//!
+//! When the input is untrusted, set an output limit —
+//! [`set_output_limit`](crate::Decoder::set_output_limit), or wrap the
+//! decoder in a [`LimitedDecoder`](crate::limit::LimitedDecoder), which
+//! sets it for you: the decoder then fails with
+//! [`Error::OutputLimitExceeded`] at the symbol that would cross the limit
+//! instead of decoding past it, in LZ and PPMd blocks alike.
+//!
 //! For a **solid group**, construct the decoder with
 //! [`Decoder::with_solid`], decode the first member as above, then call
 //! [`Decoder::begin_solid_member`] with the next member's unpacked size

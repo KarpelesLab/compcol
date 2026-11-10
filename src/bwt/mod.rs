@@ -83,6 +83,8 @@ use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
 mod transform;
 
 #[cfg(test)]
+mod limit_tests;
+#[cfg(test)]
 mod tests;
 
 /// Default block size: 256 KiB. Large enough to give the transform good
@@ -238,12 +240,34 @@ impl RawEncoder for Encoder {
 /// `finish` and drains the reconstructed bytes into the caller's output across
 /// calls. Output size per block is bounded by that block's declared `len`, so
 /// a crafted small input cannot expand without limit.
+///
+/// With an output limit set
+/// ([`Decoder::set_output_limit`](crate::Decoder::set_output_limit), which
+/// [`LimitedDecoder`](crate::limit::LimitedDecoder) calls), the block
+/// headers are followed as the input arrives and the stream is refused with
+/// [`Error::OutputLimitExceeded`] by the `decode` call that delivers the
+/// `len` field of the block taking the running total past the limit —
+/// before that block is buffered, and before any block is inverted.
 #[derive(Debug)]
 pub struct Decoder {
     input: Vec<u8>,
     output: Vec<u8>,
     out_cursor: usize,
     decoded: bool,
+    /// Most bytes the caller will take; `u64::MAX` means no limit.
+    /// Configuration: survives `reset`.
+    output_limit: u64,
+    /// Stream offset of the next block header the limit scan has not read
+    /// yet (`u64`: on a 32-bit target a header may point past `usize`).
+    scan_next: u64,
+    /// Sum of the `len` fields the limit scan has read so far.
+    scan_total: u64,
+    /// The scan met a header `finish` will reject as corrupt; nothing after
+    /// it can be trusted to be a header.
+    scan_stopped: bool,
+    /// The stream declares more than `output_limit`; every call fails
+    /// until `reset`.
+    over_limit: bool,
 }
 
 impl Default for Decoder {
@@ -260,16 +284,71 @@ impl Decoder {
             output: Vec::new(),
             out_cursor: 0,
             decoded: false,
+            output_limit: u64::MAX,
+            scan_next: 0,
+            scan_total: 0,
+            scan_stopped: false,
+            over_limit: false,
         }
+    }
+
+    /// Follow the block headers through the bytes already buffered plus
+    /// `incoming` (which is not buffered yet), and fail as soon as the
+    /// declared block lengths add up to more than the output limit.
+    ///
+    /// The transform is a permutation, so a block's `len` field *is* its
+    /// decoded size; only the 4 `len` bytes of each header are read, and
+    /// the block bodies are skipped over by offset.
+    fn scan_headers(&mut self, incoming: &[u8]) -> Result<(), Error> {
+        if self.over_limit {
+            return Err(Error::OutputLimitExceeded);
+        }
+        if self.output_limit == u64::MAX || self.scan_stopped {
+            return Ok(());
+        }
+        let buffered = self.input.len();
+        let available = buffered as u64 + incoming.len() as u64;
+        while self.scan_next + 4 <= available {
+            // `scan_next + 4 <= available`, so these indices fit `usize`.
+            let at = self.scan_next as usize;
+            let mut field = [0u8; 4];
+            for (k, b) in field.iter_mut().enumerate() {
+                let i = at + k;
+                *b = if i < buffered {
+                    self.input[i]
+                } else {
+                    incoming[i - buffered]
+                };
+            }
+            let len = u32::from_le_bytes(field);
+            if len == 0 {
+                // Corrupt; `finish` reports it, as it does without a limit.
+                self.scan_stopped = true;
+                break;
+            }
+            self.scan_total += u64::from(len);
+            if self.scan_total > self.output_limit {
+                self.over_limit = true;
+                return Err(Error::OutputLimitExceeded);
+            }
+            self.scan_next += 8 + u64::from(len);
+        }
+        Ok(())
     }
 
     /// Decode the buffered block stream into `self.output`. Idempotent.
     fn decode_all(&mut self) -> Result<(), Error> {
+        if self.over_limit {
+            return Err(Error::OutputLimitExceeded);
+        }
         if self.decoded {
             return Ok(());
         }
         let buf = &self.input[..];
         let mut pos = 0usize;
+        // Bytes the blocks before this one decode to (the scan in `decode`
+        // normally refuses first; this covers a limit set after buffering).
+        let mut total = 0u64;
         while pos < buf.len() {
             // Each block header is 8 bytes: len (u32-LE) + primary (u32-LE).
             if buf.len() - pos < 8 {
@@ -282,9 +361,19 @@ impl Decoder {
                     as usize;
             pos += 8;
 
-            // A zero-length block is never emitted by the encoder, and a
-            // primary index must address a real row.
-            if len == 0 || primary >= len {
+            // A zero-length block is never emitted by the encoder.
+            if len == 0 {
+                return Err(Error::Corrupt);
+            }
+            // Refuse the block that crosses the output limit before
+            // building it (same order of checks as `scan_headers`).
+            total += len as u64;
+            if total > self.output_limit {
+                self.over_limit = true;
+                return Err(Error::OutputLimitExceeded);
+            }
+            // A primary index must address a real row.
+            if primary >= len {
                 return Err(Error::Corrupt);
             }
             // The last column must be fully present.
@@ -316,6 +405,8 @@ impl Decoder {
 impl RawDecoder for Decoder {
     fn raw_decode(&mut self, input: &[u8], output: &mut [u8]) -> Result<RawProgress, Error> {
         if !self.decoded {
+            // Before buffering: a stream over the limit is not worth keeping.
+            self.scan_headers(input)?;
             self.input.extend_from_slice(input);
             return Ok(RawProgress {
                 consumed: input.len(),
@@ -341,5 +432,18 @@ impl RawDecoder for Decoder {
         self.output.clear();
         self.out_cursor = 0;
         self.decoded = false;
+        // `output_limit` is configuration and is kept.
+        self.scan_next = 0;
+        self.scan_total = 0;
+        self.scan_stopped = false;
+        self.over_limit = false;
+    }
+
+    fn raw_set_output_limit(&mut self, max_output_bytes: u64) {
+        self.output_limit = max_output_bytes;
+        // Follow the headers again, from the start, under the new limit.
+        self.scan_next = 0;
+        self.scan_total = 0;
+        self.scan_stopped = false;
     }
 }

@@ -247,3 +247,92 @@ fn factory_registration() {
         assert_eq!(compcol::factory::extension("arsenic"), Some("arsenic"));
     }
 }
+
+/// Feed `input` whole, then drain through `finish`.
+fn drive<D: Decoder>(dec: &mut D, input: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::new();
+    let mut obuf = vec![0u8; 1 << 16];
+    let mut pos = 0usize;
+    while pos < input.len() {
+        let (p, status) = dec.decode(&input[pos..], &mut obuf)?;
+        out.extend_from_slice(&obuf[..p.written]);
+        pos += p.consumed;
+        if status == Status::StreamEnd {
+            return Ok(out);
+        }
+    }
+    loop {
+        let (p, status) = dec.finish(&mut obuf)?;
+        out.extend_from_slice(&obuf[..p.written]);
+        if status == Status::StreamEnd {
+            return Ok(out);
+        }
+    }
+}
+
+/// The decoder builds the whole fork before handing any of it out, so it
+/// has to be told the caller's limit to refuse a stream that decodes to
+/// more, instead of building it and leaving the caller to notice.
+#[test]
+fn output_limit_is_enforced_while_decoding() {
+    let forks = walk_stuffit5(GALAX_SIT);
+    let fork = &forks[0];
+    let compressed = &GALAX_SIT[fork.data.clone()];
+    let plain = drive(&mut Arsenic::decoder(), compressed).unwrap();
+    assert_eq!(plain.len(), fork.uncompressed);
+    assert!(plain.len() > 4096);
+    let n = plain.len() as u64;
+
+    let mut dec = Arsenic::decoder();
+    dec.set_output_limit(1024);
+    assert_eq!(drive(&mut dec, compressed), Err(Error::OutputLimitExceeded));
+    // The limit is configuration: it survives a reset.
+    dec.reset();
+    assert_eq!(drive(&mut dec, compressed), Err(Error::OutputLimitExceeded));
+
+    // One byte short of the fork is still too little, and nothing is
+    // handed out first...
+    let mut dec = Arsenic::decoder();
+    dec.set_output_limit(n - 1);
+    let mut obuf = vec![0u8; 1 << 16];
+    assert_eq!(
+        dec.decode(compressed, &mut obuf),
+        Err(Error::OutputLimitExceeded)
+    );
+    // ...while exactly the fork's length decodes.
+    let mut dec = Arsenic::decoder();
+    dec.set_output_limit(n);
+    assert_eq!(drive(&mut dec, compressed).unwrap(), plain);
+}
+
+#[test]
+fn limited_decoder_passes_its_budget_down() {
+    use compcol::limit::LimitedDecoder;
+    use compcol::vec::decompress_to_vec_capped;
+
+    let forks = walk_stuffit5(GALAX_SIT);
+    let fork = &forks[0];
+    let compressed = &GALAX_SIT[fork.data.clone()];
+    let n = fork.uncompressed as u64;
+
+    // Refused on the call that sees the whole stream, before a single
+    // byte reaches the caller.
+    let mut dec = LimitedDecoder::new(Arsenic::decoder(), 1024);
+    let mut obuf = vec![0u8; 1 << 16];
+    assert_eq!(
+        dec.decode(compressed, &mut obuf),
+        Err(Error::OutputLimitExceeded)
+    );
+    assert_eq!(dec.bytes_written(), 0);
+
+    assert_eq!(
+        decompress_to_vec_capped::<Arsenic>(compressed, 1024),
+        Err(Error::OutputLimitExceeded)
+    );
+    assert_eq!(
+        decompress_to_vec_capped::<Arsenic>(compressed, n - 1),
+        Err(Error::OutputLimitExceeded)
+    );
+    let plain = decompress_to_vec_capped::<Arsenic>(compressed, n).unwrap();
+    assert_eq!(plain.len(), fork.uncompressed);
+}

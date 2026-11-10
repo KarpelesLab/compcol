@@ -11,7 +11,7 @@
 
 #![cfg(feature = "lzma")]
 
-use compcol::lzma::{Decoder, Encoder, EncoderConfig};
+use compcol::lzma::{Decoder, DecoderConfig, Encoder, EncoderConfig};
 use compcol::{Decoder as _, Encoder as _, Error, Status};
 
 const METHOD_LZMA: u16 = 14;
@@ -410,6 +410,72 @@ fn reset_keeps_zip_mode() {
     e.encode(&data, &mut buf).unwrap();
     e.reset();
     assert!(!e.eos_marker());
+}
+
+/// The ZIP entry points take the same dictionary limit as `.lzma`: the
+/// dictionary size in the entry's properties is checked against it.
+#[test]
+fn zip_max_dict_size() {
+    let data = sample(3000);
+    let len = Some(data.len() as u64);
+    // The dictionary size is bytes 5..9 of the entry (after the 4-byte ZIP
+    // LZMA header and the props byte).
+    let with_dict = |dict: u32| {
+        let mut e = encode(&data, 6, false);
+        e[5..9].copy_from_slice(&dict.to_le_bytes());
+        e
+    };
+    let cfg = |max: u64| DecoderConfig::with_max_dict_size(max);
+
+    // Default: 64 MiB, as for `.lzma`.
+    assert_eq!(Decoder::zip(false, len).max_dict_size(), 64 << 20);
+    let mut dec = Decoder::zip(false, len);
+    assert_eq!(
+        run(&mut dec, &with_dict(64 << 20), 4096, 4096).unwrap().0,
+        data
+    );
+    for mut dec in [
+        Decoder::zip(false, len),
+        Decoder::zip_from_gp_flags(0, len),
+        Decoder::zip_with_config(false, len, DecoderConfig::default()),
+    ] {
+        assert_eq!(
+            run(&mut dec, &with_dict((64 << 20) + 1), 4096, 4096),
+            Err(Error::Unsupported)
+        );
+    }
+
+    // Configured, lower and higher than the default, by either spelling.
+    for max in [1u32 << 20, 1 << 30] {
+        for (dict, ok) in [(max - 1, true), (max, true), (max + 1, false)] {
+            for mut dec in [
+                Decoder::zip_with_config(false, len, cfg(max as u64)),
+                Decoder::zip(false, len).with_max_dict_size(max as u64),
+                Decoder::zip_from_gp_flags(0, len).with_max_dict_size(max as u64),
+            ] {
+                assert_eq!(dec.max_dict_size(), max as u64);
+                let got = run(&mut dec, &with_dict(dict), 4096, 4096);
+                if ok {
+                    assert_eq!(got.unwrap().0, data, "max {max} dict {dict}");
+                    // A declared gigabyte costs what the entry produces.
+                    assert!(dec.dict_allocated() <= 8192, "{}", dec.dict_allocated());
+                } else {
+                    assert_eq!(got, Err(Error::Unsupported), "max {max} dict {dict}");
+                    assert_eq!(dec.dict_allocated(), 0);
+                }
+            }
+        }
+    }
+
+    // `reset` keeps the limit along with the ZIP settings.
+    let mut dec = Decoder::zip(false, len).with_max_dict_size(1 << 20);
+    assert_eq!(
+        run(&mut dec, &with_dict(1 << 21), 4096, 4096),
+        Err(Error::Unsupported)
+    );
+    dec.reset();
+    assert_eq!(dec.max_dict_size(), 1 << 20);
+    assert_eq!(run(&mut dec, &with_dict(1 << 20), 17, 33).unwrap().0, data);
 }
 
 // ─── external tools ────────────────────────────────────────────────────

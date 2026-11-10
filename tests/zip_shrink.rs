@@ -770,9 +770,13 @@ fn large_stream_documented_loop_framed_and_raw() {
 }
 
 #[test]
-fn large_stream_all_input_in_decode_then_finish_drains() {
-    // One `decode` with a small output buffer, then only `finish`: finish
-    // has to keep decoding the buffered input, not just drain one burst.
+fn large_stream_small_output_leaves_input_with_caller() {
+    // The whole payload offered to `decode` with a small output buffer.
+    // The decoder used to copy all of it into an internal buffer, report
+    // it consumed and leave `finish` to decode it. It no longer holds
+    // input: a call takes what it decodes, says `OutputFull`, and the
+    // caller offers the rest again. `finish` then only has the last
+    // decoded burst to drain, over as many calls as the buffer needs.
     let data = wordy(300_000);
     let payload = shrink_lzw(&data);
     assert!(
@@ -782,9 +786,21 @@ fn large_stream_all_input_in_decode_then_finish_drains() {
     let mut dec = Decoder::raw(data.len() as u64);
     let mut buf = vec![0u8; 4096];
     let (p, status) = dec.decode(&payload, &mut buf).unwrap();
-    assert_eq!(p.consumed, payload.len());
+    assert!(p.consumed < payload.len() / 4, "consumed {}", p.consumed);
+    assert_eq!(p.written, buf.len());
     assert_eq!(status, Status::OutputFull);
     let mut out = buf[..p.written].to_vec();
+    let mut consumed = p.consumed;
+    while consumed < payload.len() {
+        let (p, status) = dec.decode(&payload[consumed..], &mut buf).unwrap();
+        assert!(p.consumed > 0 || p.written > 0, "decode stalled");
+        out.extend_from_slice(&buf[..p.written]);
+        consumed += p.consumed;
+        if status == Status::StreamEnd {
+            break;
+        }
+    }
+    assert_eq!(consumed, payload.len());
     loop {
         let (p, status) = dec.finish(&mut buf).unwrap();
         out.extend_from_slice(&buf[..p.written]);
@@ -793,7 +809,7 @@ fn large_stream_all_input_in_decode_then_finish_drains() {
         }
         assert!(p.written > 0, "finish stalled");
     }
-    assert!(out == data);
+    assert!(out == data, "got {} bytes", out.len());
 }
 
 #[test]
@@ -838,5 +854,272 @@ mod factory {
     #[test]
     fn extension_is_shrunk() {
         assert_eq!(factory::extension("zip-shrink"), Some("shrunk"));
+    }
+}
+
+// ─── declared length reached with codes still buffered ──────────────────
+
+/// Decode with `in_chunk` input bytes per `decode` call and an
+/// `out_chunk`-byte output buffer, then `finish` until it ends; returns the
+/// verdict together with every byte handed out.
+fn decode_outcome(
+    dec: &mut Decoder,
+    stream: &[u8],
+    in_chunk: usize,
+    out_chunk: usize,
+) -> (Result<(), Error>, Vec<u8>) {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; out_chunk];
+    let mut pos = 0;
+    let mut steps = 0usize;
+    while pos < stream.len() {
+        steps += 1;
+        assert!(steps < 1 << 20, "decode did not terminate");
+        let end = pos.saturating_add(in_chunk).min(stream.len());
+        match dec.decode(&stream[pos..end], &mut buf) {
+            Ok((p, status)) => {
+                out.extend_from_slice(&buf[..p.written]);
+                pos += p.consumed;
+                if status == Status::StreamEnd {
+                    return (Ok(()), out);
+                }
+            }
+            Err(e) => return (Err(e), out),
+        }
+    }
+    loop {
+        steps += 1;
+        assert!(steps < 1 << 20, "finish did not terminate");
+        match dec.finish(&mut buf) {
+            Ok((p, status)) => {
+                out.extend_from_slice(&buf[..p.written]);
+                if status == Status::StreamEnd {
+                    return (Ok(()), out);
+                }
+            }
+            Err(e) => return (Err(e), out),
+        }
+    }
+}
+
+// Found by the `chunked_vs_oneshot` fuzz target. The stream declares one
+// byte, and its first code is that byte; the bytes after it do not form
+// valid codes. The decoder ends once the declared length has been
+// produced, so those bytes are never codes at all — but it used to go on
+// decoding whatever input happened to be buffered already, and so rejected
+// the stream as `Corrupt` when given all of it at once while accepting it
+// one byte at a time.
+#[test]
+fn codes_after_declared_length_are_not_decoded() {
+    let stream: [u8; 8] = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xd3, 0x07];
+    let expected = (Ok(()), vec![0u8]);
+    for in_chunk in [1usize, 2, 3, 4, 5, 6, 7, 8, 9, usize::MAX] {
+        for out_chunk in [1usize, 2, 7, 64, 1 << 16] {
+            let got = decode_outcome(&mut Decoder::new(), &stream, in_chunk, out_chunk);
+            assert_eq!(
+                got, expected,
+                "framed in_chunk {in_chunk}, out_chunk {out_chunk}"
+            );
+            let got = decode_outcome(&mut Decoder::raw(1), &stream[4..], in_chunk, out_chunk);
+            assert_eq!(
+                got, expected,
+                "raw in_chunk {in_chunk}, out_chunk {out_chunk}"
+            );
+        }
+    }
+}
+
+// Same property on a real stream: garbage after the last code needed for
+// the declared length never changes the result, including when the
+// declared length ends in the middle of a code's string.
+#[test]
+fn trailing_garbage_agrees_for_every_chunking() {
+    let data = wordy(6000);
+    let mut payload = shrink_lzw(&data);
+    payload.extend_from_slice(&[0xff; 64]);
+    for len in [1usize, 2, 1000, 5999, 6000] {
+        let expected = (Ok(()), data[..len].to_vec());
+        for in_chunk in [1usize, 3, 4, 61, 4096, usize::MAX] {
+            for out_chunk in [1usize, 255, 1 << 16] {
+                let got =
+                    decode_outcome(&mut Decoder::raw(len as u64), &payload, in_chunk, out_chunk);
+                let at = format!("len {len}, in_chunk {in_chunk}, out_chunk {out_chunk}");
+                assert_eq!((&got.0, got.1.len()), (&expected.0, len), "{at}");
+                assert!(got.1 == expected.1, "{at}: delivered bytes differ");
+            }
+        }
+    }
+}
+
+// ─── exact consumption at the end of the stream ─────────────────────────
+
+/// Offer `data[pos..]` to `decode` at most `in_chunk` bytes at a time with
+/// an `out_chunk`-byte output buffer, advancing only by what each call
+/// reports consumed, until `decode` reports `StreamEnd`; if the data runs
+/// out first, `finish`. Returns the output, the total `consumed` over all
+/// `decode` calls, and whether `decode` (rather than `finish`) ended the
+/// stream.
+fn decode_counting(
+    dec: &mut Decoder,
+    data: &[u8],
+    in_chunk: usize,
+    out_chunk: usize,
+) -> Result<(Vec<u8>, usize, bool), Error> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; out_chunk];
+    let mut pos = 0;
+    let mut idle = 0;
+    while pos < data.len() {
+        let end = pos.saturating_add(in_chunk).min(data.len());
+        let (p, status) = dec.decode(&data[pos..end], &mut buf)?;
+        assert!(p.consumed <= end - pos && p.written <= buf.len());
+        out.extend_from_slice(&buf[..p.written]);
+        pos += p.consumed;
+        if status == Status::StreamEnd {
+            return Ok((out, pos, true));
+        }
+        idle = if p.consumed == 0 && p.written == 0 {
+            idle + 1
+        } else {
+            0
+        };
+        assert!(idle < 2, "decode stalled at input offset {pos}");
+    }
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        out.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            return Ok((out, pos, false));
+        }
+        assert!(p.written > 0, "finish stalled");
+    }
+}
+
+const COUNT_IN_CHUNKS: [usize; 9] = [1, 2, 3, 5, 7, 64, 1021, 4096, usize::MAX];
+const COUNT_OUT_CHUNKS: [usize; 6] = [1, 3, 255, 4096, 20_000, 1 << 16];
+
+/// Assert that `payload` followed by each of several tails decodes to
+/// `expected`, ends in `decode`, and consumes exactly `exact` payload bytes
+/// (plus the 4-byte header when framed), for every chunking, framed and raw.
+fn assert_exact_consumption(what: &str, payload: &[u8], exact: usize, expected: &[u8]) {
+    assert!(exact <= payload.len());
+    // Tails that read as perfectly good Shrink codes if the decoder looks
+    // at them (literals, a control pair, another whole stream), plus noise.
+    let tails: [Vec<u8>; 5] = [
+        vec![0x00; 40],
+        vec![0xff; 40],
+        shrink_literals(b"these bytes belong to whatever follows the entry"),
+        {
+            let mut w = CodeWriter::new();
+            w.push(256, 13);
+            w.push(2, 13);
+            w.push(b'x' as u32, 13);
+            w.finish()
+        },
+        shrink_lzw(&wordy(3000)),
+    ];
+    for (t, tail) in tails.iter().enumerate() {
+        let mut raw_stream = payload.to_vec();
+        raw_stream.extend_from_slice(tail);
+        let framed_stream = framed(&raw_stream, expected.len() as u32);
+        for in_chunk in COUNT_IN_CHUNKS {
+            for out_chunk in COUNT_OUT_CHUNKS {
+                let at = format!("{what}, tail {t}, in_chunk {in_chunk}, out_chunk {out_chunk}");
+
+                let mut dec = Decoder::raw(expected.len() as u64);
+                let (out, consumed, in_decode) =
+                    decode_counting(&mut dec, &raw_stream, in_chunk, out_chunk).unwrap();
+                assert!(out == expected, "raw {at}: wrong output ({})", out.len());
+                assert!(in_decode, "raw {at}: decode never reported StreamEnd");
+                assert_eq!(consumed, exact, "raw {at}");
+
+                let mut dec = Decoder::new();
+                let (out, consumed, in_decode) =
+                    decode_counting(&mut dec, &framed_stream, in_chunk, out_chunk).unwrap();
+                assert!(out == expected, "framed {at}: wrong output ({})", out.len());
+                assert!(in_decode, "framed {at}: decode never reported StreamEnd");
+                assert_eq!(consumed, exact + 4, "framed {at}");
+            }
+        }
+    }
+}
+
+// `decode` used to copy every input slice into an internal buffer and
+// report all of it consumed, so the bytes after a Shrink stream were
+// swallowed and a ZIP reader could not tell where the entry ended.
+#[test]
+fn consumes_exactly_the_stream_lzw() {
+    // Big enough for every code width, partial clears and more than one
+    // internal decode burst.
+    let data = wordy(60_000);
+    let payload = shrink_lzw(&data);
+    assert_exact_consumption("lzw", &payload, payload.len(), &data);
+
+    // A stream whose last code ends exactly on a byte boundary (8 nine-bit
+    // codes = 9 bytes) and one that leaves padding bits in its last byte.
+    let payload = shrink_lzw(b"abcdefgh");
+    assert_eq!(payload.len(), 9);
+    assert_exact_consumption("aligned", &payload, 9, b"abcdefgh");
+    assert_exact_consumption("hello", HELLO, HELLO.len(), b"hello world");
+}
+
+// The declared length can end before the codes do: the stream then ends
+// with the code that produces the last declared byte, and the rest of the
+// codes are as foreign as any other trailing bytes.
+#[test]
+fn consumes_exactly_the_stream_when_length_ends_early() {
+    let data = xorshift_bytes(5000, 0x5eed_cafe_f00d_0001);
+    let payload = shrink_literals(&data);
+    for len in [1usize, 2, 7, 8, 9, 1000, 4999, 5000] {
+        // `len` nine-bit codes.
+        let exact = (len * 9).div_ceil(8);
+        assert_exact_consumption(&format!("literals {len}"), &payload, exact, &data[..len]);
+    }
+
+    // The declared length ends in the middle of a string: the whole code
+    // is consumed, the rest of its string is dropped.
+    let mut w = CodeWriter::new();
+    for code in [b'a' as u32, 257, 258, b'z' as u32] {
+        w.push(code, 9);
+    }
+    let payload = w.finish();
+    // a, aa, aaa, z -> "aaaaaaz"; four bytes need the first three codes.
+    assert_exact_consumption("mid-string", &payload, 4, b"aaaa");
+    assert_exact_consumption("whole", &payload, 5, b"aaaaaaz");
+}
+
+#[test]
+fn zero_length_stream_consumes_only_its_header() {
+    for in_chunk in [1usize, 3, 4, 5, usize::MAX] {
+        let mut stream = vec![0u8; 4];
+        stream.extend_from_slice(b"next entry");
+        let (out, consumed, in_decode) =
+            decode_counting(&mut Decoder::new(), &stream, in_chunk, 16).unwrap();
+        assert_eq!((out.len(), consumed, in_decode), (0, 4, true));
+
+        let (out, consumed, in_decode) =
+            decode_counting(&mut Decoder::raw(0), b"next entry", in_chunk, 16).unwrap();
+        assert_eq!((out.len(), consumed, in_decode), (0, 0, true));
+    }
+}
+
+// Taking input only as codes need it must not turn a short stream into a
+// clean end: every chunking still reports the truncation from `finish`.
+#[test]
+fn truncated_stream_is_unexpected_end_for_every_chunking() {
+    let data = wordy(60_000);
+    let payload = shrink_lzw(&data);
+    for cut in [0, 1, payload.len() / 2, payload.len() - 1] {
+        let f = framed(&payload[..cut], data.len() as u32);
+        for in_chunk in COUNT_IN_CHUNKS {
+            for out_chunk in COUNT_OUT_CHUNKS {
+                let at = format!("cut {cut}, in_chunk {in_chunk}, out_chunk {out_chunk}");
+                let mut dec = Decoder::raw(data.len() as u64);
+                let r = decode_counting(&mut dec, &payload[..cut], in_chunk, out_chunk);
+                assert_eq!(r.err(), Some(Error::UnexpectedEnd), "raw {at}");
+                let r = decode_counting(&mut Decoder::new(), &f, in_chunk, out_chunk);
+                assert_eq!(r.err(), Some(Error::UnexpectedEnd), "framed {at}");
+            }
+        }
     }
 }

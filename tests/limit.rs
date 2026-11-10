@@ -224,3 +224,43 @@ fn over_budget_large_stream_errors_with_output_limit_exceeded() {
     let err = drain(&mut dec, &compressed).unwrap_err();
     assert_eq!(err, Error::OutputLimitExceeded);
 }
+
+/// `LimitedDecoder::new` hands its budget to the wrapped decoder, and a
+/// boxed decoder passes it through.
+#[test]
+fn limit_is_passed_down_to_the_wrapped_decoder() {
+    use compcol::{Decoder, Error, Progress, Status};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct Probe(Rc<Cell<u64>>);
+    impl Decoder for Probe {
+        fn decode(&mut self, _: &[u8], _: &mut [u8]) -> Result<(Progress, Status), Error> {
+            Ok((Progress::default(), Status::StreamEnd))
+        }
+        fn finish(&mut self, _: &mut [u8]) -> Result<(Progress, Status), Error> {
+            Ok((Progress::default(), Status::StreamEnd))
+        }
+        fn reset(&mut self) {}
+        fn discard_output(&mut self, _: &[u8], _: usize) -> Result<(Progress, Status), Error> {
+            Ok((Progress::default(), Status::StreamEnd))
+        }
+        fn set_output_limit(&mut self, max: u64) {
+            self.0.set(max);
+        }
+    }
+
+    let seen = Rc::new(Cell::new(u64::MAX));
+    let _dec = LimitedDecoder::new(Probe(seen.clone()), 4096);
+    assert_eq!(seen.get(), 4096);
+
+    let seen = Rc::new(Cell::new(u64::MAX));
+    let boxed: Box<dyn Decoder> = Box::new(Probe(seen.clone()));
+    let mut dec = LimitedDecoder::new(boxed, 77);
+    assert_eq!(seen.get(), 77);
+    // The wrapper's own budget is a ceiling on what can be set later.
+    dec.set_output_limit(1000);
+    assert_eq!(seen.get(), 77);
+    dec.set_output_limit(10);
+    assert_eq!(seen.get(), 10);
+}

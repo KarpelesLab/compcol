@@ -36,9 +36,17 @@
 //! // feed compressed bytes via `decode(...)`, then drain via `finish(...)`.
 //! ```
 //!
-//! `decode` buffers input but never emits output; once the caller switches
-//! to `finish` the decoder runs the actual decompression in one shot and
-//! drains the result across however many `finish` calls the caller makes.
+//! Output is streamed: `decode` and `finish` both hand decompressed bytes
+//! out as they are produced, and the decoder holds a 1 MiB window plus at
+//! most ~64 KiB of not-yet-collected output whatever size was declared.
+//! `decode` reports `StreamEnd` itself once the declared size has been
+//! produced.
+//!
+//! A decoder without a size — [`Decoder::new`], [`Rar2::decoder`](Algorithm::decoder),
+//! the factory's `"rar2"` — cannot decode, because a RAR 2.x member has no
+//! end marker to stop at: it accepts an empty stream and returns
+//! [`Error::Unsupported`] for anything else. Call
+//! [`Decoder::set_unpack_size`] first.
 //!
 //! # Fixture famine and verification scope
 //!

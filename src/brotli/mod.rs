@@ -18,6 +18,17 @@
 //!   block types or context modelling on the literal/distance side —
 //!   those would push us into the "roof" tier of the spec.
 //!
+//!   [`flush`](crate::Encoder::flush) is supported at every quality: the
+//!   input taken so far goes out as complete meta-blocks, followed by an
+//!   empty metadata meta-block that pads the stream to a byte boundary
+//!   (what the reference encoder's `BROTLI_OPERATION_FLUSH` writes), so a
+//!   decoder that has the output so far can produce every byte fed so
+//!   far. Each meta-block of this encoder is compressed on its own — no
+//!   match reaches back into an earlier one — so [`Flush::Full`] has
+//!   nothing more to cut than [`Flush::Sync`] and the two write the same
+//!   bytes; by the same token, frequent flushes of small pieces cost
+//!   ratio, each piece being matched against itself only.
+//!
 //! - **Decoder**: parses the stream header, walks the meta-block chain,
 //!   and decodes:
 //!   - the empty last meta-block,
@@ -55,7 +66,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::traits::{Algorithm, RawDecoder, RawEncoder, RawProgress};
+use crate::traits::{Algorithm, Flush, RawDecoder, RawEncoder, RawProgress};
 
 mod context;
 mod dictionary;
@@ -255,6 +266,16 @@ impl BitWriter {
 // For empty input the encoder emits just the WBITS header + ISLAST=1 +
 // ISLASTEMPTY=1 + pad → a single 0x06 byte, preserving the wire output
 // the old uncompressed-only encoder produced for empty input.
+//
+// A flush closes the pending input as ISLAST=0 meta-blocks and appends an
+// empty metadata meta-block (§9.2), whose header ends with padding to the
+// next byte boundary:
+//
+//   ISLAST                (1 bit)  = 0
+//   MNIBBLES              (2 bits) = 3 → MLEN is zero, a metadata block
+//   reserved              (1 bit)  = 0
+//   MSKIPBYTES            (2 bits) = 0 → MSKIPLEN is zero, no bytes follow
+//   <zero bits up to the byte boundary>
 
 const MAX_BLOCK: usize = 1 << 16; // 65_536
 
@@ -526,6 +547,46 @@ impl Encoder {
         self.pending.drain(..start);
     }
 
+    /// Whether a flush has anything to write: input not yet in a
+    /// meta-block, a stream that has not started (the peer has no header),
+    /// or a bitstream that stops mid-byte.
+    ///
+    /// This is derived from the state rather than remembered from one
+    /// `flush` call to the next, so a flush that returned `OutputFull` and
+    /// was followed by `encode` instead of more `flush` is not mistaken for
+    /// a finished one: input taken since is pending again, and is flushed.
+    fn flush_owed(&self) -> bool {
+        self.stage == EncStage::NeedHeader
+            || !self.pending.is_empty()
+            || self.bw.pending_bits() != 0
+    }
+
+    /// Put everything a flush owes into `out`: the pending input as
+    /// ISLAST=0 meta-blocks, then an empty metadata meta-block, which
+    /// byte-aligns the stream. Leaves `pending` empty and the bit writer
+    /// on a byte boundary, i.e. [`Self::flush_owed`] false.
+    fn emit_flush(&mut self) {
+        self.ensure_header();
+        let mut start = 0;
+        while start < self.pending.len() {
+            let mlen = (self.pending.len() - start).min(MAX_BLOCK);
+            self.emit_compressed_block(start, mlen, false);
+            start += mlen;
+        }
+        self.pending.clear();
+        // ISLAST = 0
+        self.bw.write(0, 1, &mut self.out);
+        // MNIBBLES = 3: metadata meta-block, MLEN = 0
+        self.bw.write(3, 2, &mut self.out);
+        // Reserved, must be zero
+        self.bw.write(0, 1, &mut self.out);
+        // MSKIPBYTES = 0: nothing to skip
+        self.bw.write(0, 2, &mut self.out);
+        // The metadata header is followed by zero bits to a byte boundary.
+        self.bw.align(&mut self.out);
+        debug_assert!(!self.flush_owed());
+    }
+
     /// Emit the stream tail. Three cases:
     ///   - never saw any input → empty-stream terminator (single byte).
     ///   - pending data left → emit it in one final compressed block.
@@ -622,6 +683,41 @@ impl RawEncoder for Encoder {
             consumed: 0,
             written,
             done,
+        })
+    }
+
+    /// Both modes do the same: see the module docs. Meta-blocks never
+    /// refer to one another's data, so there is no history for
+    /// [`Flush::Full`] to drop. (The distance ring and the two bytes of
+    /// literal context do carry over, as the decoder's do; the format has
+    /// no way to reset them mid-stream.)
+    fn raw_flush(&mut self, output: &mut [u8], _mode: Flush) -> Result<RawProgress, Error> {
+        if matches!(self.stage, EncStage::Draining | EncStage::Done) {
+            // `finish` has written the last meta-block: no sync point can
+            // follow it.
+            return Err(Error::Corrupt);
+        }
+        // What earlier calls queued goes first; the flush is added behind
+        // it only once there is room to hand some of it over, so a caller
+        // that keeps offering a full buffer does not grow the queue.
+        let mut written = self.drain_out_into(output);
+        if self.out_pos < self.out.len() {
+            return Ok(RawProgress {
+                consumed: 0,
+                written,
+                done: false,
+            });
+        }
+        self.compact_out();
+        if self.flush_owed() {
+            self.emit_flush();
+            written += self.drain_out_into(&mut output[written..]);
+            self.compact_out();
+        }
+        Ok(RawProgress {
+            consumed: 0,
+            written,
+            done: self.out_pos == self.out.len(),
         })
     }
 

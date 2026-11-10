@@ -32,9 +32,15 @@ impl BitReader {
     }
 
     /// How many input bytes the reader has consumed so far (rounded up).
-    #[allow(dead_code)]
     pub const fn byte_pos(&self) -> usize {
         self.byte_pos
+    }
+
+    /// Tell the reader that the first `n` bytes of its input slice have been
+    /// dropped (`n <= byte_pos()`): later calls take the shortened slice.
+    pub fn rebase(&mut self, n: usize) {
+        debug_assert!(n <= self.byte_pos);
+        self.byte_pos -= n;
     }
 
     /// Refill the accumulator from `input` until it holds at least `want`

@@ -530,10 +530,9 @@ fn assert_decodes_to_records(encoded: &[u8]) {
     }
 }
 
-/// One 4 MiB frame block (the CLI default) holding three sub-blocks that
-/// share a window. The decoder used to stop after the first sub-block and
-/// call the rest of the block corrupt, so no default-settings file over
-/// 128 KiB decoded.
+/// One frame block holding three sub-blocks that share a window. The decoder used to stop after the first sub-block and
+/// call the rest of the block corrupt, so no file written with the CLI's
+/// default settings and larger than 128 KiB decoded.
 #[test]
 fn decode_reference_multiple_sub_blocks() {
     let encoded = include_bytes!("fixtures/lz5/records_l10_multi_subblock.liz");
@@ -870,4 +869,240 @@ mod factory {
         }
         assert_eq!(decoded, input);
     }
+}
+
+// ─── output limit ────────────────────────────────────────────────────────
+
+/// A 7-byte frame header for `flg`/`bd`. The header checksum byte is
+/// found by asking the decoder, which rejects every wrong value.
+fn frame_header(flg: u8, bd: u8) -> Vec<u8> {
+    let mut header = vec![0x06, 0x22, 0x4d, 0x18, flg, bd, 0x00];
+    for hc in 0..=255u8 {
+        header[6] = hc;
+        if Decoder::new().decode(&header, &mut [0u8; 16]).is_ok() {
+            return header;
+        }
+    }
+    panic!("no header checksum accepted");
+}
+
+/// The v0.7.8 audit's bomb: a frame whose one block is 15 maximum-length
+/// matches at offset 1, decoding to hundreds of MiB (138 bytes with a
+/// BD code 7 header). A frame block is decoded whole before any of it is
+/// handed out, so only a decoder that knows the caller's limit can refuse
+/// it in time. `bd` is the frame's BD byte.
+fn bomb_frame(bd: u8) -> Vec<u8> {
+    let mut f = frame_header(0x60, bd);
+    f.extend_from_slice(&[0x7b, 0, 0, 0]);
+    // Level 10, all five streams raw; lengths/offset16/offset24 empty.
+    f.extend_from_slice(&[0x0a, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    // Tokens.
+    f.extend_from_slice(&[0x0f, 0, 0, 0xf1]);
+    f.extend_from_slice(&[0xf0; 14]);
+    // Literals: one byte, then offset 1 and a maximal length, 15 times.
+    f.extend_from_slice(&[0x5b, 0, 0, 0x41, 0x01, 0x00, 0xff, 0xff, 0xff, 0xff]);
+    for _ in 0..14 {
+        f.extend_from_slice(&[0x01, 0x00, 0xff, 0xff, 0xff, 0xff]);
+    }
+    f.extend_from_slice(&[0, 0, 0, 0]);
+    assert_eq!(f.len(), 138);
+    f
+}
+
+#[test]
+fn output_limit_refuses_a_block_bomb_before_decoding_it() {
+    let frame = bomb_frame(0x70);
+    assert_eq!(frame[6], 0x73);
+    let mut buf = vec![0u8; 4096];
+
+    let mut dec = Decoder::new();
+    dec.set_output_limit(1024);
+    assert_eq!(
+        dec.decode(&frame, &mut buf),
+        Err(Error::OutputLimitExceeded)
+    );
+
+    // The limit is configuration: it survives a reset.
+    dec.reset();
+    assert_eq!(
+        dec.decode(&frame, &mut buf),
+        Err(Error::OutputLimitExceeded)
+    );
+}
+
+#[test]
+fn limited_decoder_refuses_a_block_bomb() {
+    use compcol::limit::LimitedDecoder;
+    use compcol::vec::decompress_to_vec_capped;
+
+    let frame = bomb_frame(0x70);
+    let mut dec = LimitedDecoder::new(Decoder::new(), 1024);
+    let mut buf = vec![0u8; 4096];
+    assert_eq!(
+        dec.decode(&frame, &mut buf),
+        Err(Error::OutputLimitExceeded)
+    );
+    assert_eq!(dec.bytes_written(), 0);
+    assert_eq!(
+        decompress_to_vec_capped::<Lz5>(&frame, 1024),
+        Err(Error::OutputLimitExceeded)
+    );
+}
+
+/// The limit is a bound on the whole frame: exactly the content length
+/// decodes, one byte less does not, for compressed blocks (independent
+/// and dependent) and for stored ones.
+#[test]
+fn output_exactly_at_the_limit_decodes() {
+    use compcol::vec::decompress_to_vec_capped;
+
+    let records = records_input();
+    let stored_input: Vec<u8> = (0..300_000u32).map(|i| (i * 7 + i / 251) as u8).collect();
+    let stored = encode_all(&stored_input);
+    let cases: [(&[u8], &[u8]); 3] = [
+        (
+            include_bytes!("fixtures/lz5/records_l10_multi_subblock.liz"),
+            &records,
+        ),
+        (
+            include_bytes!("fixtures/lz5/records_l15_b1_dependent.liz"),
+            &records,
+        ),
+        (&stored, &stored_input),
+    ];
+    for (i, (encoded, want)) in cases.into_iter().enumerate() {
+        let n = want.len() as u64;
+        for (in_chunk, out_chunk) in [(encoded.len(), 1 << 16), (777, 333)] {
+            let mut dec = Decoder::new();
+            dec.set_output_limit(n);
+            let got = decode_chunked_with(&mut dec, encoded, in_chunk, out_chunk).unwrap();
+            assert!(got == want, "case {i}: mismatch at the limit");
+
+            let mut dec = Decoder::new();
+            dec.set_output_limit(n - 1);
+            assert_eq!(
+                decode_chunked_with(&mut dec, encoded, in_chunk, out_chunk),
+                Err(Error::OutputLimitExceeded),
+                "case {i}"
+            );
+        }
+        assert!(decompress_to_vec_capped::<Lz5>(encoded, n).unwrap() == want);
+        assert_eq!(
+            decompress_to_vec_capped::<Lz5>(encoded, n - 1),
+            Err(Error::OutputLimitExceeded),
+            "case {i}"
+        );
+    }
+}
+
+/// A block that outgrows the frame's own block size is still a corrupt
+/// frame, not a limit error, unless the limit is what it hit first.
+#[test]
+fn block_larger_than_the_frame_block_size_is_still_corrupt() {
+    // The bomb again, in a 128 KiB-block frame (BD code 1).
+    let frame = bomb_frame(0x10);
+    let mut buf = vec![0u8; 4096];
+    assert_eq!(Decoder::new().decode(&frame, &mut buf), Err(Error::Corrupt));
+    let mut dec = Decoder::new();
+    dec.set_output_limit(1 << 20);
+    assert_eq!(dec.decode(&frame, &mut buf), Err(Error::Corrupt));
+    let mut dec = Decoder::new();
+    dec.set_output_limit(1024);
+    assert_eq!(
+        dec.decode(&frame, &mut buf),
+        Err(Error::OutputLimitExceeded)
+    );
+}
+
+// ─── block-size cap ──────────────────────────────────────────────────────
+
+/// The frame header's BD code sets how large a block the decoder will
+/// build. A configured cap refuses a larger one when the header is read,
+/// before any block data is looked at.
+#[test]
+fn max_block_size_rejects_larger_frames_at_the_header() {
+    use compcol::lz5::{DecoderConfig, MAX_BLOCK_SIZE};
+
+    assert_eq!(DecoderConfig::default().max_block_size, MAX_BLOCK_SIZE);
+    assert_eq!(MAX_BLOCK_SIZE, 256 << 20);
+
+    // BD codes 1..=7 and the block size each names.
+    let sizes: [usize; 7] = [
+        128 << 10,
+        256 << 10,
+        1 << 20,
+        4 << 20,
+        16 << 20,
+        64 << 20,
+        256 << 20,
+    ];
+    let mut buf = [0u8; 16];
+    for (i, &size) in sizes.iter().enumerate() {
+        let header = frame_header(0x60, ((i + 1) as u8) << 4);
+
+        // The default accepts every code.
+        assert!(Lz5::decoder().decode(&header, &mut buf).is_ok());
+
+        // A cap of exactly the block size accepts it...
+        let config = DecoderConfig::default().with_max_block_size(size);
+        let mut dec = Lz5::decoder_with(config);
+        let (p, _) = dec.decode(&header, &mut buf).unwrap();
+        assert_eq!(p.consumed, header.len());
+
+        // ...and one byte less refuses it on the header alone.
+        let config = DecoderConfig::default().with_max_block_size(size - 1);
+        let mut dec = Decoder::with_config(config);
+        assert_eq!(dec.decode(&header, &mut buf), Err(Error::Unsupported));
+
+        // The cap is configuration: it survives a reset.
+        dec.reset();
+        assert_eq!(dec.decode(&header, &mut buf), Err(Error::Unsupported));
+    }
+}
+
+#[test]
+fn max_block_size_refuses_the_block_bomb_and_keeps_small_frames() {
+    use compcol::lz5::DecoderConfig;
+    use compcol::vec::decompress_to_vec_capped_with;
+
+    let config = DecoderConfig::default().with_max_block_size(4 << 20);
+
+    // The 256 MiB-block bomb never gets past its header.
+    let mut buf = vec![0u8; 4096];
+    assert_eq!(
+        Decoder::with_config(config).decode(&bomb_frame(0x70), &mut buf),
+        Err(Error::Unsupported)
+    );
+
+    // Frames within the cap decode as before: the encoder's own 128 KiB
+    // blocks and a reference-CLI frame declaring 1 MiB ones.
+    let input: Vec<u8> = (0..300_000u32).map(|i| (i * 7 + i / 251) as u8).collect();
+    let encoded = encode_all(&input);
+    let mut dec = Decoder::with_config(config);
+    let got = decode_chunked_with(&mut dec, &encoded, 777, 333).unwrap();
+    assert!(got == input);
+
+    let reference = include_bytes!("fixtures/lz5/records_l10_multi_subblock.liz");
+    assert_eq!(reference[5] >> 4, 3, "fixture declares 1 MiB blocks");
+    let records = records_input();
+    assert!(decompress_to_vec_capped_with::<Lz5>(reference, config, 1 << 20).unwrap() == records);
+    let tight = DecoderConfig::default().with_max_block_size(256 << 10);
+    assert_eq!(
+        decompress_to_vec_capped_with::<Lz5>(reference, tight, 1 << 20),
+        Err(Error::Unsupported)
+    );
+}
+
+/// A header that is malformed is still reported as such, whatever the cap.
+#[test]
+fn max_block_size_does_not_mask_a_bad_header() {
+    use compcol::lz5::DecoderConfig;
+
+    let mut header = frame_header(0x60, 0x70);
+    header[6] ^= 0x55;
+    let config = DecoderConfig::default().with_max_block_size(128 << 10);
+    assert_eq!(
+        Decoder::with_config(config).decode(&header, &mut [0u8; 16]),
+        Err(Error::ChecksumMismatch)
+    );
 }

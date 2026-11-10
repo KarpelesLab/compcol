@@ -14,6 +14,14 @@
 //! work is discarded and the attempt is retried when more bytes arrive (or
 //! reported as truncation at `finish`). This keeps the decoder correct under
 //! arbitrary input/output chunking.
+//!
+//! The decoded fork is therefore held in memory until drained, up to an
+//! internal 256 MiB cap. A caller's output limit
+//! ([`set_output_limit`](crate::Decoder::set_output_limit), set for you by
+//! [`LimitedDecoder`](crate::limit::LimitedDecoder)) tightens that: a stream
+//! that decodes to more fails with [`Error::OutputLimitExceeded`] before the
+//! excess is built, and before a block too long for the remaining budget has
+//! its inverse-BWT tables allocated.
 
 use alloc::vec::Vec;
 
@@ -42,6 +50,9 @@ pub struct Decoder {
     finished: bool,
     /// Set on any hard error so callers cannot resume.
     poisoned: bool,
+    /// Caller's output limit (`u64::MAX` = none). Configuration: kept
+    /// across `reset`.
+    limit: u64,
 }
 
 impl Decoder {
@@ -55,6 +66,7 @@ impl Decoder {
             next_attempt_len: 1,
             finished: false,
             poisoned: false,
+            limit: u64::MAX,
         }
     }
 
@@ -74,7 +86,7 @@ impl Decoder {
     /// trailer, leaves `decoded` false and returns `Ok(false)` (need more
     /// input). On success, populates `output` and returns `Ok(true)`.
     fn try_decode(&mut self) -> Result<bool, Error> {
-        match pipeline::decode_stream(&self.input)? {
+        match pipeline::decode_stream(&self.input, self.limit)? {
             DecodeOutcome::Complete(out) => {
                 self.output = out;
                 self.decoded = true;
@@ -202,5 +214,9 @@ impl RawDecoder for Decoder {
         self.next_attempt_len = 1;
         self.finished = false;
         self.poisoned = false;
+    }
+
+    fn raw_set_output_limit(&mut self, max_output_bytes: u64) {
+        self.limit = max_output_bytes;
     }
 }

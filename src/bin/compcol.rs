@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use compcol::factory;
+use compcol::limit::LimitedDecoder;
 use compcol::{Decoder, Encoder};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -25,6 +26,8 @@ Required:
     -t, --type ALGO         Algorithm (use --list to see what's compiled in).
                             Optional on -d: if omitted, the format is
                             auto-detected from the input's magic bytes.
+                            Archives (RAR, StuffIt) are recognised but not
+                            unpacked: -t is needed to run a codec on one.
 
 Mode:
     -d, --decompress        Decompress instead of compress
@@ -46,9 +49,25 @@ Compression tuning:
                               brotli quality:    0..=11, default 6
                             Out-of-range values are clamped per algorithm.
 
+Decompression safety:
+        --max-output SIZE   Fail (and remove the partial output) rather than
+                            write more than SIZE decompressed bytes — the
+                            defence against decompression bombs. SIZE is a
+                            byte count, optionally with a K, M, G or T
+                            suffix (powers of 1024: 64M, 2G). Default: no
+                            limit. Only valid with -d.
+        --ignore-trailing   Input left over after the end of the compressed
+                            stream is an error by default (the output is
+                            removed, the input kept). With this flag it is
+                            ignored with a warning. Only valid with -d.
+
 Misc:
     -k, --keep              Keep input file even in in-place mode
-    -f, --force             Overwrite an existing output file
+    -f, --force             Replace an existing output file. The output is
+                            written to a temporary file next to it and
+                            renamed over it once complete, so a failed run
+                            leaves the old file as it was, and a symlink
+                            is replaced rather than followed.
     -L, --list              List available algorithms and exit
     -V, --version           Print version and exit
     -h, --help              Print this help and exit
@@ -78,6 +97,12 @@ struct Args {
     /// When `Some`, compression level passed to the encoder via
     /// `factory::encoder_by_name_with_level`. Ignored on decompress.
     level: Option<u8>,
+    /// When `Some`, the most decompressed bytes `-d` may produce before the
+    /// run is aborted (see [`LimitedDecoder`]).
+    max_output: Option<u64>,
+    /// Accept (with a warning) input left over after the end of the
+    /// compressed stream instead of failing.
+    ignore_trailing: bool,
     input: Option<PathBuf>,
 }
 
@@ -87,6 +112,7 @@ enum ParseError {
     UnknownFlag(String),
     ExtraPositional(String),
     BadLevel(String),
+    BadSize(String),
 }
 
 impl core::fmt::Display for ParseError {
@@ -96,6 +122,10 @@ impl core::fmt::Display for ParseError {
             Self::UnknownFlag(s) => write!(f, "unknown option: {s}"),
             Self::ExtraPositional(s) => write!(f, "unexpected extra argument: {s}"),
             Self::BadLevel(s) => write!(f, "--level expects an integer in 0..=255, got '{s}'"),
+            Self::BadSize(s) => write!(
+                f,
+                "--max-output expects a byte count with an optional K/M/G/T suffix, got '{s}'"
+            ),
         }
     }
 }
@@ -127,6 +157,7 @@ where
             "-c" | "--stdout" => args.stdout = true,
             "-k" | "--keep" => args.keep = true,
             "-f" | "--force" => args.force = true,
+            "--ignore-trailing" => args.ignore_trailing = true,
             "-t" | "--type" => {
                 let v = iter.next().ok_or(ParseError::MissingValue("-t"))?;
                 args.algorithm = Some(v.to_string_lossy().into_owned());
@@ -142,6 +173,19 @@ where
                     .to_string_lossy()
                     .into_owned();
                 args.level = Some(v.parse().map_err(|_| ParseError::BadLevel(v))?);
+            }
+            "--max-output" => {
+                let v = iter
+                    .next()
+                    .ok_or(ParseError::MissingValue("--max-output"))?
+                    .to_string_lossy()
+                    .into_owned();
+                args.max_output = Some(parse_size(&v).ok_or(ParseError::BadSize(v))?);
+            }
+            s if s.starts_with("--max-output=") => {
+                let v = &s["--max-output=".len()..];
+                args.max_output =
+                    Some(parse_size(v).ok_or_else(|| ParseError::BadSize(v.to_string()))?);
             }
             s if s.starts_with("--type=") => {
                 args.algorithm = Some(s["--type=".len()..].to_string());
@@ -170,6 +214,24 @@ where
         }
     }
     Ok(args)
+}
+
+/// Parse a byte count: a decimal integer, optionally followed by a binary
+/// multiplier — `K`, `M`, `G` or `T` (case-insensitive, optionally spelled
+/// `KiB` etc.), each a power of 1024. `None` if malformed or beyond `u64`.
+fn parse_size(s: &str) -> Option<u64> {
+    let digits = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (number, suffix) = s.split_at(digits);
+    let number: u64 = number.parse().ok()?;
+    let shift = match suffix.to_ascii_lowercase().as_str() {
+        "" => 0,
+        "k" | "kib" => 10,
+        "m" | "mib" => 20,
+        "g" | "gib" => 30,
+        "t" | "tib" => 40,
+        _ => return None,
+    };
+    number.checked_mul(1u64 << shift)
 }
 
 fn set_positional(args: &mut Args, raw: OsString) -> Result<(), ParseError> {
@@ -237,16 +299,23 @@ fn stream_encode(
     Ok(())
 }
 
+/// Decode `reader` into `writer`.
+///
+/// Returns whether input was left over once the decoder reported the end of
+/// the stream — bytes that belong to no stream this decoder understands. The
+/// caller decides whether that is an error. Nothing past the read that
+/// carried the end of the stream is consumed beyond a single probing byte.
 fn stream_decode(
     mut dec: Box<dyn Decoder>,
     reader: &mut dyn Read,
     writer: &mut dyn Write,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     use compcol::Status;
     let mut in_buf = [0u8; BUF_SIZE];
     let mut out_buf = [0u8; BUF_SIZE];
+    let mut trailing = false;
 
-    loop {
+    'input: loop {
         let n = reader.read(&mut in_buf)?;
         if n == 0 {
             break;
@@ -267,7 +336,15 @@ fn stream_decode(
                         return Err(io::Error::other("decoder stalled with input pending"));
                     }
                 }
-                Status::StreamEnd => break,
+                // The stream is over. Whatever input remains — the rest of
+                // this buffer, or anything still unread — is trailing data.
+                // (Formats that allow concatenated members, like gzip, are
+                // handled inside the decoder and don't end here.) Stop
+                // reading: the decoder would not take any of it.
+                Status::StreamEnd => {
+                    trailing = consumed < n || has_more_input(reader)?;
+                    break 'input;
+                }
             }
         }
     }
@@ -300,11 +377,47 @@ fn stream_decode(
         }
     }
 
-    Ok(())
+    Ok(trailing)
 }
 
+/// Whether `reader` has at least one more byte. Reads (and drops) that one
+/// byte: enough to know, without buffering what follows.
+fn has_more_input(reader: &mut dyn Read) -> io::Result<bool> {
+    let mut probe = [0u8; 1];
+    loop {
+        match reader.read(&mut probe) {
+            Ok(n) => return Ok(n > 0),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// A codec error carried inside an `io::Error`. The library's `Error` is
+/// only a `std::error::Error` with its `std` feature on, which this binary
+/// does not require.
+#[derive(Debug)]
+struct CodecError(compcol::Error);
+
+impl std::fmt::Display for CodecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for CodecError {}
+
+/// Wrap a codec error, keeping the typed value so `run` can tell which one
+/// it was (the `Display` output is the codec error's own).
 fn codec_err(e: compcol::Error) -> io::Error {
-    io::Error::other(format!("{e}"))
+    io::Error::other(CodecError(e))
+}
+
+/// Whether `e` is the codec error `kind`, as wrapped by [`codec_err`].
+fn is_codec_err(e: &io::Error, kind: compcol::Error) -> bool {
+    e.get_ref()
+        .and_then(|inner| inner.downcast_ref::<CodecError>())
+        .is_some_and(|inner| inner.0 == kind)
 }
 
 /// Read up to `n` bytes from `reader`, returning what was available (possibly
@@ -403,37 +516,204 @@ fn strip_extension(input: &Path, ext: &str) -> Result<Option<PathBuf>, String> {
 /// output. `None` for pipes, devices and the like — and always on platforms
 /// without unix permission bits, where the output keeps its default ACL.
 fn regular_file_mode(f: &File) -> Option<u32> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        f.metadata()
-            .ok()
-            .filter(|m| m.is_file())
-            .map(|m| m.mode() & 0o777)
+    f.metadata()
+        .ok()
+        .filter(|m| m.is_file())
+        .and_then(|m| mode_bits(&m))
+}
+
+/// An output file being written.
+struct FileOutput {
+    file: File,
+    /// The path the data is going to, removed if the run fails: the
+    /// destination itself (created exclusively, so it is ours), or the
+    /// temporary file of a `--force` run. `None` when writing into something
+    /// that isn't a regular file (`-f -o /dev/null`), which is never removed.
+    written_at: Option<PathBuf>,
+    /// For a `--force` run: the destination `written_at` is renamed onto
+    /// once it is complete.
+    rename_to: Option<PathBuf>,
+    /// Permission bits to give the finished file (unix).
+    final_mode: Option<u32>,
+}
+
+impl FileOutput {
+    /// Undo a failed run: remove what was written, leaving any existing
+    /// destination of a `--force` run as it was.
+    fn discard(self) {
+        // Close first, so the removal is immediate on every platform.
+        drop(self.file);
+        if let Some(p) = &self.written_at {
+            let _ = std::fs::remove_file(p);
+        }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = f;
-        None
+
+    /// Finish a successful run: set the final permission bits and, for a
+    /// `--force` run, move the completed file onto its destination.
+    fn commit(self) -> io::Result<()> {
+        let Self {
+            file,
+            written_at,
+            rename_to,
+            final_mode,
+        } = self;
+        // Failing to set the mode leaves the file no more accessible than
+        // intended (a file we created is still owner-only), so warn rather
+        // than fail the whole run.
+        if let Some(mode) = final_mode
+            && let Err(e) = set_mode(&file, mode)
+            && let Some(shown) = rename_to.as_ref().or(written_at.as_ref())
+        {
+            eprintln!(
+                "compcol: warning: could not set permissions on {}: {e}",
+                shown.display()
+            );
+        }
+        // Close before renaming: not every platform lets an open file be
+        // moved over another.
+        drop(file);
+        if let (Some(temp), Some(dest)) = (&written_at, &rename_to)
+            && let Err(e) = std::fs::rename(temp, dest)
+        {
+            let _ = std::fs::remove_file(temp);
+            return Err(io::Error::new(
+                e.kind(),
+                format!("replace {}: {e}", dest.display()),
+            ));
+        }
+        Ok(())
     }
 }
 
-/// Open the output file: exclusively (`O_EXCL`) unless `force`, which
-/// truncates an existing file instead.
+/// Create the output file for `dest`.
 ///
-/// With `owner_only` (unix; set when the input is a regular file whose mode
-/// will be copied over afterwards) a newly created file starts out as 0600
-/// rather than `0666 & !umask`, so the data is never exposed more widely
-/// than the input was while it is being written. An existing `--force`
-/// target keeps its mode until then.
-fn open_output(path: &Path, force: bool, owner_only: bool) -> io::Result<File> {
-    let mut opts = OpenOptions::new();
-    opts.write(true);
-    if force {
-        opts.create(true).truncate(true);
-    } else {
-        opts.create_new(true);
+/// Without `force` the destination is created exclusively (`O_EXCL`) and
+/// written in place. That is already race-free — there is no gap between an
+/// existence check and the open — and never follows a symlink, dangling or
+/// not; nothing else can exist under that name, so there is nothing to
+/// preserve if the run fails, and the partial file is simply removed. (A
+/// temporary file put in place with a no-replace `hard_link` would give the
+/// same guarantee, but hard links don't exist on FAT/exFAT and some network
+/// file systems, where it would turn every plain run into an error.)
+///
+/// With `force` an existing destination must survive a failed run, and a
+/// symlink there must not be written through. So the data goes to a new,
+/// exclusively created file in the same directory, which [`run`] renames
+/// over the destination only once the stream is complete: the old file stays
+/// untouched until then, and `rename` replaces a symlink rather than
+/// following it. The existence of the destination is never consulted, so
+/// there is no check-then-open race either.
+///
+/// The exception is a `force` destination that exists but is neither a
+/// regular file nor a directory — a device, FIFO or socket, directly or
+/// through a symlink (`-f -o /dev/null`, `/dev/stdout`). It can't sensibly
+/// be replaced by a rename and holds no data to protect, so it is opened and
+/// written directly.
+///
+/// `input_mode` is the input's permission bits when it is a regular file.
+/// The output then starts out owner-only (0600 on unix) rather than
+/// `0666 & !umask`, so the data is never exposed more widely than the input
+/// was while it is being written, and gets `input_mode` once complete. With
+/// no input mode (stdin), a `force` run that replaces a regular file keeps
+/// that file's mode, as overwriting it in place used to.
+fn open_file_output(
+    dest: &Path,
+    force: bool,
+    input_mode: Option<u32>,
+) -> Result<FileOutput, RunError> {
+    let create_err = |e: io::Error| {
+        RunError::Io(io::Error::new(
+            e.kind(),
+            format!("create {}: {e}", dest.display()),
+        ))
+    };
+
+    if !force {
+        let file = new_file_options(input_mode.is_some())
+            .open(dest)
+            .map_err(|e| {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    RunError::Usage(format!(
+                        "output exists: {} (use -f to overwrite)",
+                        dest.display()
+                    ))
+                } else {
+                    create_err(e)
+                }
+            })?;
+        return Ok(FileOutput {
+            file,
+            written_at: Some(dest.to_path_buf()),
+            rename_to: None,
+            final_mode: input_mode,
+        });
     }
+
+    // What the destination resolves to (following symlinks), if anything.
+    if let Ok(target) = std::fs::metadata(dest) {
+        if target.is_dir() {
+            return Err(create_err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                "is a directory",
+            )));
+        }
+        if !target.is_file() {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(dest)
+                .map_err(create_err)?;
+            // Opened without create or truncate, so if the path was swapped
+            // for a regular file in the meantime nothing has been lost yet:
+            // refuse rather than overwrite it in place.
+            if file.metadata().map_err(create_err)?.is_file() {
+                return Err(create_err(io::Error::other(
+                    "changed while it was being opened",
+                )));
+            }
+            return Ok(FileOutput {
+                file,
+                written_at: None,
+                rename_to: None,
+                final_mode: None,
+            });
+        }
+    }
+
+    // The mode of the regular file being replaced. A symlink is replaced
+    // itself, so whatever it points to doesn't lend its mode.
+    let replaced_mode = std::fs::symlink_metadata(dest)
+        .ok()
+        .filter(|m| m.is_file())
+        .and_then(|m| mode_bits(&m));
+    let final_mode = input_mode.or(replaced_mode);
+
+    let dir = match dest.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let (file, temp) = create_temp_file(dir, final_mode.is_some()).map_err(|e| {
+        RunError::Io(io::Error::new(
+            e.kind(),
+            format!(
+                "create temporary file in {} for {}: {e}",
+                dir.display(),
+                dest.display()
+            ),
+        ))
+    })?;
+    Ok(FileOutput {
+        file,
+        written_at: Some(temp),
+        rename_to: Some(dest.to_path_buf()),
+        final_mode,
+    })
+}
+
+/// Options that create a new file exclusively — failing if anything, even a
+/// dangling symlink, already has the name — owner-only on unix if asked.
+fn new_file_options(owner_only: bool) -> OpenOptions {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     if owner_only {
         use std::os::unix::fs::OpenOptionsExt;
@@ -441,7 +721,47 @@ fn open_output(path: &Path, force: bool, owner_only: bool) -> io::Result<File> {
     }
     #[cfg(not(unix))]
     let _ = owner_only;
-    opts.open(path)
+    opts
+}
+
+/// Create a new, uniquely named file in `dir`.
+///
+/// The name combines the process id with a value from the standard
+/// library's randomly seeded hasher, so it can't be guessed ahead of time;
+/// and since the file is created exclusively, a name that does already exist
+/// (as a file or a planted symlink) is never opened — another one is tried.
+fn create_temp_file(dir: &Path, owner_only: bool) -> io::Result<(File, PathBuf)> {
+    use std::hash::{BuildHasher, Hasher};
+
+    let pid = std::process::id();
+    for attempt in 0u32..64 {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u32(attempt);
+        let path = dir.join(format!(".compcol-{pid}-{:016x}.tmp", hasher.finish()));
+        match new_file_options(owner_only).open(&path) {
+            Ok(file) => return Ok((file, path)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no unused temporary file name found",
+    ))
+}
+
+/// Permission bits from `m`; `None` on platforms without unix permissions.
+fn mode_bits(m: &std::fs::Metadata) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(m.mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = m;
+        None
+    }
 }
 
 /// Set the permission bits of the open output file to `mode`. Only regular
@@ -560,6 +880,37 @@ enum Codec {
 /// 16-byte window is comfortably sufficient.
 const PEEK_LEN: usize = 16;
 
+/// The archive format `prefix` belongs to, if it starts with the magic of a
+/// multi-member container rather than of a single compressed stream.
+///
+/// These are the magics [`factory::detect`] answers with a container *hint*
+/// — the name of a codec used for members inside such an archive (`rar1`,
+/// `rar2`, `rar3`, `rar5` for RAR; `arsenic` for StuffIt), not of something
+/// that can decode the file. They are matched here directly so the answer
+/// doesn't depend on which of those codecs are compiled in; `detected` is
+/// checked as well, so a hint that `detect` derives some other way is still
+/// never auto-dispatched.
+fn archive_kind(prefix: &[u8], detected: Option<&str>) -> Option<&'static str> {
+    // RAR 1.5–4.x ("Rar!\x1A\x07\x00") and RAR 5 ("Rar!\x1A\x07\x01\x00").
+    if prefix.starts_with(b"Rar!\x1A\x07") {
+        return Some("RAR");
+    }
+    // StuffIt classic ("SIT!" with the "rLau" signature at offset 10) and
+    // StuffIt 5 ("StuffIt (c)...").
+    if (prefix.len() >= 14 && prefix.starts_with(b"SIT!") && &prefix[10..14] == b"rLau")
+        || prefix.starts_with(b"StuffIt")
+    {
+        return Some("StuffIt");
+    }
+    match detected {
+        Some("rar1" | "rar2" | "rar3" | "rar5") => Some("RAR"),
+        Some("arsenic") => Some("StuffIt"),
+        _ => None,
+    }
+}
+
+const TRAILING_DATA: &str = "trailing data after the end of the compressed stream";
+
 fn run(args: &Args) -> Result<(), RunError> {
     if args.decompress && args.level.is_some() {
         // Decompressors don't have a level — flag it rather than silently
@@ -569,6 +920,16 @@ fn run(args: &Args) -> Result<(), RunError> {
             "--level is only meaningful on compression (no -d)".into(),
         ));
     }
+    if !args.decompress && args.max_output.is_some() {
+        return Err(RunError::Usage(
+            "--max-output is only meaningful on decompression (-d)".into(),
+        ));
+    }
+    if !args.decompress && args.ignore_trailing {
+        return Err(RunError::Usage(
+            "--ignore-trailing is only meaningful on decompression (-d)".into(),
+        ));
+    }
 
     // For in-place mode (input file + no -c/-o), we also remove the input on
     // success unless -k. Capture that decision up front.
@@ -576,7 +937,7 @@ fn run(args: &Args) -> Result<(), RunError> {
     let should_remove_input = in_place && !args.keep;
 
     // Reader. When the input is a regular file, remember its permission bits
-    // so a file output can be given the same ones (see `open_output`).
+    // so a file output can be given the same ones (see `open_file_output`).
     let mut input_mode: Option<u32> = None;
     let mut reader: Box<dyn Read> = if let Some(p) = &args.input {
         let f = File::open(p).map_err(|e| {
@@ -602,7 +963,17 @@ fn run(args: &Args) -> Result<(), RunError> {
         // Only reachable on decompress: main() rejects a missing -t on
         // compress before calling run().
         peeked = read_up_to(&mut reader, PEEK_LEN)?;
-        match factory::detect(&peeked) {
+        let detected = factory::detect(&peeked);
+        // For archive magics `detect` returns a member codec's name purely
+        // as a format hint. Dispatching on it would feed the archive's own
+        // headers and directory to a decoder for one member's raw stream.
+        if let Some(kind) = archive_kind(&peeked, detected) {
+            return Err(RunError::Usage(format!(
+                "looks like a {kind} archive; compcol decodes single compressed \
+                 streams, not archives — pass -t to force"
+            )));
+        }
+        match detected {
             Some(name) => name.to_string(),
             None => {
                 return Err(RunError::Usage(
@@ -624,7 +995,14 @@ fn run(args: &Args) -> Result<(), RunError> {
     // existing one.
     let unknown = || RunError::Usage(format!("unknown algorithm: '{algo}' (use --list)"));
     let codec = if args.decompress {
-        Codec::Decoder(factory::decoder_by_name(&algo).ok_or_else(unknown)?)
+        let dec = factory::decoder_by_name(&algo).ok_or_else(unknown)?;
+        // --max-output: bound the decoded size. The wrapper also hands the
+        // budget to the decoder itself, so codecs that build output
+        // internally refuse early instead of allocating it first.
+        Codec::Decoder(match args.max_output {
+            Some(limit) => Box::new(LimitedDecoder::new(dec, limit)),
+            None => dec,
+        })
     } else {
         Codec::Encoder(
             match args.level {
@@ -637,15 +1015,16 @@ fn run(args: &Args) -> Result<(), RunError> {
 
     let output = derive_output(args, &algo).map_err(RunError::Usage)?;
 
-    // Writer + the path we'd remove on cleanup if anything goes wrong.
+    // Writer, plus what is needed to finish or undo a file output.
     let stdout = io::stdout();
-    let mut final_mode: Option<(File, u32, PathBuf)> = None;
-    let (mut writer, output_path): (Box<dyn Write>, Option<PathBuf>) = match &output {
-        Output::Stdout => (Box::new(BufWriter::new(stdout.lock())), None),
+    let mut file_output: Option<FileOutput> = None;
+    let mut writer: Box<dyn Write> = match &output {
+        Output::Stdout => Box::new(BufWriter::new(stdout.lock())),
         Output::File(p) => {
-            // Refuse to write over the file we are about to read: opening it
-            // for writing (--force truncates) would destroy the input before
-            // a single byte of it had been consumed.
+            // Refuse to write over the file we are reading. --force no
+            // longer truncates its target up front, but replacing the input
+            // under its own name with its (de)compressed form is never what
+            // was asked for.
             if let Some(input) = &args.input
                 && is_same_file(input, p)
             {
@@ -654,53 +1033,55 @@ fn run(args: &Args) -> Result<(), RunError> {
                     p.display()
                 )));
             }
-            // Without --force, create the output atomically with O_EXCL
-            // (create_new). This eliminates the TOCTOU between an existence
-            // check and the open, and refuses to follow a pre-existing or
-            // dangling symlink into an attacker-controlled target. With
-            // --force we keep the documented overwrite (truncate) behavior.
-            //
-            // For the --force path, remember whether the target already
-            // existed: if a later codec error triggers cleanup we must NOT
-            // delete a file the user already had (data loss). Only output we
-            // newly created is ours to remove on failure. (The non-force path
-            // uses create_new, so a successful open there always created the
-            // file — it is always safe to clean up.)
-            let preexisting = args.force && p.exists();
-            let f = open_output(p, args.force, input_mode.is_some()).map_err(|e| {
-                if !args.force && e.kind() == io::ErrorKind::AlreadyExists {
-                    RunError::Usage(format!(
-                        "output exists: {} (use -f to overwrite)",
-                        p.display()
-                    ))
-                } else {
-                    RunError::Io(io::Error::new(
+            let out = open_file_output(p, args.force, input_mode)?;
+            // The writer gets a second handle; the first stays in `out` so
+            // the permission bits can be applied to this very file (not to
+            // whatever the path names by then) once it is complete.
+            let handle = match out.file.try_clone() {
+                Ok(handle) => handle,
+                Err(e) => {
+                    out.discard();
+                    return Err(RunError::Io(io::Error::new(
                         e.kind(),
                         format!("create {}: {e}", p.display()),
-                    ))
+                    )));
                 }
-            })?;
-            // Cleanup only files we created. A pre-existing --force target is
-            // left in place (already truncated) rather than deleted out from
-            // under the user.
-            let cleanup = if preexisting { None } else { Some(p.clone()) };
-            // Keep a second handle so the input's permission bits can be
-            // applied to this very file (not to whatever the path names by
-            // then) once it is completely written. If the handle can't be
-            // duplicated the output simply stays owner-only.
-            if let Some(mode) = input_mode
-                && let Ok(handle) = f.try_clone()
-            {
-                final_mode = Some((handle, mode, p.clone()));
-            }
-            (Box::new(BufWriter::new(f)), cleanup)
+            };
+            file_output = Some(out);
+            Box::new(BufWriter::new(handle))
         }
     };
 
-    // From here on the output exists: every failure — including the final
-    // flush — must go through the cleanup below rather than an early `?`.
+    // From here on the output (or its temporary file) exists: every failure
+    // — including the final flush — must go through the cleanup below rather
+    // than an early `?`.
     let result = match codec {
-        Codec::Decoder(dec) => stream_decode(dec, &mut *reader, &mut *writer),
+        Codec::Decoder(dec) => {
+            stream_decode(dec, &mut *reader, &mut *writer).and_then(|trailing| {
+                if !trailing {
+                    return Ok(());
+                }
+                // Input left over after the end of the stream: the file is
+                // not (just) what it claims to be — appended garbage, a
+                // second stream in a format that has no notion of one, or a
+                // truncated copy of something else. Succeeding would, in
+                // in-place mode, delete an input whose content was only
+                // partly accounted for. The rule is the same for every
+                // output mode so that the exit status means the same thing
+                // whether or not -c / -o is used.
+                if args.ignore_trailing {
+                    eprintln!("compcol: warning: {TRAILING_DATA} ignored");
+                    // Keep reading to the end as the CLI always did, so a
+                    // process piping into us isn't killed by a closed pipe.
+                    let _ = io::copy(&mut *reader, &mut io::sink());
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!(
+                        "{TRAILING_DATA} (pass --ignore-trailing to accept it)"
+                    )))
+                }
+            })
+        }
         Codec::Encoder(enc) => stream_encode(enc, &mut *reader, &mut *writer),
     }
     .and_then(|()| writer.flush());
@@ -708,23 +1089,27 @@ fn run(args: &Args) -> Result<(), RunError> {
     // Release the file handle before removing or reporting anything.
     drop(writer);
     if let Err(e) = result {
-        // Best-effort: remove the partial output, leave the input intact.
-        if let Some(p) = output_path {
-            let _ = std::fs::remove_file(&p);
+        // Best-effort: remove the partial output, leave the input — and a
+        // --force destination that already existed — intact.
+        if let Some(out) = file_output {
+            out.discard();
+        }
+        // Name the flag and the limit rather than the library's generic
+        // "configured limit" wording.
+        if let Some(limit) = args.max_output
+            && is_codec_err(&e, compcol::Error::OutputLimitExceeded)
+        {
+            return Err(RunError::Io(io::Error::other(format!(
+                "decompressed output exceeds the --max-output limit of {limit} bytes"
+            ))));
         }
         return Err(RunError::Io(e));
     }
 
-    // The output is complete: hand it the input's permission bits. Failing
-    // to do so leaves it no more accessible than intended (a file we created
-    // is still owner-only), so warn rather than fail the whole run.
-    if let Some((handle, mode, path)) = final_mode
-        && let Err(e) = set_mode(&handle, mode)
-    {
-        eprintln!(
-            "compcol: warning: could not set permissions on {}: {e}",
-            path.display()
-        );
+    // The output is complete: give it its final permissions and name. The
+    // input is only removed once that has worked.
+    if let Some(out) = file_output {
+        out.commit()?;
     }
 
     if should_remove_input
@@ -808,5 +1193,117 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("stalled"), "{err}");
+    }
+
+    /// A decoder whose stream is exactly `left` bytes long, copied verbatim.
+    struct FixedLen {
+        left: usize,
+    }
+
+    impl Decoder for FixedLen {
+        fn decode(&mut self, input: &[u8], out: &mut [u8]) -> Result<(Progress, Status), Error> {
+            let n = input.len().min(out.len()).min(self.left);
+            out[..n].copy_from_slice(&input[..n]);
+            self.left -= n;
+            let status = if self.left == 0 {
+                Status::StreamEnd
+            } else {
+                Status::InputEmpty
+            };
+            Ok((
+                Progress {
+                    consumed: n,
+                    written: n,
+                },
+                status,
+            ))
+        }
+        fn finish(&mut self, _: &mut [u8]) -> Result<(Progress, Status), Error> {
+            if self.left == 0 {
+                Ok((Progress::default(), Status::StreamEnd))
+            } else {
+                Err(Error::UnexpectedEnd)
+            }
+        }
+        fn reset(&mut self) {}
+        fn discard_output(&mut self, _: &[u8], _: usize) -> Result<(Progress, Status), Error> {
+            unreachable!("the CLI never skips output")
+        }
+    }
+
+    /// Hands out its chunks one per `read` (never joining two) and counts
+    /// the bytes read.
+    struct Chunked<'a> {
+        chunks: std::collections::VecDeque<&'a [u8]>,
+        bytes_read: usize,
+    }
+
+    impl Read for Chunked<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let Some(first) = self.chunks.front_mut() else {
+                return Ok(0);
+            };
+            let n = first.len().min(buf.len());
+            buf[..n].copy_from_slice(&first[..n]);
+            *first = &first[n..];
+            if first.is_empty() {
+                self.chunks.pop_front();
+            }
+            self.bytes_read += n;
+            Ok(n)
+        }
+    }
+
+    fn decode_chunks(stream_len: usize, chunks: &[&[u8]]) -> (Vec<u8>, bool, usize) {
+        let mut reader = Chunked {
+            chunks: chunks.iter().copied().collect(),
+            bytes_read: 0,
+        };
+        let mut out = Vec::new();
+        let trailing = stream_decode(
+            Box::new(FixedLen { left: stream_len }),
+            &mut reader,
+            &mut out,
+        )
+        .unwrap();
+        (out, trailing, reader.bytes_read)
+    }
+
+    #[test]
+    fn stream_decode_reports_no_trailing_data_on_a_clean_end() {
+        let (out, trailing, _) = decode_chunks(6, &[b"abc", b"def"]);
+        assert_eq!(out, b"abcdef");
+        assert!(!trailing);
+    }
+
+    #[test]
+    fn stream_decode_reports_trailing_data_in_the_same_read() {
+        let (out, trailing, _) = decode_chunks(4, &[b"abcdXY"]);
+        assert_eq!(out, b"abcd");
+        assert!(trailing);
+    }
+
+    #[test]
+    fn stream_decode_reports_trailing_data_in_a_later_read() {
+        // The stream ends exactly at a read boundary: the leftover is only
+        // visible by reading on.
+        let (out, trailing, _) = decode_chunks(4, &[b"abcd", b"XY"]);
+        assert_eq!(out, b"abcd");
+        assert!(trailing);
+    }
+
+    #[test]
+    fn stream_decode_does_not_read_through_trailing_data() {
+        // One probing byte is enough to know; the megabytes behind it must
+        // not be pulled in.
+        let big = vec![0u8; 4096];
+        let chunks: Vec<&[u8]> = [&b"abcd"[..], b"X"]
+            .into_iter()
+            .chain(std::iter::repeat_n(&big[..], 64))
+            .collect();
+        let (out, trailing, bytes_read) = decode_chunks(4, &chunks);
+        assert_eq!(out, b"abcd");
+        assert!(trailing);
+        assert_eq!(bytes_read, 5);
     }
 }

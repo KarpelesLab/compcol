@@ -30,6 +30,10 @@
 //! Count exceeds the decoder's current Insert Count, it returns
 //! [`Error::Corrupt`] rather than waiting. Feed the encoder stream first.
 //!
+//! The encoder stream can be fed in whatever pieces it comes off the QUIC
+//! stream in: the decoder keeps the bytes of an instruction that is not
+//! complete yet and applies each instruction exactly once.
+//!
 //! # Encoder — static-only and dynamic-table modes
 //!
 //! [`QpackEncoder`] has two modes:
@@ -532,6 +536,13 @@ pub struct QpackDecoder {
     max_capacity: usize,
     /// Cap on one decoded field section, in §3.2.1 field-size units.
     max_field_section_size: usize,
+    /// Leading bytes of an encoder-stream instruction whose remainder has not
+    /// arrived yet. Never holds a complete instruction, and is bounded by
+    /// the table capacity (see `scan_instruction`).
+    encoder_stream_tail: Vec<u8>,
+    /// The error that ended the encoder stream; every later
+    /// [`feed_encoder_stream`](Self::feed_encoder_stream) call returns it.
+    encoder_stream_error: Option<Error>,
 }
 
 /// [`DEFAULT_MAX_TABLE_CAPACITY`] with the [`DEFAULT_MAX_FIELD_SECTION_SIZE`]
@@ -586,6 +597,8 @@ impl QpackDecoder {
             table: DynamicTable::new(),
             max_capacity: max_table_capacity,
             max_field_section_size,
+            encoder_stream_tail: Vec::new(),
+            encoder_stream_error: None,
         }
     }
 
@@ -594,57 +607,166 @@ impl QpackDecoder {
         self.max_field_section_size = max;
     }
 
-    /// Process encoder-stream instructions (§4.3), mutating the dynamic table:
-    /// Set Dynamic Table Capacity, Insert with Name Reference, Insert with
-    /// Literal Name, and Duplicate. Returns [`Error::Corrupt`] on a malformed
-    /// instruction, a bad table reference, an over-limit capacity, or an insert
-    /// that cannot fit; [`Error::UnexpectedEnd`] on truncation.
+    /// Process the next bytes of the encoder stream (§4.3), mutating the
+    /// dynamic table: Set Dynamic Table Capacity, Insert with Name Reference,
+    /// Insert with Literal Name, and Duplicate.
     ///
-    /// `data` must end on an instruction boundary: this method does not
-    /// buffer a partial instruction. On any error — including
-    /// [`Error::UnexpectedEnd`] for a truncated tail — the complete
-    /// instructions that preceded it have already been applied to the
-    /// dynamic table, so callers must not feed those bytes again.
+    /// The encoder stream is a QUIC byte stream, so `data` may start and end
+    /// anywhere, including in the middle of an instruction: call this with
+    /// each chunk as it arrives, in order, and never feed a byte twice. Every
+    /// instruction is applied exactly once, however the bytes are split. When
+    /// a chunk ends inside an instruction, the unparsed bytes are kept in the
+    /// decoder and the call returns `Ok(())`; the instruction is applied once
+    /// the rest of it has been fed.
+    /// [`encoder_stream_pending`](Self::encoder_stream_pending) tells how
+    /// many such bytes are held. This method therefore never returns
+    /// [`Error::UnexpectedEnd`]: a truncated instruction is only an error if
+    /// the stream has ended, which the caller knows and the decoder does not
+    /// (and the encoder stream ending is itself a connection error, RFC 9204
+    /// §4.2).
+    ///
+    /// The bytes held are bounded by the dynamic table's current capacity:
+    /// an insert whose strings could not fit in the table is rejected as
+    /// soon as their length prefixes have been read, without waiting for (or
+    /// buffering) the strings. At most about four times the capacity is
+    /// held, since a Huffman-coded string can be that much longer than the
+    /// text it decodes to.
+    ///
+    /// Returns [`Error::Corrupt`] on a malformed instruction, a bad table
+    /// reference, an over-limit capacity, or an insert that cannot fit. Such
+    /// an error is a connection error (`QPACK_ENCODER_STREAM_ERROR`, RFC 9204
+    /// §6) and is final: the instructions that preceded the bad one stay
+    /// applied, the bad one and everything after it are dropped, and every
+    /// later call returns the same error without reading its input.
     pub fn feed_encoder_stream(&mut self, data: &[u8]) -> Result<(), Error> {
+        if let Some(e) = self.encoder_stream_error {
+            return Err(e);
+        }
+        let res = if self.encoder_stream_tail.is_empty() {
+            // Nothing held: parse straight from the caller's slice and keep
+            // only the incomplete instruction at its end, if any.
+            self.apply_encoder_stream(data).map(|used| {
+                self.encoder_stream_tail.extend_from_slice(&data[used..]);
+            })
+        } else {
+            let mut buf = core::mem::take(&mut self.encoder_stream_tail);
+            buf.extend_from_slice(data);
+            self.apply_encoder_stream(&buf).map(|used| {
+                buf.drain(..used);
+                self.encoder_stream_tail = buf;
+            })
+        };
+        if let Err(e) = res {
+            self.encoder_stream_tail = Vec::new();
+            self.encoder_stream_error = Some(e);
+        }
+        res
+    }
+
+    /// Number of encoder-stream bytes received by
+    /// [`feed_encoder_stream`](Self::feed_encoder_stream) that are the start
+    /// of an instruction whose end has not arrived yet. `0` means the bytes
+    /// fed so far end on an instruction boundary. If the encoder stream ends
+    /// while this is non-zero, its last instruction was truncated.
+    pub fn encoder_stream_pending(&self) -> usize {
+        self.encoder_stream_tail.len()
+    }
+
+    /// Apply every complete instruction at the front of `data` and return
+    /// how many bytes they took. The rest (`data[used..]`) is the start of
+    /// one incomplete instruction, or empty.
+    fn apply_encoder_stream(&mut self, data: &[u8]) -> Result<usize, Error> {
         let mut pos = 0;
         while pos < data.len() {
-            let b = data[pos];
-            if b & 0b1000_0000 != 0 {
-                // §4.3.2 Insert with Name Reference: 1 T name-index(6+).
-                let t_static = b & 0b0100_0000 != 0;
-                let (name_idx, np) = decode_int(data, pos, 6)?;
-                pos = np;
-                let (value, np) = read_string(data, pos, 7)?;
-                pos = np;
-                let name = self.resolve_insert_name(name_idx, t_static)?;
-                self.do_insert(&name, &value)?;
-            } else if b & 0b0100_0000 != 0 {
-                // §4.3.3 Insert with Literal Name: 0 1 H name-len(5+).
-                let (name, np) = read_string(data, pos, 5)?;
-                pos = np;
-                let (value, np) = read_string(data, pos, 7)?;
-                pos = np;
-                self.do_insert(&name, &value)?;
-            } else if b & 0b0010_0000 != 0 {
-                // §4.3.1 Set Dynamic Table Capacity: 0 0 1 capacity(5+).
-                let (cap, np) = decode_int(data, pos, 5)?;
-                pos = np;
-                if !self.table.set_capacity(cap, self.max_capacity) {
-                    return Err(Error::Corrupt);
-                }
-            } else {
-                // §4.3.4 Duplicate: 0 0 0 index(5+) (relative index).
-                let (rel, np) = decode_int(data, pos, 5)?;
-                pos = np;
-                let abs = self
-                    .table
-                    .relative_to_absolute_encoder(rel)
-                    .ok_or(Error::Corrupt)?;
-                let (n, v) = self.table.get_absolute(abs).ok_or(Error::Corrupt)?;
-                let (n, v) = (n.to_vec(), v.to_vec());
-                self.do_insert(&n, &v)?;
-            }
+            // Find the instruction's end first, reading only its integers:
+            // an incomplete instruction then costs O(1) per call, however
+            // many times it is retried as its bytes trickle in.
+            let Some(len) = self.scan_instruction(&data[pos..])? else {
+                break;
+            };
+            self.apply_instruction(&data[pos..pos + len])?;
+            pos += len;
         }
+        Ok(pos)
+    }
+
+    /// Length of the instruction starting at `data[0]`, or `None` if `data`
+    /// ends before the instruction does. Decodes no string and changes
+    /// nothing.
+    ///
+    /// An insert that cannot fit in the table at its current capacity (which
+    /// is exact here: every earlier instruction has been applied) is
+    /// [`Error::Corrupt`] from its string length prefixes alone, so the
+    /// caller only ever buffers an instruction that could still be valid.
+    fn scan_instruction(&self, data: &[u8]) -> Result<Option<usize>, Error> {
+        let b = data[0];
+        let scanned = if b & 0b1100_0000 != 0 {
+            // Bytes left for the new entry's name and value (§3.2.1).
+            let mut room = self
+                .table
+                .capacity()
+                .checked_sub(dynamic_table::ENTRY_OVERHEAD)
+                .ok_or(Error::Corrupt)?;
+            if b & 0b1000_0000 != 0 {
+                // §4.3.2 Insert with Name Reference: 1 T name-index(6+),
+                // then the value.
+                decode_int(data, 0, 6).and_then(|(_, p)| scan_string(data, p, 7, &mut room))
+            } else {
+                // §4.3.3 Insert with Literal Name: 0 1 H name-len(5+), then
+                // the value.
+                scan_string(data, 0, 5, &mut room).and_then(|p| scan_string(data, p, 7, &mut room))
+            }
+        } else {
+            // §4.3.1 Set Dynamic Table Capacity and §4.3.4 Duplicate are one
+            // 5-bit-prefix integer.
+            decode_int(data, 0, 5).map(|(_, p)| p)
+        };
+        match scanned {
+            Ok(end) => Ok(Some(end)),
+            // The only way these report truncation is by running off `data`.
+            Err(Error::UnexpectedEnd) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Apply the one complete instruction in `ins`, as delimited by
+    /// [`scan_instruction`](Self::scan_instruction).
+    fn apply_instruction(&mut self, ins: &[u8]) -> Result<(), Error> {
+        let b = ins[0];
+        let end = if b & 0b1000_0000 != 0 {
+            // §4.3.2 Insert with Name Reference: 1 T name-index(6+).
+            let t_static = b & 0b0100_0000 != 0;
+            let (name_idx, pos) = decode_int(ins, 0, 6)?;
+            let (value, pos) = read_string(ins, pos, 7)?;
+            let name = self.resolve_insert_name(name_idx, t_static)?;
+            self.do_insert(&name, &value)?;
+            pos
+        } else if b & 0b0100_0000 != 0 {
+            // §4.3.3 Insert with Literal Name: 0 1 H name-len(5+).
+            let (name, pos) = read_string(ins, 0, 5)?;
+            let (value, pos) = read_string(ins, pos, 7)?;
+            self.do_insert(&name, &value)?;
+            pos
+        } else if b & 0b0010_0000 != 0 {
+            // §4.3.1 Set Dynamic Table Capacity: 0 0 1 capacity(5+).
+            let (cap, pos) = decode_int(ins, 0, 5)?;
+            if !self.table.set_capacity(cap, self.max_capacity) {
+                return Err(Error::Corrupt);
+            }
+            pos
+        } else {
+            // §4.3.4 Duplicate: 0 0 0 index(5+) (relative index).
+            let (rel, pos) = decode_int(ins, 0, 5)?;
+            let abs = self
+                .table
+                .relative_to_absolute_encoder(rel)
+                .ok_or(Error::Corrupt)?;
+            let (n, v) = self.table.get_absolute(abs).ok_or(Error::Corrupt)?;
+            let (n, v) = (n.to_vec(), v.to_vec());
+            self.do_insert(&n, &v)?;
+            pos
+        };
+        debug_assert_eq!(end, ins.len());
         Ok(())
     }
 
@@ -901,6 +1023,35 @@ fn read_string(block: &[u8], pos: usize, n: u32) -> Result<(Vec<u8>, usize), Err
         raw.to_vec()
     };
     Ok((data, end))
+}
+
+/// Skip the string literal (§4.1.2) of an encoder-stream insert at `pos`
+/// without decoding it, returning the position after it
+/// ([`Error::UnexpectedEnd`] if `block` ends first).
+///
+/// `room` is what is left of the dynamic-table capacity for this entry's name
+/// and value. The string's smallest possible decoded length is taken from it
+/// as soon as the length prefix is known, and a string that cannot fit is
+/// [`Error::Corrupt`] whether or not its octets are present. A raw string
+/// decodes to its own length; `len` Huffman octets hold at least
+/// `(8 * len - 7) / 30` symbols, rounded up (a code is at most 30 bits long
+/// and the padding at most 7).
+fn scan_string(block: &[u8], pos: usize, n: u32, room: &mut usize) -> Result<usize, Error> {
+    let first = *block.get(pos).ok_or(Error::UnexpectedEnd)?;
+    let huff = first & (1u8 << n) != 0;
+    let (len, p) = decode_int(block, pos, n)?;
+    let min_decoded = if huff {
+        let bits = len.checked_mul(8).ok_or(Error::Corrupt)?;
+        bits.saturating_sub(7).div_ceil(30)
+    } else {
+        len
+    };
+    *room = room.checked_sub(min_decoded).ok_or(Error::Corrupt)?;
+    let end = p.checked_add(len).ok_or(Error::Corrupt)?;
+    if end > block.len() {
+        return Err(Error::UnexpectedEnd);
+    }
+    Ok(end)
 }
 
 #[cfg(test)]
