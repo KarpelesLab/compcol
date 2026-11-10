@@ -1075,7 +1075,9 @@ impl Ppmd7 {
         let s = self.found_state;
         self.prev_success =
             (2 * self.st_freq(s) as u32 > self.ctx_summ_freq(self.min_context)) as u32;
-        self.run_length += self.prev_success as i32;
+        // Wrapping, like the reference's `Int32`: nothing resets the count
+        // during an arbitrarily long run of predicted symbols.
+        self.run_length = self.run_length.wrapping_add(self.prev_success as i32);
         let c = self.min_context;
         self.ctx_add_summ_freq(c, 4);
         self.st_add_freq(s, 4);
@@ -1090,7 +1092,7 @@ impl Ppmd7 {
         let f = self.st_freq(s);
         self.st_set_freq(s, f + (f < 128) as u8);
         self.prev_success = 1;
-        self.run_length += 1;
+        self.run_length = self.run_length.wrapping_add(1);
         self.next_context();
     }
 
@@ -1317,5 +1319,30 @@ mod tests {
             assert_eq!(p.base.len(), pad + mem as usize + UNIT_SIZE as usize);
             assert!(p.base.iter().all(|&b| b == 0));
         }
+    }
+
+    /// `run_length` counts consecutive predicted symbols with nothing to
+    /// reset it on a long enough run; like the reference's `Int32` it must
+    /// wrap rather than trip an overflow check.
+    #[test]
+    fn run_length_wraps_at_i32_max() {
+        use crate::ppmd::range_dec::Mode;
+
+        // Order 6, 16 MB, 1280 bytes of a repeating 20-byte phrase: past
+        // the first few periods every symbol comes from a binary context.
+        let stream: &[u8] = include_bytes!("../../tests/fixtures/ppmd/repeat.ppmd");
+        let plain: &[u8] = include_bytes!("../../tests/fixtures/ppmd/repeat.bin");
+        let mut model = Ppmd7::new(16 << 20).unwrap();
+        model.init(6);
+        let (mut rc, _) = RangeDec::init(Mode::SevenZip, stream, 11).unwrap();
+        for &want in &plain[..640] {
+            assert_eq!(model.decode_symbol(&mut rc).unwrap(), want);
+        }
+        assert!(model.run_length > 0);
+
+        // Stand in for 2^31 predicted symbols.
+        model.run_length = i32::MAX;
+        assert_eq!(model.decode_symbol(&mut rc).unwrap(), plain[640]);
+        assert_eq!(model.run_length, i32::MIN);
     }
 }
