@@ -271,6 +271,137 @@ fn kwkwk_round_trip() {
     round_trip(&input);
 }
 
+// ─── CLEAR split across decode calls ───────────────────────────────────
+//
+// After a CLEAR code the rest of the current 8-code group is padding, and
+// only then does the dictionary reset. If the input ran out inside that
+// padding, the decoder used to forget the CLEAR was in progress: on the
+// next call it decoded the remaining padding codes as data and never reset
+// the dictionary — wrong output with no error, or a spurious `Corrupt`.
+
+/// Decode with fixed input chunks and a roomy output buffer, without
+/// unwrapping errors.
+fn try_decode_chunked(encoded: &[u8], in_chunk: usize) -> Result<Vec<u8>, compcol::Error> {
+    let mut dec = Decoder::new();
+    let mut decoded = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    for chunk in encoded.chunks(in_chunk) {
+        let mut consumed = 0;
+        loop {
+            let (p, status) = dec.decode(&chunk[consumed..], &mut buf)?;
+            decoded.extend_from_slice(&buf[..p.written]);
+            consumed += p.consumed;
+            match status {
+                Status::OutputFull => continue,
+                Status::InputEmpty | Status::StreamEnd => break,
+            }
+        }
+        assert_eq!(consumed, chunk.len());
+    }
+    loop {
+        let (p, status) = dec.finish(&mut buf)?;
+        decoded.extend_from_slice(&buf[..p.written]);
+        if status == Status::StreamEnd {
+            break;
+        }
+        assert!(p.written > 0, "decoder finish stalled");
+    }
+    Ok(decoded)
+}
+
+/// Header (block mode, 16 bits), then the 9-bit codes 'a', CLEAR, six
+/// padding codes (rest of the 8-code group), 'b', 'c'.
+const CLEAR_STREAM: &[u8] = &[
+    0x1f, 0x9d, 0x90, 0x61, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0xc6, 0x00,
+];
+
+#[test]
+fn clear_padding_split_at_every_byte() {
+    assert_eq!(
+        try_decode_chunked(CLEAR_STREAM, CLEAR_STREAM.len()).as_deref(),
+        Ok(&b"abc"[..])
+    );
+    // Two calls, split at every position.
+    for split in 0..=CLEAR_STREAM.len() {
+        let mut dec = Decoder::new();
+        let mut buf = [0u8; 64];
+        let mut out = Vec::new();
+        for part in [&CLEAR_STREAM[..split], &CLEAR_STREAM[split..]] {
+            let (p, _) = dec.decode(part, &mut buf).unwrap();
+            assert_eq!(p.consumed, part.len());
+            out.extend_from_slice(&buf[..p.written]);
+        }
+        let (p, status) = dec.finish(&mut buf).unwrap();
+        out.extend_from_slice(&buf[..p.written]);
+        assert_eq!(status, Status::StreamEnd);
+        assert_eq!(out, b"abc", "split at {split}");
+    }
+    // Every fixed chunk size.
+    for chunk in 1..=CLEAR_STREAM.len() {
+        assert_eq!(
+            try_decode_chunked(CLEAR_STREAM, chunk).as_deref(),
+            Ok(&b"abc"[..]),
+            "chunk size {chunk}"
+        );
+    }
+}
+
+#[test]
+fn clear_pending_does_not_survive_reset() {
+    // Stop inside the post-CLEAR padding, reset, then decode a fresh
+    // stream: the abandoned CLEAR must not eat the new stream's codes.
+    let mut dec = Decoder::new();
+    let mut buf = [0u8; 64];
+    dec.decode(&CLEAR_STREAM[..8], &mut buf).unwrap();
+    dec.reset();
+    let (p, _) = dec.decode(CLEAR_STREAM, &mut buf).unwrap();
+    let mut out = buf[..p.written].to_vec();
+    let (p, status) = dec.finish(&mut buf).unwrap();
+    out.extend_from_slice(&buf[..p.written]);
+    assert_eq!(status, Status::StreamEnd);
+    assert_eq!(out, b"abc");
+}
+
+#[test]
+fn encoder_clears_decode_the_same_in_any_chunking() {
+    // Text from a fixed vocabulary fills the dictionary and compresses
+    // well; the random tail then wrecks the ratio, so the encoder emits
+    // CLEAR codes. One-shot and chunked decodes must agree.
+    let mut s = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let vocab: Vec<Vec<u8>> = (0..3000)
+        .map(|_| {
+            let len = 2 + (next() % 9) as usize;
+            (0..len).map(|_| b'a' + (next() % 26) as u8).collect()
+        })
+        .collect();
+    let mut input = Vec::new();
+    while input.len() < 1_000_000 {
+        input.extend_from_slice(&vocab[(next() % 3000) as usize]);
+        input.push(b' ');
+    }
+    for _ in 0..300_000 {
+        input.push(next() as u8);
+    }
+
+    let encoded = compcol::vec::compress_to_vec::<Lzw>(&input).unwrap();
+    let one_shot = try_decode_chunked(&encoded, encoded.len());
+    assert!(one_shot.as_ref() == Ok(&input), "one-shot decode differs");
+    for chunk in [1, 7, 4096] {
+        let got = try_decode_chunked(&encoded, chunk);
+        assert!(
+            got.as_ref() == Ok(&input),
+            "chunk size {chunk}: {:?}",
+            got.map(|v| v.len())
+        );
+    }
+}
+
 #[cfg(feature = "factory")]
 mod factory {
     use compcol::Status;
