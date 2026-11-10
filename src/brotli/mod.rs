@@ -68,6 +68,9 @@ mod encoder_optimal;
 mod huffman;
 mod transforms;
 
+#[cfg(test)]
+mod decoder_tests;
+
 use alloc::rc::Rc;
 
 use context::ContextMode;
@@ -1855,6 +1858,9 @@ pub struct Decoder {
     /// The compressed meta-block being decoded, once its header is read
     /// and until its last command is done.
     meta_block: Option<Box<MetaBlock>>,
+    /// Test instrumentation: bytes of `out` shifted down by `compact_out`.
+    #[cfg(test)]
+    out_moved: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1897,6 +1903,8 @@ impl Decoder {
             p1: 0,
             p2: 0,
             meta_block: None,
+            #[cfg(test)]
+            out_moved: 0,
         }
     }
 
@@ -1950,28 +1958,34 @@ impl Decoder {
     /// Compact the output queue, retaining the last `window_size` bytes
     /// of history for back-references. Caller-consumed bytes beyond the
     /// retained history are dropped.
+    ///
+    /// Only done once the droppable prefix is at least as large as what
+    /// stays (the window plus the output not yet handed out). Dropping
+    /// just the bytes read by each call would shift everything kept —
+    /// up to 16 MiB of window and as much queued output — on every call,
+    /// however small the read. This way each byte kept is moved at most
+    /// once per byte dropped, and `out` stays under twice what it has to
+    /// hold.
+    ///
+    /// `out_pos` is the only index into `out` kept across calls (copies
+    /// address it from its end, via `total_out`), so nothing else needs
+    /// adjusting.
     fn compact_out(&mut self) {
-        if self.out_pos == 0 {
-            return;
-        }
         let want_history = self.window_size as usize;
-        // Cap the working buffer at `want_history` bytes of history
-        // plus any not-yet-delivered output. We never drop output that
-        // hasn't been written to the caller.
-        let unread = self.out.len() - self.out_pos;
-        let total_keep_target = want_history + unread;
-        if self.out.len() <= total_keep_target {
-            // Everything currently in `out` fits in window+queue: leave
-            // it untouched. out_pos stays as the read cursor; we just
-            // don't drop anything.
+        // Bytes already handed out that no back-reference can reach.
+        let Some(drop_n) = self.out_pos.checked_sub(want_history) else {
+            return;
+        };
+        let keep = self.out.len() - drop_n;
+        if drop_n == 0 || drop_n < keep {
             return;
         }
-        let drop_n = self.out.len() - total_keep_target;
-        let drop_n = drop_n.min(self.out_pos);
-        if drop_n > 0 {
-            self.out.drain(..drop_n);
-            self.out_pos -= drop_n;
+        #[cfg(test)]
+        {
+            self.out_moved += keep as u64;
         }
+        self.out.drain(..drop_n);
+        self.out_pos -= drop_n;
     }
 
     /// Try to parse the stream header. Returns Ok(true) when consumed,
