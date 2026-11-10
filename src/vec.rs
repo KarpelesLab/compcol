@@ -60,7 +60,17 @@ pub fn compress_to_vec_with<A: Algorithm>(
         consumed += p.consumed;
         match status {
             Status::InputEmpty => break,
-            Status::OutputFull => continue,
+            // `OutputFull` normally means "drain and call again", but an
+            // encoder that reports it without consuming input or writing
+            // output has stalled, and looping would spin on unchanged state
+            // forever. Input is still pending, so moving on to `finish`
+            // would return a stream that silently lacks it: fail instead,
+            // as the `finish` stall below does.
+            Status::OutputFull => {
+                if p.consumed == 0 && p.written == 0 {
+                    return Err(Error::Corrupt);
+                }
+            }
             Status::StreamEnd => break,
         }
     }

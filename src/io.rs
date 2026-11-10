@@ -17,7 +17,9 @@
 //! The two writer adapters call their codec's `finish` on `Drop` if not
 //! already finished, swallowing any I/O or codec error. Call
 //! [`EncoderWriter::finish`] / [`DecoderWriter::finish`] explicitly to
-//! surface those errors.
+//! surface those errors. Once the codec itself has failed, a writer is done
+//! for: `Drop` leaves the codec alone and an explicit `finish` reports an
+//! error, rather than finishing a codec whose state is unspecified.
 //!
 //! ```ignore
 //! use std::io::Write;
@@ -90,6 +92,10 @@ pub struct EncoderWriter<W: Write, E: Encoder> {
     out_pos: usize,
     out_len: usize,
     finished: bool,
+    /// Set once the codec has reported an error or stalled. Its state is
+    /// then unspecified, so it is never driven again — in particular not by
+    /// the finish-on-`Drop`, whose output would land in `inner`.
+    errored: bool,
 }
 
 impl<W: Write, E: Encoder> EncoderWriter<W, E> {
@@ -102,6 +108,7 @@ impl<W: Write, E: Encoder> EncoderWriter<W, E> {
             out_pos: 0,
             out_len: 0,
             finished: false,
+            errored: false,
         }
     }
 
@@ -138,13 +145,24 @@ impl<W: Write, E: Encoder> EncoderWriter<W, E> {
         if self.finished {
             return Ok(());
         }
+        if self.errored {
+            return Err(io::Error::other(
+                "encoder failed earlier; the stream is incomplete",
+            ));
+        }
         let inner = match self.inner.as_mut() {
             Some(w) => w,
             None => return Ok(()),
         };
         drain_pending(inner, &self.scratch, &mut self.out_pos, self.out_len)?;
         loop {
-            let (p, status) = self.enc.finish(&mut self.scratch)?;
+            let (p, status) = match self.enc.finish(&mut self.scratch) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.errored = true;
+                    return Err(e.into());
+                }
+            };
             self.out_pos = 0;
             self.out_len = p.written;
             drain_pending(inner, &self.scratch, &mut self.out_pos, self.out_len)?;
@@ -152,6 +170,7 @@ impl<W: Write, E: Encoder> EncoderWriter<W, E> {
                 break;
             }
             if p.written == 0 {
+                self.errored = true;
                 return Err(io::Error::other("encoder stalled in finish"));
             }
         }
@@ -174,7 +193,13 @@ impl<W: Write, E: Encoder> Write for EncoderWriter<W, E> {
         drain_pending(inner, &self.scratch, &mut self.out_pos, self.out_len)?;
         let mut consumed = 0;
         while consumed < buf.len() {
-            let (p, status) = self.enc.encode(&buf[consumed..], &mut self.scratch)?;
+            let (p, status) = match self.enc.encode(&buf[consumed..], &mut self.scratch) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.errored = true;
+                    return Err(e.into());
+                }
+            };
             consumed += p.consumed;
             self.out_pos = 0;
             self.out_len = p.written;
@@ -189,7 +214,16 @@ impl<W: Write, E: Encoder> Write for EncoderWriter<W, E> {
             }
             match status {
                 Status::InputEmpty => break,
-                Status::OutputFull => continue,
+                // `OutputFull` normally means "drain and call again", but a
+                // codec that reports it without consuming input or writing
+                // output has stalled: calling again would spin on unchanged
+                // state forever.
+                Status::OutputFull => {
+                    if p.consumed == 0 && p.written == 0 {
+                        self.errored = true;
+                        return Err(io::Error::other("encoder stalled with input pending"));
+                    }
+                }
                 Status::StreamEnd => break,
             }
         }
@@ -204,6 +238,11 @@ impl<W: Write, E: Encoder> Write for EncoderWriter<W, E> {
             return Ok(());
         };
         drain_pending(w, &self.scratch, &mut self.out_pos, self.out_len)?;
+        if self.errored {
+            return Err(io::Error::other(
+                "encoder failed earlier; the stream is incomplete",
+            ));
+        }
         if !self.finished {
             loop {
                 let (p, status) = match self.enc.flush(&mut self.scratch, Flush::Sync) {
@@ -211,7 +250,10 @@ impl<W: Write, E: Encoder> Write for EncoderWriter<W, E> {
                     // A build that cannot byte-align mid-stream (`embed`)
                     // has nothing it can flush; that's not a write error.
                     Err(Error::Unsupported) => break,
-                    Err(e) => return Err(e.into()),
+                    Err(e) => {
+                        self.errored = true;
+                        return Err(e.into());
+                    }
                 };
                 self.out_pos = 0;
                 self.out_len = p.written;
@@ -220,6 +262,7 @@ impl<W: Write, E: Encoder> Write for EncoderWriter<W, E> {
                     break;
                 }
                 if p.written == 0 {
+                    self.errored = true;
                     return Err(io::Error::other("encoder stalled in flush"));
                 }
             }
@@ -353,6 +396,10 @@ pub struct DecoderWriter<W: Write, D: Decoder> {
     out_pos: usize,
     out_len: usize,
     finished: bool,
+    /// Set once the codec has reported an error or stalled. Its state is
+    /// then unspecified, so it is never driven again — in particular not by
+    /// the finish-on-`Drop`, whose output would land in `inner`.
+    errored: bool,
 }
 
 impl<W: Write, D: Decoder> DecoderWriter<W, D> {
@@ -364,6 +411,7 @@ impl<W: Write, D: Decoder> DecoderWriter<W, D> {
             out_pos: 0,
             out_len: 0,
             finished: false,
+            errored: false,
         }
     }
 
@@ -394,13 +442,24 @@ impl<W: Write, D: Decoder> DecoderWriter<W, D> {
         if self.finished {
             return Ok(());
         }
+        if self.errored {
+            return Err(io::Error::other(
+                "decoder failed earlier; the stream is incomplete",
+            ));
+        }
         let inner = match self.inner.as_mut() {
             Some(w) => w,
             None => return Ok(()),
         };
         drain_pending(inner, &self.scratch, &mut self.out_pos, self.out_len)?;
         loop {
-            let (p, status) = self.dec.finish(&mut self.scratch)?;
+            let (p, status) = match self.dec.finish(&mut self.scratch) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.errored = true;
+                    return Err(e.into());
+                }
+            };
             self.out_pos = 0;
             self.out_len = p.written;
             drain_pending(inner, &self.scratch, &mut self.out_pos, self.out_len)?;
@@ -408,6 +467,7 @@ impl<W: Write, D: Decoder> DecoderWriter<W, D> {
                 break;
             }
             if p.written == 0 {
+                self.errored = true;
                 return Err(io::Error::other("decoder stalled in finish"));
             }
         }
@@ -430,7 +490,13 @@ impl<W: Write, D: Decoder> Write for DecoderWriter<W, D> {
         drain_pending(inner, &self.scratch, &mut self.out_pos, self.out_len)?;
         let mut consumed = 0;
         while consumed < buf.len() {
-            let (p, status) = self.dec.decode(&buf[consumed..], &mut self.scratch)?;
+            let (p, status) = match self.dec.decode(&buf[consumed..], &mut self.scratch) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.errored = true;
+                    return Err(e.into());
+                }
+            };
             consumed += p.consumed;
             self.out_pos = 0;
             self.out_len = p.written;
@@ -445,7 +511,16 @@ impl<W: Write, D: Decoder> Write for DecoderWriter<W, D> {
             }
             match status {
                 Status::InputEmpty => break,
-                Status::OutputFull => continue,
+                // `OutputFull` normally means "drain and call again", but a
+                // codec that reports it without consuming input or writing
+                // output has stalled: calling again would spin on unchanged
+                // state forever.
+                Status::OutputFull => {
+                    if p.consumed == 0 && p.written == 0 {
+                        self.errored = true;
+                        return Err(io::Error::other("decoder stalled with input pending"));
+                    }
+                }
                 Status::StreamEnd => break,
             }
         }

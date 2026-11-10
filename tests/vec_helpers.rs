@@ -352,3 +352,73 @@ mod drain_contract {
         );
     }
 }
+
+// ─── stall guard: an encoder that makes no progress ─────────────────────
+
+mod stalled_encoder {
+    use compcol::{Algorithm, Decoder, Encoder, Error, Progress, Status};
+
+    /// Reports `OutputFull` forever without consuming or producing a byte.
+    /// No real codec does this; the helper must still terminate. To keep a
+    /// regression from hanging the suite, the mock panics once it has been
+    /// called far more often than any sane driver would.
+    #[derive(Default)]
+    struct StallingEncoder {
+        calls: u32,
+    }
+
+    impl Encoder for StallingEncoder {
+        fn encode(&mut self, _: &[u8], _: &mut [u8]) -> Result<(Progress, Status), Error> {
+            self.calls += 1;
+            assert!(self.calls < 1000, "driver spins on a stalled encoder");
+            Ok((Progress::default(), Status::OutputFull))
+        }
+        fn finish(&mut self, _: &mut [u8]) -> Result<(Progress, Status), Error> {
+            Ok((Progress::default(), Status::StreamEnd))
+        }
+        fn reset(&mut self) {
+            self.calls = 0;
+        }
+    }
+
+    struct NullDecoder;
+
+    impl Decoder for NullDecoder {
+        fn decode(&mut self, _: &[u8], _: &mut [u8]) -> Result<(Progress, Status), Error> {
+            Ok((Progress::default(), Status::StreamEnd))
+        }
+        fn finish(&mut self, _: &mut [u8]) -> Result<(Progress, Status), Error> {
+            Ok((Progress::default(), Status::StreamEnd))
+        }
+        fn reset(&mut self) {}
+        fn discard_output(&mut self, _: &[u8], _: usize) -> Result<(Progress, Status), Error> {
+            Ok((Progress::default(), Status::StreamEnd))
+        }
+    }
+
+    struct Stalling;
+
+    impl Algorithm for Stalling {
+        const NAME: &'static str = "stalling";
+        type Encoder = StallingEncoder;
+        type Decoder = NullDecoder;
+        type EncoderConfig = ();
+        type DecoderConfig = ();
+        fn encoder_with(_: ()) -> StallingEncoder {
+            StallingEncoder::default()
+        }
+        fn decoder_with(_: ()) -> NullDecoder {
+            NullDecoder
+        }
+    }
+
+    #[test]
+    fn compress_to_vec_errors_instead_of_spinning() {
+        // Input is still pending, so quietly moving on to `finish` would
+        // return a "successful" stream that is missing all of it.
+        assert_eq!(
+            compcol::vec::compress_to_vec::<Stalling>(b"pending input"),
+            Err(Error::Corrupt)
+        );
+    }
+}

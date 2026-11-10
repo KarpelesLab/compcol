@@ -209,7 +209,13 @@ fn stream_encode(
             consumed += p.consumed;
             match status {
                 Status::InputEmpty => break,
-                Status::OutputFull => continue,
+                // "Drain and call again" — unless nothing moved, in which
+                // case calling again would spin on unchanged state forever.
+                Status::OutputFull => {
+                    if p.consumed == 0 && p.written == 0 {
+                        return Err(io::Error::other("encoder stalled with input pending"));
+                    }
+                }
                 Status::StreamEnd => break,
             }
         }
@@ -254,7 +260,13 @@ fn stream_decode(
             consumed += p.consumed;
             match status {
                 Status::InputEmpty => break,
-                Status::OutputFull => continue,
+                // "Drain and call again" — unless nothing moved, in which
+                // case calling again would spin on unchanged state forever.
+                Status::OutputFull => {
+                    if p.consumed == 0 && p.written == 0 {
+                        return Err(io::Error::other("decoder stalled with input pending"));
+                    }
+                }
                 Status::StreamEnd => break,
             }
         }
@@ -726,4 +738,75 @@ fn run(args: &Args) -> Result<(), RunError> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use compcol::{Error, Progress, Status};
+
+    /// A codec that reports `OutputFull` forever without consuming or
+    /// producing anything. No real codec does this; the streaming loops must
+    /// still terminate. To keep a regression from hanging the suite, the mock
+    /// panics once it has been called far more often than a sane driver
+    /// would.
+    #[derive(Default)]
+    struct Stalling {
+        calls: u32,
+    }
+
+    impl Stalling {
+        fn step(&mut self) -> Result<(Progress, Status), Error> {
+            self.calls += 1;
+            assert!(self.calls < 1000, "streaming loop spins on a stalled codec");
+            Ok((Progress::default(), Status::OutputFull))
+        }
+    }
+
+    impl Encoder for Stalling {
+        fn encode(&mut self, _: &[u8], _: &mut [u8]) -> Result<(Progress, Status), Error> {
+            self.step()
+        }
+        fn finish(&mut self, _: &mut [u8]) -> Result<(Progress, Status), Error> {
+            Ok((Progress::default(), Status::StreamEnd))
+        }
+        fn reset(&mut self) {}
+    }
+
+    impl Decoder for Stalling {
+        fn decode(&mut self, _: &[u8], _: &mut [u8]) -> Result<(Progress, Status), Error> {
+            self.step()
+        }
+        fn finish(&mut self, _: &mut [u8]) -> Result<(Progress, Status), Error> {
+            Ok((Progress::default(), Status::StreamEnd))
+        }
+        fn reset(&mut self) {}
+        fn discard_output(&mut self, _: &[u8], _: usize) -> Result<(Progress, Status), Error> {
+            self.step()
+        }
+    }
+
+    #[test]
+    fn stream_encode_errors_on_a_stalled_encoder() {
+        let mut out = Vec::new();
+        let err = stream_encode(
+            Box::new(Stalling::default()),
+            &mut &b"pending input"[..],
+            &mut out,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("stalled"), "{err}");
+    }
+
+    #[test]
+    fn stream_decode_errors_on_a_stalled_decoder() {
+        let mut out = Vec::new();
+        let err = stream_decode(
+            Box::new(Stalling::default()),
+            &mut &b"pending input"[..],
+            &mut out,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("stalled"), "{err}");
+    }
 }
