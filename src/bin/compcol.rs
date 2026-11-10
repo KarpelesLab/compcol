@@ -421,6 +421,12 @@ impl From<io::Error> for RunError {
     }
 }
 
+/// The codec selected for this run, resolved before any output is opened.
+enum Codec {
+    Encoder(Box<dyn Encoder>),
+    Decoder(Box<dyn Decoder>),
+}
+
 /// Number of leading bytes buffered for format auto-detection. The longest
 /// magic we examine is the StuffIt-classic check, which reaches byte 13, so a
 /// 16-byte window is comfortably sufficient.
@@ -482,6 +488,22 @@ fn run(args: &Args) -> Result<(), RunError> {
         Box::new(io::Cursor::new(peeked).chain(reader))
     };
 
+    // Resolve the codec BEFORE touching the output: an unknown algorithm must
+    // not create an empty output file, nor (with --force) truncate an
+    // existing one.
+    let unknown = || RunError::Usage(format!("unknown algorithm: '{algo}' (use --list)"));
+    let codec = if args.decompress {
+        Codec::Decoder(factory::decoder_by_name(&algo).ok_or_else(unknown)?)
+    } else {
+        Codec::Encoder(
+            match args.level {
+                Some(level) => factory::encoder_by_name_with_level(&algo, level),
+                None => factory::encoder_by_name(&algo),
+            }
+            .ok_or_else(unknown)?,
+        )
+    };
+
     let output = derive_output(args, &algo).map_err(RunError::Usage)?;
 
     // Writer + the path we'd remove on cleanup if anything goes wrong.
@@ -532,30 +554,23 @@ fn run(args: &Args) -> Result<(), RunError> {
         }
     };
 
-    let result = if args.decompress {
-        let dec = factory::decoder_by_name(&algo)
-            .ok_or_else(|| RunError::Usage(format!("unknown algorithm: '{algo}' (use --list)")))?;
-        stream_decode(dec, &mut *reader, &mut *writer)
-    } else {
-        let enc = match args.level {
-            Some(level) => factory::encoder_by_name_with_level(&algo, level),
-            None => factory::encoder_by_name(&algo),
-        }
-        .ok_or_else(|| RunError::Usage(format!("unknown algorithm: '{algo}' (use --list)")))?;
-        stream_encode(enc, &mut *reader, &mut *writer)
-    };
+    // From here on the output exists: every failure — including the final
+    // flush — must go through the cleanup below rather than an early `?`.
+    let result = match codec {
+        Codec::Decoder(dec) => stream_decode(dec, &mut *reader, &mut *writer),
+        Codec::Encoder(enc) => stream_encode(enc, &mut *reader, &mut *writer),
+    }
+    .and_then(|()| writer.flush());
 
+    // Release the file handle before removing or reporting anything.
+    drop(writer);
     if let Err(e) = result {
-        // Best-effort: drop the writer (releases the file handle), remove the
-        // partial output, leave the input intact.
-        drop(writer);
+        // Best-effort: remove the partial output, leave the input intact.
         if let Some(p) = output_path {
             let _ = std::fs::remove_file(&p);
         }
         return Err(RunError::Io(e));
     }
-    writer.flush()?;
-    drop(writer);
 
     if should_remove_input
         && let Some(p) = &args.input

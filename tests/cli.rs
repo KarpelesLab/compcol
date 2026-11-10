@@ -540,3 +540,49 @@ fn level_ignored_on_algorithms_without_a_level_knob() {
     assert_eq!(code, 0);
     assert_eq!(back, b"aaaa");
 }
+
+// ─── output-file safety ─────────────────────────────────────────────────
+
+#[test]
+fn unknown_algorithm_does_not_truncate_force_target() {
+    // The algorithm must be validated before the output is opened: with -f
+    // an unknown -t used to truncate the existing target and then bail out.
+    for mode in [&[][..], &["-d"][..]] {
+        let s = Scratch::new("unknown_algo_force");
+        let input = s.file("in.txt");
+        let keep = s.file("keep.txt");
+        fs::write(&input, b"input data").unwrap();
+        fs::write(&keep, b"precious user data").unwrap();
+
+        let mut args = vec!["-t", "nosuch", "-f", "-o", keep.to_str().unwrap()];
+        args.extend_from_slice(mode);
+        args.push(input.to_str().unwrap());
+        let (_out, err, code) = run(&args);
+        assert_eq!(code, 2, "stderr: {}", String::from_utf8_lossy(&err));
+        assert!(
+            String::from_utf8_lossy(&err).contains("unknown algorithm"),
+            "{}",
+            String::from_utf8_lossy(&err)
+        );
+        assert_eq!(file_contents(&keep), b"precious user data");
+        assert_eq!(file_contents(&input), b"input data");
+    }
+}
+
+#[test]
+fn unknown_algorithm_does_not_create_output() {
+    for mode in [&[][..], &["-d"][..]] {
+        let s = Scratch::new("unknown_algo_new");
+        let input = s.file("in.txt");
+        let out = s.file("new.out");
+        fs::write(&input, b"input data").unwrap();
+
+        let mut args = vec!["-t", "nosuch", "-o", out.to_str().unwrap()];
+        args.extend_from_slice(mode);
+        args.push(input.to_str().unwrap());
+        let (_out, err, code) = run(&args);
+        assert_eq!(code, 2, "stderr: {}", String::from_utf8_lossy(&err));
+        assert!(!out.exists(), "an empty output file was left behind");
+        assert!(input.exists());
+    }
+}
