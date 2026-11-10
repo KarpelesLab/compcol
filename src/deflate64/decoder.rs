@@ -257,10 +257,13 @@ impl Decoder {
                     ..
                 }
         );
-        if blocked_on_output {
+        // Only bytes fed in this call can be handed back. Should the reader
+        // ever hold more than that, they stay where they are: `consumed`
+        // is then not exact, but no input is lost.
+        let held = (self.bit_reader.bits_available() / 8) as usize;
+        if blocked_on_output && held <= *consumed {
             let n = self.bit_reader.unfeed_whole_bytes() as usize;
-            debug_assert!(n <= *consumed);
-            *consumed -= n.min(*consumed);
+            *consumed -= n;
         }
     }
 }
@@ -445,10 +448,14 @@ impl Decoder {
                     progress = true;
                 }
                 if remaining == 0 {
+                    // Leaving the block is progress even when it was empty
+                    // and no byte moved: the caller's loop must go on to the
+                    // next block header with the bits already held, not
+                    // stop and leave them for the next call.
                     self.transition_after_block();
-                } else {
-                    self.state = DecState::Stored { remaining };
+                    return Ok(true);
                 }
+                self.state = DecState::Stored { remaining };
                 Ok(progress)
             }
 

@@ -776,3 +776,36 @@ fn finish_with_no_room_keeps_pending_output() {
     }
     assert_eq!(out, plain);
 }
+
+/// An empty stored block followed by more of the stream in the same call:
+/// the decoder used to stop after the empty block with the next block's
+/// bits still in its bit reader, and the following call then handed back
+/// bytes it had never been given (found by the `decoder_deflate64` fuzz
+/// target). The whole stream must decode in one call, with `consumed`
+/// stopping exactly at its end.
+#[test]
+fn empty_stored_block_does_not_strand_the_next_block() {
+    // Stored block of length 0 (not final), then a final fixed block
+    // holding one literal (200) — 8 bytes — and one byte of trailing data.
+    let data = [0x00, 0x00, 0x00, 0xff, 0xff, 0x3b, 0x01, 0x80, 0x00];
+    for chunk in [data.len(), 1, 2, 3, 5] {
+        let mut dec = Deflate64::decoder();
+        let mut out = [0u8; 16];
+        let (mut pos, mut written, mut ended) = (0, 0, false);
+        while pos < data.len() && !ended {
+            let end = (pos + chunk).min(data.len());
+            let (p, status) = dec.decode(&data[pos..end], &mut out[written..]).unwrap();
+            pos += p.consumed;
+            written += p.written;
+            ended = status == Status::StreamEnd;
+            assert!(ended || p.consumed > 0, "stalled at {pos} (chunk {chunk})");
+        }
+        if !ended {
+            let (p, status) = dec.finish(&mut out[written..]).unwrap();
+            written += p.written;
+            assert_eq!(status, Status::StreamEnd);
+        }
+        assert_eq!(&out[..written], &[200], "chunk {chunk}");
+        assert_eq!(pos, 8, "consumed past the stream end (chunk {chunk})");
+    }
+}
