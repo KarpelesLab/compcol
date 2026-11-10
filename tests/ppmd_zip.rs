@@ -457,3 +457,69 @@ fn regenerate_fixtures() {
         std::fs::write(path, entry).unwrap();
     }
 }
+
+// ─── memory cap ───────────────────────────────────────────────────────
+
+/// The 2-byte header sizes the model arena (up to 256 MiB), allocated as
+/// soon as it is read. With a cap, a larger request is refused first.
+#[test]
+fn max_memory_rejects_a_larger_model_at_the_header() {
+    // Order 6, 256 MiB, restart: the whole input is the header.
+    let hostile = [0xF5, 0x0F];
+    let mut out = [0u8; 16];
+    let mut dec = ZipDecoder::new(1).with_max_memory(16 << 20);
+    assert_eq!(dec.decode(&hostile, &mut out), Err(Error::Unsupported));
+    assert_eq!(dec.finish(&mut out), Err(Error::Unsupported));
+    // The cap is configuration: it survives a reset.
+    dec.reset();
+    assert_eq!(dec.decode(&hostile, &mut out), Err(Error::Unsupported));
+
+    let mut dec = ZipDecoder::until_end_marker().with_max_memory(16 << 20);
+    assert_eq!(dec.decode(&hostile, &mut out), Err(Error::Unsupported));
+}
+
+#[test]
+fn max_memory_is_an_inclusive_bound() {
+    for name in ["short", "o16_text"] {
+        let data = fixture(name);
+        let want = input(name);
+        let h = u16::from_le_bytes([data[0], data[1]]);
+        let mem = (((h >> 4) & 0xFF) as usize + 1) << 20;
+
+        let dec = ZipDecoder::new(want.len() as u64).with_max_memory(mem);
+        let got = decode_chunked(dec, &data, usize::MAX, 1 << 16).unwrap();
+        assert!(got == want, "{name}: output differs");
+
+        let dec = ZipDecoder::new(want.len() as u64).with_max_memory(mem - 1);
+        assert_eq!(
+            decode_chunked(dec, &data, usize::MAX, 1 << 16),
+            Err(Error::Unsupported),
+            "{name}"
+        );
+    }
+}
+
+/// A reused decoder keeps its arena between entries; the cap must go on
+/// applying to each new header after `reset`.
+#[test]
+fn max_memory_applies_to_every_entry() {
+    let mut data = fixture("short");
+    let want = input("short");
+    let h = u16::from_le_bytes([data[0], data[1]]);
+    let mem = (((h >> 4) & 0xFF) as usize + 1) << 20;
+    // Padding, so `decode` alone can reach the last symbol.
+    data.extend_from_slice(&[0xAA; 1024]);
+    let mut dec = ZipDecoder::new(want.len() as u64).with_max_memory(mem);
+    let mut out = vec![0u8; want.len() + 1];
+    for _ in 0..2 {
+        let (p, st) = dec.decode(&data, &mut out).unwrap();
+        assert_eq!((p.written, st), (want.len(), Status::StreamEnd));
+        dec.reset();
+    }
+    // Same decoder, an entry asking for one MiB more.
+    let bigger = (h & 0xF00F) | ((((h >> 4) & 0xFF) + 1) << 4);
+    assert_eq!(
+        dec.decode(&bigger.to_le_bytes(), &mut out),
+        Err(Error::Unsupported)
+    );
+}

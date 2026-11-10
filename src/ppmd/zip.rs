@@ -44,9 +44,12 @@ enum Phase {
 /// know where to stop.
 ///
 /// The model allocates the memory size named in the header (up to
-/// 256 MiB) when the header arrives. If that allocation fails the decoder
-/// returns [`Error::Unsupported`]. The freeze restore method (2) is also
-/// [`Error::Unsupported`], as in 7-Zip.
+/// 256 MiB) when the header arrives, so two bytes of input can commit
+/// 256 MiB. Cap it with [`with_max_memory`](Self::with_max_memory) when
+/// the entry is not trusted: a header asking for more is then
+/// [`Error::Unsupported`], and nothing is allocated. If the allocation
+/// itself fails the decoder also returns [`Error::Unsupported`]. The
+/// freeze restore method (2) is [`Error::Unsupported`] too, as in 7-Zip.
 ///
 /// ```
 /// use compcol::ppmd::ZipDecoder;
@@ -79,6 +82,9 @@ pub struct ZipDecoder {
     model: Option<Box<Ppmd8>>,
     rc: RcState,
     poisoned: Option<Error>,
+    /// Largest model arena a header may ask for, in bytes. Configuration:
+    /// kept across `reset`.
+    max_memory: usize,
 }
 
 impl ZipDecoder {
@@ -101,6 +107,27 @@ impl ZipDecoder {
         Self::with_target(None)
     }
 
+    /// Cap the model arena at `max_memory` bytes: an entry whose header
+    /// asks for more is rejected with [`Error::Unsupported`] before the
+    /// arena is allocated. The default is
+    /// [`MAX_MEMORY`](super::MAX_MEMORY) (256 MiB), which accepts every
+    /// valid header. The setting is kept across
+    /// [`reset`](crate::Decoder::reset).
+    ///
+    /// ```
+    /// use compcol::ppmd::ZipDecoder;
+    /// use compcol::{Decoder as _, Error};
+    ///
+    /// // A header asking for 256 MiB, and nothing else.
+    /// let mut dec = ZipDecoder::new(1).with_max_memory(16 << 20);
+    /// let mut out = [0u8; 16];
+    /// assert_eq!(dec.decode(&[0xF5, 0x0F], &mut out), Err(Error::Unsupported));
+    /// ```
+    pub fn with_max_memory(mut self, max_memory: usize) -> Self {
+        self.max_memory = max_memory;
+        self
+    }
+
     fn with_target(target: Option<u64>) -> Self {
         Self {
             target,
@@ -111,6 +138,7 @@ impl ZipDecoder {
             model: None,
             rc: RcState::default(),
             poisoned: None,
+            max_memory: super::MAX_MEMORY,
         }
     }
 
@@ -151,6 +179,11 @@ impl ZipDecoder {
             _ => return Err(Error::BadHeader),
         }
         let mem_bytes = mem << 20;
+        // Refuse an arena over the caller's cap before allocating it (or
+        // reusing one kept from an earlier entry).
+        if mem_bytes as u64 > self.max_memory as u64 {
+            return Err(Error::Unsupported);
+        }
         let model = match self.model.take() {
             Some(m) if m.mem_size() == mem_bytes => m,
             _ => Box::new(Ppmd8::new(mem_bytes)?),

@@ -23,6 +23,7 @@ use alloc::vec::Vec;
 use crate::error::Error;
 use crate::traits::{RawDecoder, RawProgress};
 
+use super::DecoderConfig;
 use super::ppmd7::Ppmd7;
 use super::range_dec::{Mode, RangeDec};
 
@@ -50,13 +51,16 @@ pub struct Decoder {
     /// Caller's output limit (`u64::MAX` = none). Configuration: kept
     /// across `reset`.
     limit: u64,
+    /// Largest model arena a header may ask for
+    /// ([`DecoderConfig::max_memory`]). Configuration: kept across `reset`.
+    max_memory: usize,
 }
 
 /// Validate the 11-byte framing header, returning the declared unpacked
 /// length. Called from `raw_decode` as soon as 11 bytes have been buffered
 /// (so a hostile stream with a bad header is rejected immediately instead
 /// of after buffering its whole payload) and again from `run_decode`.
-fn validate_header(h: &[u8], limit: u64) -> Result<u64, Error> {
+fn validate_header(h: &[u8], limit: u64, max_memory: usize) -> Result<u64, Error> {
     let order = h[0] as u32;
     let mem_mb = h[1] as u32;
     let restoration = h[2];
@@ -68,6 +72,11 @@ fn validate_header(h: &[u8], limit: u64) -> Result<u64, Error> {
     }
     if restoration > 2 {
         return Err(Error::BadHeader);
+    }
+    // The header names the model arena's size and the arena is allocated
+    // whole; refuse one over the configured cap before that happens.
+    if (mem_mb as u64) << 20 > max_memory as u64 {
+        return Err(Error::Unsupported);
     }
     let expected_len = u64::from_le_bytes(h[3..11].try_into().unwrap());
     // PPMd carries no in-band end-of-stream marker, so a stream whose
@@ -96,8 +105,19 @@ fn validate_header(h: &[u8], limit: u64) -> Result<u64, Error> {
 }
 
 impl Decoder {
+    /// Decoder with the default configuration: any model size a header can
+    /// name (up to 255 MiB here) is allocated. See
+    /// [`with_config`](Self::with_config) to cap it.
     pub fn new() -> Self {
+        Self::with_config(DecoderConfig::default())
+    }
+
+    /// Decoder with the given options, e.g.
+    /// `DecoderConfig::default().with_max_memory(16 << 20)` to refuse
+    /// streams whose header asks for a model arena over 16 MiB.
+    pub fn with_config(config: DecoderConfig) -> Self {
         Self {
+            max_memory: config.max_memory,
             in_buf: Vec::new(),
             decoded: Vec::new(),
             decoded_idx: 0,
@@ -122,7 +142,7 @@ impl Decoder {
         let h = &self.in_buf[..HEADER_LEN];
         let order = h[0] as u32;
         let mem_mb = h[1] as u32;
-        let expected_len = validate_header(h, self.limit)?;
+        let expected_len = validate_header(h, self.limit, self.max_memory)?;
 
         let mem_bytes = mem_mb.saturating_mul(1024 * 1024);
         let mut model = Ppmd7::new(mem_bytes)?;
@@ -193,7 +213,8 @@ impl RawDecoder for Decoder {
         self.in_buf.extend_from_slice(input);
         if !self.header_checked && self.in_buf.len() >= HEADER_LEN {
             self.header_checked = true;
-            if let Err(e) = validate_header(&self.in_buf[..HEADER_LEN], self.limit) {
+            if let Err(e) = validate_header(&self.in_buf[..HEADER_LEN], self.limit, self.max_memory)
+            {
                 return Err(self.poison(e));
             }
         }

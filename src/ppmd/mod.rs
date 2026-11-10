@@ -60,6 +60,29 @@
 //! byte is retained for archive-wrapper parity; the model restarts on
 //! memory pressure regardless.
 //!
+//! ### Memory
+//!
+//! A PPMd model lives in an arena whose size the *stream header* picks:
+//! 1..=255 MiB in the standalone framing (header byte 1), 1..=256 MiB in a
+//! ZIP method 98 entry (8 bits of its 2-byte header). The decoder allocates
+//! and zero-fills the whole arena as soon as the header has been read,
+//! whatever the size of the data behind it, so by default **two header
+//! bytes are enough to make it commit 256 MiB**.
+//!
+//! When the input is not trusted, cap it: [`DecoderConfig::with_max_memory`]
+//! for the standalone decoder (or [`Decoder::with_config`]), and
+//! [`ZipDecoder::with_max_memory`] for ZIP entries. A header asking for a
+//! larger arena is then rejected with [`Error::Unsupported`] before anything
+//! is allocated. The default is [`MAX_MEMORY`] (256 MiB), which accepts
+//! every valid header. A stream can only be decoded with the arena size it
+//! was encoded for, so the cap decides which streams are accepted, not how
+//! well they decode.
+//!
+//! The cap is on the model arena only. The standalone decoder also buffers
+//! its input and its decoded output (at most 64 MiB); bound the latter with
+//! [`LimitedDecoder`](crate::limit::LimitedDecoder), which this decoder
+//! honours before decoding.
+//!
 //! ### References
 //!
 //! - Shkarin 2002 DCC paper "PPM: One step to practicality".
@@ -90,6 +113,53 @@ pub(crate) use ppmd7::Ppmd7;
 #[cfg(feature = "rar3")]
 pub(crate) use range_dec::{Mode as RangeMode, RangeDec};
 
+/// Largest model arena a PPMd header can ask for, in bytes (256 MiB, the
+/// top of the ZIP method 98 range), and the default
+/// [`DecoderConfig::max_memory`].
+pub const MAX_MEMORY: usize = 256 * 1024 * 1024;
+
+/// Decoder options for the standalone PPMd framing.
+///
+/// `#[non_exhaustive]`: construct via [`DecoderConfig::default`] and the
+/// `with_*` builders rather than a struct literal, so new options can be
+/// added in future without breaking downstream code.
+///
+/// ```
+/// use compcol::Algorithm;
+/// use compcol::ppmd::{DecoderConfig, Ppmd};
+///
+/// // Refuse streams whose header asks for a model over 16 MiB.
+/// let config = DecoderConfig::default().with_max_memory(16 << 20);
+/// let _decoder = Ppmd::decoder_with(config);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DecoderConfig {
+    /// Largest model arena, in bytes, a stream header may ask for. A
+    /// header asking for more is rejected with [`Error::Unsupported`]
+    /// before the arena is allocated. Default [`MAX_MEMORY`] (256 MiB),
+    /// which accepts every valid header; see the
+    /// [module docs](self#memory).
+    pub max_memory: usize,
+}
+
+impl Default for DecoderConfig {
+    fn default() -> Self {
+        Self {
+            max_memory: MAX_MEMORY,
+        }
+    }
+}
+
+impl DecoderConfig {
+    /// Set [`max_memory`](Self::max_memory), the largest model arena in
+    /// bytes a stream header may ask for.
+    pub fn with_max_memory(mut self, max_memory: usize) -> Self {
+        self.max_memory = max_memory;
+        self
+    }
+}
+
 /// Zero-sized marker type implementing [`Algorithm`] for PPMd.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Ppmd;
@@ -99,12 +169,12 @@ impl Algorithm for Ppmd {
     type Encoder = Encoder;
     type Decoder = Decoder;
     type EncoderConfig = ();
-    type DecoderConfig = ();
+    type DecoderConfig = DecoderConfig;
     fn encoder_with(_: ()) -> Encoder {
         Encoder::new()
     }
-    fn decoder_with(_: ()) -> Decoder {
-        Decoder::new()
+    fn decoder_with(config: DecoderConfig) -> Decoder {
+        Decoder::with_config(config)
     }
 }
 
