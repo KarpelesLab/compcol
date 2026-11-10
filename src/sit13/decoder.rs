@@ -52,8 +52,18 @@ const EOS_SYMBOL: u32 = 0x140;
 /// decoding runs until the `0x140` end-of-stream symbol, bounded by
 /// [`DEFAULT_OUTPUT_CAP`]: a stream that would produce more is rejected with
 /// [`Error::Corrupt`].
-pub(crate) fn decode_payload(input: &[u8], expected_len: Option<usize>) -> Result<Vec<u8>, Error> {
-    decode_payload_capped(input, expected_len, DEFAULT_OUTPUT_CAP)
+///
+/// `limit` is the caller's output limit
+/// ([`Decoder::set_output_limit`](crate::Decoder::set_output_limit),
+/// `u64::MAX` for none): a stream that would decode to more fails with
+/// [`Error::OutputLimitExceeded`] before the byte or match that crosses it
+/// is built, so no more than `limit` bytes are ever held.
+pub(crate) fn decode_payload(
+    input: &[u8],
+    expected_len: Option<usize>,
+    limit: u64,
+) -> Result<Vec<u8>, Error> {
+    decode_payload_capped(input, expected_len, DEFAULT_OUTPUT_CAP, limit)
 }
 
 /// [`decode_payload`] with the open-ended output cap as a parameter
@@ -62,6 +72,7 @@ fn decode_payload_capped(
     input: &[u8],
     expected_len: Option<usize>,
     open_cap: usize,
+    limit: u64,
 ) -> Result<Vec<u8>, Error> {
     if let Some(0) = expected_len {
         return Ok(Vec::new());
@@ -73,10 +84,12 @@ fn decode_payload_capped(
     }
 
     let cap = expected_len.unwrap_or(open_cap);
+    // The caller's output limit, as a length `out` may not grow past.
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
     let mut out: Vec<u8> = Vec::new();
     if let Some(n) = expected_len {
         // Pre-reserve modestly; do not trust a huge n to pre-allocate.
-        out.reserve(n.min(1 << 20));
+        out.reserve(n.min(limit).min(1 << 20));
     }
 
     let mut reader = BitReader::new(input);
@@ -145,6 +158,9 @@ fn decode_payload_capped(
                 // that would cross it.
                 return Err(Error::Corrupt);
             }
+            if out.len() >= limit {
+                return Err(Error::OutputLimitExceeded);
+            }
             window::emit_literal(&mut out, litlen as u8);
             use_a = true;
             continue;
@@ -181,15 +197,15 @@ fn decode_payload_capped(
         };
 
         // Bound the copy so a crafted huge length can't blow past the cap.
-        if out
-            .len()
-            .checked_add(length)
-            .map(|t| t > cap)
-            .unwrap_or(true)
-        {
+        let end = out.len().checked_add(length).ok_or(Error::Corrupt)?;
+        if end > cap {
             // For an explicit expected_len this is a corrupt stream; for the
             // open-ended cap it is a bomb guard.
             return Err(Error::Corrupt);
+        }
+        // Likewise the caller's limit, checked before the copy is made.
+        if end > limit {
+            return Err(Error::OutputLimitExceeded);
         }
         window::emit_match(&mut out, distance, length)?;
         use_a = false;
@@ -266,6 +282,13 @@ enum State {
 /// [`super::DecoderConfig`] (optionally [`with_len`](super::DecoderConfig::with_len)).
 /// Buffers the raw method-13 payload, decodes it in one pass once the stream
 /// ends, then drains the decoded bytes across `decode`/`finish` calls.
+///
+/// The decoded fork is held in memory until it has been drained. With an
+/// output limit set ([`set_output_limit`](crate::Decoder::set_output_limit),
+/// which [`LimitedDecoder`](crate::limit::LimitedDecoder) does for you), a
+/// stream that decodes to more than the limit fails with
+/// [`Error::OutputLimitExceeded`] before the excess is built; without one
+/// the bound is the supplied length, or 256 MiB when there is none.
 #[derive(Debug)]
 pub struct Decoder {
     expected_len: Option<usize>,
@@ -274,6 +297,9 @@ pub struct Decoder {
     out_cursor: usize,
     state: State,
     poisoned: bool,
+    /// Caller's output limit (`u64::MAX` = none). Configuration: kept
+    /// across `reset`.
+    limit: u64,
 }
 
 impl Default for Decoder {
@@ -293,6 +319,7 @@ impl Decoder {
             out_cursor: 0,
             state: State::Buffering,
             poisoned: false,
+            limit: u64::MAX,
         }
     }
 
@@ -306,6 +333,7 @@ impl Decoder {
             out_cursor: 0,
             state: State::Buffering,
             poisoned: false,
+            limit: u64::MAX,
         }
     }
 
@@ -316,7 +344,7 @@ impl Decoder {
         if self.expected_len == Some(0) {
             self.output = Vec::new();
         } else {
-            self.output = decode_payload(&self.input, self.expected_len)?;
+            self.output = decode_payload(&self.input, self.expected_len, self.limit)?;
         }
         self.state = State::Draining;
         Ok(())
@@ -390,40 +418,60 @@ impl RawDecoder for Decoder {
         self.state = State::Buffering;
         self.poisoned = false;
     }
+
+    fn raw_set_output_limit(&mut self, max_output_bytes: u64) {
+        self.limit = max_output_bytes;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limit::LimitedDecoder;
+    use crate::traits::Decoder as _;
 
-    /// Minimal method-13 writer for the predefined code set 1: literals and
-    /// the end-of-stream symbol only, so every symbol uses code A.
+    /// MSB-canonical codes for a length list, as `from_lengths` assigns
+    /// them: `(code, bit length)` per symbol.
+    fn canonical(lengths: &[u8]) -> Vec<(u32, u32)> {
+        let mut order: Vec<usize> = (0..lengths.len()).filter(|&s| lengths[s] != 0).collect();
+        order.sort_by_key(|&s| (lengths[s], s));
+        let mut codes = alloc::vec![(0u32, 0u32); lengths.len()];
+        let (mut code, mut prev) = (0u64, lengths[order[0]] as u32);
+        for s in order {
+            let l = lengths[s] as u32;
+            code <<= l - prev;
+            prev = l;
+            codes[s] = (code as u32, l);
+            code += 1;
+        }
+        codes
+    }
+
+    /// Minimal method-13 writer for the predefined code set 1: literals,
+    /// longest-form matches at distance 1, and the end-of-stream symbol.
     struct Writer {
         bytes: Vec<u8>,
         bits: usize,
-        codes: Vec<(u32, u32)>,
+        code_a: Vec<(u32, u32)>,
+        code_b: Vec<(u32, u32)>,
+        offsets: Vec<(u32, u32)>,
+        /// Next literal/length symbol uses code A (else code B).
+        use_a: bool,
     }
+
+    /// Bytes one [`Writer::runs`] match decodes to: symbol `0x13F` with all
+    /// 15 extra bits set.
+    const RUN_LEN: usize = 0x7FFF + 65;
 
     impl Writer {
         fn new() -> Self {
-            // MSB-canonical codes for the length list, as `from_lengths`
-            // assigns them.
-            let lengths = tables::PREDEFINED_FIRST[0];
-            let mut order: Vec<usize> = (0..lengths.len()).filter(|&s| lengths[s] != 0).collect();
-            order.sort_by_key(|&s| (lengths[s], s));
-            let mut codes = alloc::vec![(0u32, 0u32); lengths.len()];
-            let (mut code, mut prev) = (0u64, lengths[order[0]] as u32);
-            for s in order {
-                let l = lengths[s] as u32;
-                code <<= l - prev;
-                prev = l;
-                codes[s] = (code as u32, l);
-                code += 1;
-            }
             let mut w = Self {
                 bytes: Vec::new(),
                 bits: 0,
-                codes,
+                code_a: canonical(tables::PREDEFINED_FIRST[0]),
+                code_b: canonical(tables::PREDEFINED_SECOND[0]),
+                offsets: canonical(tables::PREDEFINED_OFFSET[0]),
+                use_a: true,
             };
             // Control byte: high nibble 1 = predefined set 1.
             for i in 0..8 {
@@ -440,17 +488,42 @@ mod tests {
             self.bits += 1;
         }
 
-        /// Emit a literal/length symbol: MSB-canonical code, first bit first.
-        fn symbol(&mut self, sym: u32) {
-            let (code, len) = self.codes[sym as usize];
+        /// Emit a code: MSB-canonical, first bit first.
+        fn code(&mut self, (code, len): (u32, u32)) {
+            assert!(len != 0, "symbol absent from the predefined code");
             for i in (0..len).rev() {
                 self.bit((code >> i) & 1);
             }
         }
 
+        /// Emit a literal/length symbol with whichever code is current.
+        fn symbol(&mut self, sym: u32) {
+            let c = if self.use_a {
+                self.code_a[sym as usize]
+            } else {
+                self.code_b[sym as usize]
+            };
+            self.code(c);
+        }
+
         fn literals(mut self, data: &[u8]) -> Self {
             for &b in data {
                 self.symbol(b as u32);
+                self.use_a = true;
+            }
+            self
+        }
+
+        /// `count` matches of [`RUN_LEN`] bytes at distance 1.
+        fn runs(mut self, count: usize) -> Self {
+            for _ in 0..count {
+                self.symbol(0x13F);
+                for _ in 0..15 {
+                    self.bit(1);
+                }
+                let c = self.offsets[0];
+                self.code(c);
+                self.use_a = false;
             }
             self
         }
@@ -463,18 +536,56 @@ mod tests {
         }
     }
 
+    /// Feed `stream` whole, then drain through `finish`.
+    fn drive<D: crate::traits::Decoder>(dec: &mut D, stream: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut out = Vec::new();
+        let mut buf = alloc::vec![0u8; 64 * 1024];
+        let mut pos = 0;
+        while pos < stream.len() {
+            let (p, _) = dec.decode(&stream[pos..], &mut buf)?;
+            out.extend_from_slice(&buf[..p.written]);
+            pos += p.consumed;
+        }
+        loop {
+            let (p, status) = dec.finish(&mut buf)?;
+            out.extend_from_slice(&buf[..p.written]);
+            if status == crate::Status::StreamEnd {
+                return Ok(out);
+            }
+        }
+    }
+
     #[test]
     fn writer_round_trips() {
         let stream = Writer::new().literals(b"stuffit!").finish(true);
-        assert_eq!(decode_payload(&stream, None).unwrap(), b"stuffit!");
-        assert_eq!(decode_payload(&stream, Some(8)).unwrap(), b"stuffit!");
+        assert_eq!(
+            decode_payload(&stream, None, u64::MAX).unwrap(),
+            b"stuffit!"
+        );
+        assert_eq!(
+            decode_payload(&stream, Some(8), u64::MAX).unwrap(),
+            b"stuffit!"
+        );
+    }
+
+    #[test]
+    fn writer_runs_round_trip() {
+        let stream = Writer::new()
+            .literals(b"x")
+            .runs(2)
+            .literals(b"y")
+            .finish(true);
+        let out = decode_payload(&stream, None, u64::MAX).unwrap();
+        assert_eq!(out.len(), 2 + 2 * RUN_LEN);
+        assert!(out[..out.len() - 1].iter().all(|&b| b == b'x'));
+        assert_eq!(out[out.len() - 1], b'y');
     }
 
     #[test]
     fn open_ended_output_exactly_at_cap_is_accepted() {
         let stream = Writer::new().literals(b"stuffit!").finish(true);
         assert_eq!(
-            decode_payload_capped(&stream, None, 8).unwrap(),
+            decode_payload_capped(&stream, None, 8, u64::MAX).unwrap(),
             b"stuffit!"
         );
     }
@@ -485,10 +596,89 @@ mod tests {
     #[test]
     fn open_ended_literal_past_cap_is_an_error() {
         let stream = Writer::new().literals(b"stuffit!!").finish(true);
-        assert_eq!(decode_payload_capped(&stream, None, 8), Err(Error::Corrupt));
+        assert_eq!(
+            decode_payload_capped(&stream, None, 8, u64::MAX),
+            Err(Error::Corrupt)
+        );
         // A known length is still the authority on where to stop.
         assert_eq!(
-            decode_payload_capped(&stream, Some(8), 8).unwrap(),
+            decode_payload_capped(&stream, Some(8), 8, u64::MAX).unwrap(),
+            b"stuffit!"
+        );
+    }
+
+    /// The audit's bomb, scaled down: a few dozen bytes that decode to
+    /// 1.3 MB. With an output limit the decoder must refuse instead of
+    /// building the fork.
+    #[test]
+    fn output_limit_refuses_a_bomb() {
+        let stream = Writer::new().literals(b"x").runs(40).finish(true);
+        assert!(stream.len() < 256);
+        let total = 1 + 40 * RUN_LEN;
+
+        let mut dec = Decoder::new();
+        assert_eq!(drive(&mut dec, &stream).unwrap().len(), total);
+
+        let mut dec = Decoder::new();
+        dec.set_output_limit(1024);
+        assert_eq!(drive(&mut dec, &stream), Err(Error::OutputLimitExceeded));
+
+        // The limit is configuration: it survives a reset.
+        dec.reset();
+        assert_eq!(drive(&mut dec, &stream), Err(Error::OutputLimitExceeded));
+    }
+
+    /// The limit is a bound, not an off-by-one: exactly `limit` bytes
+    /// decode, one more does not, whether the last token is a match or a
+    /// literal.
+    #[test]
+    fn output_exactly_at_the_limit_decodes() {
+        for stream in [
+            Writer::new().literals(b"x").runs(2).finish(true),
+            Writer::new()
+                .literals(b"x")
+                .runs(2)
+                .literals(b"yz")
+                .finish(true),
+        ] {
+            let plain = decode_payload(&stream, None, u64::MAX).unwrap();
+            let n = plain.len() as u64;
+
+            let mut dec = Decoder::new();
+            dec.set_output_limit(n);
+            assert_eq!(drive(&mut dec, &stream).unwrap(), plain);
+            dec.set_output_limit(n - 1);
+            dec.reset();
+            assert_eq!(drive(&mut dec, &stream), Err(Error::OutputLimitExceeded));
+
+            // Same with the length known out of band.
+            let mut dec = Decoder::with_len(plain.len());
+            dec.set_output_limit(n);
+            assert_eq!(drive(&mut dec, &stream).unwrap(), plain);
+            let mut dec = Decoder::with_len(plain.len());
+            dec.set_output_limit(n - 1);
+            assert_eq!(drive(&mut dec, &stream), Err(Error::OutputLimitExceeded));
+        }
+    }
+
+    /// `LimitedDecoder` passes its budget down, so the bomb is refused
+    /// rather than decoded and then found to be too long.
+    #[test]
+    fn limited_decoder_refuses_a_bomb() {
+        let stream = Writer::new().literals(b"x").runs(40).finish(true);
+        let mut dec = LimitedDecoder::new(Decoder::new(), 1024);
+        assert_eq!(drive(&mut dec, &stream), Err(Error::OutputLimitExceeded));
+        assert_eq!(
+            crate::vec::decompress_to_vec_capped::<crate::sit13::Sit13>(&stream, 1024),
+            Err(Error::OutputLimitExceeded)
+        );
+
+        // At exactly the budget a stream still decodes.
+        let small = Writer::new().literals(b"stuffit!").finish(true);
+        let mut dec = LimitedDecoder::new(Decoder::new(), 8);
+        assert_eq!(drive(&mut dec, &small).unwrap(), b"stuffit!");
+        assert_eq!(
+            crate::vec::decompress_to_vec_capped::<crate::sit13::Sit13>(&small, 8).unwrap(),
             b"stuffit!"
         );
     }
