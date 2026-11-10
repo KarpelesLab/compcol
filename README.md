@@ -449,6 +449,8 @@ Required:
     -t, --type ALGO         Algorithm (use --list to see what's compiled in).
                             Optional on -d: if omitted, the format is
                             auto-detected from the input's magic bytes.
+                            Archives (RAR, StuffIt) are recognised but not
+                            unpacked: -t is needed to run a codec on one.
 
 Mode:
     -d, --decompress        Decompress instead of compress

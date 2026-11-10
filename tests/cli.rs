@@ -1273,3 +1273,51 @@ fn force_from_stdin_keeps_the_replaced_files_permissions() {
     assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
     assert_eq!(mode_of(&fresh), mode_of(&reference));
 }
+
+// ─── auto-detection vs. archive containers ──────────────────────────────
+
+#[test]
+fn auto_detect_refuses_archive_containers() {
+    // `factory::detect` answers RAR and StuffIt magics with the name of a
+    // member codec, as a hint. The CLI used to take the hint literally and
+    // feed the whole archive — headers, directory and all — to that codec.
+    let mut sit_classic = b"SIT!\x00\x01\x00\x00\x10\x00rLau\x01\x00".to_vec();
+    sit_classic.extend_from_slice(&[0u8; 64]);
+    let cases: [(&[u8], &str); 4] = [
+        (b"Rar!\x1a\x07\x01\x00 rar5 archive body ...", "RAR"),
+        (b"Rar!\x1a\x07\x00 rar4 archive body .......", "RAR"),
+        (&sit_classic, "StuffIt"),
+        (b"StuffIt (c)1997-2002 Aladdin Systems, Inc.", "StuffIt"),
+    ];
+    for (bytes, kind) in cases {
+        let (out, err, code) = run_with_stdin(&["-d"], bytes);
+        let err = String::from_utf8_lossy(&err);
+        assert_eq!(code, 2, "{kind}: {err}");
+        assert!(
+            err.contains(&format!("looks like a {kind} archive")),
+            "{kind}: {err}"
+        );
+        assert!(err.contains("pass -t to force"), "{kind}: {err}");
+        assert!(out.is_empty());
+
+        // An explicit -t is taken at its word: the codec runs (and gets to
+        // report whatever it makes of the bytes), without the archive hint.
+        let (_out, err, _code) = run_with_stdin(&["-d", "-t", "gzip"], bytes);
+        let err = String::from_utf8_lossy(&err);
+        assert!(!err.contains("archive"), "{kind} with -t: {err}");
+    }
+}
+
+#[test]
+fn auto_detect_archive_refusal_touches_no_files() {
+    let s = Scratch::new("archive_detect");
+    let input = s.file("stuff.rar");
+    let bytes = b"Rar!\x1a\x07\x01\x00 not really an archive, but it claims to be";
+    fs::write(&input, bytes).unwrap();
+
+    let (_out, err, code) = run(&["-d", input.to_str().unwrap()]);
+    assert_eq!(code, 2, "{}", String::from_utf8_lossy(&err));
+    assert!(String::from_utf8_lossy(&err).contains("RAR archive"));
+    assert_eq!(names_in(&s.path), ["stuff.rar"]);
+    assert_eq!(file_contents(&input), bytes);
+}

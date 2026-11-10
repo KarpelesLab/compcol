@@ -26,6 +26,8 @@ Required:
     -t, --type ALGO         Algorithm (use --list to see what's compiled in).
                             Optional on -d: if omitted, the format is
                             auto-detected from the input's magic bytes.
+                            Archives (RAR, StuffIt) are recognised but not
+                            unpacked: -t is needed to run a codec on one.
 
 Mode:
     -d, --decompress        Decompress instead of compress
@@ -864,6 +866,35 @@ enum Codec {
 /// 16-byte window is comfortably sufficient.
 const PEEK_LEN: usize = 16;
 
+/// The archive format `prefix` belongs to, if it starts with the magic of a
+/// multi-member container rather than of a single compressed stream.
+///
+/// These are the magics [`factory::detect`] answers with a container *hint*
+/// — the name of a codec used for members inside such an archive (`rar1`,
+/// `rar2`, `rar3`, `rar5` for RAR; `arsenic` for StuffIt), not of something
+/// that can decode the file. They are matched here directly so the answer
+/// doesn't depend on which of those codecs are compiled in; `detected` is
+/// checked as well, so a hint that `detect` derives some other way is still
+/// never auto-dispatched.
+fn archive_kind(prefix: &[u8], detected: Option<&str>) -> Option<&'static str> {
+    // RAR 1.5–4.x ("Rar!\x1A\x07\x00") and RAR 5 ("Rar!\x1A\x07\x01\x00").
+    if prefix.starts_with(b"Rar!\x1A\x07") {
+        return Some("RAR");
+    }
+    // StuffIt classic ("SIT!" with the "rLau" signature at offset 10) and
+    // StuffIt 5 ("StuffIt (c)...").
+    if (prefix.len() >= 14 && prefix.starts_with(b"SIT!") && &prefix[10..14] == b"rLau")
+        || prefix.starts_with(b"StuffIt")
+    {
+        return Some("StuffIt");
+    }
+    match detected {
+        Some("rar1" | "rar2" | "rar3" | "rar5") => Some("RAR"),
+        Some("arsenic") => Some("StuffIt"),
+        _ => None,
+    }
+}
+
 const TRAILING_DATA: &str = "trailing data after the end of the compressed stream";
 
 fn run(args: &Args) -> Result<(), RunError> {
@@ -918,7 +949,17 @@ fn run(args: &Args) -> Result<(), RunError> {
         // Only reachable on decompress: main() rejects a missing -t on
         // compress before calling run().
         peeked = read_up_to(&mut reader, PEEK_LEN)?;
-        match factory::detect(&peeked) {
+        let detected = factory::detect(&peeked);
+        // For archive magics `detect` returns a member codec's name purely
+        // as a format hint. Dispatching on it would feed the archive's own
+        // headers and directory to a decoder for one member's raw stream.
+        if let Some(kind) = archive_kind(&peeked, detected) {
+            return Err(RunError::Usage(format!(
+                "looks like a {kind} archive; compcol decodes single compressed \
+                 streams, not archives — pass -t to force"
+            )));
+        }
+        match detected {
             Some(name) => name.to_string(),
             None => {
                 return Err(RunError::Usage(
