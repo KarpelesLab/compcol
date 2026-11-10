@@ -307,6 +307,28 @@ fn data_past_declared_size_is_corrupt() {
     assert_eq!(decode_one_shot(&stream), Err(Error::Corrupt));
 }
 
+/// A match that runs past the declared size is corrupt too: it used to be
+/// cut at the size and the stream reported as complete.
+#[test]
+fn match_past_declared_size_is_corrupt() {
+    // 30 bytes that end inside a match.
+    let data = b"abcabcabcabcabcabcabcabcabcabc";
+    let good = encode_one_shot(data);
+    assert_eq!(decode_one_shot(&good).unwrap(), data);
+    for (size, ok) in [(30u64, true), (29, false), (26, false), (4, false)] {
+        let mut stream = good.clone();
+        stream[5..13].copy_from_slice(&size.to_le_bytes());
+        for (ic, oc) in [(stream.len(), 65536), (1, 1), (7, 3)] {
+            let r = decode_chunked(&stream, ic, oc);
+            if ok {
+                assert_eq!(r.unwrap(), data, "size {size} chunks {ic}/{oc}");
+            } else {
+                assert_eq!(r, Err(Error::Corrupt), "size {size} chunks {ic}/{oc}");
+            }
+        }
+    }
+}
+
 // ─── algorithm metadata ─────────────────────────────────────────────────
 
 #[test]

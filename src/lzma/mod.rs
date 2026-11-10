@@ -745,16 +745,14 @@ impl LzmaCore {
     /// `Error::UnexpectedEnd`.
     fn step(&mut self, buf: &[u8], at_eof: bool) -> Result<PacketOutcome, Error> {
         let outcome = self.step_inner(buf, at_eof)?;
-        // The stream must end at exactly the declared size. With
-        // a size cap (`uncompressed_size`) matches are cut at the size; with
-        // a required marker nothing may run past it.
+        // The stream must end at exactly the declared size: no literal or
+        // match may run past it, whether or not a marker is required. (So
+        // the size caps on match copies in `drain_output` never bind.)
         if let Some(t) = self.expected_len {
             let bad = match outcome {
                 PacketOutcome::Eos => self.output_pos != t,
                 PacketOutcome::Literal(_) => self.output_pos >= t,
-                PacketOutcome::Match { length } => {
-                    self.uncompressed_size.is_none() && self.output_pos + length as u64 > t
-                }
+                PacketOutcome::Match { length } => self.output_pos + length as u64 > t,
                 PacketOutcome::NeedInput => false,
             };
             if bad {
@@ -1001,8 +999,8 @@ impl Decoder {
     ///   after them is read too).
     /// - marker only, or neither: decode until the marker.
     ///
-    /// A marker before the declared size, or data past it when the marker
-    /// is required, is [`Error::Corrupt`]. When the stream ends inside a
+    /// A marker before the declared size, or data past it (a literal, or a
+    /// match that runs over it), is [`Error::Corrupt`]. When the stream ends inside a
     /// [`decode`](crate::Decoder::decode) call the decoder returns
     /// `StreamEnd` and leaves the bytes after the entry unconsumed (except
     /// for up to 20 bytes taken by earlier calls when the input arrives in
