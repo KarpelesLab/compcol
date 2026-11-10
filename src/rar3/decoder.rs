@@ -16,27 +16,22 @@
 //!
 //! The compressed stream is still buffered in full by `decode`, and
 //! decoding starts on the first `finish` call: a PPMd block's range coder
-//! reads ahead of the symbols it has decoded and cannot be suspended, and
-//! the LZ path does not retry a symbol cut short by a chunk boundary. From
-//! there the output is produced incrementally, as the caller drains it:
-//! `finish` returns as soon as it has bytes to hand out, and decoding
-//! resumes on the next call.
+//! reads ahead of the symbols it has decoded, and neither path retries a
+//! symbol cut short by a chunk boundary. From there the output is produced
+//! incrementally, as the caller drains it: `finish` returns as soon as it
+//! has bytes to hand out, and decoding resumes at the next symbol on the
+//! next call — in LZ and PPMd blocks alike (a PPMd block's range coder is
+//! saved between calls; an escape sequence counts as one symbol).
 //!
 //! Decoded bytes are released one dictionary behind the decoding position
 //! — the lag the reference decoder has between unpacking into its 4 MiB
 //! window and writing it out, which is also when in-band filters run — and
-//! never past the start of a filter window that is not complete yet. For
-//! LZ blocks the output held inside the decoder is therefore bounded by
-//! the dictionary plus one filter window (about 4.3 MiB), whatever the
-//! unpacked size. Members smaller than the dictionary are released when
-//! they end, so an error in such a member is reported before any of its
-//! output.
+//! never past the start of a filter window that is not complete yet. The
+//! output held inside the decoder is therefore bounded by the dictionary
+//! plus one filter window (about 4.3 MiB), whatever the unpacked size.
+//! Members smaller than the dictionary are released when they end, so an
+//! error in such a member is reported before any of its output.
 //!
-//! **PPMd blocks are the exception**: the range decoder borrows the input
-//! for as long as it lives and its state cannot be saved, so a PPMd block
-//! decodes in one go and its whole output is held until it has been
-//! drained (lifting this needs a way to save and restore the range
-//! decoder's state in `crate::ppmd`).
 //! Set an output limit ([`set_output_limit`](crate::Decoder::set_output_limit),
 //! or wrap the decoder in a [`LimitedDecoder`](crate::limit::LimitedDecoder))
 //! when the input is untrusted: with a limit the decoder — in LZ and PPMd
@@ -105,7 +100,7 @@ use super::tables::{
     LOW_OFFSET_SIZE, MAIN_SIZE, OFFSET_BASE, OFFSET_EXTRA_BITS, OFFSET_SIZE, PRECODE_SIZE,
     SHORT_BASE, SHORT_EXTRA_BITS,
 };
-use crate::ppmd::{Ppmd7, RangeDec, RangeMode};
+use crate::ppmd::{Ppmd7, RangeDec, RangeDecState, RangeMode};
 
 /// Streaming RAR 3.x decoder. See module docs for the calling convention.
 pub struct Decoder {
@@ -339,9 +334,7 @@ impl RawDecoder for Decoder {
     /// With a limit set, a stream that decodes to more than
     /// `max_output_bytes` (in total — across the members of a solid group)
     /// fails with [`Error::OutputLimitExceeded`] at the symbol that would
-    /// cross it, before those bytes are produced. This matters most for
-    /// PPMd blocks, whose output is built in full before any of it is
-    /// handed out.
+    /// cross it, before those bytes are produced.
     fn raw_set_output_limit(&mut self, max_output_bytes: u64) {
         self.output_limit = max_output_bytes;
     }
@@ -382,7 +375,7 @@ const FILTER_WORK_FACTOR: u64 = 4;
 /// How a run of symbol decoding ended.
 enum Segment {
     /// Decoded output is waiting for the caller; decoding resumes at the
-    /// next symbol once it has been drained. (LZ blocks only.)
+    /// next symbol once it has been drained.
     Paused,
     /// The member is complete (declared size produced and, in solid mode,
     /// the end-of-member marker consumed).
@@ -476,6 +469,12 @@ struct RunCtx {
     /// blocks and solid members: a later PPMd block header without the
     /// reset flag reuses it (with a freshly initialised range coder).
     ppmd: Option<Box<PpmdBlock>>,
+    /// The range coder of the PPMd block being decoded, saved when
+    /// [`run_ppmd`] paused to let the caller drain. `None` when the block's
+    /// coder has yet to be primed from the bytes after its header. Never
+    /// outlives its block or its member: the coder reads this member's
+    /// payload only.
+    ppmd_coder: Option<RangeDecState>,
     /// Decoding mode of the current block (LZ+Huffman or PPMd).
     block: BlockKind,
     /// Whether valid LZ code tables are in effect, i.e. whether the next
@@ -541,6 +540,7 @@ impl RunCtx {
             last_filter_slot: 0,
             pending_filters: VecDeque::new(),
             ppmd: None,
+            ppmd_coder: None,
             block: BlockKind::Lz,
             tables_read: false,
         }
@@ -574,6 +574,8 @@ impl RunCtx {
         // Filter *programs* persist across solid members, but scheduled
         // filter instances never span a member boundary.
         self.pending_filters.clear();
+        // Nor does a range coder: it read the previous member's payload.
+        self.ppmd_coder = None;
         // A fresh stream — or a previous member that announced new tables —
         // starts with a block header; otherwise symbol decoding continues
         // directly under the carried-over tables.
@@ -632,10 +634,9 @@ impl RunCtx {
     /// finished. Only called with nothing waiting, so the delivered prefix
     /// can be dropped first.
     ///
-    /// LZ blocks stop at the release pass that made bytes final. A PPMd
-    /// block cannot stop — its range decoder borrows the input and has no
-    /// way to save its state — so it runs to its end; `out` then holds the
-    /// block's whole output (see the module docs).
+    /// LZ and PPMd blocks alike stop at the release pass that made bytes
+    /// final, which is what keeps `out` bounded (see
+    /// [`HELD_AFTER_RELEASE_MAX`]).
     fn pump(&mut self, solid: bool) -> Result<(), Error> {
         self.compact();
         loop {
@@ -923,6 +924,9 @@ fn parse_block_header(ctx: &mut RunCtx) -> Result<(), Error> {
         }
         ctx.bits.byte_align();
         ctx.block = BlockKind::Ppm;
+        // Every PPMd block header starts a fresh range coder, primed from
+        // the bytes that follow it.
+        ctx.ppmd_coder = None;
         // A PPMd block never leaves LZ tables in effect: after a PPMd
         // member, the next member always starts with its own header.
         ctx.tables_read = false;
@@ -1281,30 +1285,53 @@ fn read_member_end_lz(ctx: &mut RunCtx) -> Result<Segment, Error> {
 /// equal the escape byte, which introduces a control code (end-of-data, an
 /// LZ match, a filter declaration, a new table, or a literal-escape).
 /// Matches copy through the same sliding window as the LZ path so they
-/// interleave seamlessly. On return the bit reader is repositioned to the
-/// byte where the range-coded data ended.
+/// interleave seamlessly.
+///
+/// Like [`expand`], this returns [`Segment::Paused`] as soon as a release
+/// pass has made bytes final. The model lives in the context; the range
+/// coder borrows the input, so it is rebuilt on every call — primed from
+/// the payload on the block's first call, restored from
+/// `RunCtx::ppmd_coder` after a pause. On any other return the block is
+/// over and the bit reader is repositioned to the byte where the
+/// range-coded data ended.
 fn run_ppmd(ctx: &mut RunCtx, solid: bool) -> Result<Segment, Error> {
-    ctx.bits.byte_align();
+    let saved = ctx.ppmd_coder.take();
+    if saved.is_none() {
+        ctx.bits.byte_align();
+    }
     let payload_start = ctx.bits.consumed_bytes();
     // The range decoder reads the same bytes the bit reader owns: borrow
     // them (and the model) out of the context so the emit helpers can take
     // the context mutably alongside; both are put back on every path.
     let input = ctx.bits.take_buf();
-    let result = if payload_start > input.len() {
+    let result = if saved.is_none() && payload_start > input.len() {
         Err(Error::UnexpectedEnd)
     } else {
         match ctx.ppmd.take() {
             None => Err(Error::Corrupt),
             Some(mut pb) => {
-                let r = run_ppmd_inner(ctx, &input, payload_start, &mut pb, solid);
+                let coder = match saved {
+                    Some(state) => Ok(RangeDec::resume(RangeMode::Rar, &input, state)),
+                    None => RangeDec::init(RangeMode::Rar, &input, payload_start).map(|r| r.0),
+                };
+                let r = coder.and_then(|mut rc| {
+                    let seg = run_ppmd_inner(ctx, &mut rc, &mut pb, solid)?;
+                    Ok((seg, rc.save(), rc.pos()))
+                });
                 ctx.ppmd = Some(pb);
                 r
             }
         }
     };
     ctx.bits.restore_buf(input);
-    let (seg, end_pos) = result?;
-    ctx.bits.seek_byte(end_pos);
+    let (seg, coder, end_pos) = result?;
+    if matches!(seg, Segment::Paused) {
+        // The bit reader stays where the block's header left it; nothing
+        // reads it until the block ends.
+        ctx.ppmd_coder = Some(coder);
+    } else {
+        ctx.bits.seek_byte(end_pos);
+    }
     Ok(seg)
 }
 
@@ -1322,19 +1349,19 @@ fn ppmd_symbol(m: &mut Ppmd7, rc: &mut RangeDec) -> Result<u8, Error> {
     Ok(s)
 }
 
+/// The symbol loop of a PPMd block. Every return leaves `rc` between two
+/// symbols of the escape layer — a literal or one whole escape sequence,
+/// its match or filter declaration included — so the caller can save it.
 fn run_ppmd_inner(
     ctx: &mut RunCtx,
-    input: &[u8],
-    payload_start: usize,
+    rc: &mut RangeDec,
     pb: &mut PpmdBlock,
     solid: bool,
-) -> Result<(Segment, usize), Error> {
-    let (mut rc, _) = RangeDec::init(RangeMode::Rar, input, payload_start)?;
-
+) -> Result<Segment, Error> {
     loop {
         if ctx.done() {
             if !solid {
-                return Ok((Segment::MemberEnd, rc.pos()));
+                return Ok(Segment::MemberEnd);
             }
             // The encoder coded this member's end marker through the model;
             // decode it the same way or the shared statistics desync from
@@ -1343,64 +1370,69 @@ fn run_ppmd_inner(
             // still-running range coder across payloads — cross-member
             // coder state we don't support (rar 6.24 ends PPMd members
             // with an explicit marker).
-            let s = ppmd_symbol(&mut pb.model, &mut rc).map_err(|e| match e {
+            let s = ppmd_symbol(&mut pb.model, rc).map_err(|e| match e {
                 Error::UnexpectedEnd => Error::Unsupported,
                 other => other,
             })?;
             if s != pb.escape {
                 return Err(Error::Corrupt);
             }
-            let code = ppmd_symbol(&mut pb.model, &mut rc)?;
+            let code = ppmd_symbol(&mut pb.model, rc)?;
             return match code {
-                2 => Ok((Segment::MemberEnd, rc.pos())),
-                0 => Ok((Segment::NewTableThenEnd, rc.pos())),
+                2 => Ok(Segment::MemberEnd),
+                0 => Ok(Segment::NewTableThenEnd),
                 _ => Err(Error::Corrupt),
             };
         }
         if ctx.produced() >= ctx.next_release_at {
             // Same release points as the LZ path, so filters run (and the
-            // pending queue drains) at the same stream positions — but no
-            // pause: the range decoder cannot be suspended.
+            // pending queue drains) at the same stream positions.
             ctx.release(false)?;
+            if ctx.has_ready() {
+                // Let the caller drain before decoding further. The coder
+                // sits between two symbols; the caller saves it, and the
+                // model and escape byte stay in the context.
+                return Ok(Segment::Paused);
+            }
         }
-        let s = ppmd_symbol(&mut pb.model, &mut rc)?;
+        let s = ppmd_symbol(&mut pb.model, rc)?;
         if s != pb.escape {
             ctx.emit_literal(s)?;
             continue;
         }
-        let code = ppmd_symbol(&mut pb.model, &mut rc)?;
+        let code = ppmd_symbol(&mut pb.model, rc)?;
         match code {
             0 => {
                 // start-new-table: a fresh block header follows in the bit
                 // domain at the coder's byte position (it may keep PPMd
                 // with or without a model reset, or switch back to LZ).
-                return Ok((Segment::NewTable, rc.pos()));
+                return Ok(Segment::NewTable);
             }
             2 => {
                 // End of PPMd data before the declared size: short member.
                 // Solid mode turns this into an error in `finish_member`.
-                return Ok((Segment::MemberEnd, rc.pos()));
+                return Ok(Segment::MemberEnd);
             }
             3 => {
                 // A filter declaration carried in the PPMd stream: the same
                 // wire layout as main symbol 257, with every byte decoded
                 // through the model.
-                read_filter_declaration_ppmd(ctx, &mut pb.model, &mut rc)?;
+                read_filter_declaration_ppmd(ctx, &mut pb.model, rc)?;
             }
             4 => {
                 // 24-bit distance from three symbols (big-endian), then a
                 // length symbol. Distance +2, length +32.
                 let mut dist = 0u32;
                 for i in (0..3).rev() {
-                    let b = ppmd_symbol(&mut pb.model, &mut rc)? as u32;
+                    let b = ppmd_symbol(&mut pb.model, rc)? as u32;
                     dist |= b << (i * 8);
                 }
-                let len = ppmd_symbol(&mut pb.model, &mut rc)? as u32;
+                let len = ppmd_symbol(&mut pb.model, rc)? as u32;
                 ctx.emit_match(dist + 2, len + 32)?;
             }
             5 => {
                 // Distance-1 run: length symbol, length +4.
-                let len = ppmd_symbol(&mut pb.model, &mut rc)? as u32;
+                let len = ppmd_symbol(&mut pb.model, rc)? as u32;
                 ctx.emit_match(1, len + 4)?;
             }
             _ => {
@@ -1742,6 +1774,7 @@ mod tests {
             last_filter_slot: 0,
             pending_filters: VecDeque::new(),
             ppmd: None,
+            ppmd_coder: None,
             block: BlockKind::Lz,
             tables_read: false,
         }
@@ -2138,6 +2171,133 @@ mod tests {
         let mut want = [0x90, 0x90, 0xE8, 0x40, 0x00, 0x00, 0x00, 0x90];
         apply_e8_filter(&mut want, 0, false);
         assert_eq!(ctx.out, want);
+    }
+
+    // ─── Pausing inside PPMd blocks ──────────────────────────────────────
+
+    const PPMD_NOTES: &[u8] = include_bytes!("../../tests/fixtures/rar3/ppmd_notes.bin");
+    const PPMD_PROSE: &[u8] = include_bytes!("../../tests/fixtures/rar3/solid_ppmd_prose.bin");
+
+    /// What [`decode_group_pausing`] saw.
+    struct Paused {
+        /// Each member's delivered bytes.
+        members: Vec<Vec<u8>>,
+        err: Option<Error>,
+        /// `pump` calls that returned with a PPMd block suspended.
+        ppmd_pauses: usize,
+    }
+
+    /// Decode a solid group through the context, bringing the next release
+    /// pass — and with it the next pause — forward to `every` bytes after
+    /// each resumption. The real fixtures are far smaller than the
+    /// dictionary and would otherwise never pause.
+    fn decode_group_pausing(group: &[(&[u8], u64)], every: u64) -> Paused {
+        let mut ctx = RunCtx::new();
+        let mut seen = Paused {
+            members: Vec::new(),
+            err: None,
+            ppmd_pauses: 0,
+        };
+        let mut buf = [0u8; 61];
+        for &(payload, unpack_size) in group {
+            ctx.begin_member(payload.to_vec(), unpack_size, u64::MAX, None);
+            let mut out = Vec::new();
+            loop {
+                if !ctx.has_ready() && !ctx.member_finished() {
+                    ctx.next_release_at = ctx
+                        .next_release_at
+                        .min(ctx.produced().saturating_add(every));
+                    if let Err(e) = ctx.pump(true) {
+                        seen.members.push(out);
+                        seen.err = Some(e);
+                        return seen;
+                    }
+                    if ctx.ppmd_coder.is_some() {
+                        assert!(matches!(ctx.phase, Phase::Symbols));
+                        assert!(matches!(ctx.block, BlockKind::Ppm));
+                        seen.ppmd_pauses += 1;
+                    }
+                }
+                let n = ctx.drain_into(&mut buf);
+                out.extend_from_slice(&buf[..n]);
+                if !ctx.has_ready() && ctx.member_finished() {
+                    break;
+                }
+            }
+            assert!(ctx.ppmd_coder.is_none(), "a coder outlived its member");
+            ctx.end_member();
+            seen.members.push(out);
+        }
+        seen
+    }
+
+    /// A PPMd block suspended and resumed at every symbol of the escape
+    /// layer — between literals, around the match escapes rar codes
+    /// notes.txt with, and in a block that continues the previous member's
+    /// model — decodes exactly what an uninterrupted run does. (`tests/rar3.rs`
+    /// checks the uninterrupted run against the archives' CRCs.)
+    #[test]
+    fn ppmd_block_resumes_at_every_symbol() {
+        let group: &[(&[u8], u64)] = &[(PPMD_NOTES, 20001), (PPMD_PROSE, 236737)];
+        let straight = decode_group_pausing(group, u64::MAX);
+        assert_eq!(straight.err, None);
+        assert_eq!(straight.ppmd_pauses, 0);
+        assert_eq!(straight.members[0].len(), 20001);
+        assert_eq!(straight.members[1].len(), 236737);
+        for every in [1, 7, 4099] {
+            let paused = decode_group_pausing(group, every);
+            assert_eq!(paused.err, None, "every {every}");
+            assert!(
+                paused.members == straight.members,
+                "output differs when pausing every {every} bytes"
+            );
+            // Pauses come at symbol boundaries, so a match can overshoot
+            // `every`; they are still at least this frequent.
+            let total = 20001 + 236737;
+            assert!(
+                paused.ppmd_pauses as u64 >= total / (every + 300),
+                "every {every}: only {} pauses",
+                paused.ppmd_pauses
+            );
+        }
+    }
+
+    /// Damaged and truncated PPMd members (a flipped bit in the first, or
+    /// in the cut-short second) fail the same way whether or not the block
+    /// is suspended along the way, and nothing panics.
+    #[test]
+    fn damaged_ppmd_block_resumes_consistently() {
+        let mut seed = 0x2545_F491u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for round in 0..8 {
+            let mut notes = PPMD_NOTES.to_vec();
+            let mut prose = PPMD_PROSE[..2048].to_vec();
+            if round % 2 == 0 {
+                let at = next() as usize % notes.len();
+                notes[at] ^= 1 << (next() % 8);
+            } else {
+                let at = next() as usize % prose.len();
+                prose[at] ^= 1 << (next() % 8);
+            }
+            let group: &[(&[u8], u64)] = &[(&notes, 20001), (&prose, 236737)];
+            let straight = decode_group_pausing(group, u64::MAX);
+            for every in [1, 300] {
+                let paused = decode_group_pausing(group, every);
+                // Both runs decode the same symbols (no filters are in
+                // play), so they stop at the same one; the paused run has
+                // merely delivered more of the output by then.
+                assert_eq!(paused.err, straight.err, "round {round} every {every}");
+                assert_eq!(paused.members.len(), straight.members.len());
+                for (p, s) in paused.members.iter().zip(&straight.members) {
+                    assert!(p.len() >= s.len() && p[..s.len()] == s[..]);
+                }
+            }
+        }
     }
 
     #[test]

@@ -755,11 +755,18 @@ impl Synthetic {
 
 /// Assemble a single-block RAR3 LZ stream running `ops`, ending with the
 /// end-of-data marker.
+fn build_lz_stream(ops: &[Op]) -> Synthetic {
+    build_lz_block(ops, false)
+}
+
+/// Assemble a RAR3 LZ block running `ops`. It ends with the end-of-data
+/// marker, or — with `then_new_table` — with the "new tables follow"
+/// marker, after which the caller appends the next block's header.
 ///
 /// Main code: eight 3-bit symbols — the four literals, 256 (end), 257
 /// (filter), 258 (repeat match), 298 (longest length slot); canonical codes
 /// are assigned in symbol order. Offset code: symbols 0 and 1, one bit each.
-fn build_lz_stream(ops: &[Op]) -> Synthetic {
+fn build_lz_block(ops: &[Op], then_new_table: bool) -> Synthetic {
     const MAIN: [usize; 8] = [0x00, 0x01, 0x41, 0xE8, 256, 257, 258, 298];
     let main_code = |sym: usize| MAIN.iter().position(|&s| s == sym).unwrap() as u32;
 
@@ -863,7 +870,11 @@ fn build_lz_stream(ops: &[Op]) -> Synthetic {
         }
     }
     w.push(main_code(256), 3);
-    w.push(0, 2); // no new table; next member starts with its own header
+    if then_new_table {
+        w.push(1, 1); // the next block's header follows, byte-aligned
+    } else {
+        w.push(0, 2); // no new table; next member starts with its own header
+    }
     Synthetic {
         stream: w.bytes,
         raw,
@@ -1332,4 +1343,175 @@ fn filter_start_beyond_dictionary_is_corrupt() {
     let syn = build_lz_stream(&ops);
     let (_, err, _) = decode_chunked(Decoder::new(), &syn.stream, usize::MAX, 4096);
     assert_eq!(err, Some(Error::Corrupt));
+}
+
+// ─── Streaming through PPMd blocks ───────────────────────────────────────
+//
+// The PPMd fixtures are far smaller than the dictionary, so they are
+// released in one piece when they end and never make the decoder suspend a
+// PPMd block. (The unit tests in `src/rar3/decoder.rs` force a pause at
+// every symbol of those fixtures.) A PPMd stream of several MiB is needed
+// here, and this crate has no PPMd encoder to make one with: arbitrary
+// bytes are not a valid range-coded payload — sooner or later they run into
+// an escape sequence or leave the coder's interval. One payload is valid
+// at any length, though: all zero bytes. The coder then always lands in the
+// first interval, which the model gives to byte 0 from the first symbol on,
+// so the block decodes to zeros — it is what an encoder writes for a run of
+// zeros, less its final flush — at about 2700 output bytes per payload
+// byte.
+
+/// Output bytes a zero-payload PPMd block yields per payload byte, rounded
+/// down (2720 measured; the block ends in `UnexpectedEnd` when its payload
+/// runs out).
+const PPMD_ZEROS_PER_BYTE: usize = 2600;
+
+/// A PPMd block header (fresh model, order 3, 1 MiB, escape byte 0xC8)
+/// followed by `payload` zero bytes. Decodes to at least
+/// `payload * PPMD_ZEROS_PER_BYTE` zero bytes.
+fn ppmd_zero_block(payload: usize) -> Vec<u8> {
+    // PPMd flag, model reset (0x20), explicit escape byte (0x40), order - 1.
+    let mut block = vec![0x80 | 0x60 | 2, 0, 0xC8];
+    block.resize(block.len() + payload, 0);
+    block
+}
+
+/// A PPMd member is streamed like an LZ one: a 6 MiB PPMd block never has
+/// more than the dictionary's worth (plus slack) waiting inside the
+/// decoder, whatever buffer it is drained through.
+#[test]
+fn ppmd_output_buffering_is_bounded() {
+    let unp = (6usize << 20) + 12_345;
+    let stream = ppmd_zero_block(unp / PPMD_ZEROS_PER_BYTE + 16);
+    for out_chunk in [1 << 16, 4099] {
+        let (out, err, peak) = decode_chunked(
+            Decoder::with_unpack_size(unp as u64),
+            &stream,
+            usize::MAX,
+            out_chunk,
+        );
+        assert_eq!(err, None);
+        assert_eq!(out.len(), unp, "drained by {out_chunk}");
+        assert!(out.iter().all(|&b| b == 0), "drained by {out_chunk}");
+        assert!(
+            peak <= BUFFERED_OUTPUT_BOUND,
+            "{peak} bytes buffered for a {unp} byte PPMd block"
+        );
+    }
+}
+
+/// Decode a failing zero-payload stream through two differently sized
+/// output buffers and check that the same bytes come out before the same
+/// error. Returns how many, and the error.
+fn same_failure_for_every_chunking(make: impl Fn() -> Decoder, stream: &[u8]) -> (usize, Error) {
+    let (out_a, err_a, peak_a) = decode_chunked(make(), stream, usize::MAX, 1 << 16);
+    let (out_b, err_b, peak_b) = decode_chunked(make(), stream, 4096, 4099);
+    assert!(out_a == out_b, "delivered bytes differ");
+    assert_eq!(err_a, err_b);
+    assert!(peak_a.max(peak_b) <= BUFFERED_OUTPUT_BOUND);
+    assert!(out_a.iter().all(|&b| b == 0));
+    (out_a.len(), err_a.expect("the stream should fail"))
+}
+
+/// A PPMd payload that runs out several MiB in fails at the same symbol
+/// whatever the chunking: the same bytes are delivered first — everything
+/// released before the failure, which for a block longer than the
+/// dictionary is no longer nothing — and then the same error.
+#[test]
+fn truncated_ppmd_block_fails_at_the_same_position() {
+    // Runs dry somewhere past 5 MiB, well short of the declared size.
+    let stream = ppmd_zero_block((5 << 20) / PPMD_ZEROS_PER_BYTE);
+    let (delivered, err) =
+        same_failure_for_every_chunking(|| Decoder::with_unpack_size(64 << 20), &stream);
+    assert_eq!(err, Error::UnexpectedEnd);
+    assert!(delivered > 3 << 20, "only {delivered} bytes delivered");
+    assert!(delivered < 6 << 20);
+}
+
+/// The output limit is checked symbol by symbol in a PPMd block that has
+/// already been suspended and resumed: the bytes released before the limit
+/// come out, then `OutputLimitExceeded`, for every chunking.
+#[test]
+fn output_limit_holds_in_a_resumed_ppmd_block() {
+    let limit = (5u64 << 20) + 77;
+    let stream = ppmd_zero_block((6 << 20) / PPMD_ZEROS_PER_BYTE);
+    let make = || {
+        let mut dec = Decoder::new();
+        dec.set_output_limit(limit);
+        dec
+    };
+    let (delivered, err) = same_failure_for_every_chunking(make, &stream);
+    assert_eq!(err, Error::OutputLimitExceeded);
+    assert!(delivered > 3 << 20, "only {delivered} bytes delivered");
+    assert!(delivered as u64 <= limit);
+}
+
+/// Solid mode keeps its end-of-member policy across pauses: a PPMd member
+/// that reaches its declared size after being suspended must still code
+/// its end marker through the model, and one that does not is refused.
+#[test]
+fn solid_ppmd_member_without_end_marker_fails_after_pauses() {
+    let unp = (4u64 << 20) + (300 << 10);
+    let stream = ppmd_zero_block((5 << 20) / PPMD_ZEROS_PER_BYTE);
+    let (delivered, err) =
+        same_failure_for_every_chunking(|| Decoder::with_unpack_size(unp).with_solid(), &stream);
+    // The symbol after the last byte is another zero, not the escape byte.
+    assert_eq!(err, Error::Corrupt);
+    assert!(delivered > 3 << 20, "only {delivered} bytes delivered");
+    assert!((delivered as u64) < unp);
+}
+
+/// An LZ block handing over to a PPMd block mid-member, with a Delta
+/// filter window that starts in the LZ block's output, ends in the PPMd
+/// block's, and is still incomplete when the decoder first releases output
+/// — which it now does from inside the PPMd block. The window is held back
+/// across that pause, filtered once it completes, and the rest of the
+/// PPMd block streams on.
+#[test]
+fn lz_block_switching_to_ppmd_streams_across_the_switch() {
+    // The first release pass comes once this much has been decoded.
+    const FIRST_RELEASE: usize = (4 << 20) - 260;
+    const WINDOW: usize = 0x1E000;
+    let mut ops = Vec::new();
+    let mut produced = 0usize;
+    let mut block = 0usize;
+    let mut declared = false;
+    while produced < FIRST_RELEASE - 50_000 {
+        if !declared && produced >= FIRST_RELEASE - 80_000 {
+            ops.push(Op::Delta {
+                start: 0,
+                len: WINDOW as u32,
+                channels: 3,
+            });
+            declared = true;
+        }
+        ops.push(Op::Lit(SYN_LITERALS[(block * 5 + block / 7) % 4]));
+        ops.push(Op::Run);
+        produced += 259;
+        block += 1;
+    }
+    let mut syn = build_lz_block(&ops, true);
+    let lz_len = syn.raw.len();
+    let (window_start, _, _) = syn.filters[0];
+    assert!(window_start < lz_len && lz_len < FIRST_RELEASE);
+    assert!(FIRST_RELEASE < window_start + WINDOW);
+
+    let ppmd_len = (4 << 20) + (400 << 10);
+    syn.stream
+        .extend_from_slice(&ppmd_zero_block(ppmd_len / PPMD_ZEROS_PER_BYTE + 16));
+    syn.raw.resize(lz_len + ppmd_len, 0);
+    let want = syn.filtered();
+    // The filter carries the LZ block's bytes into the PPMd block's zeros.
+    assert!(want[lz_len..window_start + WINDOW].iter().any(|&b| b != 0));
+
+    for out_chunk in [1 << 16, 4099] {
+        let (out, err, peak) = decode_chunked(
+            Decoder::with_unpack_size(want.len() as u64),
+            &syn.stream,
+            usize::MAX,
+            out_chunk,
+        );
+        assert_eq!(err, None);
+        assert!(out == want, "output differs (drained by {out_chunk})");
+        assert!(peak <= BUFFERED_OUTPUT_BOUND, "{peak} bytes buffered");
+    }
 }

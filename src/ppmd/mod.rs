@@ -111,7 +111,7 @@ pub use zip::ZipDecoder;
 #[cfg(feature = "rar3")]
 pub(crate) use ppmd7::Ppmd7;
 #[cfg(feature = "rar3")]
-pub(crate) use range_dec::{Mode as RangeMode, RangeDec};
+pub(crate) use range_dec::{Mode as RangeMode, RangeDec, RangeDecState};
 
 /// Largest model arena a PPMd header can ask for, in bytes (256 MiB, the
 /// top of the ZIP method 98 range), and the default

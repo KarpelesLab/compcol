@@ -34,9 +34,10 @@ pub(crate) enum Mode {
 /// to the next, without the borrow of the input. [`RangeDec::save`] takes
 /// one between two symbols and [`RangeDec::resume`] rebuilds the decoder
 /// over the same input, so a caller that owns the input can stop decoding,
-/// return to its own caller, and pick up at the next symbol later.
+/// return to its own caller, and pick up at the next symbol later. Only the
+/// RAR3 decoder suspends its coder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(feature = "rar3"), allow(dead_code))]
 pub(crate) struct RangeDecState {
     range: u32,
     code: u32,
@@ -106,7 +107,7 @@ impl<'a> RangeDec<'a> {
     /// state; callers check both after every symbol and stop for good when
     /// either is set.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(feature = "rar3"), allow(dead_code))]
     pub(crate) fn save(&self) -> RangeDecState {
         RangeDecState {
             range: self.range,
@@ -120,7 +121,7 @@ impl<'a> RangeDec<'a> {
     /// `mode` and `input` must be the ones the saved decoder was working
     /// with; decoding then continues exactly as if it had never stopped.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(feature = "rar3"), allow(dead_code))]
     pub(crate) fn resume(mode: Mode, input: &'a [u8], state: RangeDecState) -> Self {
         RangeDec {
             range: state.range,
