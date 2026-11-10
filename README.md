@@ -477,6 +477,10 @@ Decompression safety:
                             byte count, optionally with a K, M, G or T
                             suffix (powers of 1024: 64M, 2G). Default: no
                             limit. Only valid with -d.
+        --ignore-trailing   Input left over after the end of the compressed
+                            stream is an error by default (the output is
+                            removed, the input kept). With this flag it is
+                            ignored with a warning. Only valid with -d.
 
 Misc:
     -k, --keep              Keep input file even in in-place mode

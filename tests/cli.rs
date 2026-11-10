@@ -871,3 +871,164 @@ fn max_output_rejects_malformed_values() {
     assert_eq!(code, 2);
     assert!(String::from_utf8_lossy(&err).contains("requires an argument"));
 }
+
+// ─── trailing data after the stream ─────────────────────────────────────
+
+const TRAILING_MSG: &str = "trailing data after the end of the compressed stream";
+
+#[test]
+fn trailing_data_fails_in_place_decompress_and_keeps_input() {
+    // `cp a.gz g.gz; echo garbage >> g.gz; compcol -d g.gz` used to exit 0,
+    // silently drop the extra bytes and delete g.gz.
+    let (gz, _err, code) = run_with_stdin(&["-t", "gzip"], b"payload before the garbage\n");
+    assert_eq!(code, 0);
+    // A short tail, and one far larger than any buffer the CLI reads with.
+    for tail in [b"garbage\n".to_vec(), vec![0x55u8; 300 * 1024]] {
+        let s = Scratch::new("trailing");
+        let input = s.file("g.gz");
+        let mut bytes = gz.clone();
+        bytes.extend_from_slice(&tail);
+        fs::write(&input, &bytes).unwrap();
+
+        let (_out, err, code) = run(&["-d", input.to_str().unwrap()]);
+        let err = String::from_utf8_lossy(&err);
+        assert_eq!(code, 1, "{err}");
+        assert!(err.contains(TRAILING_MSG), "{err}");
+        assert!(!s.file("g").exists(), "output must be removed");
+        assert_eq!(file_contents(&input), bytes, "input must be kept");
+    }
+}
+
+#[test]
+fn trailing_data_fails_in_stdout_and_pipe_modes_too() {
+    let (gz, _err, code) = run_with_stdin(&["-t", "gzip"], b"payload before the garbage\n");
+    assert_eq!(code, 0);
+    let mut bytes = gz.clone();
+    bytes.extend_from_slice(b"garbage\n");
+
+    // stdin → stdout.
+    let (_out, err, code) = run_with_stdin(&["-d"], &bytes);
+    assert_eq!(code, 1);
+    assert!(String::from_utf8_lossy(&err).contains(TRAILING_MSG));
+
+    // file → stdout (-c) and file → -o: the input is kept either way.
+    let s = Scratch::new("trailing_c");
+    let input = s.file("g.gz");
+    fs::write(&input, &bytes).unwrap();
+    let (_out, err, code) = run(&["-d", "-c", input.to_str().unwrap()]);
+    assert_eq!(code, 1);
+    assert!(String::from_utf8_lossy(&err).contains(TRAILING_MSG));
+    let out = s.file("out");
+    let (_out, err, code) = run(&["-d", "-o", out.to_str().unwrap(), input.to_str().unwrap()]);
+    assert_eq!(code, 1);
+    assert!(String::from_utf8_lossy(&err).contains(TRAILING_MSG));
+    assert!(!out.exists(), "output must be removed");
+    assert_eq!(file_contents(&input), bytes);
+}
+
+#[test]
+fn ignore_trailing_restores_the_lenient_behaviour_with_a_warning() {
+    let payload = b"payload before the garbage\n";
+    let (gz, _err, code) = run_with_stdin(&["-t", "gzip"], payload);
+    assert_eq!(code, 0);
+    for tail in [b"garbage\n".to_vec(), vec![0x55u8; 300 * 1024]] {
+        let mut bytes = gz.clone();
+        bytes.extend_from_slice(&tail);
+
+        let (out, err, code) = run_with_stdin(&["-d", "--ignore-trailing"], &bytes);
+        let err = String::from_utf8_lossy(&err);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out, payload);
+        assert!(err.contains("warning"), "{err}");
+        assert!(err.contains("trailing data"), "{err}");
+
+        let s = Scratch::new("ignore_trailing");
+        let input = s.file("g.gz");
+        fs::write(&input, &bytes).unwrap();
+        let (_out, err, code) = run(&["-d", "--ignore-trailing", input.to_str().unwrap()]);
+        let err = String::from_utf8_lossy(&err);
+        assert_eq!(code, 0, "{err}");
+        assert!(err.contains("warning"), "{err}");
+        assert_eq!(file_contents(&s.file("g")), payload);
+        assert!(!input.exists(), "input is removed as on any success");
+    }
+}
+
+#[test]
+fn ignore_trailing_is_silent_without_trailing_data() {
+    let (gz, _err, code) = run_with_stdin(&["-t", "gzip"], b"clean");
+    assert_eq!(code, 0);
+    let (out, err, code) = run_with_stdin(&["-d", "--ignore-trailing"], &gz);
+    assert_eq!(code, 0);
+    assert_eq!(out, b"clean");
+    assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+}
+
+#[test]
+fn ignore_trailing_is_rejected_when_compressing() {
+    let (_out, err, code) = run_with_stdin(&["-t", "gzip", "--ignore-trailing"], b"data");
+    assert_eq!(code, 2);
+    assert!(
+        String::from_utf8_lossy(&err).contains("only meaningful on decompression"),
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+}
+
+#[test]
+fn concatenated_members_are_not_trailing_data() {
+    // Formats whose decoder continues into a following member/stream must
+    // keep doing so: that is more stream, not trailing data.
+    let a = b"first member\n".repeat(50);
+    let b = b"second member, different text\n".repeat(5000);
+    let mut codecs = vec!["gzip"];
+    if cfg!(feature = "xz") {
+        codecs.push("xz");
+    }
+    if cfg!(feature = "bzip2") {
+        codecs.push("bzip2");
+    }
+    for codec in codecs {
+        let (mut joined, _err, code) = run_with_stdin(&["-t", codec], &a);
+        assert_eq!(code, 0);
+        let (second, _err, code) = run_with_stdin(&["-t", codec], &b);
+        assert_eq!(code, 0);
+        joined.extend_from_slice(&second);
+
+        let (out, err, code) = run_with_stdin(&["-d", "-t", codec], &joined);
+        assert_eq!(code, 0, "{codec}: {}", String::from_utf8_lossy(&err));
+        assert_eq!(out, [&a[..], &b[..]].concat(), "{codec}");
+    }
+}
+
+#[test]
+fn round_trips_never_report_trailing_data() {
+    // Every codec that can both encode and decode through the CLI must come
+    // back clean: an end-of-stream that leaves the encoder's own padding or
+    // trailer unconsumed would now be an error.
+    let (list, _err, code) = run(&["--list"]);
+    assert_eq!(code, 0);
+    let list = String::from_utf8(list).unwrap();
+    let payloads: [Vec<u8>; 3] = [
+        b"x".to_vec(),
+        b"The quick brown fox jumps over the lazy dog. ".repeat(40),
+        (0..200_000usize)
+            .map(|i| (i.wrapping_mul(2654435761) >> 11) as u8)
+            .collect(),
+    ];
+    for codec in list.lines() {
+        for payload in &payloads {
+            let (encoded, _err, code) = run_with_stdin(&["-t", codec], payload);
+            if code != 0 {
+                continue; // decode-only codec
+            }
+            let (_out, err, _code) = run_with_stdin(&["-d", "-t", codec], &encoded);
+            let err = String::from_utf8_lossy(&err);
+            assert!(
+                !err.contains("trailing data"),
+                "{codec} ({} bytes): {err}",
+                payload.len()
+            );
+        }
+    }
+}

@@ -54,6 +54,10 @@ Decompression safety:
                             byte count, optionally with a K, M, G or T
                             suffix (powers of 1024: 64M, 2G). Default: no
                             limit. Only valid with -d.
+        --ignore-trailing   Input left over after the end of the compressed
+                            stream is an error by default (the output is
+                            removed, the input kept). With this flag it is
+                            ignored with a warning. Only valid with -d.
 
 Misc:
     -k, --keep              Keep input file even in in-place mode
@@ -90,6 +94,9 @@ struct Args {
     /// When `Some`, the most decompressed bytes `-d` may produce before the
     /// run is aborted (see [`LimitedDecoder`]).
     max_output: Option<u64>,
+    /// Accept (with a warning) input left over after the end of the
+    /// compressed stream instead of failing.
+    ignore_trailing: bool,
     input: Option<PathBuf>,
 }
 
@@ -144,6 +151,7 @@ where
             "-c" | "--stdout" => args.stdout = true,
             "-k" | "--keep" => args.keep = true,
             "-f" | "--force" => args.force = true,
+            "--ignore-trailing" => args.ignore_trailing = true,
             "-t" | "--type" => {
                 let v = iter.next().ok_or(ParseError::MissingValue("-t"))?;
                 args.algorithm = Some(v.to_string_lossy().into_owned());
@@ -285,16 +293,23 @@ fn stream_encode(
     Ok(())
 }
 
+/// Decode `reader` into `writer`.
+///
+/// Returns whether input was left over once the decoder reported the end of
+/// the stream — bytes that belong to no stream this decoder understands. The
+/// caller decides whether that is an error. Nothing past the read that
+/// carried the end of the stream is consumed beyond a single probing byte.
 fn stream_decode(
     mut dec: Box<dyn Decoder>,
     reader: &mut dyn Read,
     writer: &mut dyn Write,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     use compcol::Status;
     let mut in_buf = [0u8; BUF_SIZE];
     let mut out_buf = [0u8; BUF_SIZE];
+    let mut trailing = false;
 
-    loop {
+    'input: loop {
         let n = reader.read(&mut in_buf)?;
         if n == 0 {
             break;
@@ -315,7 +330,15 @@ fn stream_decode(
                         return Err(io::Error::other("decoder stalled with input pending"));
                     }
                 }
-                Status::StreamEnd => break,
+                // The stream is over. Whatever input remains — the rest of
+                // this buffer, or anything still unread — is trailing data.
+                // (Formats that allow concatenated members, like gzip, are
+                // handled inside the decoder and don't end here.) Stop
+                // reading: the decoder would not take any of it.
+                Status::StreamEnd => {
+                    trailing = consumed < n || has_more_input(reader)?;
+                    break 'input;
+                }
             }
         }
     }
@@ -348,7 +371,20 @@ fn stream_decode(
         }
     }
 
-    Ok(())
+    Ok(trailing)
+}
+
+/// Whether `reader` has at least one more byte. Reads (and drops) that one
+/// byte: enough to know, without buffering what follows.
+fn has_more_input(reader: &mut dyn Read) -> io::Result<bool> {
+    let mut probe = [0u8; 1];
+    loop {
+        match reader.read(&mut probe) {
+            Ok(n) => return Ok(n > 0),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Wrap a codec error, keeping the typed value so `run` can tell which one
@@ -617,6 +653,8 @@ enum Codec {
 /// 16-byte window is comfortably sufficient.
 const PEEK_LEN: usize = 16;
 
+const TRAILING_DATA: &str = "trailing data after the end of the compressed stream";
+
 fn run(args: &Args) -> Result<(), RunError> {
     if args.decompress && args.level.is_some() {
         // Decompressors don't have a level — flag it rather than silently
@@ -629,6 +667,11 @@ fn run(args: &Args) -> Result<(), RunError> {
     if !args.decompress && args.max_output.is_some() {
         return Err(RunError::Usage(
             "--max-output is only meaningful on decompression (-d)".into(),
+        ));
+    }
+    if !args.decompress && args.ignore_trailing {
+        return Err(RunError::Usage(
+            "--ignore-trailing is only meaningful on decompression (-d)".into(),
         ));
     }
 
@@ -769,7 +812,32 @@ fn run(args: &Args) -> Result<(), RunError> {
     // From here on the output exists: every failure — including the final
     // flush — must go through the cleanup below rather than an early `?`.
     let result = match codec {
-        Codec::Decoder(dec) => stream_decode(dec, &mut *reader, &mut *writer),
+        Codec::Decoder(dec) => {
+            stream_decode(dec, &mut *reader, &mut *writer).and_then(|trailing| {
+                if !trailing {
+                    return Ok(());
+                }
+                // Input left over after the end of the stream: the file is
+                // not (just) what it claims to be — appended garbage, a
+                // second stream in a format that has no notion of one, or a
+                // truncated copy of something else. Succeeding would, in
+                // in-place mode, delete an input whose content was only
+                // partly accounted for. The rule is the same for every
+                // output mode so that the exit status means the same thing
+                // whether or not -c / -o is used.
+                if args.ignore_trailing {
+                    eprintln!("compcol: warning: {TRAILING_DATA} ignored");
+                    // Keep reading to the end as the CLI always did, so a
+                    // process piping into us isn't killed by a closed pipe.
+                    let _ = io::copy(&mut *reader, &mut io::sink());
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!(
+                        "{TRAILING_DATA} (pass --ignore-trailing to accept it)"
+                    )))
+                }
+            })
+        }
         Codec::Encoder(enc) => stream_encode(enc, &mut *reader, &mut *writer),
     }
     .and_then(|()| writer.flush());
@@ -886,5 +954,117 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("stalled"), "{err}");
+    }
+
+    /// A decoder whose stream is exactly `left` bytes long, copied verbatim.
+    struct FixedLen {
+        left: usize,
+    }
+
+    impl Decoder for FixedLen {
+        fn decode(&mut self, input: &[u8], out: &mut [u8]) -> Result<(Progress, Status), Error> {
+            let n = input.len().min(out.len()).min(self.left);
+            out[..n].copy_from_slice(&input[..n]);
+            self.left -= n;
+            let status = if self.left == 0 {
+                Status::StreamEnd
+            } else {
+                Status::InputEmpty
+            };
+            Ok((
+                Progress {
+                    consumed: n,
+                    written: n,
+                },
+                status,
+            ))
+        }
+        fn finish(&mut self, _: &mut [u8]) -> Result<(Progress, Status), Error> {
+            if self.left == 0 {
+                Ok((Progress::default(), Status::StreamEnd))
+            } else {
+                Err(Error::UnexpectedEnd)
+            }
+        }
+        fn reset(&mut self) {}
+        fn discard_output(&mut self, _: &[u8], _: usize) -> Result<(Progress, Status), Error> {
+            unreachable!("the CLI never skips output")
+        }
+    }
+
+    /// Hands out its chunks one per `read` (never joining two) and counts
+    /// the bytes read.
+    struct Chunked<'a> {
+        chunks: std::collections::VecDeque<&'a [u8]>,
+        bytes_read: usize,
+    }
+
+    impl Read for Chunked<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let Some(first) = self.chunks.front_mut() else {
+                return Ok(0);
+            };
+            let n = first.len().min(buf.len());
+            buf[..n].copy_from_slice(&first[..n]);
+            *first = &first[n..];
+            if first.is_empty() {
+                self.chunks.pop_front();
+            }
+            self.bytes_read += n;
+            Ok(n)
+        }
+    }
+
+    fn decode_chunks(stream_len: usize, chunks: &[&[u8]]) -> (Vec<u8>, bool, usize) {
+        let mut reader = Chunked {
+            chunks: chunks.iter().copied().collect(),
+            bytes_read: 0,
+        };
+        let mut out = Vec::new();
+        let trailing = stream_decode(
+            Box::new(FixedLen { left: stream_len }),
+            &mut reader,
+            &mut out,
+        )
+        .unwrap();
+        (out, trailing, reader.bytes_read)
+    }
+
+    #[test]
+    fn stream_decode_reports_no_trailing_data_on_a_clean_end() {
+        let (out, trailing, _) = decode_chunks(6, &[b"abc", b"def"]);
+        assert_eq!(out, b"abcdef");
+        assert!(!trailing);
+    }
+
+    #[test]
+    fn stream_decode_reports_trailing_data_in_the_same_read() {
+        let (out, trailing, _) = decode_chunks(4, &[b"abcdXY"]);
+        assert_eq!(out, b"abcd");
+        assert!(trailing);
+    }
+
+    #[test]
+    fn stream_decode_reports_trailing_data_in_a_later_read() {
+        // The stream ends exactly at a read boundary: the leftover is only
+        // visible by reading on.
+        let (out, trailing, _) = decode_chunks(4, &[b"abcd", b"XY"]);
+        assert_eq!(out, b"abcd");
+        assert!(trailing);
+    }
+
+    #[test]
+    fn stream_decode_does_not_read_through_trailing_data() {
+        // One probing byte is enough to know; the megabytes behind it must
+        // not be pulled in.
+        let big = vec![0u8; 4096];
+        let chunks: Vec<&[u8]> = [&b"abcd"[..], b"X"]
+            .into_iter()
+            .chain(std::iter::repeat_n(&big[..], 64))
+            .collect();
+        let (out, trailing, bytes_read) = decode_chunks(4, &chunks);
+        assert_eq!(out, b"abcd");
+        assert!(trailing);
+        assert_eq!(bytes_read, 5);
     }
 }
