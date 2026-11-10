@@ -1349,3 +1349,113 @@ fn flushes_interoperate_with_system_zstd() {
     check_flushes_with_system_tool("zstd", Flush::Sync);
     check_flushes_with_system_tool("zstd", Flush::Full);
 }
+
+// ─── decoder: Frame_Content_Size validation ─────────────────────────────
+
+/// Frame = magic + `header` (FHD onwards) + `blocks`.
+fn frame_from_parts(header: &[u8], blocks: &[u8]) -> Vec<u8> {
+    let mut f = vec![0x28, 0xB5, 0x2F, 0xFD];
+    f.extend_from_slice(header);
+    f.extend_from_slice(blocks);
+    f
+}
+
+/// Decode with several input/output chunkings; all must agree.
+fn decode_all_chunkings(frame: &[u8]) -> Result<Vec<u8>, Error> {
+    let first = decode_chunked(frame, 4096, 4096);
+    for (i, o) in [(1, 1), (1, 4096), (4096, 1), (3, 2)] {
+        assert_eq!(decode_chunked(frame, i, o), first, "chunking {i}/{o}");
+    }
+    first
+}
+
+/// A frame whose header declares a `Frame_Content_Size` must decode to
+/// exactly that many bytes (reference zstd: "Data corruption detected").
+#[test]
+fn frame_content_size_is_enforced() {
+    // Single_Segment, 1-byte FCS, one last Raw_Block "abc".
+    let raw_abc = [0x19, 0x00, 0x00, b'a', b'b', b'c'];
+    assert_eq!(
+        decode_all_chunkings(&frame_from_parts(&[0x20, 3], &raw_abc)).unwrap(),
+        b"abc"
+    );
+    // Declared 5, content 3: short.
+    assert_eq!(
+        decode_all_chunkings(&frame_from_parts(&[0x20, 5], &raw_abc)),
+        Err(Error::Corrupt)
+    );
+    // Declared 1, content 3: long.
+    assert_eq!(
+        decode_all_chunkings(&frame_from_parts(&[0x20, 1], &raw_abc)),
+        Err(Error::Corrupt)
+    );
+
+    // Windowed header (1 KiB) with a 4-byte FCS, so block sizes are not
+    // limited by the content size. Blocks: Raw "abc" (not last), RLE 'x' * 4
+    // (not last), Raw "de" (last) = 9 bytes.
+    let blocks = [
+        0x18, 0x00, 0x00, b'a', b'b', b'c', // Raw, 3 bytes
+        0x22, 0x00, 0x00, b'x', // RLE, 4 bytes
+        0x11, 0x00, 0x00, b'd', b'e', // Raw, 2 bytes, last
+    ];
+    let with_fcs = |n: u32| {
+        let mut h = vec![0x80, 0x00];
+        h.extend_from_slice(&n.to_le_bytes());
+        frame_from_parts(&h, &blocks)
+    };
+    assert_eq!(decode_all_chunkings(&with_fcs(9)).unwrap(), b"abcxxxxde");
+    // 2 and 5 are exceeded by a non-last block, 8 by the last one; 10 and
+    // 1000 are never reached.
+    for n in [0, 2, 5, 8, 10, 1000] {
+        assert_eq!(
+            decode_all_chunkings(&with_fcs(n)),
+            Err(Error::Corrupt),
+            "FCS={n}"
+        );
+    }
+
+    // Compressed_Block regenerating "abcdddd" (7 bytes).
+    let comp = [
+        0x55, 0x00, 0x00, 0x20, b'a', b'b', b'c', b'd', 0x01, 0x00, 0x00, 0x8E, 0x08,
+    ];
+    let with_fcs = |n: u32| {
+        let mut h = vec![0x80, 0x00];
+        h.extend_from_slice(&n.to_le_bytes());
+        frame_from_parts(&h, &comp)
+    };
+    assert_eq!(decode_all_chunkings(&with_fcs(7)).unwrap(), b"abcdddd");
+    for n in [0, 6, 8] {
+        assert_eq!(
+            decode_all_chunkings(&with_fcs(n)),
+            Err(Error::Corrupt),
+            "FCS={n}"
+        );
+    }
+}
+
+/// Nothing past the declared size is ever handed to the caller.
+#[test]
+fn frame_content_size_overrun_emits_nothing_past_it() {
+    // FCS = 2, then a Raw_Block "ab" (not last) and an RLE_Block of 1000.
+    let frame = frame_from_parts(
+        &[0x80, 0x00, 2, 0, 0, 0],
+        &[0x10, 0x00, 0x00, b'a', b'b', 0x43, 0x1F, 0x00, b'z'],
+    );
+    let mut dec = Decoder::new();
+    let mut out = vec![0u8; 4096];
+    let mut total = 0;
+    let mut pos = 0;
+    let err = loop {
+        match dec.decode(&frame[pos..], &mut out[total..]) {
+            Ok((p, status)) => {
+                pos += p.consumed;
+                total += p.written;
+                assert_ne!(status, Status::StreamEnd, "frame accepted");
+                assert!(p.consumed + p.written > 0, "decoder stalled");
+            }
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(err, Error::Corrupt);
+    assert!(total <= 2, "emitted {total} bytes for a 2-byte frame");
+}
