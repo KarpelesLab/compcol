@@ -1814,8 +1814,16 @@ fn check_hand_built(label: &str, stream: &[u8], want: Option<&[u8]>) {
     for in_chunk in [1, 3, stream.len()] {
         let got = decode_chunked(stream, in_chunk, 4096);
         match want {
-            Some(plain) => assert_eq!(got.as_deref(), Ok(plain), "{label}, in_chunk {in_chunk}"),
-            None => assert_eq!(got, Err(Error::Corrupt), "{label}, in_chunk {in_chunk}"),
+            Some(plain) => assert!(
+                got.as_deref() == Ok(plain),
+                "{label}, in_chunk {in_chunk}: {:?}",
+                got.map(|v| v.len())
+            ),
+            None => assert!(
+                got == Err(Error::Corrupt),
+                "{label}, in_chunk {in_chunk}: {:?}",
+                got.map(|v| v.len())
+            ),
         }
     }
     if tool_available("xz") {
@@ -1857,6 +1865,88 @@ fn block_header_sizes_are_verified() {
         check_hand_built("uncompressed", &header(None, Some(uncomp)), None);
         check_hand_built("uncompressed", &header(Some(5), Some(uncomp)), None);
     }
+}
+
+/// The first LZMA2 chunk of `data` as this crate's encoder writes it — a
+/// full-reset compressed chunk — split into its 5 control/size bytes, its
+/// properties byte and its LZMA payload. `data` must compress into one
+/// chunk.
+fn split_first_chunk(data: &[u8]) -> ([u8; 5], u8, Vec<u8>) {
+    let stream = encode_all(data);
+    let at = 12 + (stream[12] as usize + 1) * 4;
+    let c = &stream[at..];
+    assert!(c[0] >= 0xE0, "not a full-reset compressed chunk");
+    let uncomp = (((c[0] & 0x1F) as usize) << 16 | (c[1] as usize) << 8 | c[2] as usize) + 1;
+    assert_eq!(uncomp, data.len());
+    let comp = ((c[3] as usize) << 8 | c[4] as usize) + 1;
+    assert_eq!(c[6 + comp], 0x00, "end marker after the chunk");
+    (
+        [c[0], c[1], c[2], c[3], c[4]],
+        c[5],
+        c[6..6 + comp].to_vec(),
+    )
+}
+
+/// Block Header body for a plain LZMA2 Block with a 4 MiB dictionary.
+const PLAIN_LZMA2_BLOCK: [u8; 4] = [0x00, 0x21, 0x01, 0x14];
+
+/// After a dictionary reset the next compressed chunk must carry new
+/// properties (liblzma's `need_properties`): a stored `0x01` chunk followed
+/// by a `0x80`/`0xA0` chunk used to be decoded with made-up default
+/// properties.
+#[test]
+fn compressed_chunk_after_dict_reset_needs_properties() {
+    let data = b"hello hello hello hello hello hello hello hello ".repeat(20);
+    let (head, props, payload) = split_first_chunk(&data);
+    let size_bits = head[0] & 0x1F;
+    // Four stored bytes keep the payload's position alignment (pb = 2).
+    let stored = [0x01, 0x00, 0x03, b'Z', b'Z', b'Z', b'Z'];
+    let plain = [b"ZZZZ", &data[..]].concat();
+    let chunk = |control: u8, with_props: bool| {
+        let mut c = vec![control | size_bits];
+        c.extend_from_slice(&head[1..]);
+        if with_props {
+            c.push(props);
+        }
+        c.extend_from_slice(&payload);
+        c
+    };
+
+    // New properties (0xC0) or a full reset (0xE0) after the stored chunk.
+    for control in [0xC0, 0xE0] {
+        let lzma2 = [&stored[..], &chunk(control, true), &[0x00]].concat();
+        let stream = build_xz(&PLAIN_LZMA2_BLOCK, &lzma2, &plain);
+        // (0xE0 drops the stored bytes from the dictionary, not the output.)
+        check_hand_built("with properties", &stream, Some(&plain));
+    }
+    // No properties: state reset only (0xA0), or nothing reset (0x80).
+    for control in [0xA0, 0x80] {
+        let lzma2 = [&stored[..], &chunk(control, false), &[0x00]].concat();
+        let stream = build_xz(&PLAIN_LZMA2_BLOCK, &lzma2, &plain);
+        check_hand_built("without properties", &stream, None);
+    }
+    // Properties given once do not survive a later dictionary reset.
+    for control in [0xA0, 0x80] {
+        let lzma2 = [
+            &chunk(0xE0, true)[..],
+            &stored,
+            &chunk(control, false),
+            &[0x00],
+        ]
+        .concat();
+        let plain = [&data[..], b"ZZZZ", &data[..]].concat();
+        let stream = build_xz(&PLAIN_LZMA2_BLOCK, &lzma2, &plain);
+        check_hand_built("after a later reset", &stream, None);
+    }
+    // A Block's first chunk must reset the dictionary.
+    for control in [0x80, 0xA0, 0xC0] {
+        let with_props = control == 0xC0;
+        let lzma2 = [&chunk(control, with_props)[..], &[0x00]].concat();
+        let stream = build_xz(&PLAIN_LZMA2_BLOCK, &lzma2, &data);
+        check_hand_built("first chunk", &stream, None);
+    }
+    let stream = build_xz(&PLAIN_LZMA2_BLOCK, &[0x02, 0x00, 0x00, b'A', 0x00], b"A");
+    check_hand_built("first chunk stored without reset", &stream, None);
 }
 
 /// A Block running past a size its header declared fails as soon as it

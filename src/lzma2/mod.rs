@@ -627,6 +627,11 @@ pub struct Decoder {
 
     /// First chunk in the stream must perform a dictionary reset.
     expecting_first: bool,
+    /// The next compressed chunk must carry a properties byte (control
+    /// `0xC0..=0xFF`): set at the start of the stream and by every
+    /// dictionary reset, cleared by a chunk that brings properties
+    /// (liblzma's `need_properties`).
+    need_props: bool,
 
     // Scratch for partial header bytes spanning input chunks.
     scratch: Vec<u8>,
@@ -662,6 +667,7 @@ impl Decoder {
             phase: Phase::Control,
             poisoned,
             expecting_first: true,
+            need_props: true,
             scratch: Vec::new(),
             scratch_want: 0,
             comp_ctrl: 0,
@@ -759,6 +765,9 @@ impl RawDecoder for Decoder {
                         if control == 0x01 {
                             // Dictionary reset clears any straddling LZ state.
                             self.reset_dict_for_uncompressed();
+                            // Whatever properties were in force do not
+                            // survive a dictionary reset.
+                            self.need_props = true;
                         }
                         self.expecting_first = false;
                         self.scratch_want = 2;
@@ -767,6 +776,13 @@ impl RawDecoder for Decoder {
                         // First chunk must full-reset (dict + props + state),
                         // i.e. control byte in 0xE0..=0xFF.
                         if self.expecting_first && control < 0xE0 {
+                            return Err(self.poison(Error::Corrupt));
+                        }
+                        // After a dictionary reset the chunk must bring
+                        // new properties: 0xC0..=0xFF.
+                        if control >= 0xC0 {
+                            self.need_props = false;
+                        } else if self.need_props {
                             return Err(self.poison(Error::Corrupt));
                         }
                         self.comp_ctrl = control;
@@ -957,6 +973,7 @@ impl RawDecoder for Decoder {
         self.phase = Phase::Control;
         self.poisoned = false;
         self.expecting_first = true;
+        self.need_props = true;
         self.scratch.clear();
         self.scratch_want = 0;
         self.comp_ctrl = 0;

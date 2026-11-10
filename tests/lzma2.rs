@@ -685,6 +685,51 @@ fn stored_chunk(control: u8, data: &[u8]) -> Vec<u8> {
     c
 }
 
+/// After a dictionary reset the next compressed chunk must carry new
+/// properties (liblzma's `need_properties`): a `0x80..=0xBF` chunk used to
+/// be decoded with made-up default properties.
+#[test]
+fn compressed_chunk_after_dict_reset_needs_properties() {
+    let first: &[u8] = b"0123456789abcdef";
+    let payload = match_len2_dist9_payload();
+    let with_props = compressed_chunk(0xC0, 2, &payload);
+    // The same chunk without its properties byte: state reset only (0xA0)
+    // or no reset at all (0x80).
+    let without_props = |control: u8| {
+        let mut c = with_props.clone();
+        c[0] = control;
+        c.remove(5);
+        c
+    };
+    let decode = |chunks: &[&[u8]]| {
+        let s = [&chunks.concat()[..], &[0x00]].concat();
+        decode_all(&s, DecoderConfig::default(), 64)
+    };
+    let stored = stored_chunk(0x01, first);
+
+    for control in [0xA0, 0x80] {
+        // Straight after the stream's first (dictionary-reset) chunk.
+        let r = decode(&[&stored, &without_props(control)]);
+        assert_eq!(r, Err(Error::Corrupt), "{control:#x}");
+        // Properties given once do not survive a later dictionary reset.
+        let r = decode(&[&stored, &with_props, &stored, &without_props(control)]);
+        assert_eq!(r, Err(Error::Corrupt), "{control:#x} after a later reset");
+    }
+    // With properties in force, a state-reset chunk needs none (the
+    // payload expects a fresh state, so 0xA0 it is). A stored chunk that
+    // keeps the dictionary (0x02) keeps the properties too.
+    let got = decode(&[&stored, &with_props, &without_props(0xA0)]).unwrap();
+    assert_eq!(got, b"0123456789abcdef789a");
+    let more = stored_chunk(0x02, b"..");
+    let got = decode(&[&stored, &with_props, &more, &without_props(0xA0)]).unwrap();
+    assert_eq!(got, b"0123456789abcdef78..bc");
+
+    // The stream's first chunk must reset the dictionary.
+    assert_eq!(decode(&[&with_props]), Err(Error::Corrupt));
+    assert_eq!(decode(&[&without_props(0xA0)]), Err(Error::Corrupt));
+    assert_eq!(decode(&[&more]), Err(Error::Corrupt));
+}
+
 /// A dictionary reset keeps the decoder's dictionary buffer (re-allocating
 /// it per `0x01` chunk was a CPU DoS), so the bytes from before the reset
 /// are still in memory: no match may reach them.

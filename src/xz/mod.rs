@@ -1335,6 +1335,12 @@ pub struct Decoder {
     /// (control byte `0xE0..=0xFF` for compressed, or `0x01` for
     /// uncompressed); reject any other first chunk.
     expecting_block_first_chunk: bool,
+    /// The next compressed chunk must carry a properties byte (control
+    /// `0xC0..=0xFF`): set at the start of a Block and by every dictionary
+    /// reset, cleared by a chunk that brings properties. This is liblzma's
+    /// `need_properties`; a `0x80..=0xBF` chunk while it is set has no
+    /// properties to decode with and is corrupt.
+    lzma2_need_props: bool,
     /// Control byte of the in-flight compressed chunk.
     comp_ctrl: u8,
     /// Uncompressed size of the in-flight chunk (1..=65_536 for
@@ -1398,6 +1404,7 @@ impl Decoder {
             lzma2_dict_size: 0,
             lzma_core: None,
             expecting_block_first_chunk: false,
+            lzma2_need_props: true,
             comp_ctrl: 0,
             comp_uncomp_size: 0,
             comp_size: 0,
@@ -1747,6 +1754,7 @@ impl RawDecoder for Decoder {
                             self.block_uncompressed_seen = 0;
                             self.check = BlockCheck::new(self.check_id);
                             self.expecting_block_first_chunk = true;
+                            self.lzma2_need_props = true;
                             self.phase = DecPhase::BlockHeader;
                         }
                     } else {
@@ -1830,6 +1838,9 @@ impl RawDecoder for Decoder {
                         // harmless: nothing is written in between.)
                         if control == 0x01 {
                             self.reset_dict_for_uncompressed();
+                            // Whatever properties were in force do not
+                            // survive a dictionary reset.
+                            self.lzma2_need_props = true;
                         }
                         self.expecting_block_first_chunk = false;
                         self.scratch_want = 3;
@@ -1854,6 +1865,14 @@ impl RawDecoder for Decoder {
                         // First chunk in a block must perform a full dict
                         // reset, i.e. control byte in `0xE0..=0xFF`.
                         if self.expecting_block_first_chunk && control < 0xE0 {
+                            return Err(self.poison(Error::Corrupt));
+                        }
+                        // After a dictionary reset (and so also at the
+                        // start of a Block) the chunk must bring new
+                        // properties: 0xC0..=0xFF.
+                        if control >= 0xC0 {
+                            self.lzma2_need_props = false;
+                        } else if self.lzma2_need_props {
                             return Err(self.poison(Error::Corrupt));
                         }
                         self.comp_ctrl = control;
