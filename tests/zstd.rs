@@ -1733,6 +1733,20 @@ fn huffman_literal_streams_must_be_fully_consumed() {
     assert_eq!(decode_all_chunkings(&six(0x00)), Err(Error::Corrupt));
 }
 
+/// 4-stream Huffman literals need a Regenerated_Size of at least 6
+/// (reference `MIN_LITERALS_FOR_4_STREAMS`: "Header of Literals' block
+/// doesn't respect format specification"). Four literals, one per stream,
+/// used to be accepted; six (see the test above) is the smallest legal size.
+#[test]
+fn four_stream_literals_need_six_bytes() {
+    // Same tree as above; streams `02 03 02 03` = symbols 0, 1, 0, 1.
+    let four = compressed_block_frame(&[
+        0x46, 0x00, 0x03, 0x80, 0x10, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x02, 0x03, 0x02, 0x03,
+        0x00,
+    ]);
+    assert_eq!(decode_all_chunkings(&four), Err(Error::Corrupt));
+}
+
 /// The exact-consumption checks must never reject what the crate's own
 /// encoder writes: many small inputs of different shapes (so 1- and 4-stream
 /// Huffman literals, FSE-compressed / RLE / predefined / repeat sequence
