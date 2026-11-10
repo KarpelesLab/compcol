@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.9](https://github.com/KarpelesLab/compcol/compare/v0.7.8...v0.7.9) - 2026-11-10
+
+### Fixed
+
+- security audit of v0.7.8 — hangs, CPU blowups, limit bypasses, integrity gaps ([#169](https://github.com/KarpelesLab/compcol/pull/169))
+
+### Other
+
+- decode everything the Lizard CLI writes (sub-blocks, -BD, LIZv1, Huffman) ([#171](https://github.com/KarpelesLab/compcol/pull/171))
+
 ## [0.7.8](https://github.com/KarpelesLab/compcol/compare/v0.7.7...v0.7.8) - 2026-10-31
 
 ### Added
